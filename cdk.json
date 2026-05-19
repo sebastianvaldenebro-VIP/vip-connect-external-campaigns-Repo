@@ -1,0 +1,53 @@
+{
+  "app": "npx ts-node --prefer-ts-exts infra/bin/app.ts",
+  "watch": {
+    "include": ["infra/**/*.ts"],
+    "exclude": ["node_modules", "cdk.out", "**/*.d.ts", "services/**"]
+  },
+  "context": {
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:validateSnapshotRemovalPolicy": true,
+    "@aws-cdk/aws-dynamodb:retainTableReplica": true,
+
+    "_comment_env": "Fill these before running 'cdk deploy'",
+    "awsAccountId": "165505826690",
+    "awsRegion": "us-east-1",
+    "connectInstanceId": "6b3f17ba-68a4-472a-9b20-db1991507009",
+
+    "_comment_vpc": "Matches existing connectcampaignRedisSub VPC (discovered from get-function-configuration)",
+    "vpcId": "vpc-0d32b420acc84d370",
+    "privateSubnetIds": ["subnet-06c7669b5e3e0e814", "subnet-088367ac9fc0a2fec"],
+    "lambdaSecurityGroupId": "sg-01d54d29c2a4785f1",
+
+    "_comment_redis": "ElastiCache Redis. No auth (VPC isolation), leave redisPasswordSecretArn empty.",
+    "redisHost": "production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com",
+    "redisPort": "6379",
+    "redisPasswordSecretArn": "",
+
+    "_comment_app": "Application constants",
+    "team": "BASIC_TEAM",
+    "feederScheduleMinutes": "5",
+    "auditRetentionYears": "6",
+
+    "_comment_iam": "Org-mandated permission boundary — required to CreateRole",
+    "permissionsBoundaryName": "EngineeringPermissionBoundary",
+
+    "_comment_admin_ui": "VIP Admin UI config — Customer Profiles + Cognito",
+    "profilesDomainName": "amazon-connect-vipmedicalgroup",
+    "cognitoDomainPrefix": "vip-admin-ui-165505826690",
+    "cognitoCallbackUrls": [
+      "http://localhost:5173/callback",
+      "https://dprtjww5c9892.cloudfront.net/callback"
+    ],
+    "cognitoLogoutUrls": [
+      "http://localhost:5173/",
+      "https://dprtjww5c9892.cloudfront.net/"
+    ],
+    "corsAllowOrigins": [
+      "http://localhost:5173",
+      "https://dprtjww5c9892.cloudfront.net"
+    ]
+  }
+}

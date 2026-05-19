@@ -1,0 +1,536 @@
+{
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Lambda \u2014 Errors & Throttles"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 1,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Errors",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-admin-ui-api-plans",
+            {
+              "label": "api-plans",
+              "color": "#d62728"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-external-campaigns-feeder",
+            {
+              "label": "feeder",
+              "color": "#ff7f0e"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-admin-ui-api-segments",
+            {
+              "label": "api-segments",
+              "color": "#ffbb78"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-admin-ui-api-campaigns",
+            {
+              "label": "api-campaigns",
+              "color": "#aec7e8"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-admin-ui-api-metrics",
+            {
+              "label": "api-metrics",
+              "color": "#c5b0d5"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "vip-admin-ui-api-profiles",
+            {
+              "label": "api-profiles",
+              "color": "#bcbd22"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 1,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Throttles",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/Lambda",
+            "Throttles",
+            "FunctionName",
+            "vip-admin-ui-api-plans",
+            {
+              "label": "api-plans (5 reserved)",
+              "color": "#d62728"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Throttles",
+            "FunctionName",
+            "vip-external-campaigns-feeder",
+            {
+              "label": "feeder (1 reserved)",
+              "color": "#ff7f0e"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Throttles",
+            "FunctionName",
+            "vip-admin-ui-api-segments",
+            {
+              "label": "api-segments",
+              "color": "#ffbb78"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Throttles",
+            "FunctionName",
+            "vip-admin-ui-api-campaigns",
+            {
+              "label": "api-campaigns",
+              "color": "#aec7e8"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 7,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## Lambda \u2014 Invocations & Duration"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Invocations",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-admin-ui-api-plans",
+            {
+              "label": "api-plans"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-external-campaigns-feeder",
+            {
+              "label": "feeder"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-admin-ui-api-segments",
+            {
+              "label": "api-segments"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-admin-ui-api-campaigns",
+            {
+              "label": "api-campaigns"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-admin-ui-api-metrics",
+            {
+              "label": "api-metrics"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Invocations",
+            "FunctionName",
+            "vip-admin-ui-api-profiles",
+            {
+              "label": "api-profiles"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 8,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "Lambda Duration p99 ms (funciones de larga duracion)",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 300,
+        "stat": "p99",
+        "metrics": [
+          [
+            "AWS/Lambda",
+            "Duration",
+            "FunctionName",
+            "vip-admin-ui-api-plans",
+            {
+              "label": "api-plans",
+              "color": "#d62728"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Duration",
+            "FunctionName",
+            "vip-external-campaigns-feeder",
+            {
+              "label": "feeder",
+              "color": "#ff7f0e"
+            }
+          ],
+          [
+            "AWS/Lambda",
+            "Duration",
+            "FunctionName",
+            "vip-admin-ui-api-segments",
+            {
+              "label": "api-segments",
+              "color": "#ffbb78"
+            }
+          ]
+        ],
+        "annotations": {
+          "horizontal": [
+            {
+              "value": 240000,
+              "label": "4 min (80% timeout)",
+              "color": "#ff7f0e"
+            }
+          ]
+        },
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 14,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## DynamoDB \u2014 VipAdminPlans"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 15,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "VipAdminPlans \u2014 Consumed RCU / WCU",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/DynamoDB",
+            "ConsumedReadCapacityUnits",
+            "TableName",
+            "VipAdminPlans",
+            {
+              "label": "RCU"
+            }
+          ],
+          [
+            "AWS/DynamoDB",
+            "ConsumedWriteCapacityUnits",
+            "TableName",
+            "VipAdminPlans",
+            {
+              "label": "WCU"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 15,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "VipAdminPlans \u2014 Throttles & System Errors",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/DynamoDB",
+            "ThrottledRequests",
+            "TableName",
+            "VipAdminPlans",
+            {
+              "label": "Throttles",
+              "color": "#ff7f0e"
+            }
+          ],
+          [
+            "AWS/DynamoDB",
+            "SystemErrors",
+            "TableName",
+            "VipAdminPlans",
+            {
+              "label": "System Errors",
+              "color": "#d62728"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 21,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## EventBridge \u2014 Reglas de planes"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "EventBridge \u2014 Invocations",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/Events",
+            "Invocations",
+            "RuleName",
+            "vip-plans-prestart-check",
+            {
+              "label": "prestart-check"
+            }
+          ],
+          [
+            "AWS/Events",
+            "Invocations",
+            "RuleName",
+            "campaign-events",
+            {
+              "label": "campaign-events"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "title": "EventBridge \u2014 Failed Invocations",
+        "view": "timeSeries",
+        "stacked": false,
+        "period": 60,
+        "stat": "Sum",
+        "metrics": [
+          [
+            "AWS/Events",
+            "FailedInvocations",
+            "RuleName",
+            "vip-plans-prestart-check",
+            {
+              "label": "prestart-check",
+              "color": "#d62728"
+            }
+          ],
+          [
+            "AWS/Events",
+            "FailedInvocations",
+            "RuleName",
+            "campaign-events",
+            {
+              "label": "campaign-events",
+              "color": "#ff7f0e"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0
+          }
+        },
+        "region": "us-east-1",
+        "annotations": {
+          "horizontal": []
+        }
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 0,
+      "y": 28,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "title": "Estado de alarmas",
+        "alarms": [
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-plans-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-plans-throttles",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-plans-duration-p99",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-feeder-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-feeder-throttles",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-feeder-duration-p99",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-segments-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-segments-duration-p99",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-campaigns-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-metrics-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-profiles-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-plans-table-system-errors",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-plans-table-throttles",
+          "arn:aws:cloudwatch:us-east-1:165505826690:alarm:vip-prestart-check-failed-invocations"
+        ]
+      }
+    }
+  ]
+}

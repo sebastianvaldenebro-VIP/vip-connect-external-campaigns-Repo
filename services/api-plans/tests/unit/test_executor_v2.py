@@ -1,0 +1,1903 @@
+"""Tests for executor.py v2 — DAG campaigns, parallel buckets, pre-start, loop."""
+from __future__ import annotations
+
+import sys
+import os
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _campaign_def(cid: str, name: str = "", depends_on: list | None = None) -> dict:
+    return {"id": cid, "name": name or cid, "states": ["NY"], "groups": [], "dependsOn": depends_on or []}
+
+
+def _campaign_state(cid: str, status: str = "queued", connect_id: str | None = None, exit_reason: str | None = None) -> dict:
+    return {
+        "campaignId": cid,
+        "name": cid,
+        "status": status,
+        "connectCampaignId": connect_id,
+        "segmentName": None,
+        "segmentArn": None,
+        "leadCount": None,
+        "startedAt": None,
+        "completedAt": None,
+        "exitReason": exit_reason,
+        "errorDetail": None,
+    }
+
+
+def _bucket_state(bucket_id: str, campaign_states: list, status: str = "running", schedule_name: str = "sched-x") -> dict:
+    return {
+        "bucketId": bucket_id,
+        "name": bucket_id,
+        "status": status,
+        "scheduleName": schedule_name,
+        "startedAt": "2026-05-08T10:00:00+00:00",
+        "completedAt": None,
+        "campaignStates": campaign_states,
+    }
+
+
+def _bucket_def(bid: str, campaigns: list, run_mode: str = "status_based",
+                duration: int = 30, parallel: bool = False, cleanup: bool = False,
+                prestart_next: bool = True) -> dict:
+    return {
+        "id": bid,
+        "name": bid,
+        "run_mode": run_mode,
+        "duration_minutes": duration,
+        "cleanup": cleanup,
+        "prestart_next": prestart_next,
+        "parallel": parallel,
+        "campaigns": campaigns,
+        "campaignConfig": {
+            "queueId": "q-1",
+            "contactFlowId": "cf-1",
+            "sourcePhoneNumber": "+12125550100",
+            "dialerType": "progressive",
+            "bandwidthAllocation": 1.0,
+            "dialingCapacity": 1.0,
+            "amdEnabled": True,
+        },
+    }
+
+
+def _make_plan(buckets: list) -> dict:
+    return {
+        "planId": "plan-1",
+        "name": "Test",
+        "trigger": {"type": "manual"},
+        "isTemplate": False,
+        "buckets": buckets,
+    }
+
+
+def _make_run(
+    plan: dict,
+    bucket_states: list,
+    status: str = "running",
+    bucket_index: int = 0,
+) -> dict:
+    return {
+        "planId": "plan-1",
+        "runId": "run-1",
+        "status": status,
+        "planSnapshot": plan,
+        "currentBucketIndex": bucket_index,
+        "bucketStates": bucket_states,
+        "startedAt": "2026-05-08T10:00:00+00:00",
+        "completedAt": None,
+        "_version": 0,
+        "triggeredBy": "manual",
+        "error": None,
+    }
+
+
+# ── _find_campaign_state ──────────────────────────────────────────────────────
+
+
+def test_find_campaign_state_same_bucket():
+    import executor
+    run = _make_run(
+        _make_plan([]),
+        [_bucket_state("b0", [_campaign_state("c1"), _campaign_state("c2")])],
+    )
+    assert executor._find_campaign_state(run, "c2")["campaignId"] == "c2"
+
+
+def test_find_campaign_state_cross_bucket():
+    import executor
+    run = _make_run(
+        _make_plan([]),
+        [
+            _bucket_state("b0", [_campaign_state("c0")]),
+            _bucket_state("b1", [_campaign_state("c1")]),
+        ],
+    )
+    assert executor._find_campaign_state(run, "c0")["campaignId"] == "c0"
+    assert executor._find_campaign_state(run, "c1")["campaignId"] == "c1"
+
+
+def test_find_campaign_state_missing_returns_none():
+    import executor
+    run = _make_run(_make_plan([]), [_bucket_state("b0", [_campaign_state("c0")])])
+    assert executor._find_campaign_state(run, "nope") is None
+
+
+# ── _all_campaigns_terminal ───────────────────────────────────────────────────
+
+
+def test_all_campaigns_terminal_true():
+    import executor
+    run = _make_run(
+        _make_plan([]),
+        [_bucket_state("b0", [
+            _campaign_state("c1", "completed"),
+            _campaign_state("c2", "cancelled"),
+        ])],
+    )
+    assert executor._all_campaigns_terminal(run, 0) is True
+
+
+def test_all_campaigns_terminal_false():
+    import executor
+    run = _make_run(
+        _make_plan([]),
+        [_bucket_state("b0", [
+            _campaign_state("c1", "completed"),
+            _campaign_state("c2", "running"),
+        ])],
+    )
+    assert executor._all_campaigns_terminal(run, 0) is False
+
+
+def test_all_campaigns_terminal_error_counts_as_terminal():
+    import executor
+    run = _make_run(
+        _make_plan([]),
+        [_bucket_state("b0", [_campaign_state("c1", "error")])],
+    )
+    assert executor._all_campaigns_terminal(run, 0) is True
+
+
+# ── _dispatch_ready_campaigns: stage-1 auto-start ────────────────────────────
+
+
+def test_dispatch_stage1_starts_immediately():
+    """Stage-1 (empty dependsOn) campaigns in bucket 0 start without waiting."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c1"), _campaign_state("c2")]),
+    ])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert changed is True
+    assert start.call_count == 2
+
+
+def test_dispatch_stage2_waits_for_parent():
+    """Stage-2 (dependsOn populated) stays queued while parent is still running."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c1 = _campaign_state("c1", "running")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
+
+    with patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    start.assert_not_called()
+    assert changed is False
+
+
+def test_dispatch_stage2_starts_after_parent_completes():
+    """Stage-2 is dispatched once its parent reaches 'completed'."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c1 = _campaign_state("c1", "completed")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    start.assert_called_once_with(run, plan, 0, 1)
+    assert changed is True
+
+
+def test_dispatch_cascade_cancel_on_parent_error():
+    """If parent errors, dependent gets cancelled with parent_cancelled exit reason."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c1 = _campaign_state("c1", "error")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    start.assert_not_called()
+    assert changed is True
+    assert c2["status"] == "cancelled"
+    assert c2["exitReason"] == "parent_cancelled"
+
+
+def test_dispatch_cascade_cancel_on_parent_cancelled():
+    """Cancelled parent also triggers cascade."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c1 = _campaign_state("c1", "cancelled")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert c2["status"] == "cancelled"
+    assert c2["exitReason"] == "parent_cancelled"
+
+
+def test_dispatch_cascade_cancel_on_parent_expired():
+    """Expired parent also triggers cascade."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c1 = _campaign_state("c1", "expired")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert c2["status"] == "cancelled"
+    assert c2["exitReason"] == "parent_cancelled"
+
+
+# ── _dispatch_ready_campaigns: cross-bucket deps ─────────────────────────────
+
+
+def test_dispatch_cross_bucket_dep_waits_for_previous_bucket_campaign():
+    """Campaign in bucket 1 with dependsOn=[c0] waits until c0 is completed."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "running")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="running"),
+        _bucket_state("b1", [c1], status="running"),
+    ])
+
+    with patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 1)
+
+    start.assert_not_called()
+    assert changed is False
+
+
+def test_dispatch_cross_bucket_dep_starts_after_parent_completes():
+    """Campaign in bucket 1 starts once c0 in bucket 0 is completed."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="running"),
+    ])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 1)
+
+    start.assert_called_once_with(run, plan, 1, 0)
+    assert changed is True
+
+
+# ── Sequential bucket: stage-1 waits for previous bucket ─────────────────────
+
+
+def test_dispatch_sequential_stage1_waits_for_previous_bucket():
+    """Stage-1 (empty dependsOn) campaign in sequential bucket 1 waits for bucket 0 to complete."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")], status="running"),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="running"),
+    ])
+
+    with patch("executor._start_one_campaign") as start:
+        executor._dispatch_ready_campaigns(run, plan, 1)
+
+    start.assert_not_called()
+
+
+def test_dispatch_sequential_stage1_starts_when_previous_bucket_done():
+    """Stage-1 in sequential bucket 1 starts once bucket 0 is completed."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")], status="completed"),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="running"),
+    ])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 1)
+
+    start.assert_called_once()
+    assert changed is True
+
+
+# ── Parallel bucket ───────────────────────────────────────────────────────────
+
+
+def test_dispatch_parallel_bucket_starts_immediately():
+    """Stage-1 campaign in a parallel bucket starts without waiting for previous bucket."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")], parallel=True),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")], status="running"),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="running"),
+    ])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        changed = executor._dispatch_ready_campaigns(run, plan, 1)
+
+    start.assert_called_once()
+    assert changed is True
+
+
+# ── tick: stale / terminal guard ─────────────────────────────────────────────
+
+
+def test_tick_stale_when_bucket_not_active():
+    """tick for a bucket whose status is 'queued' is a stale tick."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")], status="running"),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+    ])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._delete_bucket_schedule_safe"):
+        result = executor.tick("plan-1", "run-1", 1)
+
+    assert result["reason"] == "stale_tick"
+
+
+def test_tick_already_terminal_run():
+    """tick returns already_terminal when run.status != running."""
+    import executor
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "completed")], status="completed")],
+                    status="completed")
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._delete_bucket_schedule_safe"):
+        result = executor.tick("plan-1", "run-1", 0)
+
+    assert result["reason"] == "already_terminal"
+
+
+# ── tick: status-based all-terminal advances bucket ──────────────────────────
+
+
+def test_tick_advances_when_all_campaigns_terminal():
+    """tick calls _advance_bucket when all campaigns reach a terminal state."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    cs = _campaign_state("c0", "running", connect_id="conn-0")
+    run = _make_run(plan, [
+        _bucket_state("b0", [cs]),
+        _bucket_state("b1", [_campaign_state("c1")], status="queued"),
+    ])
+
+    def poll_to_completed(campaign_state):
+        campaign_state["status"] = "completed"
+        campaign_state["exitReason"] = "completed"
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._poll_campaign_state", side_effect=poll_to_completed), \
+         patch("executor._advance_bucket") as advance, \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        result = executor.tick("plan-1", "run-1", 0)
+
+    advance.assert_called_once()
+    assert result["reason"] == "advanced"
+
+
+def test_tick_does_not_advance_when_campaigns_still_running():
+    """tick does NOT advance when a campaign is still running."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1")]),
+    ])
+    cs0 = _campaign_state("c0", "completed")
+    cs1 = _campaign_state("c1", "running", connect_id="conn-1")
+    run = _make_run(plan, [_bucket_state("b0", [cs0, cs1])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._poll_campaign_state"), \
+         patch("executor._advance_bucket") as advance, \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        executor.tick("plan-1", "run-1", 0)
+
+    advance.assert_not_called()
+
+
+# ── tick: time-based expiry ───────────────────────────────────────────────────
+
+
+def test_tick_expires_time_based_bucket():
+    """tick calls _expire_bucket when elapsed >= duration_minutes."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=10),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    # Started 15 minutes ago → elapsed > 10 min
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    cs = _campaign_state("c0", "running", connect_id="conn-0")
+    bs = _bucket_state("b0", [cs])
+    bs["startedAt"] = past_iso
+    run = _make_run(plan, [bs, _bucket_state("b1", [_campaign_state("c1")], status="queued")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._poll_campaign_state"), \
+         patch("executor._expire_bucket") as expire, \
+         patch("executor._prestart_next_bucket"), \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        result = executor.tick("plan-1", "run-1", 0)
+
+    expire.assert_called_once_with(run, plan, 0)
+    assert result["reason"] == "expired"
+
+
+# ── tick: pre-start warming ───────────────────────────────────────────────────
+
+
+def test_tick_triggers_prestart_when_within_window():
+    """tick calls _prestart_next_bucket when elapsed >= duration - PRESTART_MINUTES."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20, prestart_next=True),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    # Started 16 minutes ago → within 5-min pre-start window (20 - 5 = 15)
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    cs = _campaign_state("c0", "running", connect_id="conn-0")
+    bs = _bucket_state("b0", [cs])
+    bs["startedAt"] = past_iso
+    run = _make_run(plan, [bs, _bucket_state("b1", [_campaign_state("c1")], status="queued")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._poll_campaign_state"), \
+         patch("executor._prestart_next_bucket") as prestart, \
+         patch("executor._next_bucket_warming", return_value=False), \
+         patch("executor._all_campaigns_terminal", return_value=False), \
+         patch("executor._dispatch_ready_campaigns", return_value=False), \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        executor.tick("plan-1", "run-1", 0)
+
+    prestart.assert_called_once_with(run, plan, 0)
+
+
+def test_tick_does_not_double_prestart_if_already_warming():
+    """tick skips _prestart_next_bucket if next bucket is already warming."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20, prestart_next=True),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    past_iso = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    bs = _bucket_state("b0", [_campaign_state("c0", "running", connect_id="conn-0")])
+    bs["startedAt"] = past_iso
+    run = _make_run(plan, [bs, _bucket_state("b1", [_campaign_state("c1")], status="warming")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._poll_campaign_state"), \
+         patch("executor._prestart_next_bucket") as prestart, \
+         patch("executor._next_bucket_warming", return_value=True), \
+         patch("executor._all_campaigns_terminal", return_value=False), \
+         patch("executor._dispatch_ready_campaigns", return_value=False), \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        executor.tick("plan-1", "run-1", 0)
+
+    prestart.assert_not_called()
+
+
+# ── _prestart_next_bucket ─────────────────────────────────────────────────────
+
+
+def test_prestart_sets_next_bucket_to_warming():
+    """_prestart_next_bucket sets next bucket state to 'warming'."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+    ])
+
+    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn:seg-w", True)):
+        executor._prestart_next_bucket(run, plan, 0)
+
+    assert run["bucketStates"][1]["status"] == "warming"
+
+
+def test_prestart_only_creates_stage1_campaigns():
+    """_prestart_next_bucket creates campaigns only for stage-1 (empty dependsOn)."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1"), _campaign_def("c2", depends_on=["c1"])]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1"), _campaign_state("c2")], status="queued"),
+    ])
+
+    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn-w", True)) as create:
+        executor._prestart_next_bucket(run, plan, 0)
+
+    # Only c1 has no dependsOn → only 1 create call
+    assert create.call_count == 1
+    assert run["bucketStates"][1]["campaignStates"][0]["status"] == "warming"
+    assert run["bucketStates"][1]["campaignStates"][1]["status"] == "queued"
+
+
+def test_prestart_skips_if_next_bucket_already_warming():
+    """_prestart_next_bucket is a no-op when next bucket status != queued."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1")], status="warming"),
+    ])
+
+    with patch("executor._create_campaign_only") as create:
+        executor._prestart_next_bucket(run, plan, 0)
+
+    create.assert_not_called()
+
+
+# ── _expire_bucket ────────────────────────────────────────────────────────────
+
+
+def test_expire_bucket_stops_running_and_cancels_queued():
+    """_expire_bucket: running → expired, queued → cancelled, then advances."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1")]),
+        _bucket_def("b1", [_campaign_def("c2")]),
+    ])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0, c1]),
+        _bucket_state("b1", [_campaign_state("c2")], status="queued"),
+    ])
+
+    with patch("executor._safe_stop_campaign") as stop, \
+         patch("executor._advance_bucket") as advance:
+        executor._expire_bucket(run, plan, 0)
+
+    stop.assert_called_once_with("conn-0")
+    assert c0["status"] == "expired"
+    assert c0["exitReason"] == "expired"
+    assert c1["status"] == "cancelled"
+    assert c1["exitReason"] == "bucket_expired"
+    advance.assert_called_once_with(run, plan, 0, reason="time_expired")
+
+
+# ── _advance_bucket ───────────────────────────────────────────────────────────
+
+
+def test_advance_bucket_starts_next_sequential():
+    """_advance_bucket calls _start_bucket for the next sequential (non-parallel) bucket."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")]),
+        _bucket_state("b1", [_campaign_state("c1")], status="queued"),
+    ])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor._start_bucket") as start_next, \
+         patch("executor.save_run"):
+        executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    start_next.assert_called_once_with(run, 1)
+    assert run["bucketStates"][0]["status"] == "completed"
+
+
+def test_advance_bucket_activates_warming_next():
+    """_advance_bucket calls _activate_warming_bucket when next bucket is pre-warmed."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based"),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")]),
+        _bucket_state("b1", [_campaign_state("c1", "warming", connect_id="conn-w")], status="warming"),
+    ])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor._activate_warming_bucket") as activate, \
+         patch("executor.save_run"):
+        executor._advance_bucket(run, plan, 0, "time_expired")
+
+    activate.assert_called_once_with(run, plan, 1)
+
+
+def test_advance_last_bucket_completes_run():
+    """_advance_bucket sets run.status=completed when all buckets are done."""
+    import executor
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "completed")])])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.unlock_plan_run") as unlock, \
+         patch("executor._maybe_loop"), \
+         patch("executor.start_run_chained") as chained:
+        executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    assert run["status"] == "completed"
+    unlock.assert_called_once_with("plan-1")
+    chained.assert_called_once_with("plan-1")
+
+
+def test_advance_parallel_bucket_does_not_start_next():
+    """_advance_bucket does not start the next bucket if it is parallel (already running)."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")], parallel=True),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")]),
+        _bucket_state("b1", [_campaign_state("c1", "running")], status="running"),
+    ])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor._start_bucket") as start_next, \
+         patch("executor._activate_warming_bucket") as activate, \
+         patch("executor.save_run"):
+        executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    start_next.assert_not_called()
+    activate.assert_not_called()
+
+
+def test_advance_parallel_bucket_completes_run_when_all_done():
+    """When both parallel buckets complete (out-of-order), run is marked completed."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")], parallel=True),
+    ])
+    # b0 advances last; b1 is already completed
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")]),
+        _bucket_state("b1", [_campaign_state("c1", "completed")], status="completed"),
+    ])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.unlock_plan_run"), \
+         patch("executor._maybe_loop"), \
+         patch("executor.start_run_chained") as chained:
+        executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    assert run["status"] == "completed"
+    chained.assert_called_once_with("plan-1")
+
+
+# ── abort_run ─────────────────────────────────────────────────────────────────
+
+
+def test_abort_run_not_running_raises():
+    import executor
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0")])], status="completed")
+
+    with patch("executor.get_run", return_value=run):
+        with pytest.raises(ValueError, match="not running"):
+            executor.abort_run("plan-1", "run-1")
+
+
+def test_abort_run_stops_running_campaigns_in_all_buckets():
+    """abort_run stops campaigns in ALL active buckets (handles parallel)."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1")], parallel=True),
+    ])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    c1 = _campaign_state("c1", "running", connect_id="conn-1")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="running"),
+        _bucket_state("b1", [c1], status="running"),
+    ])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._safe_stop_campaign") as stop, \
+         patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor.unlock_plan_run"):
+        result = executor.abort_run("plan-1", "run-1")
+
+    assert stop.call_count == 2
+    calls = {c[0][0] for c in stop.call_args_list}
+    assert "conn-0" in calls
+    assert "conn-1" in calls
+    assert result["status"] == "aborted"
+
+
+def test_abort_run_cancels_queued_and_warming_campaigns():
+    """abort_run marks queued and warming campaigns as cancelled."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1"), _campaign_def("c2")]),
+    ])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    c1 = _campaign_state("c1", "queued")
+    c2 = _campaign_state("c2", "warming", connect_id="conn-w")
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1, c2])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._safe_delete_campaign"), \
+         patch("executor._safe_delete_segment"), \
+         patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor.unlock_plan_run"):
+        executor.abort_run("plan-1", "run-1")
+
+    assert c0["status"] == "cancelled"
+    assert c0["exitReason"] == "aborted"
+    assert c1["status"] == "cancelled"
+    assert c1["exitReason"] == "aborted"
+    assert c2["status"] == "cancelled"
+    assert c2["exitReason"] == "aborted"
+
+
+def test_abort_run_deletes_warming_connect_campaign():
+    """abort_run deletes (not just stops) a warming Connect campaign."""
+    import executor
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "warming", connect_id="conn-w")
+    c0["segmentName"] = "seg-w"
+    run = _make_run(plan, [_bucket_state("b0", [c0])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._safe_stop_campaign") as stop, \
+         patch("executor._safe_delete_campaign") as delete_camp, \
+         patch("executor._safe_delete_segment") as delete_seg, \
+         patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor.unlock_plan_run"):
+        executor.abort_run("plan-1", "run-1")
+
+    stop.assert_called_with("conn-w")
+    delete_camp.assert_called_with("conn-w")
+    delete_seg.assert_called_with("seg-w")
+
+
+def test_abort_run_cancels_creating_campaigns():
+    """abort_run must cancel campaigns in 'creating' state (two-phase claim in progress)."""
+    import executor
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1")])])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    c1 = _campaign_state("c1", "creating")  # stuck in two-phase claim
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._safe_delete_campaign"), \
+         patch("executor._safe_delete_segment"), \
+         patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run"), \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor.unlock_plan_run"):
+        executor.abort_run("plan-1", "run-1")
+
+    assert c1["status"] == "cancelled"
+    assert c1["exitReason"] == "aborted"
+
+
+# ── start_run_chained ─────────────────────────────────────────────────────────
+
+
+def test_start_run_chained_fires_downstream_plans():
+    """start_run_chained starts all plans triggered by the upstream plan."""
+    import executor
+    downstream = {"planId": "plan-2", "trigger": {"type": "on_plan_complete", "planId": "plan-1", "repeat": True}}
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[downstream]), \
+         patch("executor.start_run") as start, \
+         patch("executor.update_plan_trigger"):
+        executor.start_run_chained("plan-1")
+
+    start.assert_called_once_with("plan-2", triggered_by="chained")
+
+
+def test_start_run_chained_resets_trigger_when_repeat_false():
+    """start_run_chained resets trigger to manual after firing when repeat=False."""
+    import executor
+    downstream = {"planId": "plan-2", "trigger": {"type": "on_plan_complete", "planId": "plan-1", "repeat": False}}
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[downstream]), \
+         patch("executor.start_run"), \
+         patch("executor.update_plan_trigger") as reset:
+        executor.start_run_chained("plan-1")
+
+    reset.assert_called_once_with("plan-2", {"type": "manual"})
+
+
+def test_start_run_chained_does_not_reset_when_repeat_true():
+    """start_run_chained does NOT reset trigger when repeat=True."""
+    import executor
+    downstream = {"planId": "plan-2", "trigger": {"type": "on_plan_complete", "planId": "plan-1", "repeat": True}}
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[downstream]), \
+         patch("executor.start_run"), \
+         patch("executor.update_plan_trigger") as reset:
+        executor.start_run_chained("plan-1")
+
+    reset.assert_not_called()
+
+
+def test_start_run_chained_continues_on_error():
+    """start_run_chained swallows errors so one failure doesn't block other chains."""
+    import executor
+    d1 = {"planId": "plan-2", "trigger": {"type": "on_plan_complete", "planId": "plan-1", "repeat": True}}
+    d2 = {"planId": "plan-3", "trigger": {"type": "on_plan_complete", "planId": "plan-1", "repeat": True}}
+
+    call_log = []
+    def _start(plan_id, triggered_by):
+        call_log.append(plan_id)
+        if plan_id == "plan-2":
+            raise RuntimeError("boom")
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[d1, d2]), \
+         patch("executor.start_run", side_effect=_start), \
+         patch("executor.update_plan_trigger"):
+        executor.start_run_chained("plan-1")
+
+    assert "plan-3" in call_log  # plan-3 still fires despite plan-2 failure
+
+
+# ── _maybe_loop ───────────────────────────────────────────────────────────────
+
+
+def test_maybe_loop_fires_when_before_until():
+    """_maybe_loop starts the plan again if current COT time is within loop window."""
+    import executor
+    plan = {"planId": "plan-1", "loop": {"startTime": "08:00", "endTime": "19:00"}, "buckets": []}
+
+    _COT = timezone(timedelta(hours=-5))
+    mock_now = datetime(2024, 1, 15, 10, 0, tzinfo=_COT)  # 10:00 COT — within 08:00–19:00
+
+    with patch("executor.get_plan", return_value=plan), \
+         patch("executor.get_latest_run", return_value=None), \
+         patch("executor.datetime") as mock_dt, \
+         patch("executor.start_run") as start:
+        mock_dt.now.return_value = mock_now
+        executor._maybe_loop("plan-1")
+
+    start.assert_called_once_with("plan-1", triggered_by="loop")
+
+
+def test_maybe_loop_skips_when_past_until():
+    """_maybe_loop does not start again if current COT time is past loop endTime."""
+    import executor
+    plan = {"planId": "plan-1", "loop": {"startTime": "08:00", "endTime": "19:00"}, "buckets": []}
+
+    _COT = timezone(timedelta(hours=-5))
+    mock_now = datetime(2024, 1, 15, 20, 0, tzinfo=_COT)  # 20:00 COT — past end
+
+    with patch("executor.get_plan", return_value=plan), \
+         patch("executor.get_latest_run", return_value=None), \
+         patch("executor.datetime") as mock_dt, \
+         patch("executor.start_run") as start:
+        mock_dt.now.return_value = mock_now
+        executor._maybe_loop("plan-1")
+
+    start.assert_not_called()
+
+
+def test_maybe_loop_skips_when_no_loop():
+    """_maybe_loop is a no-op when plan has no loop field."""
+    import executor
+    plan = {"planId": "plan-1", "loop": None, "buckets": []}
+
+    with patch("executor.get_plan", return_value=plan), \
+         patch("executor.get_latest_run", return_value=None), \
+         patch("executor.start_run") as start:
+        executor._maybe_loop("plan-1")
+
+    start.assert_not_called()
+
+
+# ── Bug fix: _dispatch_cross_bucket_ready must NOT cascade-cancel ─────────────
+#
+# Root cause: when eager-start failed in bucket [bi], its campaign was set to
+# "error"/"cancelled" in-memory, and the cascade block in the same loop iteration
+# would immediately cascade-cancel campaigns in bucket [bi+1], [bi+2], … — wiping
+# out the entire downstream chain before any bucket had a chance to run.
+
+
+def test_cross_bucket_ready_no_cascade_when_parent_already_cancelled():
+    """_dispatch_cross_bucket_ready must NOT cascade-cancel future queued campaigns.
+
+    Even when a parent in a previous bucket is already cancelled, the function only
+    handles eager starts (parent completed). Cascade happens in _dispatch_ready_campaigns
+    when the target bucket actually activates.
+    """
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+        _bucket_def("b2", [_campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c0 = _campaign_state("c0", "cancelled")  # already cancelled
+    c1 = _campaign_state("c1", "queued")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="queued"),
+        _bucket_state("b2", [c2], status="queued"),
+    ])
+
+    with patch("executor._start_one_campaign") as start, \
+         patch("executor._schedule_tick"):
+        changed = executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    # Cross-bucket eager dispatch does NOT cascade-cancel c1 or c2
+    start.assert_not_called()
+    assert c1["status"] == "queued", "c1 must stay queued — cascade is _dispatch_ready_campaigns' job"
+    assert c2["status"] == "queued", "c2 must stay queued — cascade is _dispatch_ready_campaigns' job"
+    assert changed is False
+
+
+def test_cross_bucket_ready_no_cascade_from_inline_eager_start_failure():
+    """Phase 2 removed: _dispatch_cross_bucket_ready never calls _start_one_campaign directly.
+
+    c1 is left in "creating" state after save_run (Phase 1 claim). The next tick for
+    that bucket will reset it to "queued" via the _dispatch_ready_campaigns recovery path.
+    c2 must remain "queued" regardless — cascade-cancel is _dispatch_ready_campaigns' job.
+    """
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+        _bucket_def("b2", [_campaign_def("c2", depends_on=["c1"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "queued")
+    c2 = _campaign_state("c2", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="queued"),
+        _bucket_state("b2", [c2], status="queued"),
+    ])
+
+    with patch("executor._start_one_campaign") as mock_start, \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor.save_run"):
+        executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    # Phase 2 removed — _start_one_campaign must never be called by this function
+    mock_start.assert_not_called()
+    # c1 is left in "creating" (Phase 1 claim persisted) — next tick resets to "queued"
+    assert c1["status"] == "creating"
+    # c2 must NOT be cascade-cancelled — it stays queued
+    assert c2["status"] == "queued", (
+        "Phase 2 removal must not cascade-cancel downstream campaigns"
+    )
+
+
+# ── Bug fix: force_start_campaign must reject completed buckets ───────────────
+#
+# A force-start in a completed bucket creates an orphan Connect campaign with no
+# tick to poll its state, so DynamoDB never reflects completion.
+
+
+def test_force_start_campaign_rejects_completed_bucket_non_cancelled():
+    """force_start_campaign must raise ValueError for completed buckets with non-cancelled campaigns."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "error")
+    run = _make_run(plan, [_bucket_state("b0", [c0], status="completed")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan):
+        with pytest.raises(ValueError, match="completed"):
+            executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+
+def test_force_start_campaign_allows_completed_bucket_with_cancelled_campaign():
+    """force_start_campaign must allow cancelled campaigns in completed buckets (parent_cancelled recovery)."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "cancelled", exit_reason="parent_cancelled")
+    run = _make_run(plan, [_bucket_state("b0", [c0], status="completed")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor._start_one_campaign"), \
+         patch("executor.save_run"):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    assert run["bucketStates"][0]["status"] == "running"
+    assert c0["status"] == "queued"
+
+
+def test_force_start_campaign_resets_cascade_cancelled_children():
+    """force_start_campaign must reset parent_cancelled descendants so the dispatcher can resume them."""
+    import executor
+
+    # c0 → c1 → c2 (chain); c0 was cancelled, cascade-cancelled c1 and c2
+    plan = _make_plan([_bucket_def("b0", [
+        _campaign_def("c0"),
+        _campaign_def("c1", depends_on=["c0"]),
+        _campaign_def("c2", depends_on=["c1"]),
+    ])])
+    c0 = _campaign_state("c0", "cancelled", exit_reason="parent_cancelled")
+    c1 = _campaign_state("c1", "cancelled", exit_reason="parent_cancelled")
+    c2 = _campaign_state("c2", "cancelled", exit_reason="parent_cancelled")
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1, c2], status="running")])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor._start_one_campaign"), \
+         patch("executor.save_run"):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    assert c1["status"] == "queued", "direct child must be reset to queued"
+    assert c2["status"] == "queued", "grandchild must be reset to queued recursively"
+
+
+# ── Bug fix: _advance_bucket rescues tick for eagerly-activated next bucket ───
+#
+# If _dispatch_cross_bucket_ready set the next bucket to "running" but failed to
+# schedule a tick (exception), _advance_bucket must schedule it so campaigns are
+# polled and the bucket can advance.
+
+
+def test_advance_bucket_rescues_tick_for_already_running_next_bucket():
+    """_advance_bucket must schedule a tick when the next bucket is 'running' but has no scheduleName."""
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "running", connect_id="conn-1")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="running"),
+        {**_bucket_state("b1", [c1], status="running"), "scheduleName": None},
+    ])
+
+    with patch("executor._schedule_tick", return_value="sched-rescue") as mock_sched, \
+         patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor._fire_bucket_chains"), \
+         patch("executor.save_run"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._safe_delete_campaign"), \
+         patch("executor._safe_delete_segment"):
+        executor._advance_bucket(run, plan, 0, reason="all_campaigns_done")
+
+    mock_sched.assert_called_once_with(plan_id="plan-1", run_id="run-1", bucket_index=1)
+    assert run["bucketStates"][1]["scheduleName"] == "sched-rescue"
+
+
+# ── Bug fix: two-phase claim in _dispatch_cross_bucket_ready ──────────────────
+#
+# Before the fix, two concurrent ticks both called _start_one_campaign (Connect API)
+# before saving DynamoDB state — creating duplicate campaigns.
+# The fix: mark campaigns "creating" and call save_run BEFORE touching Connect.
+
+
+def test_cross_bucket_ready_saves_claim_without_phase2():
+    """Phase 2 removed: save_run (Phase 1 claim) is called but _start_one_campaign is NOT.
+
+    Concurrent-tick safety is achieved by the claim (campaign → "creating") persisted to
+    DynamoDB. The actual Connect campaign creation happens on the next tick for the bucket
+    via the _dispatch_ready_campaigns "creating" → "queued" recovery path.
+    """
+    import executor
+
+    call_order: list[str] = []
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="queued"),
+    ])
+
+    with patch("executor.save_run", side_effect=lambda _: call_order.append("save_run")), \
+         patch("executor._start_one_campaign", side_effect=lambda *a: call_order.append("start_one_campaign")), \
+         patch("executor._schedule_tick", return_value="sched-1"):
+        executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    assert "save_run" in call_order, "Phase 1 claim (save_run) must always be called"
+    assert "start_one_campaign" not in call_order, (
+        "Phase 2 (_start_one_campaign) must NOT be called — removed to eliminate 30s sleep in tick"
+    )
+
+
+def test_cross_bucket_ready_marks_creating_during_claim():
+    """Campaign status must be 'creating' at the moment save_run is called (Phase 1).
+
+    If save_run wins the optimistic lock, the campaign is visible as 'creating' to
+    any other tick that reads the run before Phase 2 completes.
+    """
+    import executor
+
+    status_at_save: list[str] = []
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="queued"),
+    ])
+
+    def capture(r):
+        status_at_save.append(r["bucketStates"][1]["campaignStates"][0]["status"])
+
+    with patch("executor.save_run", side_effect=capture), \
+         patch("executor._start_one_campaign"), \
+         patch("executor._schedule_tick", return_value="sched-1"):
+        executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    assert status_at_save == ["creating"], (
+        "Campaign must be 'creating' when save_run is called so concurrent ticks see the claim"
+    )
+
+
+# ── Bug fix: _EmptySegmentError is retried, not immediately cancelled ─────────
+#
+# Mid-rebuild Redis passes is_ready() (California leads load first) but northeastern
+# state filters return 0 results — causing immediate cancellation before the fix.
+# The fix: treat _EmptySegmentError like _RedisRebuildingError — retry with 30s delay.
+
+
+def test_start_one_campaign_retries_generic_exception_before_succeeding():
+    """_start_one_campaign retries generic segment-creation errors up to reconcileRetryLimit times."""
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    attempt_count = {"n": 0}
+
+    def fail_twice_then_succeed(b, c):
+        attempt_count["n"] += 1
+        if attempt_count["n"] < 3:
+            raise RuntimeError("Transient segment error")
+        return "seg-name", "arn:aws:profiles:us-east-1:123:domains/d/segment-definitions/s"
+
+    with patch("executor._create_segment", side_effect=fail_twice_then_succeed), \
+         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert attempt_count["n"] == 3, "Should retry generic errors up to reconcileRetryLimit+1 times"
+    assert cs["status"] == "running", "Campaign must be running after eventual success"
+
+
+def test_start_one_campaign_cancels_immediately_on_empty_segment():
+    """_EmptySegmentError cancels the campaign immediately — no retries.
+
+    Empty segment is now always genuine (Redis rebuilding is a distinct error class).
+    """
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    with patch("executor._create_segment", side_effect=executor._EmptySegmentError("No leads")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "cancelled", "Empty segment must cancel immediately"
+    assert cs["exitReason"] == "skipped_empty"
+
+
+def test_start_one_campaign_redis_rebuilding_leaves_queued():
+    """_RedisRebuildingError leaves campaign 'queued' so the next tick retries cleanly.
+
+    No time.sleep is called — returning early avoids holding the Lambda execution open
+    and triggering ConcurrentWriteError races with sibling bucket ticks.
+    """
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    with patch("executor._create_segment", side_effect=executor._RedisRebuildingError("rebuilding")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "queued", "Redis rebuilding must leave campaign queued for next tick retry"
+
+
+def test_start_one_campaign_succeeds_when_segment_already_existed():
+    """Campaign must start successfully when the segment was orphaned by a prior crashed Lambda.
+
+    Scenario: previous tick created the CP segment but crashed before persisting
+    connectCampaignId. Campaign is still 'queued'. _create_segment now handles the
+    'already exists' ClientError and returns the existing ARN. This test verifies
+    _start_one_campaign proceeds to 'running' in that case.
+    """
+    import executor
+
+    existing_arn = "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/11-5-26-NY-NL-2-1953"
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    with patch("executor._create_segment", return_value=("11-5-26-NY-NL-2-1953", existing_arn)), \
+         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "running", "Campaign must reach running even when segment already existed"
+    assert cs["segmentName"] == "11-5-26-NY-NL-2-1953"
+    assert cs["connectCampaignId"] == "conn-1"
+
+
+# ── skip_campaign ─────────────────────────────────────────────────────────────
+#
+# skip_campaign marks a campaign cancelled(skipped) — transparent to cascade-cancel.
+# Unlike force_stop (exitReason=manually_stopped), skip does NOT cascade-cancel children.
+
+
+def test_skip_queued_campaign_marks_skipped():
+    """skip_campaign on a queued campaign sets status=cancelled, exitReason=skipped."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1")])])
+    c0 = _campaign_state("c0", "queued")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor.save_run"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._dispatch_ready_campaigns", return_value=False), \
+         patch("executor._advance_bucket"):
+        executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    assert c0["status"] == "cancelled"
+    assert c0["exitReason"] == "skipped", "exitReason must be 'skipped' to be transparent to cascade-cancel"
+
+
+def test_skip_running_campaign_stops_connect_campaign():
+    """skip_campaign on a running campaign calls _safe_stop_campaign before marking skipped."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "running", connect_id="conn-abc")
+    run = _make_run(plan, [_bucket_state("b0", [c0])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor.save_run"), \
+         patch("executor._safe_stop_campaign") as mock_stop, \
+         patch("executor._advance_bucket"):
+        executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    mock_stop.assert_called_once_with("conn-abc")
+    assert c0["status"] == "cancelled"
+    assert c0["exitReason"] == "skipped"
+
+
+def test_skip_does_not_cascade_cancel_children():
+    """Skipping a parent must NOT cascade-cancel children — exitReason=skipped is transparent.
+
+    This is the core regression guard: force_stop sets exitReason=stopped which cascades;
+    skip_campaign sets exitReason=skipped which the cascade-cancel logic ignores.
+    """
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "queued")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0]),
+        _bucket_state("b1", [c1], status="queued"),
+    ])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor.save_run"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._advance_bucket"):
+        executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    assert c0["exitReason"] == "skipped"
+    # c1 must NOT be cascade-cancelled — skipped parent is transparent
+    assert c1["status"] == "queued", (
+        "Children of a skipped campaign must remain queued — "
+        "skipped parents are transparent to the cascade-cancel logic"
+    )
+
+
+def test_skip_unblocks_dependent_campaigns_in_same_bucket():
+    """Skipping campaign c0 must unblock c1 (depends on c0) in the same bucket via dispatch."""
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [
+            _campaign_def("c0"),
+            _campaign_def("c1", depends_on=["c0"]),
+        ]),
+    ])
+    c0 = _campaign_state("c0", "queued")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1])])
+
+    started = []
+
+    def fake_start(r, p, bi, ci):
+        started.append(ci)
+        # Must advance campaign status so dispatch loop doesn't re-fire infinitely
+        r["bucketStates"][bi]["campaignStates"][ci]["status"] = "running"
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor.save_run"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._advance_bucket"), \
+         patch("executor._start_one_campaign", side_effect=fake_start):
+        executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    # c1 (index 1) must have been dispatched after c0 was skipped
+    assert 1 in started, "Skipping c0 must trigger _dispatch_ready_campaigns and start c1"
+
+
+def test_skip_terminal_campaign_raises():
+    """skip_campaign must reject campaigns that are already terminal (completed, error, expired)."""
+    import executor
+
+    for terminal_status in ("completed", "error", "expired"):
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        cs = _campaign_state("c0", terminal_status)
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+
+        with patch("executor.get_run", return_value=run), \
+             patch("executor.get_plan", return_value=plan):
+            with pytest.raises(ValueError, match="terminal"):
+                executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+
+def test_tick_force_finishes_when_working_hours_end_reached():
+    """tick force-finishes run when _now_cot_hhmm() >= workingHours.endTime."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["workingHours"] = {"days": ["MON", "TUE", "WED", "THU", "FRI"], "startTime": "08:00", "endTime": "17:00"}
+    cs = _campaign_state("c0", "running", connect_id="conn-0")
+    run = _make_run(plan, [_bucket_state("b0", [cs])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor._now_cot_hhmm", return_value=17 * 60), \
+         patch("executor._force_finish_internal") as mock_finish, \
+         patch("executor._past_daily_cutoff", return_value=False):
+        result = executor.tick("plan-1", "run-1", 0)
+
+    mock_finish.assert_called_once()
+    assert result.get("reason") == "working_hours_cutoff"
+
+
+def test_tick_does_not_cutoff_before_working_hours_end():
+    """tick does NOT force-finish when current COT time is before workingHours.endTime."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["workingHours"] = {"days": ["MON", "TUE", "WED", "THU", "FRI"], "startTime": "08:00", "endTime": "17:00"}
+    cs = _campaign_state("c0", "running", connect_id="conn-0")
+    run = _make_run(plan, [_bucket_state("b0", [cs])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor._now_cot_hhmm", return_value=16 * 60 + 59), \
+         patch("executor._force_finish_internal") as mock_finish, \
+         patch("executor._poll_campaign_state"), \
+         patch("executor._past_daily_cutoff", return_value=False), \
+         patch("executor.save_run"):
+        result = executor.tick("plan-1", "run-1", 0)
+
+    mock_finish.assert_not_called()
+    assert result.get("reason") != "working_hours_cutoff"
+
+
+# ── Bug A fix: _dispatch_cross_bucket_ready Phase 2 removed ─────────────────
+
+
+def test_dispatch_cross_bucket_no_phase2():
+    """After Phase 1 (save_run), _dispatch_cross_bucket_ready must NOT call _start_one_campaign.
+
+    The newly-activated bucket's campaign is left in "creating" state.
+    The next tick for that bucket resets it to "queued" via _dispatch_ready_campaigns recovery,
+    starting the campaign within ~1 minute without any 30s sleep inside a tick handler.
+    """
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "queued")
+    run = _make_run(plan, [
+        _bucket_state("b0", [c0], status="completed"),
+        _bucket_state("b1", [c1], status="queued"),
+    ])
+
+    with patch("executor.save_run"), \
+         patch("executor._start_one_campaign") as mock_start, \
+         patch("executor._schedule_tick", return_value="sched-1"):
+        result = executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    assert result is True, "Must return True (state changed)"
+    mock_start.assert_not_called()
+    # Campaign remains "creating" — next tick for the bucket resets it to "queued"
+    assert c1["status"] == "creating", (
+        "Campaign must stay 'creating' after Phase 1 so the next tick's recovery path starts it"
+    )
+
+
+# ── Bug B fix: _advance_bucket reschedules on ConcurrentWriteError ────────────
+
+
+def test_advance_bucket_reschedules_on_concurrent_write():
+    """If save_run raises ConcurrentWriteError after the EventBridge rule was already deleted,
+    _advance_bucket must reschedule the bucket tick before re-raising so the bucket is not
+    stranded forever with no tick to drive it forward.
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "completed")])])
+
+    with patch("executor._delete_bucket_schedule_safe"), \
+         patch("executor.save_run", side_effect=ConcurrentWriteError("version mismatch")), \
+         patch("executor._schedule_tick") as mock_sched, \
+         patch("executor._fire_bucket_chains"):
+        with pytest.raises(ConcurrentWriteError):
+            executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    mock_sched.assert_called_once_with(plan_id="plan-1", run_id="run-1", bucket_index=0)
+
+
+# ── Bug C fix: _start_bucket cleans orphan EventBridge rule on ConcurrentWriteError ─
+
+
+def test_start_bucket_cleans_orphan_on_concurrent_write():
+    """If save_run raises ConcurrentWriteError on the pre-dispatch save (after _schedule_tick),
+    _start_bucket must delete the orphaned EventBridge rule before re-raising.
+
+    B1-D: schedule is created first, then a single save persists running+scheduleName.
+    If that save loses an optimistic-lock race, the rule is cleaned up.
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")], status="queued")])
+    run["planSnapshot"] = plan
+
+    with patch("executor.save_run", side_effect=ConcurrentWriteError("version mismatch")), \
+         patch("executor._schedule_tick", return_value="sched-orphan") as mock_sched, \
+         patch("executor._delete_schedule_safe") as mock_delete, \
+         patch("executor._dispatch_ready_campaigns", return_value=False):
+        with pytest.raises(ConcurrentWriteError):
+            executor._start_bucket(run, 0)
+
+    mock_sched.assert_called_once()
+    mock_delete.assert_called_once_with("sched-orphan")
+
+
+# ── Bug D fix: _activate_warming_bucket cleans orphan EventBridge rule on ConcurrentWriteError ─
+
+
+def test_activate_warming_bucket_cleans_orphan_on_concurrent_write():
+    """If save_run raises ConcurrentWriteError after _schedule_tick already created the rule,
+    _activate_warming_bucket must delete the orphaned EventBridge rule before re-raising.
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "warming", connect_id="conn-w")
+    cs["warmupStarted"] = True
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="warming")])
+
+    with patch("executor.save_run", side_effect=ConcurrentWriteError("version mismatch")), \
+         patch("executor._schedule_tick", return_value="sched-orphan") as mock_sched, \
+         patch("executor._delete_schedule_safe") as mock_delete, \
+         patch("executor._dispatch_ready_campaigns", return_value=False):
+        with pytest.raises(ConcurrentWriteError):
+            executor._activate_warming_bucket(run, plan, 0)
+
+    mock_sched.assert_called_once()
+    mock_delete.assert_called_once_with("sched-orphan")
+
+
+# ── New tests for 26-issue bug sweep ─────────────────────────────────────────
+
+
+# B1-A: Two-phase claim in _dispatch_ready_campaigns
+
+def test_dispatch_ready_claims_before_connect():
+    """save_run (Phase 3 claim) is called BEFORE _start_one_campaign (Phase 4 Connect)."""
+    import executor
+
+    call_order: list[str] = []
+
+    def _track_save(r):
+        call_order.append("save_run")
+
+    def _track_start(run, plan, bi, ci):
+        call_order.append("start_one")
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")])])
+
+    with patch("executor.save_run", side_effect=_track_save), \
+         patch("executor._start_one_campaign", side_effect=_track_start):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert call_order.index("save_run") < call_order.index("start_one"), \
+        "Phase 3 claim save must happen before Phase 4 Connect call"
+
+
+def test_dispatch_ready_concurrent_write_no_connect():
+    """ConcurrentWriteError on Phase 3 claim must prevent any _start_one_campaign call."""
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")])])
+
+    with patch("executor.save_run", side_effect=ConcurrentWriteError("race")), \
+         patch("executor._start_one_campaign") as mock_start:
+        with pytest.raises(ConcurrentWriteError):
+            executor._dispatch_ready_campaigns(run, plan, 0)
+
+    mock_start.assert_not_called()
+
+
+def test_dispatch_ready_confirm_save_after_start():
+    """Phase 5 confirm save is called after _start_one_campaign to persist connectCampaignId."""
+    import executor
+
+    save_count = {"n": 0}
+
+    def _count_save(r):
+        save_count["n"] += 1
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")])])
+
+    with patch("executor.save_run", side_effect=_count_save), \
+         patch("executor._start_one_campaign"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert save_count["n"] == 2, "Expected Phase 3 (claim) + Phase 5 (confirm) = 2 saves"
+
+
+# B1-B: _dispatch_cross_bucket_ready schedule-failure rollback
+
+def test_dispatch_cross_bucket_schedule_failure_no_claim():
+    """If _schedule_tick raises, the bucket must stay 'queued' and no campaign is claimed."""
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")]),
+        _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "completed")], status="completed"),
+        _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+    ])
+
+    with patch("executor._schedule_tick", side_effect=RuntimeError("EventBridge error")), \
+         patch("executor.save_run") as mock_save:
+        result = executor._dispatch_cross_bucket_ready(run, plan, 0)
+
+    assert result is False, "Should return False — no successful claim"
+    mock_save.assert_not_called()
+    assert run["bucketStates"][1]["status"] == "queued", "Bucket must remain queued on schedule failure"
+    assert run["bucketStates"][1]["campaignStates"][0]["status"] == "queued", "Campaign must remain queued"
+
+
+# B1-C: _force_finish_internal and abort_run always unlock
+
+def test_force_finish_unlocks_on_save_failure():
+    """unlock_plan_run is called even when save_run raises."""
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "running", connect_id="conn-1")])])
+
+    with patch("executor.save_run", side_effect=ConcurrentWriteError("race")), \
+         patch("executor.unlock_plan_run") as mock_unlock, \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._delete_bucket_schedule_safe"):
+        with pytest.raises(ConcurrentWriteError):
+            executor._force_finish_internal(run, plan)
+
+    mock_unlock.assert_called_once_with("plan-1")
+
+
+def test_abort_run_unlocks_on_save_failure():
+    """unlock_plan_run is called even when save_run raises in abort_run."""
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "running", connect_id="conn-1")])])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.save_run", side_effect=ConcurrentWriteError("race")), \
+         patch("executor.unlock_plan_run") as mock_unlock, \
+         patch("executor.update_plan_pending_warmup"), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._safe_delete_campaign"), \
+         patch("executor._safe_delete_segment"), \
+         patch("executor._delete_bucket_schedule_safe"):
+        with pytest.raises(ConcurrentWriteError):
+            executor.abort_run("plan-1", "run-1")
+
+    mock_unlock.assert_called_once_with("plan-1")
+
+
+# B1-D: _start_bucket raises when schedule fails
+
+def test_start_bucket_raises_when_schedule_fails():
+    """_start_bucket must raise (not dispatch) if _schedule_tick fails."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")], status="queued")])
+    run["planSnapshot"] = plan
+
+    with patch("executor._schedule_tick", side_effect=RuntimeError("EventBridge down")), \
+         patch("executor._dispatch_ready_campaigns") as mock_dispatch, \
+         patch("executor.save_run"):
+        with pytest.raises(RuntimeError):
+            executor._start_bucket(run, 0)
+
+    mock_dispatch.assert_not_called()
+
+
+# B2-A: Redis rebuilding and empty segment behavior
+
+def test_start_one_campaign_empty_segment_cancels_immediately():
+    """_EmptySegmentError cancels immediately — no time.sleep, no retries."""
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    call_count = {"n": 0}
+
+    def _count_calls(b, c):
+        call_count["n"] += 1
+        raise executor._EmptySegmentError("No leads")
+
+    with patch("executor._create_segment", side_effect=_count_calls):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert call_count["n"] == 1, "_EmptySegmentError must not be retried"
+    assert cs["status"] == "cancelled"
+    assert cs["exitReason"] == "skipped_empty"
+
+
+# B2-B: start_run lock-before-create
+
+def test_start_run_no_orphan_on_lock_race():
+    """If lock_plan_run raises, no DynamoDB run record should be created."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+
+    with patch("executor.get_plan", return_value=plan), \
+         patch("executor.get_latest_run", return_value=None), \
+         patch("executor.lock_plan_run", side_effect=ValueError("already locked")), \
+         patch("executor.create_run") as mock_create:
+        with pytest.raises(ValueError, match="already locked"):
+            executor.start_run("plan-1")
+
+    mock_create.assert_not_called()
+
+
+# B2-C: Working hours and template guards in chain firing
+
+def test_fire_bucket_chains_respects_working_hours():
+    """_fire_bucket_chains skips plans that are outside their working hours window."""
+    import executor
+
+    outside_hours_plan = _make_plan([])
+    outside_hours_plan["planId"] = "plan-outside"
+    outside_hours_plan["workingHours"] = {"startTime": "08:00", "endTime": "09:00", "days": []}
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[outside_hours_plan]), \
+         patch("executor._within_working_hours", return_value=False), \
+         patch("executor.start_run") as mock_start:
+        executor._fire_bucket_chains("plan-upstream", 0)
+
+    mock_start.assert_not_called()
+
+
+def test_fire_bucket_chains_skips_templates():
+    """_fire_bucket_chains must not start template plans."""
+    import executor
+
+    template_plan = _make_plan([])
+    template_plan["planId"] = "plan-tmpl"
+    template_plan["isTemplate"] = True
+    template_plan["trigger"] = {"type": "on_plan_complete", "planId": "plan-upstream", "afterBucket": 0}
+
+    with patch("executor.find_plans_by_trigger_planid", return_value=[template_plan]), \
+         patch("executor.start_run") as mock_start:
+        executor._fire_bucket_chains("plan-upstream", 0)
+
+    mock_start.assert_not_called()
+
+
+# B2-D: force_start_campaign startedAt reset
+
+def test_force_start_resets_started_at():
+    """Reactivating a completed bucket must reset startedAt so elapsed_min restarts at 0."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=30)])
+    cs = _campaign_state("c0", "cancelled", exit_reason="parent_cancelled")
+    bs = _bucket_state("b0", [cs], status="completed")
+    bs["startedAt"] = "2026-05-10T08:00:00+00:00"  # hours ago
+    run = _make_run(plan, [bs])
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.save_run"), \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor._start_one_campaign"), \
+         patch("executor._reset_cascade_cancelled_children"):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    assert bs["startedAt"] != "2026-05-10T08:00:00+00:00", "startedAt must be reset on bucket reactivation"
+    assert bs["status"] == "running"
+
+
+# B3-A: _get_campaign_state distinguishes 404
+
+def test_get_campaign_state_returns_deleted_on_404():
+    """ResourceNotFoundException from Connect must return 'Deleted', not 'Unknown'."""
+    import executor
+    from botocore.exceptions import ClientError
+
+    not_found = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException", "Message": "not found"}},
+        "GetCampaignState",
+    )
+
+    with patch("executor._get_campaign_state.__wrapped__", create=True):
+        pass  # just verify import
+
+    oc_mock = type("OC", (), {"get_campaign_state": lambda self, cid: (_ for _ in ()).throw(not_found)})()
+
+    with patch("vip_shared.infrastructure.persistence.outbound_campaigns_client.build", return_value=oc_mock):
+        result = executor._get_campaign_state("camp-deleted")
+
+    assert result == "Deleted"
+
+
+# B3-B: _within_working_hours inclusive end
+
+def test_within_working_hours_inclusive_end():
+    """Plan must still be within working hours at 23:59 when endTime defaults to 24:00."""
+    import executor
+    from datetime import timezone as tz, timedelta
+
+    plan = _make_plan([])
+    plan["workingHours"] = {"startTime": "08:00"}  # no endTime → defaults to 24:00
+
+    _COT_TZ = tz(timedelta(hours=-5))
+    fake_now = datetime(2026, 5, 10, 23, 59, 0, tzinfo=_COT_TZ)
+
+    with patch("executor.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.fromisoformat = datetime.fromisoformat
+        result = executor._within_working_hours(plan)
+
+    assert result is True, "Plan must be within working hours at 23:59 when endTime is unset"

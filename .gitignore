@@ -1,0 +1,40 @@
+node_modules/
+cdk.out/
+cdk.context.json
+*.tsbuildinfo
+dist/
+build/
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Lambda build artifacts
+services/*/dist/
+services/*/.aws-sam/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

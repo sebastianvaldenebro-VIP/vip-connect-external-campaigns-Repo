@@ -1,0 +1,222 @@
+/**
+ * Source of truth for the State → Location mapping used by the Segment create
+ * form. Each entry is the literal `location` value stored in Customer Profiles.
+ *
+ * When the operator picks one or more states, the UI narrows the Location
+ * multi-select to just the locations in those states. Selecting none still
+ * requires the state — the final filter becomes ``location INCLUSIVE [all
+ * locations from selected states]``.
+ */
+
+export type StateGroup = {
+  /** Label shown in the UI dropdown. */
+  state: string;
+  /** Short, human-readable slug used inside auto-generated segment names. */
+  slug: string;
+  /** Two or three letter code embedded in the auto-name (NJ, NY, SCA, etc.). */
+  code: string;
+  locations: readonly string[];
+};
+
+export const STATE_LOCATION_MAP: readonly StateGroup[] = [
+  {
+    state: 'South CA',
+    slug: 'SouthCA',
+    code: 'SCA',
+    locations: [
+      'CA - Arcadia',
+      'CA - Encino',
+      'CA - Huntington Beach',
+      'CA - Irvine',
+      'CA - Long Beach',
+      'CA - National City',
+      'CA - Newport Beach',
+      'CA - Poway',
+      'CA - San Diego',
+      'CA - Temecula',
+      'CA - Torrance',
+      'California',
+    ],
+  },
+  {
+    state: 'North CA',
+    slug: 'NorthCA',
+    code: 'NCA',
+    locations: ['CA - Palo Alto', 'CA - Sacramento', 'CA - San Jose'],
+  },
+  {
+    state: 'Connecticut',
+    slug: 'Connecticut',
+    code: 'CT',
+    locations: [
+      'Connecticut',
+      'CT - Farmington',
+      'CT - Hamden',
+      'CT - Stamford',
+    ],
+  },
+  {
+    state: 'Maryland',
+    slug: 'Maryland',
+    code: 'MD',
+    locations: [
+      'DC',
+      'Maryland',
+      'MD - Bethesda',
+      'MD - Bowie',
+      'MD - Maple Lawn Office',
+    ],
+  },
+  {
+    state: 'New Jersey',
+    slug: 'NewJersey',
+    code: 'NJ',
+    locations: [
+      'New Jersey',
+      'NJ - Clifton',
+      'NJ - Edgewater',
+      'NJ - Harrison Office',
+      'NJ - Hoboken',
+      'NJ - Marlton',
+      'NJ - Morris County Office',
+      'NJ - Morristown',
+      'NJ - Paramus',
+      'NJ - Princeton',
+      'NJ - Scotch Plains',
+      'NJ - West Orange Office',
+      'NJ - West Orange Office (NEW)',
+      'NJ - Woodbridge',
+      'NJ - Woodland Park Office',
+    ],
+  },
+  {
+    state: 'New York',
+    slug: 'NewYork',
+    code: 'NY',
+    locations: [
+      'New York',
+      'NY - Brighton Beach',
+      'NY - Bronx',
+      'NY - Forest Hills',
+      'NY - Hartsdale',
+      'NY - Upper East Side',
+      'NY - Yonkers',
+      'NYC - Astoria',
+      'NYC - Bronx',
+      'NYC - Brooklyn - Williamsburg',
+      'NYC - Downtown Brooklyn',
+      'NYC - FiDi Manhattan',
+      'NYC - Midtown Manhattan',
+      'NYC - Staten Island',
+      'NYC - Williamsburg',
+    ],
+  },
+  {
+    state: 'Long Island',
+    slug: 'LongIsland',
+    code: 'LI',
+    locations: [
+      'Long Island',
+      'NY - LI Hampton Bays',
+      'NY - LI Jericho',
+      'NY - LI Port Jefferson',
+      'NY - LI Rockville',
+      'NY - LI West Islip',
+    ],
+  },
+  {
+    state: 'Texas',
+    slug: 'Texas',
+    code: 'TX',
+    locations: [
+      'Texas',
+      'TX - Addison',
+      'TX - Arlington',
+      'TX - Cedar Park',
+      'TX - Cibolo Creek',
+      'TX - Dallas - Addison',
+      'TX - Flower Mound',
+      'TX - Fort Worth',
+      'TX - Kyle',
+      'TX - Medical Center',
+      'TX - Spring Branch',
+      'TX - Sugar Land',
+    ],
+  },
+];
+
+/** Flat lookup: location name → state slug (for summaries / reverse lookup). */
+export const LOCATION_TO_STATE: Record<string, string> = Object.fromEntries(
+  STATE_LOCATION_MAP.flatMap((group) =>
+    group.locations.map((loc) => [loc, group.state]),
+  ),
+);
+
+export function locationsForStates(states: string[]): string[] {
+  const selected = new Set(states);
+  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).flatMap(
+    (g) => g.locations,
+  );
+}
+
+export function slugsForStates(states: string[]): string[] {
+  const selected = new Set(states);
+  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).map(
+    (g) => g.slug,
+  );
+}
+
+export function codesForStates(states: string[]): string[] {
+  const selected = new Set(states);
+  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).map(
+    (g) => g.code,
+  );
+}
+
+/**
+ * Walk a Customer Profiles `SegmentGroups` JSON and extract the unique state
+ * codes implied by its location filters. Used by EnableCampaignModal to pick
+ * a phone number whose area code matches the segment's geography.
+ *
+ * Returns an empty array when the segment has no `location` filter or when
+ * none of its location values are recognized in `STATE_LOCATION_MAP`.
+ */
+export function stateCodesFromSegmentGroups(segmentGroups: unknown): string[] {
+  const found = new Set<string>();
+  const groups = (segmentGroups as { Groups?: unknown[] } | undefined)?.Groups;
+  if (!Array.isArray(groups)) return [];
+  for (const group of groups) {
+    const dimensions = (group as { Dimensions?: unknown[] }).Dimensions;
+    if (!Array.isArray(dimensions)) continue;
+    for (const dim of dimensions) {
+      const attrs = (dim as { ProfileAttributes?: { Attributes?: Record<string, { Values?: string[] }> } })
+        .ProfileAttributes?.Attributes;
+      const locationAttr = attrs?.location;
+      if (!locationAttr || !Array.isArray(locationAttr.Values)) continue;
+      for (const value of locationAttr.Values) {
+        const stateName = LOCATION_TO_STATE[value];
+        if (!stateName) continue;
+        const code = STATE_LOCATION_MAP.find((g) => g.state === stateName)?.code;
+        if (code) found.add(code);
+      }
+    }
+  }
+  return Array.from(found);
+}
+
+const KNOWN_STATE_CODES = new Set(STATE_LOCATION_MAP.map((g) => g.code));
+
+/**
+ * Extract a state code from a segment name like "29-4-26-TX-3NL-1202-v4".
+ * The naming convention is <date-parts>-<STATE>-<description>-<id>-<version>.
+ * Returns the first token that matches a known state code, or [] if none found.
+ *
+ * Reconciled segments have SegmentGroups as a static ID list (no location filter),
+ * so this is the reliable fallback for auto-selecting campaign flow and phone.
+ */
+export function stateCodesFromSegmentName(name: string): string[] {
+  for (const token of name.toUpperCase().split('-')) {
+    if (KNOWN_STATE_CODES.has(token)) return [token];
+  }
+  return [];
+}

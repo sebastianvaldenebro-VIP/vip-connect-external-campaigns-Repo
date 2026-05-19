@@ -1,0 +1,12 @@
+{
+  "pipeline": "vip-connect",
+  "jobs": [
+    {
+      "source": {
+        "name": "campaign_mapping",
+        "bookmark_bucket": "config-json-etl-jobs",
+        "bookmark_column": "extracted_at"
+      }
+    }
+  ]
+}

@@ -1,0 +1,235 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IamManageOurResourcesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::165505826690:role/VipAdmin*",
+        "arn:aws:iam::165505826690:role/vip-admin-*"
+      ]
+    },
+    {
+      "Sid": "IamReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:ListRoles",
+        "iam:ListPolicies",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KmsForDataKey",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateKey",
+        "kms:CreateAlias",
+        "kms:DeleteAlias",
+        "kms:UpdateAlias",
+        "kms:Describe*",
+        "kms:List*",
+        "kms:Get*",
+        "kms:PutKeyPolicy",
+        "kms:ScheduleKeyDeletion",
+        "kms:EnableKeyRotation",
+        "kms:DisableKeyRotation",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:UpdateKeyDescription",
+        "kms:CreateGrant",
+        "kms:RetireGrant",
+        "kms:RevokeGrant",
+        "kms:ListGrants"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DynamoDbAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:UpdateContinuousBackups",
+        "dynamodb:UpdateTimeToLive",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource",
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:ListTagsOfResource"
+      ],
+      "Resource": "arn:aws:dynamodb:*:165505826690:table/*"
+    },
+    {
+      "Sid": "CognitoAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "cognito-idp:CreateUserPool*",
+        "cognito-idp:DeleteUserPool*",
+        "cognito-idp:UpdateUserPool*",
+        "cognito-idp:DescribeUserPool*",
+        "cognito-idp:TagResource",
+        "cognito-idp:UntagResource",
+        "cognito-idp:SetUserPoolMfaConfig",
+        "cognito-idp:GetUserPoolMfaConfig"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LambdaAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:DeleteFunction",
+        "lambda:UpdateFunction*",
+        "lambda:Invoke*",
+        "lambda:GetFunction*",
+        "lambda:TagResource",
+        "lambda:UntagResource",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency",
+        "lambda:ListTags",
+        "lambda:PublishLayerVersion",
+        "lambda:DeleteLayerVersion",
+        "lambda:GetLayerVersion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3Admin",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:Put*",
+        "s3:Get*",
+        "s3:List*",
+        "s3:TagResource",
+        "s3:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:s3:::vip-admin-*",
+        "arn:aws:s3:::vip-admin-*/*",
+        "arn:aws:s3:::cdk-hnb659fds-assets-*",
+        "arn:aws:s3:::cdk-hnb659fds-assets-*/*"
+      ]
+    },
+    {
+      "Sid": "LogsAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DeleteRetentionPolicy",
+        "logs:AssociateKmsKey",
+        "logs:DisassociateKmsKey",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:DescribeLogGroups",
+        "logs:ListTagsLogGroup"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Ec2ForLambdaVpc",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:CreateNetworkInterface",
+        "ec2:DeleteNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface",
+        "ec2:AssignPrivateIpAddresses",
+        "ec2:UnassignPrivateIpAddresses",
+        "ec2:CreateTags",
+        "ec2:DeleteTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ApiGatewayAdmin",
+      "Effect": "Allow",
+      "Action": ["apigateway:*"],
+      "Resource": [
+        "arn:aws:apigateway:*::/apis",
+        "arn:aws:apigateway:*::/apis/*",
+        "arn:aws:apigateway:*::/tags/*"
+      ]
+    },
+    {
+      "Sid": "CloudFrontAdmin",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreateDistribution*",
+        "cloudfront:UpdateDistribution*",
+        "cloudfront:DeleteDistribution*",
+        "cloudfront:GetDistribution*",
+        "cloudfront:CreateOriginAccessControl",
+        "cloudfront:DeleteOriginAccessControl",
+        "cloudfront:UpdateOriginAccessControl",
+        "cloudfront:GetOriginAccessControl",
+        "cloudfront:CreateCachePolicy",
+        "cloudfront:DeleteCachePolicy",
+        "cloudfront:UpdateCachePolicy",
+        "cloudfront:GetCachePolicy",
+        "cloudfront:CreateResponseHeadersPolicy",
+        "cloudfront:DeleteResponseHeadersPolicy",
+        "cloudfront:UpdateResponseHeadersPolicy",
+        "cloudfront:GetResponseHeadersPolicy",
+        "cloudfront:TagResource",
+        "cloudfront:UntagResource",
+        "cloudfront:ListTagsForResource",
+        "cloudfront:CreateInvalidation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SsmForBootstrap",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:*:165505826690:parameter/cdk-bootstrap/*"
+    },
+    {
+      "Sid": "CloudFormationRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStack*",
+        "cloudformation:GetTemplate*",
+        "cloudformation:GetStackPolicy",
+        "cloudformation:List*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
