@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 
-import { Badge, Button, Card, Spinner } from '@/components/ui';
+import { Badge, Spinner } from '@/components/ui';
 import { EnableCampaignModal } from '@/components/EnableCampaignModal';
 import {
   api,
@@ -145,47 +145,74 @@ export function SegmentDetail(): ReactNode {
     },
   });
 
-  if (detail.isPending) return <p className="text-muted-foreground">Loading…</p>;
-  if (detail.isError)
-    return <p className="text-destructive">{(detail.error as Error).message}</p>;
+  if (detail.isPending) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <Spinner />
+      </div>
+    );
+  }
+  if (detail.isError) {
+    return (
+      <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        {(detail.error as Error).message}
+      </div>
+    );
+  }
 
   const seg = detail.data;
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-start justify-between">
+    <div className="flex flex-col gap-5">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Segment</p>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">
+          <p className="text-xs uppercase tracking-wide text-gray-400 mb-0.5">Segment</p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <h2 className="text-xl font-semibold tracking-tight">
               {seg.displayName ?? seg.name}
-            </h1>
+            </h2>
             {seg.version ? (
-              <span className="rounded bg-muted px-2 py-0.5 text-xs font-medium uppercase tracking-wide">
+              <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-gray-500">
                 v{seg.version}
               </span>
             ) : null}
           </div>
-          <p className="mt-1 font-mono text-sm text-muted-foreground">{seg.name}</p>
+          <p className="mt-1 font-mono text-xs text-gray-400">{seg.name}</p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={() => refresh.mutate()}>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => refresh.mutate()}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Refresh count
-          </Button>
-          <Button onClick={() => setEnableOpen(true)}>Enable Campaign</Button>
-          <Button variant="outline" onClick={() => snapshot.mutate()}>
+          </button>
+          <button
+            type="button"
+            onClick={() => setEnableOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors"
+          >
+            Enable Campaign
+          </button>
+          <button
+            type="button"
+            onClick={() => snapshot.mutate()}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Export snapshot
-          </Button>
-          <Button
-            variant="destructive"
+          </button>
+          <button
+            type="button"
             onClick={() => {
               if (confirm(`Delete segment "${seg.name}"?`)) remove.mutate();
             }}
+            className="rounded-lg px-3 py-1.5 text-xs text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors"
           >
             Delete
-          </Button>
+          </button>
         </div>
-      </header>
+      </div>
 
       <EnableCampaignModal
         open={enableOpen}
@@ -199,48 +226,91 @@ export function SegmentDetail(): ReactNode {
         }
       />
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <Card>
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Member count</p>
+      {/* Stat chips strip */}
+      <div className="flex flex-wrap gap-2.5">
+        <div className="flex items-center gap-2.5 rounded-xl border border-gray-200 bg-white px-3.5 py-2.5">
           {estimate === 'pending' ? (
-            <p className="mt-2 inline-flex items-center gap-2 text-sm text-muted-foreground">
+            <span className="inline-flex items-center gap-2 text-xs text-gray-400">
               <Spinner /> computing…
-            </p>
+            </span>
           ) : estimate ? (
             <>
-              <p className="mt-2 text-3xl font-semibold">
-                {estimate.totalCount?.toLocaleString() ?? '—'}
-              </p>
-              <p className="text-xs text-muted-foreground">
-                as of {formatDateTime(estimate.at)}
-              </p>
+              <span
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-xs font-bold font-mono"
+                style={{ background: '#1d4ed822', color: '#1d4ed8' }}
+              >
+                {estimate.totalCount != null
+                  ? estimate.totalCount >= 1000
+                    ? `${Math.round(estimate.totalCount / 1000)}k`
+                    : String(estimate.totalCount)
+                  : '—'}
+              </span>
+              <div>
+                <span className="text-xs font-medium text-gray-600">Member count</span>
+                <div className="text-[10px] text-gray-400">as of {formatDateTime(estimate.at)}</div>
+              </div>
             </>
           ) : (
-            <p className="mt-2 text-sm text-muted-foreground">Click refresh to compute.</p>
-          )}
-        </Card>
-        <Card>
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Created</p>
-          <p className="mt-2 text-sm">{formatDateTime(seg.createdAt)}</p>
-        </Card>
-        <Card>
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Snapshot</p>
-          <div className="mt-2 text-sm">
-            {snapshotStatus ? <Badge>{snapshotStatus}</Badge> : <span className="text-muted-foreground">—</span>}
-            {snapshotDownloadUrls.map((url, i) => (
-              <a
-                key={i}
-                href={url}
-                download
-                className="mt-2 flex items-center gap-1 text-xs text-primary underline"
+            <>
+              <span
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-xs font-bold font-mono"
+                style={{ background: '#37415122', color: '#374151' }}
               >
-                Download CSV {snapshotDownloadUrls.length > 1 ? `(part ${i + 1})` : ''}
-              </a>
-            ))}
+                —
+              </span>
+              <span className="text-xs font-medium text-gray-600">Member count</span>
+            </>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2.5 rounded-xl border border-gray-200 bg-white px-3.5 py-2.5">
+          <span
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-xs font-bold font-mono"
+            style={{ background: '#15803d22', color: '#15803d' }}
+          >
+            {seg.version ?? '—'}
+          </span>
+          <div>
+            <span className="text-xs font-medium text-gray-600">Version</span>
+            <div className="text-[10px] text-gray-400">{formatDateTime(seg.createdAt)}</div>
           </div>
-        </Card>
+        </div>
+
+        <div className="flex items-center gap-2.5 rounded-xl border border-gray-200 bg-white px-3.5 py-2.5">
+          <span
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-xs font-bold font-mono"
+            style={{ background: snapshotStatus === 'COMPLETED' ? '#15803d22' : '#37415122', color: snapshotStatus === 'COMPLETED' ? '#15803d' : '#374151' }}
+          >
+            {snapshotStatus ? '↓' : '—'}
+          </span>
+          <div>
+            <span className="text-xs font-medium text-gray-600">Snapshot</span>
+            {snapshotStatus ? (
+              <div className="text-[10px] text-gray-400">{snapshotStatus}</div>
+            ) : (
+              <div className="text-[10px] text-gray-400">not exported</div>
+            )}
+          </div>
+        </div>
       </div>
 
+      {/* Snapshot download links */}
+      {snapshotDownloadUrls.length > 0 ? (
+        <div className="flex flex-wrap gap-2">
+          {snapshotDownloadUrls.map((url, i) => (
+            <a
+              key={i}
+              href={url}
+              download
+              className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 transition-colors"
+            >
+              ↓ Download CSV{snapshotDownloadUrls.length > 1 ? ` (part ${i + 1})` : ''}
+            </a>
+          ))}
+        </div>
+      ) : null}
+
+      {/* Verification panel */}
       <VerificationPanel
         verification={verification}
         lastReconcile={lastReconcile}
@@ -255,19 +325,21 @@ export function SegmentDetail(): ReactNode {
         diagnosePending={diagnoseMutation.isPending}
       />
 
-      <Card>
-        <h2 className="text-sm font-semibold">Description</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
+      {/* Description */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-2">Description</h3>
+        <p className="text-sm text-gray-500">
           {seg.description || 'No description.'}
         </p>
-      </Card>
+      </div>
 
-      <Card>
-        <h2 className="text-sm font-semibold">Segment groups (raw)</h2>
-        <pre className="mt-2 max-h-96 overflow-auto rounded-md bg-muted p-3 text-xs">
+      {/* Segment groups raw */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-2">Segment groups (raw)</h3>
+        <pre className="max-h-96 overflow-auto rounded-lg bg-gray-50 border border-gray-100 p-3 text-xs text-gray-700">
           {JSON.stringify(seg.segmentGroups, null, 2)}
         </pre>
-      </Card>
+      </div>
     </div>
   );
 }
@@ -299,28 +371,34 @@ function VerificationPanel({
 }): ReactNode {
   if (!verification) {
     return (
-      <Card className="flex items-center justify-between">
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm flex items-start justify-between gap-4">
         <div>
-          <h2 className="text-sm font-semibold">Verification</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <h3 className="text-sm font-semibold text-gray-900">Verification</h3>
+          <p className="mt-1 text-sm text-gray-500">
             Scans Redis with the segment's filters and compares counts against what
             Customer Profiles currently reports. Reconcile rebuilds a{' '}
             <code>v{'{N+1}'}</code> segment with the exact Redis-matching set and
             retargets active campaigns.
           </p>
         </div>
-        <Button onClick={onVerify}>Verify</Button>
-      </Card>
+        <button
+          type="button"
+          onClick={onVerify}
+          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors"
+        >
+          Verify
+        </button>
+      </div>
     );
   }
 
   if (verification === 'pending') {
     return (
-      <Card>
-        <p className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <p className="inline-flex items-center gap-2 text-sm text-gray-500">
           <Spinner /> Scanning Redis + asking CP for a fresh estimate…
         </p>
-      </Card>
+      </div>
     );
   }
 
@@ -353,40 +431,46 @@ function VerificationPanel({
     !extrasResult && !extrasFailed && extrasComputing;
 
   return (
-    <Card className="flex flex-col gap-4">
+    <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm flex flex-col gap-4">
+      {/* Section header */}
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-sm font-semibold">Verification</h2>
-          <p className="text-xs text-muted-foreground">
+          <h3 className="text-sm font-semibold text-gray-900">Verification</h3>
+          <p className="text-xs text-gray-400">
             Last run {formatDateTime(verification.verifiedAt)}
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
+          <button
+            type="button"
             onClick={onDiagnose}
             disabled={diagnosePending}
             title="Sample Redis profiles and check CP membership + attributes — produces evidence of staleness for AWS support"
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
           >
             {diagnosePending ? (
               <span className="inline-flex items-center gap-2"><Spinner /> Diagnosing…</span>
             ) : 'Diagnose CP staleness'}
-          </Button>
-          <Button variant="outline" size="sm" onClick={onVerify}>
+          </button>
+          <button
+            type="button"
+            onClick={onVerify}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Re-verify
-          </Button>
+          </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <Tile label="Redis count" value={verification.redisCount.toLocaleString()} tone="default" />
-        <Tile
+      {/* Stat tiles */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatTile label="Redis count" value={verification.redisCount.toLocaleString()} tone="default" />
+        <StatTile
           label="CP segment count"
           value={verification.segmentCount.toLocaleString()}
           tone={inSync ? 'success' : 'danger'}
         />
-        <Tile
+        <StatTile
           label="Missing (to add)"
           value={
             extrasResult
@@ -397,7 +481,7 @@ function VerificationPanel({
           }
           tone={extrasResult ? (missing > 0 ? 'danger' : 'success') : 'default'}
         />
-        <Tile
+        <StatTile
           label="Extras (to remove)"
           value={
             extrasResult
@@ -411,9 +495,12 @@ function VerificationPanel({
       </div>
 
       {legacyWarning ? (
-        <div className="rounded-md border border-amber-400/50 bg-amber-50 p-3 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-          <strong className="font-semibold">Legacy filter: </strong>
-          {legacyWarning}
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
+          <span className="mt-0.5 shrink-0">⚠</span>
+          <div>
+            <strong className="font-semibold">Legacy filter: </strong>
+            {legacyWarning}
+          </div>
         </div>
       ) : null}
 
@@ -425,33 +512,41 @@ function VerificationPanel({
       />
 
       {extrasPlaceholder ? (
-        <p className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+        <p className="inline-flex items-center gap-2 text-xs text-gray-400">
           <Spinner /> Snapshotting CP for the real missing/extras diff (~1–2 min)…
           The Missing tile shows the Redis total as a placeholder until then. Rebuild
           still works — it always rebuilds from Redis truth.
         </p>
       ) : extrasFailed ? (
-        <div className="rounded-md border border-amber-400/50 bg-amber-50 p-3 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-          <strong>Extras detection unavailable:</strong> the CP snapshot didn't finish
-          (commonly the IAM boundary still missing the <code>Allow PassRole</code>{' '}
-          statement). Missing tile shows the Redis total as a placeholder. Rebuild
-          still works — it rebuilds from Redis truth without needing the snapshot.
+        <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
+          <span className="mt-0.5 shrink-0">⚠</span>
+          <div>
+            <strong>Extras detection unavailable:</strong> the CP snapshot didn't finish
+            (commonly the IAM boundary still missing the <code>Allow PassRole</code>{' '}
+            statement). Missing tile shows the Redis total as a placeholder. Rebuild
+            still works — it rebuilds from Redis truth without needing the snapshot.
+          </div>
         </div>
       ) : null}
 
       {inSync ? (
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-gray-500">
           Redis and Customer Profiles agree — no rebuild needed.
         </p>
       ) : (
         <>
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-sm text-muted-foreground">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-sm text-gray-500">
               Rebuild creates a new segment <code>v{verification.version + 1}</code> with
               exactly the {verification.redisCount.toLocaleString()} Redis-matching
               customerIds, retargets campaigns, and deletes the old segment.
             </p>
-            <Button onClick={onReconcile} disabled={reconcilePending}>
+            <button
+              type="button"
+              onClick={onReconcile}
+              disabled={reconcilePending}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+            >
               {reconcilePending ? (
                 <span className="inline-flex items-center gap-2">
                   <Spinner /> rebuilding…
@@ -459,56 +554,59 @@ function VerificationPanel({
               ) : (
                 'Rebuild segment'
               )}
-            </Button>
+            </button>
           </div>
 
-          <div className="overflow-hidden rounded-md border border-border">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
-                <tr>
-                  <th className="px-3 py-2 text-left font-medium">Customer ID</th>
-                  <th className="px-3 py-2 text-left font-medium">Direction</th>
-                  <th className="px-3 py-2 text-left font-medium">Note</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {missingIds.length === 0 && extrasIds.length === 0 ? (
-                  <tr>
-                    <td colSpan={3} className="px-3 py-4 text-center text-muted-foreground">
-                      No diff to display.
-                    </td>
+          {/* Diff table */}
+          <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-100">
+                    <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Customer ID</th>
+                    <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Direction</th>
+                    <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Note</th>
                   </tr>
-                ) : (
-                  <>
-                    {missingIds.slice(0, 20).map((cid) => (
-                      <tr key={`miss-${cid}`}>
-                        <td className="px-3 py-2 font-mono text-xs">{cid}</td>
-                        <td className="px-3 py-2">
-                          <Badge tone="success">+ add</Badge>
-                        </td>
-                        <td className="px-3 py-2 text-xs text-muted-foreground">
-                          (in Redis, not in CP)
-                        </td>
-                      </tr>
-                    ))}
-                    {extrasIds.slice(0, 20).map((cid) => (
-                      <tr key={`extra-${cid}`}>
-                        <td className="px-3 py-2 font-mono text-xs">{cid}</td>
-                        <td className="px-3 py-2">
-                          <Badge tone="danger">− remove</Badge>
-                        </td>
-                        <td className="px-3 py-2 text-xs text-muted-foreground">
-                          (in CP, not in Redis)
-                        </td>
-                      </tr>
-                    ))}
-                  </>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {missingIds.length === 0 && extrasIds.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} className="px-4 py-6 text-center text-sm text-gray-400">
+                        No diff to display.
+                      </td>
+                    </tr>
+                  ) : (
+                    <>
+                      {missingIds.slice(0, 20).map((cid) => (
+                        <tr key={`miss-${cid}`} className="border-b border-gray-100 last:border-0 hover:bg-gray-50/50 transition-colors">
+                          <td className="px-4 py-3.5 font-mono text-xs text-gray-700">{cid}</td>
+                          <td className="px-4 py-3.5">
+                            <Badge tone="success">+ add</Badge>
+                          </td>
+                          <td className="px-4 py-3.5 text-xs text-gray-400">
+                            (in Redis, not in CP)
+                          </td>
+                        </tr>
+                      ))}
+                      {extrasIds.slice(0, 20).map((cid) => (
+                        <tr key={`extra-${cid}`} className="border-b border-gray-100 last:border-0 hover:bg-gray-50/50 transition-colors">
+                          <td className="px-4 py-3.5 font-mono text-xs text-gray-700">{cid}</td>
+                          <td className="px-4 py-3.5">
+                            <Badge tone="danger">− remove</Badge>
+                          </td>
+                          <td className="px-4 py-3.5 text-xs text-gray-400">
+                            (in CP, not in Redis)
+                          </td>
+                        </tr>
+                      ))}
+                    </>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
           {missing + extrasCount > Math.min(missingIds.length, 20) + Math.min(extrasIds.length, 20) ? (
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-gray-400">
               Showing {Math.min(missingIds.length, 20)} missing + {Math.min(extrasIds.length, 20)}{' '}
               extras of {(missing + extrasCount).toLocaleString()} total.
             </p>
@@ -519,14 +617,14 @@ function VerificationPanel({
       {diagnose ? <DiagnosePanel result={diagnose} /> : null}
 
       {lastReconcile ? (
-        <div className="rounded-md border border-border bg-muted/30 p-3 text-xs">
+        <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 text-xs text-gray-600">
           Last rebuild {formatDateTime(lastReconcile.completedAt)}:{' '}
           <code>{lastReconcile.newSegmentName}</code> ·{' '}
           <span className="text-green-700">
             +{lastReconcile.added.toLocaleString()} added
           </span>
           {' · '}
-          <span className="text-destructive">
+          <span className="text-red-500">
             −{lastReconcile.removed.toLocaleString()} removed
           </span>
           {lastReconcile.campaignsUpdated.length > 0 ? (
@@ -537,7 +635,7 @@ function VerificationPanel({
           ) : null}
         </div>
       ) : null}
-    </Card>
+    </div>
   );
 }
 
@@ -548,12 +646,12 @@ function DiagnosePanel({ result }: { result: DiagnoseResult }): ReactNode {
 
   return (
     <div
-      className={`rounded-md border p-3 text-xs ${
+      className={`rounded-xl border p-4 text-xs ${
         tone === 'amber'
-          ? 'border-amber-400/50 bg-amber-50 dark:bg-amber-950/30'
+          ? 'border-amber-200 bg-amber-50'
           : tone === 'blue'
-          ? 'border-blue-400/50 bg-blue-50 dark:bg-blue-950/30'
-          : 'border-border bg-muted/30'
+          ? 'border-blue-200 bg-blue-50'
+          : 'border-gray-200 bg-gray-50'
       }`}
     >
       <div className="flex items-start justify-between gap-3">
@@ -561,25 +659,25 @@ function DiagnosePanel({ result }: { result: DiagnoseResult }): ReactNode {
           <p className="font-semibold text-sm">
             CP Staleness Diagnosis
             {hasStale ? (
-              <span className="ml-2 text-amber-700 dark:text-amber-300">
+              <span className="ml-2 text-amber-700">
                 ⚠ {result.confirmedStaleCount} confirmed stale
               </span>
             ) : hasIngestionLag ? (
-              <span className="ml-2 text-blue-700 dark:text-blue-300">
+              <span className="ml-2 text-blue-700">
                 ⚠ {result.cpNoMatch.length} ingestion lag
               </span>
             ) : (
-              <span className="ml-2 text-green-700 dark:text-green-400">✓ No staleness detected</span>
+              <span className="ml-2 text-green-700">✓ No staleness detected</span>
             )}
           </p>
-          <p className="mt-0.5 text-muted-foreground">{result.message}</p>
-          <p className="mt-0.5 text-muted-foreground">
+          <p className="mt-0.5 text-gray-500">{result.message}</p>
+          <p className="mt-0.5 text-gray-400">
             Sampled {result.sampledFromRedis} from Redis · {result.nonMembersInSample} not segment
             members · diagnosed {formatDateTime(result.diagnosedAt)}
           </p>
         </div>
         <button
-          className="text-xs text-primary underline hover:no-underline"
+          className="text-xs text-blue-600 underline hover:no-underline shrink-0"
           onClick={() => {
             const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -595,36 +693,38 @@ function DiagnosePanel({ result }: { result: DiagnoseResult }): ReactNode {
       </div>
 
       {result.confirmedStale.length > 0 ? (
-        <div className="mt-3 overflow-hidden rounded-md border border-amber-300/50">
-          <p className="px-3 py-2 text-xs font-medium text-amber-800 dark:text-amber-200 bg-amber-100/60 dark:bg-amber-900/30">
+        <div className="mt-3 overflow-hidden rounded-xl border border-amber-200">
+          <p className="px-3 py-2 text-xs font-medium text-amber-800 bg-amber-100/60">
             Confirmed stale — CP has correct attributes but segment membership not updated
           </p>
-          <table className="w-full text-xs">
-            <thead className="bg-amber-100/40 dark:bg-amber-900/20">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium">Customer ID</th>
-                <th className="px-3 py-2 text-left font-medium">CP last updated</th>
-                <th className="px-3 py-2 text-left font-medium">CP attributes</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-amber-200/40">
-              {result.confirmedStale.slice(0, 15).map((entry) => (
-                <tr key={entry.customerId}>
-                  <td className="px-3 py-2 font-mono">{entry.customerId}</td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {entry.cpLastUpdatedAt ? formatDateTime(entry.cpLastUpdatedAt) : '—'}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-[10px] leading-relaxed">
-                    {Object.entries(entry.cpAttributes)
-                      .map(([k, v]) => `${k}=${v}`)
-                      .join(' · ')}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-amber-100/40">
+                  <th className="px-3 py-2 text-left font-medium text-amber-800">Customer ID</th>
+                  <th className="px-3 py-2 text-left font-medium text-amber-800">CP last updated</th>
+                  <th className="px-3 py-2 text-left font-medium text-amber-800">CP attributes</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {result.confirmedStale.slice(0, 15).map((entry) => (
+                  <tr key={entry.customerId} className="border-t border-amber-200/40">
+                    <td className="px-3 py-2 font-mono">{entry.customerId}</td>
+                    <td className="px-3 py-2 text-gray-400">
+                      {entry.cpLastUpdatedAt ? formatDateTime(entry.cpLastUpdatedAt) : '—'}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-[10px] leading-relaxed">
+                      {Object.entries(entry.cpAttributes)
+                        .map(([k, v]) => `${k}=${v}`)
+                        .join(' · ')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           {result.confirmedStale.length > 15 ? (
-            <p className="px-3 py-2 text-muted-foreground">
+            <p className="px-3 py-2 text-gray-400">
               +{result.confirmedStale.length - 15} more — download JSON for full list
             </p>
           ) : null}
@@ -632,35 +732,37 @@ function DiagnosePanel({ result }: { result: DiagnoseResult }): ReactNode {
       ) : null}
 
       {hasIngestionLag ? (
-        <div className="mt-3 overflow-hidden rounded-md border border-blue-300/50">
-          <p className="px-3 py-2 text-xs font-medium text-blue-800 dark:text-blue-200 bg-blue-100/60 dark:bg-blue-900/30">
+        <div className="mt-3 overflow-hidden rounded-xl border border-blue-200">
+          <p className="px-3 py-2 text-xs font-medium text-blue-800 bg-blue-100/60">
             CP ingestion lag — Redis has updated attributes but CP has not ingested them yet
           </p>
-          <table className="w-full text-xs">
-            <thead className="bg-blue-100/40 dark:bg-blue-900/20">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium">Customer ID</th>
-                <th className="px-3 py-2 text-left font-medium">CP last updated</th>
-                <th className="px-3 py-2 text-left font-medium">CP attributes (outdated)</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-blue-200/40">
-              {result.cpNoMatch.map((entry) => (
-                <tr key={entry.customerId}>
-                  <td className="px-3 py-2 font-mono">{entry.customerId}</td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {entry.cpLastUpdatedAt ? formatDateTime(entry.cpLastUpdatedAt) : '—'}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-[10px] leading-relaxed">
-                    {Object.entries(entry.cpAttributes)
-                      .map(([k, v]) => `${k}=${v}`)
-                      .join(' · ')}
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-blue-100/40">
+                  <th className="px-3 py-2 text-left font-medium text-blue-800">Customer ID</th>
+                  <th className="px-3 py-2 text-left font-medium text-blue-800">CP last updated</th>
+                  <th className="px-3 py-2 text-left font-medium text-blue-800">CP attributes (outdated)</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="px-3 py-2 text-muted-foreground">
+              </thead>
+              <tbody>
+                {result.cpNoMatch.map((entry) => (
+                  <tr key={entry.customerId} className="border-t border-blue-200/40">
+                    <td className="px-3 py-2 font-mono">{entry.customerId}</td>
+                    <td className="px-3 py-2 text-gray-400">
+                      {entry.cpLastUpdatedAt ? formatDateTime(entry.cpLastUpdatedAt) : '—'}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-[10px] leading-relaxed">
+                      {Object.entries(entry.cpAttributes)
+                        .map(([k, v]) => `${k}=${v}`)
+                        .join(' · ')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="px-3 py-2 text-gray-400">
             Showing up to 5 samples — download JSON for full context
           </p>
         </div>
@@ -686,19 +788,18 @@ function ExtrasPanel({
 
   if (!extras) {
     return (
-      <div className="rounded-md border border-dashed border-border p-3">
-        <div className="flex items-center justify-between gap-3">
+      <div className="rounded-xl border border-dashed border-gray-200 p-4">
+        <div className="flex items-start justify-between gap-3">
           <div>
-            <h3 className="text-sm font-semibold">Extras detection</h3>
-            <p className="text-xs text-muted-foreground">
+            <h3 className="text-sm font-semibold text-gray-900">Extras detection</h3>
+            <p className="text-xs text-gray-500 mt-0.5">
               Snapshots Customer Profiles and diffs against Redis to find ids the
               segment still contains that no longer match the filter. Takes a
               minute or two.
             </p>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
+          <button
+            type="button"
             onClick={onDetectExtras}
             disabled={pending || snapshotBlocked}
             title={
@@ -706,12 +807,13 @@ function ExtrasPanel({
                 ? 'Waiting on IAM boundary amendment so CP can assume the snapshot role.'
                 : undefined
             }
+            className="shrink-0 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
           >
             Detect extras
-          </Button>
+          </button>
         </div>
         {snapshotBlocked ? (
-          <p className="mt-2 text-xs text-muted-foreground">{disabledNote}</p>
+          <p className="mt-2 text-xs text-gray-400">{disabledNote}</p>
         ) : null}
       </div>
     );
@@ -719,8 +821,8 @@ function ExtrasPanel({
 
   if (extras === 'pending') {
     return (
-      <div className="rounded-md border border-border bg-muted/30 p-3">
-        <p className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+      <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+        <p className="inline-flex items-center gap-2 text-sm text-gray-500">
           <Spinner /> Snapshotting CP + diffing against Redis…
         </p>
       </div>
@@ -729,20 +831,19 @@ function ExtrasPanel({
 
   if (extras.status === 'FAILED') {
     return (
-      <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm">
-        <p className="font-semibold text-destructive">Snapshot failed.</p>
-        <p className="text-xs text-muted-foreground">
+      <div className="rounded-xl border border-red-200 bg-red-50 p-4">
+        <p className="font-semibold text-red-600 text-sm">Snapshot failed.</p>
+        <p className="text-xs text-gray-500 mt-1">
           {extras.statusMessage ?? 'CP returned no status message.'}
         </p>
-        <Button
-          size="sm"
-          variant="outline"
-          className="mt-2"
+        <button
+          type="button"
           onClick={onDetectExtras}
           disabled={pending}
+          className="mt-2 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
         >
           Retry
-        </Button>
+        </button>
       </div>
     );
   }
@@ -751,42 +852,47 @@ function ExtrasPanel({
   const shown = extras.extraCustomerIds?.length ?? 0;
 
   return (
-    <div className="rounded-md border border-border bg-muted/20 p-3">
+    <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-sm font-semibold">
+          <h3 className="text-sm font-semibold text-gray-900">
             Extras detection —{' '}
             {total === 0 ? (
               <span className="text-green-700">no drift</span>
             ) : (
-              <span className="text-destructive">
+              <span className="text-red-500">
                 {total.toLocaleString()} id{total === 1 ? '' : 's'} no longer match
               </span>
             )}
           </h3>
           {extras.computedAt ? (
-            <p className="text-xs text-muted-foreground">
+            <p className="text-xs text-gray-400 mt-0.5">
               Computed {formatDateTime(extras.computedAt)} · CP {extras.cpCount} · Redis{' '}
               {extras.redisCount}
             </p>
           ) : null}
         </div>
-        <Button size="sm" variant="outline" onClick={onDetectExtras} disabled={pending}>
+        <button
+          type="button"
+          onClick={onDetectExtras}
+          disabled={pending}
+          className="shrink-0 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
+        >
           Re-detect
-        </Button>
+        </button>
       </div>
 
       {total > 0 && shown > 0 ? (
-        <div className="mt-3 max-h-48 overflow-auto rounded-md border border-border bg-background p-2">
-          <ul className="divide-y divide-border text-xs">
+        <div className="mt-3 max-h-48 overflow-auto rounded-lg border border-gray-200 bg-white p-2">
+          <ul className="divide-y divide-gray-100 text-xs">
             {extras.extraCustomerIds!.map((cid) => (
-              <li key={cid} className="py-1 font-mono">
+              <li key={cid} className="py-1 font-mono text-gray-700">
                 {cid}
               </li>
             ))}
           </ul>
           {total > shown ? (
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 text-xs text-gray-400">
               Showing first {shown.toLocaleString()} of {total.toLocaleString()}.
             </p>
           ) : null}
@@ -796,7 +902,7 @@ function ExtrasPanel({
   );
 }
 
-function Tile({
+function StatTile({
   label,
   value,
   tone,
@@ -805,16 +911,16 @@ function Tile({
   value: string;
   tone: 'default' | 'success' | 'danger';
 }): ReactNode {
-  const toneClass =
+  const valueClass =
     tone === 'success'
       ? 'text-green-700'
       : tone === 'danger'
-      ? 'text-destructive'
-      : 'text-foreground';
+      ? 'text-red-500'
+      : 'text-gray-900';
   return (
-    <div className="rounded-md border border-border bg-card p-3">
-      <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className={`mt-1 text-2xl font-semibold ${toneClass}`}>{value}</p>
+    <div className="rounded-xl border border-gray-200 bg-gray-50 p-3">
+      <p className="text-[10px] uppercase tracking-wider font-semibold text-gray-500">{label}</p>
+      <p className={`mt-1 text-2xl font-semibold ${valueClass}`}>{value}</p>
     </div>
   );
 }

@@ -83,6 +83,10 @@ def lambda_handler(event: dict, context) -> dict:
         _logger.warn("validation_error", error=str(exc))
         return error_response(400, "VALIDATION_ERROR", str(exc))
 
+    except ConcurrentWriteError as exc:
+        _logger.warn("concurrent_write", error=str(exc), route_key=route_key)
+        return error_response(409, "CONCURRENT_WRITE", "Another operation is in progress — retry in a moment")
+
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         message = exc.response.get("Error", {}).get("Message", str(exc))

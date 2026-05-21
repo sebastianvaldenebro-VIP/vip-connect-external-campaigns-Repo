@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
 
-import { Button, Card, Field, Input, Select } from '@/components/ui';
+import { Spinner } from '@/components/ui';
 import { api, type CreateCampaignBody } from '@/lib/api';
 
 type DialerType = CreateCampaignBody['dialer']['type'];
@@ -46,6 +46,43 @@ const DEFAULTS: FormState = {
   perWeek: 0,
   perMonth: 0,
 };
+
+// ── Reusable field wrapper ────────────────────────────────────────────────────
+
+function FormField({
+  label,
+  hint,
+  hintTone = 'muted',
+  children,
+}: {
+  label: string;
+  hint?: string;
+  hintTone?: 'muted' | 'danger';
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="block text-xs font-semibold text-gray-700">{label}</label>
+      {children}
+      {hint && (
+        <p
+          className={
+            hintTone === 'danger' ? 'text-xs text-red-500' : 'text-xs text-gray-400'
+          }
+        >
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ── Input style ───────────────────────────────────────────────────────────────
+
+const inputCls =
+  'w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300';
+
+// ── Main component ────────────────────────────────────────────────────────────
 
 export function CampaignNew(): ReactNode {
   const navigate = useNavigate();
@@ -131,43 +168,62 @@ export function CampaignNew(): ReactNode {
   };
 
   return (
-    <form onSubmit={onSubmit} className="flex flex-col gap-6">
-      <header className="flex items-center justify-between">
+    <form onSubmit={onSubmit} className="flex flex-col gap-5">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">New campaign</h1>
+          <h2 className="text-xl font-semibold tracking-tight">New campaign</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Segment-driven Outbound Campaigns V2.
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button type="button" variant="outline" onClick={() => navigate('/campaigns')}>
+          <button
+            type="button"
+            onClick={() => navigate('/campaigns')}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Cancel
-          </Button>
-          <Button type="submit" disabled={create.isPending}>
-            {create.isPending ? 'Creating…' : 'Create campaign'}
-          </Button>
+          </button>
+          <button
+            type="submit"
+            disabled={create.isPending}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
+            {create.isPending ? (
+              <>
+                <Spinner /> Creating…
+              </>
+            ) : (
+              'Create campaign'
+            )}
+          </button>
         </div>
-      </header>
+      </div>
 
+      {/* Error banner */}
       {error ? (
-        <Card className="border-destructive/50 bg-destructive/5 text-sm text-destructive">
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-600">
           {error}
-        </Card>
+        </div>
       ) : null}
 
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Basics</h2>
+      {/* Basics */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Basics</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Name" htmlFor="cmp-name">
-            <Input
+          <FormField label="Name">
+            <input
               id="cmp-name"
+              className={inputCls}
               value={form.name}
               onChange={(e) => update('name', e.target.value)}
               required
             />
-          </Field>
-          <Field label="Segment" hint="Arn of the Customer Profiles segment to dial.">
-            <Select
+          </FormField>
+          <FormField label="Segment" hint="Arn of the Customer Profiles segment to dial.">
+            <select
+              className={inputCls}
               value={form.segmentArn}
               onChange={(e) => update('segmentArn', e.target.value)}
               required
@@ -178,16 +234,18 @@ export function CampaignNew(): ReactNode {
                   {s.displayName ?? s.name}
                 </option>
               ))}
-            </Select>
-          </Field>
+            </select>
+          </FormField>
         </div>
-      </Card>
+      </div>
 
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Connect routing</h2>
+      {/* Connect routing */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Connect routing</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Queue">
-            <Select
+          <FormField label="Queue">
+            <select
+              className={inputCls}
               value={form.queueId}
               onChange={(e) => update('queueId', e.target.value)}
               required
@@ -198,10 +256,11 @@ export function CampaignNew(): ReactNode {
                   {q.name}
                 </option>
               ))}
-            </Select>
-          </Field>
-          <Field label="Contact flow">
-            <Select
+            </select>
+          </FormField>
+          <FormField label="Contact flow">
+            <select
+              className={inputCls}
               value={form.contactFlowId}
               onChange={(e) => update('contactFlowId', e.target.value)}
               required
@@ -214,10 +273,11 @@ export function CampaignNew(): ReactNode {
                     {f.name}
                   </option>
                 ))}
-            </Select>
-          </Field>
-          <Field label="Campaign flow">
-            <Select
+            </select>
+          </FormField>
+          <FormField label="Campaign flow">
+            <select
+              className={inputCls}
               value={form.campaignFlowArn}
               onChange={(e) => update('campaignFlowArn', e.target.value)}
               required
@@ -230,10 +290,11 @@ export function CampaignNew(): ReactNode {
                     {f.name}
                   </option>
                 ))}
-            </Select>
-          </Field>
-          <Field label="Source phone number">
-            <Select
+            </select>
+          </FormField>
+          <FormField label="Source phone number">
+            <select
+              className={inputCls}
               value={form.sourcePhoneNumber}
               onChange={(e) => update('sourcePhoneNumber', e.target.value)}
               required
@@ -244,71 +305,78 @@ export function CampaignNew(): ReactNode {
                   {p.number}
                 </option>
               ))}
-            </Select>
-          </Field>
+            </select>
+          </FormField>
         </div>
-      </Card>
+      </div>
 
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Dialer</h2>
+      {/* Dialer */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Dialer</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Field label="Type">
-            <Select
+          <FormField label="Type">
+            <select
+              className={inputCls}
               value={form.dialerType}
               onChange={(e) => update('dialerType', e.target.value as DialerType)}
             >
               <option value="progressive">Progressive</option>
               <option value="predictive">Predictive</option>
               <option value="agentless">Agentless</option>
-            </Select>
-          </Field>
-          <Field label="Bandwidth allocation" hint="0–1">
-            <Input
+            </select>
+          </FormField>
+          <FormField label="Bandwidth allocation" hint="0–1">
+            <input
               type="number"
               min="0"
               max="1"
               step="0.05"
+              className={inputCls}
               value={form.bandwidthAllocation}
               onChange={(e) => update('bandwidthAllocation', Number(e.target.value))}
             />
-          </Field>
-          <Field label="Dialing capacity" hint="0–1">
-            <Input
+          </FormField>
+          <FormField label="Dialing capacity" hint="0–1">
+            <input
               type="number"
               min="0"
               max="1"
               step="0.05"
+              className={inputCls}
               value={form.dialingCapacity}
               onChange={(e) => update('dialingCapacity', Number(e.target.value))}
             />
-          </Field>
+          </FormField>
         </div>
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Answer machine detection">
-            <Select
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 mt-4">
+          <FormField label="Answer machine detection">
+            <select
+              className={inputCls}
               value={String(form.amdEnabled)}
               onChange={(e) => update('amdEnabled', e.target.value === 'true')}
             >
               <option value="true">Enabled</option>
               <option value="false">Disabled</option>
-            </Select>
-          </Field>
-          <Field label="Await prompt">
-            <Select
+            </select>
+          </FormField>
+          <FormField label="Await prompt">
+            <select
+              className={inputCls}
               value={String(form.amdAwaitPrompt)}
               onChange={(e) => update('amdAwaitPrompt', e.target.value === 'true')}
             >
               <option value="true">Yes</option>
               <option value="false">No</option>
-            </Select>
-          </Field>
+            </select>
+          </FormField>
         </div>
-      </Card>
+      </div>
 
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Schedule</h2>
+      {/* Schedule */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Schedule</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Field
+          <FormField
             label="Start"
             hint={
               form.startTime && new Date(form.startTime) < new Date(Date.now() + 5 * 60 * 1000)
@@ -317,63 +385,72 @@ export function CampaignNew(): ReactNode {
             }
             hintTone="danger"
           >
-            <Input
+            <input
               type="datetime-local"
+              className={inputCls}
               value={form.startTime}
               onChange={(e) => update('startTime', e.target.value)}
               required
             />
-          </Field>
-          <Field label="End">
-            <Input
+          </FormField>
+          <FormField label="End">
+            <input
               type="datetime-local"
+              className={inputCls}
               value={form.endTime}
               onChange={(e) => update('endTime', e.target.value)}
               required
             />
-          </Field>
-          <Field label="Timezone">
-            <Input
+          </FormField>
+          <FormField label="Timezone">
+            <input
+              className={inputCls}
               value={form.timezone}
               onChange={(e) => update('timezone', e.target.value)}
               placeholder="America/New_York"
             />
-          </Field>
+          </FormField>
         </div>
-      </Card>
+      </div>
 
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Communication limits (optional)</h2>
+      {/* Communication limits */}
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Communication limits (optional)</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Field label="Max per day">
-            <Input
+          <FormField label="Max per day">
+            <input
               type="number"
               min="0"
+              className={inputCls}
               value={form.perDay}
               onChange={(e) => update('perDay', Number(e.target.value))}
             />
-          </Field>
-          <Field label="Max per week">
-            <Input
+          </FormField>
+          <FormField label="Max per week">
+            <input
               type="number"
               min="0"
+              className={inputCls}
               value={form.perWeek}
               onChange={(e) => update('perWeek', Number(e.target.value))}
             />
-          </Field>
-          <Field label="Max per month">
-            <Input
+          </FormField>
+          <FormField label="Max per month">
+            <input
               type="number"
               min="0"
+              className={inputCls}
               value={form.perMonth}
               onChange={(e) => update('perMonth', Number(e.target.value))}
             />
-          </Field>
+          </FormField>
         </div>
-      </Card>
+      </div>
     </form>
   );
 }
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 function toIso(local: string): string {
   if (!local) return '';

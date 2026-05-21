@@ -2,10 +2,19 @@ import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 
+import { Spinner } from '@/components/ui';
 import { api, type AuditEntry, type CampaignSummary } from '@/lib/api';
 import { formatDateTime } from '@/lib/utils';
 
-type Tile = { label: string; value: string };
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function statusBorderClass(status: string): string {
+  const s = (status ?? '').toLowerCase();
+  if (s === 'running') return 'border-l-4 border-l-blue-400';
+  if (s === 'completed') return 'border-l-4 border-l-green-400';
+  if (s === 'failed' || s === 'error') return 'border-l-4 border-l-red-500';
+  return 'border-l-4 border-l-gray-200';
+}
 
 export function Dashboard(): ReactNode {
   const segments = useQuery({
@@ -30,76 +39,116 @@ export function Dashboard(): ReactNode {
     (c) => (c.status ?? '').toLowerCase() === 'paused',
   );
 
-  const tiles: Tile[] = [
-    { label: 'Active segments', value: String(segments.data?.segments.length ?? '—') },
-    { label: 'Campaigns running', value: String(running.length) },
-    { label: 'Campaigns paused', value: String(paused.length) },
-    { label: 'Recent audit events', value: String(audit.data?.entries.length ?? '—') },
-  ];
-
   return (
-    <div className="flex flex-col gap-8">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-      </header>
+    <div className="flex flex-col gap-6">
+      {/* Page header */}
+      <div>
+        <h2 className="text-xl font-semibold tracking-tight">Dashboard</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Overview of segments, campaigns, and recent activity.
+        </p>
+      </div>
 
-      <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {tiles.map((tile) => (
-          <div
-            key={tile.label}
-            className="rounded-lg border border-border bg-card p-4 shadow-sm"
-          >
-            <p className="text-sm text-muted-foreground">{tile.label}</p>
-            <p className="mt-2 text-3xl font-semibold tracking-tight">{tile.value}</p>
+      {/* Stat cards */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="bg-blue-50/70 border border-blue-100 rounded-xl px-4 py-4 shadow-sm">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-blue-400 mb-1">
+            Active segments
           </div>
-        ))}
-      </section>
+          <div className="text-3xl font-bold font-mono text-blue-700">
+            {segments.isPending ? '—' : String(segments.data?.segments.length ?? '—')}
+          </div>
+          <div className="text-xs text-blue-400 mt-0.5">total loaded</div>
+        </div>
 
-      <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        <CampaignsCard title="Running campaigns" items={running} emptyLabel="None running" />
+        <div className="bg-green-50/70 border border-green-100 rounded-xl px-4 py-4 shadow-sm">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-green-500 mb-1">
+            Campaigns running
+          </div>
+          <div className="text-3xl font-bold font-mono text-green-700">
+            {campaigns.isPending ? '—' : String(running.length)}
+          </div>
+          <div className="text-xs text-green-400 mt-0.5">currently active</div>
+        </div>
+
+        <div className="bg-amber-50/70 border border-amber-100 rounded-xl px-4 py-4 shadow-sm">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-amber-500 mb-1">
+            Campaigns paused
+          </div>
+          <div className="text-3xl font-bold font-mono text-amber-700">
+            {campaigns.isPending ? '—' : String(paused.length)}
+          </div>
+          <div className="text-xs text-amber-400 mt-0.5">on hold</div>
+        </div>
+
+        <div className="bg-purple-50/70 border border-purple-100 rounded-xl px-4 py-4 shadow-sm">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-purple-400 mb-1">
+            Audit events
+          </div>
+          <div className="text-3xl font-bold font-mono text-purple-700">
+            {audit.isPending ? '—' : String(audit.data?.entries.length ?? '—')}
+          </div>
+          <div className="text-xs text-purple-400 mt-0.5">recent (last 20)</div>
+        </div>
+      </div>
+
+      {/* Bottom two-column grid */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <CampaignsCard items={running} loading={campaigns.isPending} />
         <AuditCard audit={audit.data?.entries ?? []} loading={audit.isPending} />
-      </section>
+      </div>
     </div>
   );
 }
 
 function CampaignsCard({
-  title,
   items,
-  emptyLabel,
+  loading,
 }: {
-  title: string;
   items: CampaignSummary[];
-  emptyLabel: string;
+  loading: boolean;
 }): ReactNode {
   return (
-    <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
+    <div className="flex flex-col gap-3">
+      {/* Section header */}
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        <Link to="/campaigns" className="text-xs text-muted-foreground hover:text-foreground">
-          View all →
+        <h3 className="text-sm font-semibold text-gray-900">Running campaigns</h3>
+        <Link to="/campaigns" className="text-xs text-blue-600 hover:underline">
+          View all
         </Link>
       </div>
-      <div className="mt-3 divide-y divide-border">
-        {items.length === 0 ? (
-          <p className="py-3 text-sm text-muted-foreground">{emptyLabel}</p>
+
+      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+        {loading ? (
+          <div className="flex items-center justify-center py-20">
+            <Spinner />
+          </div>
+        ) : items.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-gray-200 p-8 text-center text-sm text-gray-400">
+            Nothing to show yet.
+          </div>
         ) : (
-          items.slice(0, 6).map((c) => (
-            <div key={c.id} className="flex items-center justify-between py-2">
-              <div>
-                <p className="text-sm font-medium">{c.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {(c.channelSubtypes ?? ['TELEPHONY']).join(', ')}
-                </p>
-              </div>
-              <Link
-                to={`/campaigns/${encodeURIComponent(c.id)}`}
-                className="text-xs text-muted-foreground hover:text-foreground"
+          <div className="divide-y divide-gray-100">
+            {items.slice(0, 6).map((c) => (
+              <div
+                key={c.id}
+                className={`flex items-center justify-between px-4 py-3 ${statusBorderClass(c.status ?? '')}`}
               >
-                Open →
-              </Link>
-            </div>
-          ))
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-gray-900 truncate">{c.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {(c.channelSubtypes ?? ['TELEPHONY']).join(', ')}
+                  </p>
+                </div>
+                <Link
+                  to={`/campaigns/${encodeURIComponent(c.id)}`}
+                  className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors ml-3 shrink-0"
+                >
+                  Open
+                </Link>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -114,33 +163,46 @@ function AuditCard({
   loading: boolean;
 }): ReactNode {
   return (
-    <div className="rounded-lg border border-border bg-card p-4 shadow-sm">
+    <div className="flex flex-col gap-3">
+      {/* Section header */}
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold">Recent activity</h2>
-        <Link to="/audit" className="text-xs text-muted-foreground hover:text-foreground">
-          View all →
+        <h3 className="text-sm font-semibold text-gray-900">Recent activity</h3>
+        <Link to="/audit" className="text-xs text-blue-600 hover:underline">
+          View all
         </Link>
       </div>
-      <div className="mt-3 divide-y divide-border">
+
+      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
         {loading ? (
-          <p className="py-3 text-sm text-muted-foreground">Loading…</p>
+          <div className="flex items-center justify-center py-20">
+            <Spinner />
+          </div>
         ) : audit.length === 0 ? (
-          <p className="py-3 text-sm text-muted-foreground">No recent events</p>
+          <div className="rounded-xl border border-dashed border-gray-200 p-8 text-center text-sm text-gray-400">
+            Nothing to show yet.
+          </div>
         ) : (
-          audit.slice(0, 8).map((entry, i) => (
-            <div key={i} className="flex flex-col gap-0.5 py-2 text-sm">
-              <span>
-                <span className="font-medium">{entry.actorEmail ?? entry.actorSub ?? '—'}</span>{' '}
-                <span className="text-muted-foreground">{entry.action}</span>{' '}
-                <span>
-                  {entry.entityType}:{entry.entityId}
+          <div className="divide-y divide-gray-100">
+            {audit.slice(0, 8).map((entry, i) => (
+              <div
+                key={i}
+                className="flex flex-col gap-0.5 px-4 py-3 border-l-4 border-l-gray-200"
+              >
+                <span className="text-sm">
+                  <span className="font-medium text-gray-900">
+                    {entry.actorEmail ?? entry.actorSub ?? '—'}
+                  </span>{' '}
+                  <span className="text-muted-foreground">{entry.action}</span>{' '}
+                  <span className="text-gray-700">
+                    {entry.entityType}:{entry.entityId}
+                  </span>
                 </span>
-              </span>
-              <span className="text-xs text-muted-foreground">
-                {formatDateTime(entry.timestamp)}
-              </span>
-            </div>
-          ))
+                <span className="font-mono text-xs text-gray-400">
+                  {formatDateTime(entry.timestamp)}
+                </span>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>

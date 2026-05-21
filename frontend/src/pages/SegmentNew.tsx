@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 
-import { Button, Card, Field, Input, Select, Spinner } from '@/components/ui';
+import { Spinner } from '@/components/ui';
 import { EnableCampaignModal } from '@/components/EnableCampaignModal';
 import { api, type ReconcileResult, type SegmentSummary, type VerifyResult } from '@/lib/api';
 import { buildSegmentGroups, type Rule } from '@/lib/segmentGroups';
@@ -222,81 +222,129 @@ export function SegmentNew(): ReactNode {
     const activeSegmentName = currentSegment.name;
 
     return (
-      <div className="flex flex-col gap-6">
-        <header>
-          <h1 className="text-2xl font-semibold tracking-tight">Segment created</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            <code className="font-mono">{currentSegment.name}</code>
-            {reconcileResult ? (
-              <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
-                v{reconcileResult.newVersion} reconciled
-              </span>
-            ) : null}
-          </p>
-        </header>
+      <div className="flex flex-col gap-5">
+        {/* Success header */}
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h2 className="text-xl font-semibold tracking-tight">Segment created</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              <code className="font-mono">{currentSegment.name}</code>
+              {reconcileResult ? (
+                <span className="ml-2 rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-green-700">
+                  v{reconcileResult.newVersion} reconciled
+                </span>
+              ) : null}
+            </p>
+          </div>
+        </div>
 
-        <Card className="flex flex-col gap-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <Button
-              variant="outline"
+        <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm flex flex-col gap-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
               onClick={() => verify.mutate(activeSegmentName)}
               disabled={verify.isPending || reconcile.isPending}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
             >
               {verify.isPending ? (
                 <span className="inline-flex items-center gap-2"><Spinner /> Verifying…</span>
               ) : 'Verify'}
-            </Button>
-            <Button
-              variant="outline"
+            </button>
+            <button
+              type="button"
               onClick={() => reconcile.mutate(activeSegmentName)}
               disabled={reconcile.isPending || verify.isPending}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
             >
               {reconcile.isPending ? (
                 <span className="inline-flex items-center gap-2"><Spinner /> Reconciling…</span>
               ) : 'Reconcile'}
-            </Button>
-            <Button onClick={() => setEnableOpen(true)} disabled={reconcile.isPending}>
+            </button>
+            <button
+              type="button"
+              onClick={() => setEnableOpen(true)}
+              disabled={reconcile.isPending}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+            >
               Enable Campaign
-            </Button>
-            <Button variant="outline" onClick={() => navigate('/segments')}>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/segments')}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+            >
               Back to list
-            </Button>
-            <Button variant="ghost" onClick={resetForm}>
+            </button>
+            <button
+              type="button"
+              onClick={resetForm}
+              className="rounded-lg px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50 transition-colors"
+            >
               Create another
-            </Button>
+            </button>
           </div>
 
           {verify.isError ? (
-            <p className="text-sm text-destructive">{(verify.error as Error).message}</p>
+            <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+              <span className="mt-0.5 shrink-0">⚠</span>
+              <div>{(verify.error as Error).message}</div>
+            </div>
           ) : null}
           {reconcile.isError ? (
-            <p className="text-sm text-destructive">{(reconcile.error as Error).message}</p>
+            <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+              <span className="mt-0.5 shrink-0">⚠</span>
+              <div>{(reconcile.error as Error).message}</div>
+            </div>
           ) : null}
 
           {verifyResult ? (
-            <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
-              <p className="font-semibold">Verify result</p>
-              <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-xs md:grid-cols-4">
-                <div><dt className="text-muted-foreground">Redis</dt><dd className="font-mono">{verifyResult.redisCount.toLocaleString()}</dd></div>
-                <div><dt className="text-muted-foreground">Segment (CP)</dt><dd className="font-mono">{verifyResult.segmentCount.toLocaleString()}</dd></div>
-                <div><dt className="text-muted-foreground">Missing</dt><dd className="font-mono">{verifyResult.missingCustomerIds.length.toLocaleString()}</dd></div>
-                <div><dt className="text-muted-foreground">Extras</dt><dd className="font-mono">{verifyResult.extraCustomerIds.length.toLocaleString()}</dd></div>
+            <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+              <p className="text-sm font-semibold text-gray-900 mb-3">Verify result</p>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs md:grid-cols-4">
+                <div>
+                  <dt className="text-gray-400 mb-0.5">Redis</dt>
+                  <dd className="font-mono font-semibold text-gray-900">{verifyResult.redisCount.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt className="text-gray-400 mb-0.5">Segment (CP)</dt>
+                  <dd className="font-mono font-semibold text-gray-900">{verifyResult.segmentCount.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt className="text-gray-400 mb-0.5">Missing</dt>
+                  <dd className="font-mono font-semibold text-gray-900">{verifyResult.missingCustomerIds.length.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt className="text-gray-400 mb-0.5">Extras</dt>
+                  <dd className="font-mono font-semibold text-gray-900">{verifyResult.extraCustomerIds.length.toLocaleString()}</dd>
+                </div>
               </dl>
             </div>
           ) : null}
 
           {reconcileResult ? (
-            <div className="rounded-md border border-border bg-muted/30 p-3 text-sm">
-              <p className="font-semibold">Reconcile result</p>
-              <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-xs md:grid-cols-4">
-                <div><dt className="text-muted-foreground">New name</dt><dd className="font-mono">{reconcileResult.newSegmentName}</dd></div>
-                <div><dt className="text-muted-foreground">Version</dt><dd className="font-mono">v{reconcileResult.newVersion}</dd></div>
-                <div><dt className="text-muted-foreground">Added</dt><dd className="font-mono">+{reconcileResult.added.toLocaleString()}</dd></div>
-                <div><dt className="text-muted-foreground">Removed</dt><dd className="font-mono">-{reconcileResult.removed.toLocaleString()}</dd></div>
+            <div className="rounded-xl border border-green-200 bg-green-50 p-4">
+              <p className="text-sm font-semibold text-green-900 mb-3">Reconcile result</p>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs md:grid-cols-4">
+                <div>
+                  <dt className="text-green-700 mb-0.5">New name</dt>
+                  <dd className="font-mono font-semibold text-green-900">{reconcileResult.newSegmentName}</dd>
+                </div>
+                <div>
+                  <dt className="text-green-700 mb-0.5">Version</dt>
+                  <dd className="font-mono font-semibold text-green-900">v{reconcileResult.newVersion}</dd>
+                </div>
+                <div>
+                  <dt className="text-green-700 mb-0.5">Added</dt>
+                  <dd className="font-mono font-semibold text-green-900">+{reconcileResult.added.toLocaleString()}</dd>
+                </div>
+                <div>
+                  <dt className="text-green-700 mb-0.5">Removed</dt>
+                  <dd className="font-mono font-semibold text-green-900">-{reconcileResult.removed.toLocaleString()}</dd>
+                </div>
               </dl>
             </div>
           ) : null}
-        </Card>
+        </div>
 
         <EnableCampaignModal
           open={enableOpen}
@@ -310,10 +358,11 @@ export function SegmentNew(): ReactNode {
   }
 
   return (
-    <form onSubmit={onSubmit} className="flex flex-col gap-6">
-      <header className="flex items-center justify-between">
+    <form onSubmit={onSubmit} className="flex flex-col gap-5">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">New segment</h1>
+          <h2 className="text-xl font-semibold tracking-tight">New segment</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Compose a segment from the structured filters. Name auto-generates
             from State + Attempts; preview count runs ~1s after the last
@@ -321,27 +370,43 @@ export function SegmentNew(): ReactNode {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button type="button" variant="outline" onClick={() => navigate('/segments')}>
+          <button
+            type="button"
+            onClick={() => navigate('/segments')}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Cancel
-          </Button>
-          <Button type="submit" disabled={create.isPending}>
-            {create.isPending ? 'Creating…' : 'Create segment'}
-          </Button>
+          </button>
+          <button
+            type="submit"
+            disabled={create.isPending}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
+            {create.isPending ? (
+              <span className="inline-flex items-center gap-2"><Spinner /> Creating…</span>
+            ) : (
+              'Create segment'
+            )}
+          </button>
         </div>
-      </header>
+      </div>
 
       {error ? (
-        <Card className="border-destructive/50 bg-destructive/5 text-sm text-destructive">
-          {error}
-        </Card>
+        <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+          <span className="mt-0.5 shrink-0">⚠</span>
+          <div>{error}</div>
+        </div>
       ) : null}
 
       {/* ── Identity ──────────────────────────────────────────────── */}
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Identity</h2>
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Identity</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Name (auto-generated)" htmlFor="seg-name">
-            <Input
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1" htmlFor="seg-name">
+              Name (auto-generated)
+            </label>
+            <input
               id="seg-name"
               value={segmentName}
               onChange={(e) =>
@@ -351,39 +416,48 @@ export function SegmentNew(): ReactNode {
               }
               placeholder="23-04-2026-New_Jersey-2"
               required
+              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
             />
-          </Field>
-          <Field label="Display name (optional)" htmlFor="seg-display">
-            <Input
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1" htmlFor="seg-display">
+              Display name (optional)
+            </label>
+            <input
               id="seg-display"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
               placeholder="NJ morning — attempt 2"
+              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
             />
-          </Field>
+          </div>
         </div>
-      </Card>
+      </div>
 
       {/* ── Location ─────────────────────────────────────────────── */}
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Location</h2>
-        <p className="text-xs text-muted-foreground">
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-1">Location</h3>
+        <p className="text-xs text-gray-500 mb-4">
           Pick one or more states first. Locations narrow to the states you
           chose. Leave locations empty to include all locations of the
           selected states.
         </p>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-[1fr,2fr]">
-          <Field label="State (multi-select)">
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              State (multi-select)
+            </label>
             <MultiSelect
               options={STATE_LOCATION_MAP.map((g) => g.state)}
               selected={selectedStates}
               onChange={setSelectedStates}
               placeholder="Select states…"
             />
-          </Field>
-          <Field
-            label={`Location (multi-select${availableLocationOptions.length ? ` · ${availableLocationOptions.length} available` : ''})`}
-          >
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              {`Location (multi-select${availableLocationOptions.length ? ` · ${availableLocationOptions.length} available` : ''})`}
+            </label>
             <MultiSelect
               options={availableLocationOptions}
               selected={selectedLocations}
@@ -395,26 +469,27 @@ export function SegmentNew(): ReactNode {
               }
               disabled={availableLocationOptions.length === 0}
             />
-          </Field>
+          </div>
         </div>
-      </Card>
+      </div>
 
       {/* ── Groups ──────────────────────────────────────────────── */}
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Groups</h2>
-        <p className="text-xs text-muted-foreground">
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-1">Groups</h3>
+        <p className="text-xs text-gray-500 mb-4">
           Populated from Redis. Independent of availability — the final filter
           is an AND between groups + attempts + location + availability.
         </p>
-        <Field
-          label={`Groups (multi-select${groupsQuery.data ? ` · ${groupsQuery.data.values.length} distinct values in Redis` : ''})`}
-        >
+        <div>
+          <label className="block text-xs font-semibold text-gray-700 mb-1">
+            {`Groups (multi-select${groupsQuery.data ? ` · ${groupsQuery.data.values.length} distinct values in Redis` : ''})`}
+          </label>
           {groupsQuery.isPending ? (
-            <div className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
+            <div className="flex h-9 items-center gap-2 text-xs text-gray-400">
               <Spinner /> loading distinct values…
             </div>
           ) : groupsQuery.isError ? (
-            <p className="text-xs text-destructive">
+            <p className="text-xs text-red-500">
               {(groupsQuery.error as Error).message}
             </p>
           ) : (
@@ -425,32 +500,37 @@ export function SegmentNew(): ReactNode {
               placeholder="Leave empty to not filter on groups"
             />
           )}
-        </Field>
-      </Card>
+        </div>
+      </div>
 
       {/* ── Availability & attempts ──────────────────────────────── */}
-      <Card className="flex flex-col gap-4">
-        <h2 className="text-sm font-semibold">Availability & attempts</h2>
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-4">Availability &amp; attempts</h3>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <Field label="Available status">
-            <Select
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              Available status
+            </label>
+            <select
               value={availableFilter}
               onChange={(e) => setAvailableFilter(e.target.value as AvailableFilter)}
+              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300 bg-white"
             >
               <option value="yes">Available (true)</option>
               <option value="no">Not available (false)</option>
               <option value="any">Any (no filter)</option>
-            </Select>
-          </Field>
-          <Field
-            label={`Attempt (multi-select${attemptsQuery.data ? ` · ${attemptsQuery.data.values.length} distinct values in Redis` : ''})`}
-          >
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              {`Attempt (multi-select${attemptsQuery.data ? ` · ${attemptsQuery.data.values.length} distinct values in Redis` : ''})`}
+            </label>
             {attemptsQuery.isPending ? (
-              <div className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
+              <div className="flex h-9 items-center gap-2 text-xs text-gray-400">
                 <Spinner /> loading distinct values…
               </div>
             ) : attemptsQuery.isError ? (
-              <p className="text-xs text-destructive">
+              <p className="text-xs text-red-500">
                 {(attemptsQuery.error as Error).message}
               </p>
             ) : (
@@ -461,15 +541,37 @@ export function SegmentNew(): ReactNode {
                 placeholder="Leave empty to not filter on attempt"
               />
             )}
-          </Field>
+          </div>
         </div>
-      </Card>
+      </div>
 
       {/* ── Preview ─────────────────────────────────────────────── */}
-      <Card className="flex flex-col gap-2">
-        <h2 className="text-sm font-semibold">Preview count</h2>
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+        <h3 className="text-sm font-semibold text-gray-900 mb-3">Preview count</h3>
         <PreviewView preview={preview} />
-      </Card>
+      </div>
+
+      {/* Submit footer */}
+      <div className="flex items-center justify-end gap-2 pb-2">
+        <button
+          type="button"
+          onClick={() => navigate('/segments')}
+          className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={create.isPending}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+        >
+          {create.isPending ? (
+            <span className="inline-flex items-center gap-2"><Spinner /> Creating…</span>
+          ) : (
+            'Create segment'
+          )}
+        </button>
+      </div>
     </form>
   );
 }
@@ -504,9 +606,9 @@ function MultiSelect({
           : 'flex flex-col gap-2'
       }
     >
-      <div className="flex flex-wrap gap-1 rounded-md border border-border bg-background p-2 min-h-10">
+      <div className="flex flex-wrap gap-1 rounded-lg border border-gray-200 bg-white p-2 min-h-10">
         {selected.length === 0 ? (
-          <span className="text-xs text-muted-foreground">
+          <span className="text-xs text-gray-400">
             {placeholder ?? 'Nothing selected'}
           </span>
         ) : (
@@ -516,16 +618,16 @@ function MultiSelect({
               type="button"
               onClick={() => toggle(v)}
               disabled={disabled}
-              className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-foreground hover:bg-primary/20"
+              className="inline-flex items-center gap-1 rounded-full bg-blue-50 border border-blue-200 px-2 py-0.5 text-xs text-blue-700 hover:bg-blue-100 transition-colors"
             >
               <span>{v}</span>
-              <span aria-hidden>×</span>
+              <span aria-hidden className="text-blue-400">×</span>
             </button>
           ))
         )}
       </div>
       {!disabled && options.length > 0 ? (
-        <div className="max-h-48 overflow-auto rounded-md border border-border bg-muted/20 p-1">
+        <div className="max-h-48 overflow-auto rounded-lg border border-gray-200 bg-gray-50 p-1">
           {options.map((opt) => {
             const active = selected.includes(opt);
             return (
@@ -535,12 +637,12 @@ function MultiSelect({
                 onClick={() => toggle(opt)}
                 className={
                   active
-                    ? 'flex w-full items-center justify-between rounded px-2 py-1 text-left text-sm bg-primary/10'
-                    : 'flex w-full items-center justify-between rounded px-2 py-1 text-left text-sm hover:bg-muted'
+                    ? 'flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-sm bg-blue-50 text-blue-700'
+                    : 'flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100 transition-colors'
                 }
               >
                 <span>{opt}</span>
-                {active ? <span className="text-xs">✓</span> : null}
+                {active ? <span className="text-xs text-blue-500">✓</span> : null}
               </button>
             );
           })}
@@ -562,19 +664,24 @@ function PreviewView({
 }): ReactNode {
   if (preview.status === 'loading') {
     return (
-      <span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+      <span className="inline-flex items-center gap-2 text-sm text-gray-400">
         <Spinner /> counting Redis + CP estimate…
       </span>
     );
   }
   if (preview.status === 'error') {
-    return <p className="text-sm text-destructive">{preview.message}</p>;
+    return (
+      <div className="flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700">
+        <span className="mt-0.5 shrink-0">⚠</span>
+        <div>{preview.message}</div>
+      </div>
+    );
   }
   if (preview.redis === undefined) {
     return (
-      <p className="text-sm text-muted-foreground">
+      <div className="rounded-xl border border-dashed border-gray-200 p-6 text-center text-sm text-gray-400">
         Pick at least one filter to preview the count.
-      </p>
+      </div>
     );
   }
   const drift =
@@ -583,13 +690,13 @@ function PreviewView({
       : null;
   return (
     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-      <Tile label="Redis count" value={preview.redis.toLocaleString()} tone="default" />
-      <Tile
+      <PreviewTile label="Redis count" value={preview.redis.toLocaleString()} tone="default" />
+      <PreviewTile
         label="CP estimate"
         value={preview.cp != null ? preview.cp.toLocaleString() : '—'}
         tone={drift === 0 ? 'success' : drift != null ? 'warning' : 'default'}
       />
-      <Tile
+      <PreviewTile
         label="Drift (Redis − CP)"
         value={drift != null ? (drift > 0 ? `+${drift}` : String(drift)) : '—'}
         tone={drift === 0 ? 'success' : drift != null ? 'warning' : 'default'}
@@ -598,7 +705,7 @@ function PreviewView({
   );
 }
 
-function Tile({
+function PreviewTile({
   label,
   value,
   tone,
@@ -607,16 +714,16 @@ function Tile({
   value: string;
   tone: 'default' | 'success' | 'warning';
 }): ReactNode {
-  const toneClass =
+  const valueClass =
     tone === 'success'
       ? 'text-green-700'
       : tone === 'warning'
       ? 'text-amber-700'
-      : 'text-foreground';
+      : 'text-gray-900';
   return (
-    <div className="rounded-md border border-border bg-card p-3">
-      <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
-      <p className={`mt-1 text-2xl font-semibold ${toneClass}`}>{value}</p>
+    <div className="rounded-xl border border-gray-200 bg-gray-50 p-3">
+      <p className="text-[10px] uppercase tracking-wider font-semibold text-gray-500">{label}</p>
+      <p className={`mt-1 text-2xl font-semibold ${valueClass}`}>{value}</p>
     </div>
   );
 }

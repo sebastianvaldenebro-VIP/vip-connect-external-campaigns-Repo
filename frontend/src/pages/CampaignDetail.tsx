@@ -2,10 +2,42 @@ import type { ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 
-import { Badge, Button, Card } from '@/components/ui';
+import { Badge, Spinner } from '@/components/ui';
 import { api } from '@/lib/api';
 
 type LifecycleAction = 'start' | 'stop' | 'pause' | 'resume';
+
+function stateTone(state: string): 'success' | 'warning' | 'muted' | 'danger' | 'default' {
+  switch (state) {
+    case 'RUNNING':
+      return 'success';
+    case 'PAUSED':
+      return 'warning';
+    case 'STOPPED':
+    case 'INITIALIZED':
+      return 'muted';
+    case 'FAILED':
+      return 'danger';
+    default:
+      return 'default';
+  }
+}
+
+function statusBorderClass(state: string): string {
+  switch (state) {
+    case 'RUNNING':
+      return 'border-l-4 border-l-blue-400';
+    case 'PAUSED':
+      return 'border-l-4 border-l-amber-400';
+    case 'STOPPED':
+    case 'INITIALIZED':
+      return 'border-l-4 border-l-gray-200';
+    case 'FAILED':
+      return 'border-l-4 border-l-red-500';
+    default:
+      return 'border-l-4 border-l-gray-200';
+  }
+}
 
 export function CampaignDetail(): ReactNode {
   const { id = '' } = useParams<{ id: string }>();
@@ -31,65 +63,100 @@ export function CampaignDetail(): ReactNode {
     },
   });
 
-  if (detail.isPending) return <p className="text-muted-foreground">Loading…</p>;
-  if (detail.isError)
-    return <p className="text-destructive">{(detail.error as Error).message}</p>;
+  if (detail.isPending) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <Spinner />
+      </div>
+    );
+  }
+  if (detail.isError) {
+    return (
+      <div className="rounded-xl border border-dashed border-red-200 p-8 text-center text-sm text-red-400">
+        {(detail.error as Error).message}
+      </div>
+    );
+  }
 
   const campaign = detail.data.campaign as Record<string, unknown>;
   const state = (detail.data.state ?? 'UNKNOWN').toUpperCase();
   const name = typeof campaign.name === 'string' ? campaign.name : id;
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-start justify-between">
+    <div className="flex flex-col gap-5">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Campaign</p>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">{name}</h1>
-            <Badge tone={state === 'RUNNING' ? 'success' : state === 'PAUSED' ? 'warning' : 'muted'}>
-              {state}
-            </Badge>
+          <p className="text-xs uppercase tracking-wide text-muted-foreground mb-0.5">Campaign</p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <h2 className="text-xl font-semibold tracking-tight">{name}</h2>
+            <Badge tone={stateTone(state)}>{state}</Badge>
           </div>
-          <p className="mt-1 text-sm text-muted-foreground">{id}</p>
+          <p className="mt-1 font-mono text-xs text-gray-400">{id}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {state !== 'RUNNING' ? (
-            <Button variant="outline" onClick={() => lifecycle.mutate('start')}>
+            <button
+              type="button"
+              onClick={() => lifecycle.mutate('start')}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+            >
               Start
-            </Button>
+            </button>
           ) : null}
           {state === 'RUNNING' ? (
-            <Button variant="outline" onClick={() => lifecycle.mutate('pause')}>
+            <button
+              type="button"
+              onClick={() => lifecycle.mutate('pause')}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+            >
               Pause
-            </Button>
+            </button>
           ) : null}
           {state === 'PAUSED' ? (
-            <Button variant="outline" onClick={() => lifecycle.mutate('resume')}>
+            <button
+              type="button"
+              onClick={() => lifecycle.mutate('resume')}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+            >
               Resume
-            </Button>
+            </button>
           ) : null}
           {state === 'RUNNING' || state === 'PAUSED' ? (
-            <Button variant="outline" onClick={() => lifecycle.mutate('stop')}>
+            <button
+              type="button"
+              onClick={() => lifecycle.mutate('stop')}
+              className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+            >
               Stop
-            </Button>
+            </button>
           ) : null}
-          <Button
-            variant="destructive"
+          <button
+            type="button"
             onClick={() => {
               if (confirm(`Delete campaign "${name}"?`)) remove.mutate();
             }}
+            className="rounded-lg px-2 py-1.5 text-xs text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors"
           >
             Delete
-          </Button>
+          </button>
         </div>
-      </header>
+      </div>
 
-      <Card>
-        <h2 className="text-sm font-semibold">Configuration</h2>
-        <pre className="mt-2 max-h-[480px] overflow-auto rounded-md bg-muted p-3 text-xs">
-          {JSON.stringify(campaign, null, 2)}
-        </pre>
-      </Card>
+      {/* Configuration card with status-based left border */}
+      <div
+        className={[
+          'bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm',
+          statusBorderClass(state),
+        ].join(' ')}
+      >
+        <div className="px-5 py-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">Configuration</h3>
+          <pre className="max-h-[480px] overflow-auto rounded-lg bg-gray-50 border border-gray-100 p-4 text-xs font-mono text-gray-700 leading-relaxed">
+            {JSON.stringify(campaign, null, 2)}
+          </pre>
+        </div>
+      </div>
     </div>
   );
 }

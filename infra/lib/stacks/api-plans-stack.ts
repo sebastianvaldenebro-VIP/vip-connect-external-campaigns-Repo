@@ -56,6 +56,7 @@ export class ApiPlansStack extends cdk.Stack {
       encryptionKey: props.dataKey,
       pointInTimeRecovery: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      deletionProtection: true,
     });
 
     // ── Lambda log group ─────────────────────────────────────────────

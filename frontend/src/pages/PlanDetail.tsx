@@ -14,7 +14,7 @@ import {
   type PlanSummaryV2,
   type PlanTrigger,
 } from '@/lib/api';
-import { buildChainMap, bucketColumnCount, chainBorderColor } from '@/lib/chainMap';
+import { buildChainMap } from '@/lib/chainMap';
 
 // ── Time helpers (Colombia timezone, UTC-5, no DST) ──────────────────────────
 
@@ -150,7 +150,6 @@ function CampaignCard({
   campaignDef,
   bucketDef,
   plannedStart,
-  chainIndex,
   parentNames,
   isMerge,
   onForceStart,
@@ -161,7 +160,6 @@ function CampaignCard({
   campaignDef?: CampaignDef | null;
   bucketDef?: BucketDefV2 | null;
   plannedStart: Date;
-  chainIndex?: number;
   parentNames?: string[];
   isMerge?: boolean;
   onForceStart?: () => void;
@@ -186,9 +184,19 @@ function CampaignCard({
   ];
 
   const isError = cs.status === 'error';
+  const statusBorderLeft: Record<string, string> = {
+    running: 'border-l-blue-400',
+    completed: 'border-l-green-400',
+    warming: 'border-l-amber-400',
+    cancelled: 'border-l-gray-300',
+    expired: 'border-l-gray-300',
+    error: 'border-l-red-500',
+    queued: 'border-l-gray-200',
+  };
+  const borderLeft = statusBorderLeft[cs.status] ?? 'border-l-gray-200';
   const borderColor = isError
-    ? 'border-red-300 border-l-red-500 bg-red-50'
-    : `border-gray-200 ${chainIndex !== undefined ? chainBorderColor(chainIndex) : ''}`;
+    ? `border-red-300 ${borderLeft} bg-red-50`
+    : `border-gray-200 ${borderLeft}`;
 
   return (
     <div className={`border rounded-xl p-4 space-y-2 border-l-4 ${borderColor} ${isError ? '' : 'bg-white'}`}>
@@ -309,9 +317,6 @@ function BucketSection({
     })
     .sort((a, b) => a.chain.chainIndex - b.chain.chainIndex);
 
-  // Number of distinct chains in this bucket → dynamic grid columns
-  const colCount = bucketColumnCount(campaignStates.map((cs) => cs.campaignId), chainMap);
-  const gridCols = colCount === 1 ? 'grid-cols-1' : colCount === 2 ? 'grid-cols-2' : colCount === 3 ? 'grid-cols-3' : 'grid-cols-4';
   const etaDate =
     bucketDef?.run_mode === 'time_based' && durMin > 0
       ? new Date(plannedStart.getTime() + durMin * 60_000)
@@ -372,13 +377,14 @@ function BucketSection({
         )}
       </div>
 
-      {/* Campaign grid — N columns based on distinct chains in this bucket */}
+      {/* Campaign grid — responsive auto-fill */}
       {sorted.length > 0 && (
-        <div className={`ml-12 grid ${gridCols} gap-3`}>
+        <div
+          className="ml-12 grid gap-3"
+          style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))' }}
+        >
           {sorted.map(({ cs, def, chain }) => {
-            // Merge campaigns span all columns
             const spanClass = chain.isMerge ? 'col-span-full' : '';
-            // Original campaign index (for action callbacks)
             const ci = campaignStates.indexOf(cs);
             return (
               <div key={cs.campaignId} className={spanClass}>
@@ -387,7 +393,6 @@ function BucketSection({
                   campaignDef={def}
                   bucketDef={bucketDef}
                   plannedStart={plannedStart}
-                  chainIndex={chain.chainIndex}
                   parentNames={chain.parentNames}
                   isMerge={chain.isMerge}
                   onForceStart={onForceStartCampaign ? () => onForceStartCampaign(ci) : undefined}
@@ -529,17 +534,25 @@ export function PlanDetail(): ReactNode {
   const abortMutation = useMutation({
     mutationFn: (runId: string) => api.plans.abortRunV2(id!, runId),
     onSuccess: () => {
+      setActionError(null);
       setShowAbortConfirm(false);
       qc.invalidateQueries({ queryKey: ['plans', id] });
       qc.invalidateQueries({ queryKey: ['plans', id, 'runs'] });
+    },
+    onError: (err: Error) => {
+      setActionError(err.message || 'Abort failed — try again');
     },
   });
 
   const forceFinishMutation = useMutation({
     mutationFn: (runId: string) => api.plans.forceFinishRunV2(id!, runId),
     onSuccess: () => {
+      setActionError(null);
       qc.invalidateQueries({ queryKey: ['plans', id] });
       qc.invalidateQueries({ queryKey: ['plans', id, 'runs'] });
+    },
+    onError: (err: Error) => {
+      setActionError(err.message || 'Force finish failed — try again');
     },
   });
 
@@ -549,10 +562,16 @@ export function PlanDetail(): ReactNode {
         ? api.plans.forceStartBucketV2(id!, runId, bucketIndex)
         : api.plans.forceStopBucketV2(id!, runId, bucketIndex),
     onSuccess: () => {
+      setActionError(null);
       qc.invalidateQueries({ queryKey: ['plans', id] });
       qc.invalidateQueries({ queryKey: ['plans', id, 'runs'] });
     },
+    onError: (err: Error) => {
+      setActionError(err.message || 'Action failed — try again');
+    },
   });
+
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const campaignActionMutation = useMutation({
     mutationFn: ({ runId, bucketIndex, campaignIndex, action }: { runId: string; bucketIndex: number; campaignIndex: number; action: 'start' | 'stop' | 'skip' }) =>
@@ -562,8 +581,12 @@ export function PlanDetail(): ReactNode {
           ? api.plans.skipCampaignV2(id!, runId, bucketIndex, campaignIndex)
           : api.plans.forceStopCampaignV2(id!, runId, bucketIndex, campaignIndex),
     onSuccess: () => {
+      setActionError(null);
       qc.invalidateQueries({ queryKey: ['plans', id] });
       qc.invalidateQueries({ queryKey: ['plans', id, 'runs'] });
+    },
+    onError: (err: Error) => {
+      setActionError(err.message || 'Action failed — try again');
     },
   });
 
@@ -713,6 +736,12 @@ export function PlanDetail(): ReactNode {
       {triggerMutation.isError && (
         <div className="mx-8 mt-4 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
           {String((triggerMutation.error as Error)?.message ?? 'Failed to start run')}
+        </div>
+      )}
+      {actionError && (
+        <div className="mx-8 mt-4 flex items-center justify-between text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
+          <span>{actionError}</span>
+          <button type="button" onClick={() => setActionError(null)} className="ml-3 text-red-400 hover:text-red-600">✕</button>
         </div>
       )}
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 
-import { Button, Card, Field, Input, Select, Spinner } from '@/components/ui';
+import { Spinner } from '@/components/ui';
 import {
   api,
   type BucketCampaignConfig,
@@ -30,12 +30,10 @@ const LEGACY_RUN_TYPE_MINUTES: Record<string, number> = {
   time_30: 30, time_45: 45, time_60: 60, time_90: 90, time_120: 120,
 };
 
-const GENERIC_QUEUE_ID = 'fc5e3102-44f1-4986-baaa-055ee92e0a98';        // agents outbound
-const HIGH_PRIORITY_QUEUE_ID = '6aa59c69-1d1a-4ec1-9ed2-6730402b9437'; // high priority agents outbounds
+const GENERIC_QUEUE_ID = 'fc5e3102-44f1-4986-baaa-055ee92e0a98';
+const HIGH_PRIORITY_QUEUE_ID = '6aa59c69-1d1a-4ec1-9ed2-6730402b9437';
 const CANONICAL_QUEUE_IDS = new Set([GENERIC_QUEUE_ID, HIGH_PRIORITY_QUEUE_ID]);
 
-// Production defaults — queueId and contactFlowId are fixed across all states.
-// sourcePhoneNumber is auto-derived from campaign states via STATE_DEFAULT_PHONES.
 const DEFAULT_CAMPAIGN_CONFIG: BucketCampaignConfig = {
   queueId: GENERIC_QUEUE_ID,
   contactFlowId: '3d24320b-c1e3-40f3-90a2-b6867ef70c85',
@@ -47,11 +45,7 @@ const DEFAULT_CAMPAIGN_CONFIG: BucketCampaignConfig = {
   amdAwaitPrompt: true,
 };
 
-// Canonical phone numbers per state — auto-picked when campaigns have states selected.
-// Only override sourcePhoneNumber when current value is empty or is itself a canonical default,
-// so manual overrides are never clobbered.
 const CANONICAL_PHONES = new Set(Object.values(STATE_DEFAULT_PHONES));
-
 
 function pickPhoneForCampaign(states: string[]): string {
   for (const state of states) {
@@ -61,12 +55,6 @@ function pickPhoneForCampaign(states: string[]): string {
   return '';
 }
 
-/** Derive a human-readable campaign name from states + groups.
- *  "NY-NJ" + ["New Lead / 1st Attempt"] → "NY-NJ-NL_1"
- *  "TX"   + ["Cancellation / 2nd Attempt", "Cancellation / 3rd Attempt"] → "TX-Can_2-3"
- *
- * Mirrors build_attempts_part() in builders.py exactly.
- */
 function _abbreviate(text: string): string {
   const words = text.split(/[^a-zA-Z]+/).filter(Boolean);
   if (words.length >= 2) return words.map((w) => w[0].toUpperCase()).slice(0, 4).join('');
@@ -164,7 +152,7 @@ function assignStages(campaigns: CampaignDef[]): Map<string, number> {
   return stage;
 }
 
-// ── Group checkboxes (replaces MultiSelect for campaign groups) ───────────────
+// ── Group checkboxes ──────────────────────────────────────────────────────────
 
 function GroupCheckboxes({
   options,
@@ -175,7 +163,6 @@ function GroupCheckboxes({
   selected: string[];
   onChange: (next: string[]) => void;
 }) {
-  // Build category → items map preserving insertion order
   const categoryMap = useMemo(() => {
     const map = new Map<string, string[]>();
     for (const opt of options) {
@@ -191,12 +178,11 @@ function GroupCheckboxes({
     onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]);
 
   if (options.length === 0) {
-    return <span className="text-xs text-muted-foreground">No groups available</span>;
+    return <span className="text-xs text-gray-400">No groups available</span>;
   }
 
   return (
     <div className="space-y-3">
-      {/* Selected summary pills */}
       {selected.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {selected.map((v) => (
@@ -204,7 +190,7 @@ function GroupCheckboxes({
               key={v}
               type="button"
               onClick={() => toggle(v)}
-              className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-foreground hover:bg-primary/20"
+              className="inline-flex items-center gap-1 rounded-full bg-blue-50 border border-blue-200 px-2 py-0.5 text-xs text-blue-700 hover:bg-blue-100 transition-colors"
             >
               <span>{v}</span>
               <span aria-hidden>×</span>
@@ -212,10 +198,9 @@ function GroupCheckboxes({
           ))}
         </div>
       )}
-      {/* Category sections */}
       {Array.from(categoryMap.entries()).map(([cat, items]) => (
         <div key={cat}>
-          <div className="text-xs font-medium text-gray-500 mb-1">{cat}</div>
+          <div className="text-xs font-semibold text-gray-500 mb-1">{cat}</div>
           <div className="flex flex-wrap gap-x-4 gap-y-1">
             {items.map((opt) => {
               const label = opt.includes(' / ') ? opt.split(' / ')[1] : opt;
@@ -239,7 +224,7 @@ function GroupCheckboxes({
   );
 }
 
-// ── Trigger editor ────────────────────────────────────────────────────────────
+// ── Working hours section ─────────────────────────────────────────────────────
 
 const DAYS_OF_WEEK = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'] as const;
 
@@ -252,8 +237,8 @@ function WorkingHoursSection({
 }) {
   const enabled = Boolean(workingHours);
   return (
-    <div className="border-t pt-3 space-y-2">
-      <label className="flex items-center gap-2 text-xs text-gray-600 font-medium">
+    <div className="border-t border-gray-100 pt-3 space-y-2">
+      <label className="flex items-center gap-2 text-xs text-gray-600 font-medium cursor-pointer">
         <input
           type="checkbox"
           checked={enabled}
@@ -268,7 +253,7 @@ function WorkingHoursSection({
         Restrict execution to working hours
       </label>
       {workingHours && (
-        <div className="space-y-2">
+        <div className="space-y-2 pl-1">
           <div className="flex flex-wrap gap-1">
             {DAYS_OF_WEEK.map((day) => (
               <button
@@ -280,33 +265,36 @@ function WorkingHoursSection({
                     : [...workingHours.days, day];
                   onWorkingHoursChange({ ...workingHours, days });
                 }}
-                className={`px-2 py-1 rounded text-xs font-medium border transition-colors ${
+                className={[
+                  'px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors',
                   workingHours.days.includes(day)
                     ? 'bg-blue-600 text-white border-blue-600'
-                    : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
-                }`}
+                    : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400',
+                ].join(' ')}
               >
                 {day}
               </button>
             ))}
           </div>
-          <div className="flex items-center gap-3">
-            <Field label="From (COT)">
-              <Input
+          <div className="flex items-center gap-4">
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">From (COT)</label>
+              <input
                 type="time"
                 value={workingHours.startTime}
                 onChange={(e) => onWorkingHoursChange({ ...workingHours, startTime: e.target.value })}
-                className="w-28"
+                className="w-28 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
               />
-            </Field>
-            <Field label="Until (COT)">
-              <Input
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Until (COT)</label>
+              <input
                 type="time"
                 value={workingHours.endTime}
                 onChange={(e) => onWorkingHoursChange({ ...workingHours, endTime: e.target.value })}
-                className="w-28"
+                className="w-28 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
               />
-            </Field>
+            </div>
           </div>
           <p className="text-xs text-gray-400">
             Scheduled and chained runs outside this window will be skipped automatically.
@@ -316,6 +304,8 @@ function WorkingHoursSection({
     </div>
   );
 }
+
+// ── Trigger editor ────────────────────────────────────────────────────────────
 
 function TriggerEditor({
   trigger,
@@ -337,46 +327,57 @@ function TriggerEditor({
   currentPlanId?: string;
 }) {
   return (
-    <Card className="p-4 space-y-3">
-      <div className="font-medium text-sm text-gray-700">Trigger</div>
-      <div className="flex gap-2">
+    <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+      <h3 className="text-sm font-semibold text-gray-900">Trigger</h3>
+
+      {/* Trigger type selector */}
+      <div className="flex gap-2.5 flex-wrap">
         {(['manual', 'time', 'on_plan_complete'] as const).map((t) => (
-          <button
+          <label
             key={t}
-            type="button"
-            onClick={() => {
-              if (t === 'manual') onChange({ type: 'manual' });
-              else if (t === 'time') onChange({ type: 'time', time: '08:00' });
-              else onChange({ type: 'on_plan_complete', planId: '', repeat: true });
-            }}
-            className={`px-3 py-1.5 rounded text-xs font-medium border transition-colors ${
-              trigger.type === t
-                ? 'bg-blue-600 text-white border-blue-600'
-                : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
-            }`}
+            className={[
+              'flex items-center gap-2.5 rounded-lg border px-3.5 py-2.5 cursor-pointer transition-colors',
+              trigger.type === t ? 'border-blue-400 bg-blue-50' : 'border-gray-200 bg-white hover:border-gray-300',
+            ].join(' ')}
           >
-            {t === 'manual' ? '▶ Manual' : t === 'time' ? '⏰ Scheduled' : '⛓ After plan'}
-          </button>
+            <input
+              type="radio"
+              name="trigger-type"
+              className="accent-blue-600"
+              checked={trigger.type === t}
+              onChange={() => {
+                if (t === 'manual') onChange({ type: 'manual' });
+                else if (t === 'time') onChange({ type: 'time', time: '08:00' });
+                else onChange({ type: 'on_plan_complete', planId: '', repeat: true });
+              }}
+            />
+            <span className="text-sm font-medium text-gray-700">
+              {t === 'manual' ? '▶ Manual' : t === 'time' ? '⏰ Scheduled' : '⛓ After plan'}
+            </span>
+          </label>
         ))}
       </div>
 
       {trigger.type === 'time' && (
-        <Field label="Time (Colombia COT)">
-          <Input
+        <div>
+          <label className="block text-xs font-semibold text-gray-700 mb-1">Time (Colombia COT)</label>
+          <input
             type="time"
             value={trigger.time}
             onChange={(e) => onChange({ ...trigger, time: e.target.value })}
-            className="w-32"
+            className="w-32 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
           />
-        </Field>
+        </div>
       )}
 
       {trigger.type === 'on_plan_complete' && (
-        <div className="space-y-2">
-          <Field label="After plan">
-            <Select
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">After plan</label>
+            <select
               value={trigger.planId}
               onChange={(e) => onChange({ ...trigger, planId: e.target.value, afterBucket: undefined, afterCampaign: undefined })}
+              className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
             >
               <option value="">— pick a plan —</option>
               {allPlans
@@ -386,13 +387,14 @@ function TriggerEditor({
                     {p.name}
                   </option>
                 ))}
-            </Select>
-          </Field>
+            </select>
+          </div>
           {trigger.planId && (() => {
             const upstreamBuckets = allPlans.find((p) => p.planId === trigger.planId)?.buckets ?? [];
             return upstreamBuckets.length > 1 ? (
-              <Field label="Start after bucket (optional)">
-                <Select
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Start after bucket (optional)</label>
+                <select
                   value={trigger.afterBucket != null ? String(trigger.afterBucket) : ''}
                   onChange={(e) =>
                     onChange({
@@ -401,6 +403,7 @@ function TriggerEditor({
                       afterCampaign: undefined,
                     })
                   }
+                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
                 >
                   <option value="">— wait for whole plan —</option>
                   {upstreamBuckets.map((b, i) => (
@@ -408,16 +411,17 @@ function TriggerEditor({
                       Bucket {i + 1}{b.name ? ` · ${b.name}` : ''}
                     </option>
                   ))}
-                </Select>
-              </Field>
+                </select>
+              </div>
             ) : null;
           })()}
           {trigger.planId && trigger.afterBucket != null && (() => {
             const upstreamBuckets = allPlans.find((p) => p.planId === trigger.planId)?.buckets ?? [];
             const campaigns = upstreamBuckets[trigger.afterBucket]?.campaigns ?? [];
             return campaigns.length > 1 ? (
-              <Field label="Start after campaign (optional)">
-                <Select
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Start after campaign (optional)</label>
+                <select
                   value={trigger.afterCampaign ?? ''}
                   onChange={(e) =>
                     onChange({
@@ -425,6 +429,7 @@ function TriggerEditor({
                       afterCampaign: e.target.value !== '' ? e.target.value : undefined,
                     })
                   }
+                  className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
                 >
                   <option value="">— any campaign in bucket —</option>
                   {campaigns.map((c) => (
@@ -432,11 +437,11 @@ function TriggerEditor({
                       {c.name || c.id.slice(0, 8)}
                     </option>
                   ))}
-                </Select>
-              </Field>
+                </select>
+              </div>
             ) : null;
           })()}
-          <label className="flex items-center gap-2 text-xs text-gray-600">
+          <label className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
             <input
               type="checkbox"
               checked={trigger.repeat}
@@ -447,9 +452,9 @@ function TriggerEditor({
         </div>
       )}
 
-      {/* ── Loop section — independent of trigger type ── */}
-      <div className="border-t pt-3 space-y-2">
-        <label className="flex items-center gap-2 text-xs text-gray-600 font-medium">
+      {/* Loop section */}
+      <div className="border-t border-gray-100 pt-3 space-y-2">
+        <label className="flex items-center gap-2 text-xs text-gray-600 font-medium cursor-pointer">
           <input
             type="checkbox"
             checked={Boolean(loop)}
@@ -464,30 +469,32 @@ function TriggerEditor({
           Loop — restart this plan after each completion
         </label>
         {loop && (
-          <div className="flex items-center gap-3">
-            <Field label="From (COT)">
-              <Input
-                type="time"
-                value={loop.startTime ?? '00:00'}
-                onChange={(e) => onLoopChange({ ...loop, startTime: e.target.value || undefined })}
-                className="w-28"
-              />
-            </Field>
-            <Field label="Until (COT)">
-              <Input
-                type="time"
-                value={loop.endTime}
-                onChange={(e) => onLoopChange({ ...loop, endTime: e.target.value })}
-                className="w-28"
-              />
-            </Field>
-          </div>
-        )}
-        {loop && (
-          <p className="text-xs text-gray-400">
-            After each run completes, the plan restarts if the current Colombia time is within the window.
-            Downstream chained plans fire on every completion regardless of this setting.
-          </p>
+          <>
+            <div className="flex items-center gap-4 pl-1">
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">From (COT)</label>
+                <input
+                  type="time"
+                  value={loop.startTime ?? '00:00'}
+                  onChange={(e) => onLoopChange({ ...loop, startTime: e.target.value || undefined })}
+                  className="w-28 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Until (COT)</label>
+                <input
+                  type="time"
+                  value={loop.endTime}
+                  onChange={(e) => onLoopChange({ ...loop, endTime: e.target.value })}
+                  className="w-28 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-400 pl-1">
+              After each run completes, the plan restarts if the current Colombia time is within the window.
+              Downstream chained plans fire on every completion regardless of this setting.
+            </p>
+          </>
         )}
       </div>
 
@@ -495,7 +502,7 @@ function TriggerEditor({
         workingHours={workingHours}
         onWorkingHoursChange={onWorkingHoursChange}
       />
-    </Card>
+    </div>
   );
 }
 
@@ -527,10 +534,8 @@ function CampaignCard({
   const cfg = campaign.campaignConfig ?? { ...DEFAULT_CAMPAIGN_CONFIG };
   const [configOpen, setConfigOpen] = useState(false);
 
-  // Track last auto-generated name so we know when to update it vs respect manual edits
   const prevAutoNameRef = useRef(autoNameCampaign(campaign.states, campaign.groups));
 
-  // Campaigns available as dependencies: same or earlier buckets, excluding self
   const availableDeps = useMemo(() => {
     const result: { id: string; label: string }[] = [];
     for (let bi = 0; bi <= bucketIndex; bi++) {
@@ -564,7 +569,7 @@ function CampaignCard({
 
   const updateStates = (states: string[]) => {
     const newAutoName = autoNameCampaign(states, campaign.groups);
-    const shouldUpdateName = isAutoNamed(); // capture BEFORE updating ref
+    const shouldUpdateName = isAutoNamed();
     prevAutoNameRef.current = newAutoName;
     const autoPhone = pickPhoneForCampaign(states);
     const shouldUpdatePhone =
@@ -582,9 +587,8 @@ function CampaignCard({
 
   const updateGroups = (groups: string[]) => {
     const newAutoName = autoNameCampaign(campaign.states, groups);
-    const shouldUpdateName = isAutoNamed(); // capture BEFORE updating ref
+    const shouldUpdateName = isAutoNamed();
     prevAutoNameRef.current = newAutoName;
-    // HIGH_PRIORITY only when the single selected group is exactly "New Lead / New Lead"
     const isOnlyNewLeadGroup = groups.length === 1 && groups[0] === 'New Lead / New Lead';
     const autoQueue = isOnlyNewLeadGroup ? HIGH_PRIORITY_QUEUE_ID : GENERIC_QUEUE_ID;
     const shouldUpdateQueue = !cfg.queueId || CANONICAL_QUEUE_IDS.has(cfg.queueId);
@@ -600,7 +604,6 @@ function CampaignCard({
   };
 
   const updateName = (name: string) => {
-    // Mark as manual so future state/group changes don't overwrite
     prevAutoNameRef.current = '\0manual\0';
     onChange({ ...campaign, name });
   };
@@ -616,221 +619,250 @@ function CampaignCard({
   };
 
   return (
-    <div className="border rounded-lg bg-white shadow-sm">
-      <div
-        className="flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-50"
-        onClick={onToggle}
-      >
-        <span className="text-gray-400 text-xs">{isExpanded ? '▼' : '▶'}</span>
-        <span className="text-sm font-medium flex-1 truncate">
-          {campaign.name || <span className="text-gray-400 italic">Untitled campaign</span>}
-        </span>
-        <span className="text-xs text-gray-400">
-          {campaign.states.join(', ') || '—'} ·{' '}
-          {campaign.groups.length > 0
-            ? `${campaign.groups.length} group${campaign.groups.length !== 1 ? 's' : ''}`
-            : 'no groups'}
-        </span>
-        {canRemove && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onRemove();
-            }}
-            className="text-red-400 hover:text-red-600 text-xs px-1"
-          >
-            ✕
-          </button>
-        )}
-      </div>
-
-      {isExpanded && (
-        <div className="border-t px-3 py-3 space-y-3 bg-gray-50">
-          <Field label="Name">
-            <Input
-              value={campaign.name}
-              onChange={(e) => updateName(e.target.value)}
-              placeholder={autoNameCampaign(campaign.states, campaign.groups) || 'e.g. NY New Lead 1'}
-            />
-          </Field>
-
-          <Field label="States">
-            <div className="flex flex-wrap gap-2">
-              {STATE_CODES.map((code) => (
-                <label key={code} className="flex items-center gap-1 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={campaign.states.includes(code)}
-                    onChange={() => {
-                      const states = campaign.states.includes(code)
-                        ? campaign.states.filter((s) => s !== code)
-                        : [...campaign.states, code];
-                      updateStates(states);
-                    }}
-                  />
-                  {code}
-                </label>
-              ))}
-            </div>
-          </Field>
-
-          <Field label="Groups">
-            {groupData === undefined ? (
-              <div className="flex h-9 items-center gap-2 text-xs text-muted-foreground">
-                <Spinner /> loading…
-              </div>
-            ) : (
-              <GroupCheckboxes
-                options={groupOptions}
-                selected={campaign.groups}
-                onChange={updateGroups}
-              />
-            )}
-          </Field>
-
-          <Field label="Pinned segment">
-            <Select
-              value={campaign.pinnedSegmentArn ?? ''}
-              onChange={(e) =>
-                onChange({ ...campaign, pinnedSegmentArn: e.target.value || undefined })
-              }
+    <div className="flex items-center gap-3 rounded-lg border border-gray-100 bg-white overflow-hidden transition-colors">
+      <div className="flex-1">
+        {/* Header row */}
+        <div
+          className="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-gray-50 transition-colors"
+          onClick={onToggle}
+        >
+          <span className="text-gray-400 text-xs shrink-0">{isExpanded ? '▼' : '▶'}</span>
+          <span className="text-sm font-medium text-gray-700 flex-1 truncate">
+            {campaign.name || <span className="text-gray-400 italic">Untitled campaign</span>}
+          </span>
+          <span className="text-xs text-gray-400 shrink-0">
+            {campaign.states.join(', ') || '—'} ·{' '}
+            {campaign.groups.length > 0
+              ? `${campaign.groups.length} group${campaign.groups.length !== 1 ? 's' : ''}`
+              : 'no groups'}
+          </span>
+          {canRemove && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRemove();
+              }}
+              className="rounded-lg px-2 py-1 text-xs text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors shrink-0"
             >
-              <option value="">— auto (build from Redis) —</option>
-              {segmentOptions.map((s) => (
-                <option key={s.segmentArn} value={s.segmentArn}>
-                  {s.displayName ?? s.name}
-                </option>
-              ))}
-            </Select>
-            {campaign.pinnedSegmentArn && (
-              <p className="mt-1 text-xs text-amber-600">
-                States/groups ignored — pinned segment used as-is
-              </p>
-            )}
-          </Field>
-
-          <Field label="Run type">
-            <Select
-              value={campaign.run_type}
-              onChange={(e) => onChange({ ...campaign, run_type: e.target.value as CampaignRunType })}
-            >
-              {(Object.entries(RUN_TYPE_LABELS) as [CampaignRunType, string][]).map(([k, v]) => (
-                <option key={k} value={k}>
-                  {v}
-                </option>
-              ))}
-            </Select>
-          </Field>
-
-          {campaign.run_type === 'custom' && (
-            <Field label="Duration (minutes)">
-              <Input
-                type="number"
-                min={1}
-                max={480}
-                value={campaign.run_duration_minutes ?? ''}
-                onChange={(e) => onChange({ ...campaign, run_duration_minutes: e.target.value ? parseInt(e.target.value, 10) : undefined })}
-                placeholder="e.g. 45"
-                className="w-28"
-              />
-            </Field>
+              ✕
+            </button>
           )}
+        </div>
 
-          {availableDeps.length > 0 && (
-            <div className="space-y-1">
-              <div className="text-xs font-medium text-gray-700">
-                Wait for these to complete first
-              </div>
-              <p className="text-xs text-gray-400">
-                All checked campaigns must finish before this one starts. Leave all unchecked to start when the bucket opens.
-              </p>
-              <div className="flex flex-col gap-1 max-h-28 overflow-y-auto rounded border border-border bg-muted/20 p-2">
-                {availableDeps.map(({ id, label }) => (
-                  <label key={id} className="flex items-center gap-2 text-xs cursor-pointer hover:bg-muted/40 rounded px-1 py-0.5">
+        {/* Expanded body */}
+        {isExpanded && (
+          <div className="border-t border-gray-100 px-3 py-3 space-y-3 bg-gray-50/60">
+            {/* Name */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Name</label>
+              <input
+                value={campaign.name}
+                onChange={(e) => updateName(e.target.value)}
+                placeholder={autoNameCampaign(campaign.states, campaign.groups) || 'e.g. NY New Lead 1'}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+              />
+            </div>
+
+            {/* States */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1.5">States</label>
+              <div className="flex flex-wrap gap-2">
+                {STATE_CODES.map((code) => (
+                  <label key={code} className="flex items-center gap-1 text-xs cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={campaign.dependsOn.includes(id)}
-                      onChange={() => toggleDep(id)}
+                      checked={campaign.states.includes(code)}
+                      onChange={() => {
+                        const states = campaign.states.includes(code)
+                          ? campaign.states.filter((s) => s !== code)
+                          : [...campaign.states, code];
+                        updateStates(states);
+                      }}
                     />
-                    <span className={campaign.dependsOn.includes(id) ? 'text-blue-700 font-medium' : 'text-gray-700'}>
-                      {label}
-                    </span>
+                    <span className="text-gray-700">{code}</span>
                   </label>
                 ))}
               </div>
             </div>
-          )}
 
-          {/* Per-campaign Connect config */}
-          <div>
-            <button
-              type="button"
-              onClick={() => setConfigOpen((o) => !o)}
-              className="text-xs text-gray-500 hover:text-gray-700"
-            >
-              {configOpen ? '▼' : '▶'} Connect config (queue, flow, phone, dialer)
-            </button>
-            {configOpen && (
-              <div className="mt-2 grid grid-cols-2 gap-3">
-                <Field label="Queue">
-                  <Select
-                    value={cfg.queueId}
-                    onChange={(e) => updateCfg({ queueId: e.target.value })}
-                  >
-                    <option value="">— select queue —</option>
-                    {queues.map((q) => (
-                      <option key={q.id} value={q.id}>
-                        {q.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="Contact flow">
-                  <Select
-                    value={cfg.contactFlowId}
-                    onChange={(e) => updateCfg({ contactFlowId: e.target.value })}
-                  >
-                    <option value="">— select flow —</option>
-                    {contactFlows.map((f) => (
-                      <option key={f.id} value={f.id}>
-                        {f.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="Source phone">
-                  <Input
-                    value={cfg.sourcePhoneNumber}
-                    onChange={(e) => updateCfg({ sourcePhoneNumber: e.target.value })}
-                    placeholder="+1..."
-                  />
-                </Field>
-                <Field label="Dialer type">
-                  <Select
-                    value={cfg.dialerType}
-                    onChange={(e) => updateCfg({ dialerType: e.target.value })}
-                  >
-                    <option value="progressive">Progressive</option>
-                    <option value="predictive">Predictive</option>
-                    <option value="agentless">Agentless</option>
-                  </Select>
-                </Field>
-                <Field label="AMD">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={cfg.amdEnabled}
-                      onChange={(e) => updateCfg({ amdEnabled: e.target.checked })}
-                    />
-                    Enable answer machine detection
-                  </label>
-                </Field>
+            {/* Groups */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1.5">Groups</label>
+              {groupData === undefined ? (
+                <div className="flex h-9 items-center gap-2 text-xs text-gray-400">
+                  <Spinner /> loading…
+                </div>
+              ) : (
+                <GroupCheckboxes
+                  options={groupOptions}
+                  selected={campaign.groups}
+                  onChange={updateGroups}
+                />
+              )}
+            </div>
+
+            {/* Pinned segment */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Pinned segment</label>
+              <select
+                value={campaign.pinnedSegmentArn ?? ''}
+                onChange={(e) =>
+                  onChange({ ...campaign, pinnedSegmentArn: e.target.value || undefined })
+                }
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+              >
+                <option value="">— auto (build from Redis) —</option>
+                {segmentOptions.map((s) => (
+                  <option key={s.segmentArn} value={s.segmentArn}>
+                    {s.displayName ?? s.name}
+                  </option>
+                ))}
+              </select>
+              {campaign.pinnedSegmentArn && (
+                <p className="mt-1 text-xs text-amber-600">
+                  States/groups ignored — pinned segment used as-is
+                </p>
+              )}
+            </div>
+
+            {/* Run type */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Run type</label>
+              <select
+                value={campaign.run_type}
+                onChange={(e) => onChange({ ...campaign, run_type: e.target.value as CampaignRunType })}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+              >
+                {(Object.entries(RUN_TYPE_LABELS) as [CampaignRunType, string][]).map(([k, v]) => (
+                  <option key={k} value={k}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {campaign.run_type === 'custom' && (
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Duration (minutes)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={480}
+                  value={campaign.run_duration_minutes ?? ''}
+                  onChange={(e) => onChange({ ...campaign, run_duration_minutes: e.target.value ? parseInt(e.target.value, 10) : undefined })}
+                  placeholder="e.g. 45"
+                  className="w-28 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+                />
               </div>
             )}
+
+            {/* Dependencies */}
+            {availableDeps.length > 0 && (
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-gray-700">
+                  Wait for these to complete first
+                </div>
+                <p className="text-xs text-gray-400">
+                  All checked campaigns must finish before this one starts. Leave all unchecked to start when the bucket opens.
+                </p>
+                <div className="flex flex-col gap-1 max-h-28 overflow-y-auto rounded-lg border border-gray-200 bg-white p-2">
+                  {availableDeps.map(({ id, label }) => (
+                    <label key={id} className="flex items-center gap-2 text-xs cursor-pointer hover:bg-gray-50 rounded px-1 py-0.5">
+                      <input
+                        type="checkbox"
+                        checked={campaign.dependsOn.includes(id)}
+                        onChange={() => toggleDep(id)}
+                      />
+                      <span className={campaign.dependsOn.includes(id) ? 'text-blue-700 font-medium' : 'text-gray-700'}>
+                        {label}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Per-campaign Connect config */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setConfigOpen((o) => !o)}
+                className="text-xs text-gray-500 hover:text-gray-700 flex items-center gap-1"
+              >
+                <span>{configOpen ? '▼' : '▶'}</span>
+                <span>Connect config (queue, flow, phone, dialer)</span>
+              </button>
+              {configOpen && (
+                <div className="mt-2 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-1">Queue</label>
+                    <select
+                      value={cfg.queueId}
+                      onChange={(e) => updateCfg({ queueId: e.target.value })}
+                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                    >
+                      <option value="">— select queue —</option>
+                      {queues.map((q) => (
+                        <option key={q.id} value={q.id}>
+                          {q.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-1">Contact flow</label>
+                    <select
+                      value={cfg.contactFlowId}
+                      onChange={(e) => updateCfg({ contactFlowId: e.target.value })}
+                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                    >
+                      <option value="">— select flow —</option>
+                      {contactFlows.map((f) => (
+                        <option key={f.id} value={f.id}>
+                          {f.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-1">Source phone</label>
+                    <input
+                      value={cfg.sourcePhoneNumber}
+                      onChange={(e) => updateCfg({ sourcePhoneNumber: e.target.value })}
+                      placeholder="+1..."
+                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-1">Dialer type</label>
+                    <select
+                      value={cfg.dialerType}
+                      onChange={(e) => updateCfg({ dialerType: e.target.value })}
+                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                    >
+                      <option value="progressive">Progressive</option>
+                      <option value="predictive">Predictive</option>
+                      <option value="agentless">Agentless</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-1">AMD</label>
+                    <label className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={cfg.amdEnabled}
+                        onChange={(e) => updateCfg({ amdEnabled: e.target.checked })}
+                      />
+                      <span className="text-gray-700">Enable answer machine detection</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -861,7 +893,6 @@ function DagCanvas({
   const stages = useMemo(() => assignStages(campaigns), [campaigns]);
   const maxStage = Math.max(0, ...Array.from(stages.values()));
 
-  // Group campaigns by stage for column layout
   const columns: CampaignDef[][] = Array.from({ length: maxStage + 1 }, () => []);
   campaigns.forEach((c) => columns[stages.get(c.id) ?? 0].push(c));
 
@@ -870,12 +901,9 @@ function DagCanvas({
       <div className="flex gap-4 min-w-0">
         {columns.map((col, si) => (
           <div key={si} className="flex flex-col gap-2 min-w-[240px]">
-            {si === 0 && (
-              <div className="text-xs text-gray-400 font-medium mb-1">Stage {si + 1} (starts with bucket)</div>
-            )}
-            {si > 0 && (
-              <div className="text-xs text-gray-400 font-medium mb-1">Stage {si + 1} (waits for parents)</div>
-            )}
+            <div className="text-xs text-gray-400 font-medium mb-1">
+              {si === 0 ? `Stage ${si + 1} (starts with bucket)` : `Stage ${si + 1} (waits for parents)`}
+            </div>
             {col.map((c) => {
               const ci = campaigns.findIndex((x) => x.id === c.id);
               return (
@@ -931,11 +959,18 @@ function BucketEditor({
   const updateCampaign = (ci: number, c: CampaignDef) =>
     onChange({ ...bucket, campaigns: bucket.campaigns.map((x, i) => (i === ci ? c : x)) });
 
-  const removeCampaign = (ci: number) =>
-    onChange({ ...bucket, campaigns: bucket.campaigns.filter((_, i) => i !== ci) });
+  const removeCampaign = (ci: number) => {
+    const removedId = bucket.campaigns[ci]?.id;
+    const remaining = bucket.campaigns
+      .filter((_, i) => i !== ci)
+      .map((c) => ({
+        ...c,
+        dependsOn: removedId ? c.dependsOn.filter((d) => d !== removedId) : c.dependsOn,
+      }));
+    onChange({ ...bucket, campaigns: remaining });
+  };
 
   const addCampaign = () => {
-    // Inherit config from last campaign so new campaign is pre-configured
     const prevCfg = bucket.campaigns[bucket.campaigns.length - 1]?.campaignConfig
       ?? bucket.campaignConfig
       ?? DEFAULT_CAMPAIGN_CONFIG;
@@ -945,23 +980,18 @@ function BucketEditor({
   };
 
   return (
-    <Card className="p-4 space-y-4">
-      {/* ── Header row (always visible, clicking name/arrow collapses) ── */}
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={() => setCollapsed((c) => !c)}
-          className="text-gray-400 text-xs w-4 shrink-0"
-          aria-label={collapsed ? 'Expand bucket' : 'Collapse bucket'}
-        >
-          {collapsed ? '▶' : '▼'}
-        </button>
-        <Input
+    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+      {/* Bucket header */}
+      <div className="flex items-center gap-3 px-4 py-3 bg-gray-50 border-b border-gray-100">
+        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-800 text-white text-xs font-bold shrink-0">
+          {bucketIndex + 1}
+        </span>
+        <input
           value={bucket.name}
           onChange={(e) => onChange({ ...bucket, name: e.target.value })}
           placeholder="Bucket name"
-          className="flex-1 font-medium"
           onClick={(e) => e.stopPropagation()}
+          className="flex-1 rounded-lg border border-gray-200 px-3 py-1.5 text-sm font-semibold text-gray-900 focus:outline-none focus:ring-1 focus:ring-blue-300 bg-white"
         />
         {collapsed && (
           <span className="text-xs text-gray-400 shrink-0">
@@ -970,95 +1000,126 @@ function BucketEditor({
             {bucket.parallel ? ' · parallel' : ''}
           </span>
         )}
-        <div className="flex gap-1 shrink-0">
+        {/* Run mode toggle */}
+        <div className="flex gap-1.5 shrink-0">
           {(['status_based', 'time_based'] as const).map((mode) => (
             <button
               key={mode}
               type="button"
               onClick={() => onChange({ ...bucket, run_mode: mode })}
-              className={`px-2.5 py-1 rounded text-xs border transition-colors ${
+              className={[
+                'px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors',
                 bucket.run_mode === mode
                   ? 'bg-blue-600 text-white border-blue-600'
-                  : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400'
-              }`}
+                  : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400',
+              ].join(' ')}
             >
               {mode === 'status_based' ? 'Status' : 'Time'}
             </button>
           ))}
         </div>
-        {canRemove && (
-          <button type="button" onClick={onRemove} className="text-red-400 hover:text-red-600 text-sm shrink-0">
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          className="text-gray-400 text-xs w-4 shrink-0 hover:text-gray-600"
+          aria-label={collapsed ? 'Expand bucket' : 'Collapse bucket'}
+        >
+          {collapsed ? '▶' : '▼'}
+        </button>
+        {canRemove ? (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="rounded-lg px-2 py-1 text-xs text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors shrink-0"
+          >
             ✕
           </button>
+        ) : (
+          <span
+            title="A plan must have at least one bucket"
+            className="rounded-lg px-2 py-1 text-xs text-gray-300 cursor-not-allowed shrink-0 select-none"
+          >
+            ✕
+          </span>
         )}
       </div>
 
-      {!collapsed && bucket.run_mode === 'time_based' && (
-        <div className="flex gap-4 items-end">
-          <Field label="Duration (minutes)">
-            <Input
-              type="number"
-              min={5}
-              value={bucket.duration_minutes ?? 30}
-              onChange={(e) => onChange({ ...bucket, duration_minutes: Number(e.target.value) })}
-              className="w-24"
-            />
-          </Field>
-          <label className="flex items-center gap-1.5 text-xs text-gray-600 pb-1">
-            <input
-              type="checkbox"
-              checked={bucket.prestart_next ?? true}
-              onChange={(e) => onChange({ ...bucket, prestart_next: e.target.checked })}
-            />
-            Pre-start next bucket 5 min early
-          </label>
-        </div>
-      )}
-
+      {/* Bucket body */}
       {!collapsed && (
-        <div className="flex flex-wrap gap-4">
-          <label className="flex items-center gap-1.5 text-xs text-gray-600">
-            <input
-              type="checkbox"
-              checked={bucket.cleanup}
-              onChange={(e) => onChange({ ...bucket, cleanup: e.target.checked })}
-            />
-            Clean up campaigns after bucket
-          </label>
-          {bucketIndex > 0 && (
-            <label className="flex items-center gap-1.5 text-xs text-gray-600">
+        <div className="p-4 space-y-4">
+          {/* Time-based options */}
+          {bucket.run_mode === 'time_based' && (
+            <div className="flex gap-4 items-end">
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Duration (minutes)</label>
+                <input
+                  type="number"
+                  min={5}
+                  value={bucket.duration_minutes ?? 30}
+                  onChange={(e) => onChange({ ...bucket, duration_minutes: Number(e.target.value) })}
+                  className="w-24 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+                />
+              </div>
+              <label className="flex items-center gap-1.5 text-xs text-gray-600 pb-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={bucket.prestart_next ?? true}
+                  onChange={(e) => onChange({ ...bucket, prestart_next: e.target.checked })}
+                />
+                Pre-start next bucket 5 min early
+              </label>
+            </div>
+          )}
+
+          {/* Bucket flags */}
+          <div className="flex flex-wrap gap-4">
+            <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
               <input
                 type="checkbox"
-                checked={bucket.parallel ?? false}
-                onChange={(e) => onChange({ ...bucket, parallel: e.target.checked })}
+                checked={bucket.cleanup}
+                onChange={(e) => onChange({ ...bucket, cleanup: e.target.checked })}
               />
-              Run in parallel with previous bucket
+              Clean up campaigns after bucket
             </label>
-          )}
+            {bucketIndex > 0 && (
+              <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={bucket.parallel ?? false}
+                  onChange={(e) => onChange({ ...bucket, parallel: e.target.checked })}
+                />
+                Run in parallel with previous bucket
+              </label>
+            )}
+          </div>
+
+          {/* Campaigns */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-gray-700">Campaigns</span>
+              <button
+                type="button"
+                onClick={addCampaign}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-500 hover:border-gray-400 hover:text-gray-700 transition-colors"
+              >
+                + Add campaign
+              </button>
+            </div>
+            <DagCanvas
+              campaigns={bucket.campaigns}
+              bucketIndex={bucketIndex}
+              allBuckets={allBuckets}
+              expandedId={expandedCampaignId}
+              onToggle={toggleCampaign}
+              onChange={updateCampaign}
+              onRemove={removeCampaign}
+              queues={queues}
+              contactFlows={contactFlows}
+            />
+          </div>
         </div>
       )}
-
-      {/* Campaign DAG */}
-      {!collapsed && <div>
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-xs font-medium text-gray-600">Campaigns</span>
-          <button type="button" onClick={addCampaign} className="text-xs text-blue-600 hover:underline">
-            + Add campaign
-          </button>
-        </div>
-        <DagCanvas
-          campaigns={bucket.campaigns}
-          bucketIndex={bucketIndex}
-          allBuckets={allBuckets}
-          expandedId={expandedCampaignId}
-          onToggle={toggleCampaign}
-          onChange={updateCampaign}
-          onRemove={removeCampaign}
-          queues={queues}
-          contactFlows={contactFlows}
-        />
-      </div>}
-    </Card>
+    </div>
   );
 }
 
@@ -1121,9 +1182,7 @@ export function PlanNew() {
       setTrigger(p.trigger ?? { type: 'manual' });
       setLoop(p.loop ?? null);
       setWorkingHours((p as any).workingHours ?? null);
-      // Migrate legacy run_type values (time_45/90/120 → custom + run_duration_minutes)
-      // and missing per-campaign campaignConfig
-      const buckets = p.buckets.map((b) => ({
+      const migratedBuckets = p.buckets.map((b) => ({
         ...b,
         campaigns: b.campaigns.map((c) => {
           const legacyMins = LEGACY_RUN_TYPE_MINUTES[c.run_type as string];
@@ -1135,7 +1194,7 @@ export function PlanNew() {
           };
         }),
       }));
-      setBuckets(buckets.length ? buckets : [newBucket()]);
+      setBuckets(migratedBuckets.length ? migratedBuckets : [newBucket()]);
       setIsTemplate(p.isTemplate ?? false);
     }
   }, [existingData]);
@@ -1201,7 +1260,18 @@ export function PlanNew() {
     setBuckets((prev) => prev.map((x, idx) => (idx === i ? b : x)));
 
   const removeBucket = (i: number) =>
-    setBuckets((prev) => prev.filter((_, idx) => idx !== i));
+    setBuckets((prev) => {
+      const removedIds = new Set(prev[i].campaigns.map((c) => c.id));
+      return prev
+        .filter((_, idx) => idx !== i)
+        .map((b) => ({
+          ...b,
+          campaigns: b.campaigns.map((c) => ({
+            ...c,
+            dependsOn: c.dependsOn.filter((depId) => !removedIds.has(depId)),
+          })),
+        }));
+    });
 
   const moveBucket = (i: number, dir: -1 | 1) => {
     setBuckets((prev) => {
@@ -1209,10 +1279,8 @@ export function PlanNew() {
       const j = i + dir;
       if (j < 0 || j >= arr.length) return arr;
       [arr[i], arr[j]] = [arr[j], arr[i]];
-      // After swap, build campaignId → new bucket index map
       const bucketOf = new Map<string, number>();
       arr.forEach((b, bi) => b.campaigns.forEach((c) => bucketOf.set(c.id, bi)));
-      // Strip dependsOn entries that now point to a same-or-later bucket
       return arr.map((b, bi) => ({
         ...b,
         campaigns: b.campaigns.map((c) => ({
@@ -1226,50 +1294,81 @@ export function PlanNew() {
     });
   };
 
-  if (isEdit && loadingPlan) return <Spinner />;
+  if (isEdit && loadingPlan) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <Spinner />
+      </div>
+    );
+  }
 
   return (
-    <div className="max-w-4xl mx-auto p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-xl font-semibold">{isEdit ? 'Edit Plan' : 'New Plan'}</h1>
-        <div className="flex gap-2">
-          <Button variant="outline" onClick={() => navigate(-1)}>
+    <div className="flex flex-col gap-6">
+      {/* Page header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h2 className="text-xl font-semibold tracking-tight">
+            {isEdit ? 'Edit Plan' : 'New Plan'}
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {isEdit
+              ? 'Update plan details, trigger, and bucket configuration.'
+              : 'Configure a new outbound dialing plan with buckets and campaigns.'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            className="rounded-lg border border-gray-200 px-4 py-2.5 text-sm font-medium hover:bg-gray-50 transition-colors"
+          >
             Cancel
-          </Button>
-          <Button onClick={handleSave} disabled={saveMutation.isPending || !name.trim()}>
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saveMutation.isPending || !name.trim()}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
             {saveMutation.isPending ? <Spinner /> : 'Save Plan'}
-          </Button>
+          </button>
         </div>
       </div>
 
+      {/* Top-level save error */}
       {saveMutation.isError && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-3">
+        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">
           {String((saveMutation.error as Error)?.message ?? 'Save failed')}
         </div>
       )}
 
       {/* Plan metadata */}
-      <Card className="p-4 space-y-3">
-        <Field label="Plan name">
-          <Input
+      <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+        <h3 className="text-sm font-semibold text-gray-900">Plan details</h3>
+        <div>
+          <label className="block text-xs font-semibold text-gray-700 mb-1">Plan name</label>
+          <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. NY Morning Wave"
             autoFocus
+            className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
           />
-        </Field>
-        <Field label="Description (optional)">
-          <Input
+        </div>
+        <div>
+          <label className="block text-xs font-semibold text-gray-700 mb-1">Description (optional)</label>
+          <input
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Brief description"
+            className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
           />
-        </Field>
-        <label className="flex items-center gap-2 text-xs text-gray-600">
+        </div>
+        <label className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer">
           <input type="checkbox" checked={isTemplate} onChange={(e) => setIsTemplate(e.target.checked)} />
           Save as template (cannot be run directly)
         </label>
-      </Card>
+      </div>
 
       {/* Trigger */}
       <TriggerEditor
@@ -1284,10 +1383,14 @@ export function PlanNew() {
       />
 
       {/* Buckets */}
-      <div className="space-y-4">
+      <div className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
-          <h2 className="font-medium text-gray-800">Buckets</h2>
-          <button type="button" onClick={addBucket} className="text-sm text-blue-600 hover:underline">
+          <h3 className="text-sm font-semibold text-gray-900">Buckets</h3>
+          <button
+            type="button"
+            onClick={addBucket}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-500 hover:border-gray-400 hover:text-gray-700 transition-colors"
+          >
             + Add bucket
           </button>
         </div>
@@ -1295,12 +1398,13 @@ export function PlanNew() {
         {buckets.map((bucket, bi) => (
           <div key={bucket.id} className="relative">
             <div className="flex items-start gap-2">
-              <div className="flex flex-col gap-1 pt-4">
+              {/* Up/down reorder arrows */}
+              <div className="flex flex-col gap-1 pt-3.5">
                 <button
                   type="button"
                   onClick={() => moveBucket(bi, -1)}
                   disabled={bi === 0}
-                  className="text-gray-400 hover:text-gray-600 disabled:opacity-30 text-xs"
+                  className="text-gray-400 hover:text-gray-600 disabled:opacity-30 text-xs leading-none"
                 >
                   ↑
                 </button>
@@ -1308,13 +1412,12 @@ export function PlanNew() {
                   type="button"
                   onClick={() => moveBucket(bi, 1)}
                   disabled={bi === buckets.length - 1}
-                  className="text-gray-400 hover:text-gray-600 disabled:opacity-30 text-xs"
+                  className="text-gray-400 hover:text-gray-600 disabled:opacity-30 text-xs leading-none"
                 >
                   ↓
                 </button>
               </div>
               <div className="flex-1">
-                <div className="text-xs text-gray-400 mb-1">Bucket {bi + 1}</div>
                 <BucketEditor
                   bucket={bucket}
                   bucketIndex={bi}
@@ -1328,11 +1431,12 @@ export function PlanNew() {
               </div>
             </div>
 
+            {/* Chain connector */}
             {bi < buckets.length - 1 && (
               <div className="flex items-center gap-2 my-2 ml-8">
-                <div className="flex-1 border-t border-dashed border-gray-300" />
-                <span className="text-xs text-gray-400">then</span>
-                <div className="flex-1 border-t border-dashed border-gray-300" />
+                <div className="flex-1 border-t border-dashed border-gray-200" />
+                <span className="text-xs text-gray-400 font-medium">then</span>
+                <div className="flex-1 border-t border-dashed border-gray-200" />
               </div>
             )}
           </div>
@@ -1341,8 +1445,8 @@ export function PlanNew() {
 
       {/* Overlap warning */}
       {overlaps.length > 0 && (
-        <div className="bg-amber-50 border border-amber-300 rounded-lg p-4 space-y-2">
-          <div className="text-sm font-medium text-amber-800">Overlapping campaign filters detected</div>
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-2">
+          <div className="text-sm font-semibold text-amber-800">Overlapping campaign filters detected</div>
           <ul className="text-xs text-amber-700 space-y-1">
             {overlaps.map((o) => {
               const c1 = buckets[o.b1].campaigns[o.c1];
@@ -1356,29 +1460,37 @@ export function PlanNew() {
               );
             })}
           </ul>
-          <label className="flex items-center gap-2 text-xs text-amber-800 font-medium">
+          <label className="flex items-center gap-2 text-xs text-amber-800 font-medium cursor-pointer">
             <input type="checkbox" checked={overlapAck} onChange={(e) => setOverlapAck(e.target.checked)} />
             I acknowledge this overlap and want to proceed
           </label>
         </div>
       )}
 
+      {/* Inline validation error */}
       {(saveError || saveMutation.isError) && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg p-3">
+        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">
           {saveError ?? String((saveMutation.error as Error)?.message ?? 'Save failed')}
         </div>
       )}
 
+      {/* Bottom action bar */}
       <div className="flex justify-end gap-2 pb-8">
-        <Button variant="outline" onClick={() => navigate(-1)}>
+        <button
+          type="button"
+          onClick={() => navigate(-1)}
+          className="rounded-lg border border-gray-200 px-4 py-2.5 text-sm font-medium hover:bg-gray-50 transition-colors"
+        >
           Cancel
-        </Button>
-        <Button
+        </button>
+        <button
+          type="button"
           onClick={handleSave}
           disabled={saveMutation.isPending}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-blue-700 transition-colors disabled:opacity-50"
         >
           {saveMutation.isPending ? <Spinner /> : 'Save Plan'}
-        </Button>
+        </button>
       </div>
     </div>
   );

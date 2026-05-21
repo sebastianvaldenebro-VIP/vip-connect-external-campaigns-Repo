@@ -2,7 +2,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
 
-import { Badge, Button, Card, Spinner } from '@/components/ui';
+import { Badge, Spinner } from '@/components/ui';
 import { BulkDeletePanel } from '@/components/BulkDeletePanel';
 import { EnableCampaignModal } from '@/components/EnableCampaignModal';
 import {
@@ -32,10 +32,10 @@ function SortHeader({
 }): ReactNode {
   const active = current === sortKey;
   return (
-    <th className="px-4 py-2 text-left font-medium">
+    <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">
       <button
         type="button"
-        className="inline-flex items-center gap-1 hover:text-foreground"
+        className="inline-flex items-center gap-1 hover:text-gray-800"
         onClick={() => onSort(sortKey)}
       >
         {label}
@@ -171,45 +171,56 @@ export function Segments(): ReactNode {
   });
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-center justify-between">
+    <div className="flex flex-col gap-5">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Segments</h1>
+          <h2 className="text-xl font-semibold tracking-tight">Segments</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Define Customer Profiles segments; for manual-sync ones, verify against Redis and
             rebuild when the engine drifts.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <input
-            type="search"
-            placeholder="Search segments…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="h-9 w-56 rounded-md border border-border bg-background px-3 text-sm placeholder:text-muted-foreground"
-          />
-          <Button
-            variant="outline"
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Search */}
+          <div className="relative flex-1 max-w-xs">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs">🔍</span>
+            <input
+              type="search"
+              placeholder="Search segments…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full rounded-lg border border-gray-200 bg-white py-1.5 pl-8 pr-3 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
+            />
+          </div>
+          <button
+            type="button"
             onClick={() => qc.invalidateQueries({ queryKey: ['segments'] })}
             disabled={list.isFetching}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors disabled:opacity-50"
           >
             {list.isFetching ? (
-              <span className="inline-flex items-center gap-2">
-                <Spinner /> refreshing…
-              </span>
+              <span className="inline-flex items-center gap-2"><Spinner /> refreshing…</span>
             ) : (
               'Refresh'
             )}
-          </Button>
-          <Button
-            variant="outline"
+          </button>
+          <button
+            type="button"
             onClick={() => setShowBulkDelete((v) => !v)}
+            className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
           >
             {showBulkDelete ? 'Hide bulk delete' : 'Bulk delete'}
-          </Button>
-          <Button onClick={() => navigate('/segments/new')}>New segment</Button>
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/segments/new')}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-3.5 py-2 text-sm font-medium hover:bg-blue-700 transition-colors"
+          >
+            <span className="text-xs">+</span> New segment
+          </button>
         </div>
-      </header>
+      </div>
 
       {showBulkDelete ? (
         <BulkDeletePanel
@@ -228,56 +239,62 @@ export function Segments(): ReactNode {
       ) : null}
 
       {lastReconcile ? (
-        <Card className="border-green-600/40 bg-green-50 text-sm text-green-900">
-          Rebuilt <code>{lastReconcile.newSegmentName}</code> —{' '}
-          {lastReconcile.targetCount.toLocaleString()} members (+
-          {lastReconcile.added.toLocaleString()} / −{lastReconcile.removed.toLocaleString()}).
-          {lastReconcile.campaignsUpdated.length > 0
-            ? ` Retargeted ${lastReconcile.campaignsUpdated.length} campaign(s).`
-            : null}
-        </Card>
+        <div className="flex items-start gap-2 rounded-xl border border-green-200 bg-green-50 px-3 py-2.5 text-xs text-green-800">
+          <span className="mt-0.5 shrink-0">✓</span>
+          <div>
+            Rebuilt <code>{lastReconcile.newSegmentName}</code> —{' '}
+            {lastReconcile.targetCount.toLocaleString()} members (+
+            {lastReconcile.added.toLocaleString()} / −{lastReconcile.removed.toLocaleString()}).
+            {lastReconcile.campaignsUpdated.length > 0
+              ? ` Retargeted ${lastReconcile.campaignsUpdated.length} campaign(s).`
+              : null}
+          </div>
+        </div>
       ) : null}
 
-      <Card className="p-0">
-        <table className="w-full text-sm">
-          <thead className="border-b border-border bg-muted/50 text-xs uppercase tracking-wide text-muted-foreground">
-            <tr>
-              <SortHeader label="Name" sortKey="name" current={sortKey} dir={sortDir} onSort={handleSort} />
-              <th className="px-4 py-2 text-left font-medium">Member count</th>
-              <th className="px-4 py-2 text-left font-medium">Redis vs CP</th>
-              <SortHeader label="Created" sortKey="created" current={sortKey} dir={sortDir} onSort={handleSort} />
-              <th className="px-4 py-2 text-right font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {list.isPending ? (
-              <RowMessage colSpan={5} message="Loading segments…" />
-            ) : list.isError ? (
-              <RowMessage colSpan={5} message={(list.error as Error).message} tone="danger" />
-            ) : segments.length === 0 ? (
-              <RowMessage colSpan={5} message={search ? 'No segments match your search.' : 'No segments yet — create the first one.'} />
-            ) : (
-              segments.map((seg) => (
-                <SegmentRow
-                  key={seg.name}
-                  segment={seg}
-                  estimate={estimates[seg.name]}
-                  verification={verifications[seg.name]}
-                  reconcilePending={reconciling[seg.name] === 'pending'}
-                  onRefresh={() => refreshEstimate.mutate(seg.name)}
-                  onVerify={() => verify.mutate(seg.name)}
-                  onReconcile={() => reconcile.mutate(seg.name)}
-                  onDelete={() => {
-                    if (confirm(`Delete segment "${seg.name}"? This cannot be undone.`)) {
-                      remove.mutate(seg.name);
-                    }
-                  }}
-                />
-              ))
-            )}
-          </tbody>
-        </table>
-      </Card>
+      {/* Table */}
+      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-100">
+                <SortHeader label="Name" sortKey="name" current={sortKey} dir={sortDir} onSort={handleSort} />
+                <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Member count</th>
+                <th className="px-4 py-2.5 text-left text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Redis vs CP</th>
+                <SortHeader label="Created" sortKey="created" current={sortKey} dir={sortDir} onSort={handleSort} />
+                <th className="px-4 py-2.5 text-right text-[10px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.isPending ? (
+                <RowMessage colSpan={5} message="Loading segments…" />
+              ) : list.isError ? (
+                <RowMessage colSpan={5} message={(list.error as Error).message} tone="danger" />
+              ) : segments.length === 0 ? (
+                <RowMessage colSpan={5} message={search ? 'No segments match your search.' : 'No segments yet — create the first one.'} />
+              ) : (
+                segments.map((seg) => (
+                  <SegmentRow
+                    key={seg.name}
+                    segment={seg}
+                    estimate={estimates[seg.name]}
+                    verification={verifications[seg.name]}
+                    reconcilePending={reconciling[seg.name] === 'pending'}
+                    onRefresh={() => refreshEstimate.mutate(seg.name)}
+                    onVerify={() => verify.mutate(seg.name)}
+                    onReconcile={() => reconcile.mutate(seg.name)}
+                    onDelete={() => {
+                      if (confirm(`Delete segment "${seg.name}"? This cannot be undone.`)) {
+                        remove.mutate(seg.name);
+                      }
+                    }}
+                  />
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }
@@ -297,8 +314,8 @@ function RowMessage({
         colSpan={colSpan}
         className={
           tone === 'danger'
-            ? 'px-4 py-8 text-center text-sm text-destructive'
-            : 'px-4 py-8 text-center text-sm text-muted-foreground'
+            ? 'px-4 py-8 text-center text-sm text-red-500'
+            : 'px-4 py-8 text-center text-sm text-gray-400'
         }
       >
         {message}
@@ -343,34 +360,34 @@ function SegmentRow({
     : stateCodesFromSegmentName(segment.name);
 
   return (
-    <tr>
-      <td className="px-4 py-3 align-top">
+    <tr className="border-b border-gray-100 last:border-0 hover:bg-gray-50/50 transition-colors">
+      <td className="px-4 py-3.5 align-top">
         <Link
           to={`/segments/${encodeURIComponent(segment.name)}`}
-          className="font-medium hover:underline"
+          className="font-medium text-gray-900 hover:underline"
         >
           {segment.displayName ?? segment.name}
         </Link>
-        <div className="font-mono text-xs text-muted-foreground">
+        <div className="font-mono text-xs text-gray-400 mt-0.5">
           {segment.name}
           {segment.version ? (
-            <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
+            <span className="ml-2 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide">
               v{segment.version}
             </span>
           ) : null}
         </div>
       </td>
-      <td className="px-4 py-3 align-top">
+      <td className="px-4 py-3.5 align-top">
         {estimate === 'pending' ? (
-          <span className="inline-flex items-center gap-2 text-muted-foreground">
+          <span className="inline-flex items-center gap-2 text-gray-400 text-xs">
             <Spinner /> computing…
           </span>
         ) : estimate ? (
           <div>
-            <span className="font-medium">
+            <span className="font-medium text-gray-900">
               {estimate.totalCount?.toLocaleString() ?? '—'}
             </span>
-            <div className="text-xs text-muted-foreground">
+            <div className="text-xs text-gray-400">
               as of {formatDateTime(estimate.at)}
             </div>
           </div>
@@ -378,7 +395,7 @@ function SegmentRow({
           <Badge tone="muted">not computed</Badge>
         )}
       </td>
-      <td className="px-4 py-3 align-top">
+      <td className="px-4 py-3.5 align-top">
         <VerificationCell
           verification={verification}
           reconcilePending={reconcilePending}
@@ -386,20 +403,32 @@ function SegmentRow({
           onReconcile={onReconcile}
         />
       </td>
-      <td className="px-4 py-3 align-top text-muted-foreground">
+      <td className="px-4 py-3.5 align-top font-mono text-xs text-gray-400">
         {formatDateTime(segment.createdAt)}
       </td>
-      <td className="px-4 py-3 align-top">
-        <div className="flex items-center justify-end gap-2">
-          <Button size="sm" variant="outline" onClick={onRefresh}>
+      <td className="px-4 py-3.5 align-top">
+        <div className="flex items-center justify-end gap-1.5">
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+          >
             Refresh count
-          </Button>
-          <Button size="sm" onClick={() => setEnableOpen(true)}>
+          </button>
+          <button
+            type="button"
+            onClick={() => setEnableOpen(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium hover:bg-blue-700 transition-colors"
+          >
             Enable Campaign
-          </Button>
-          <Button size="sm" variant="ghost" onClick={onDelete}>
+          </button>
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded-lg px-2 py-1.5 text-xs text-red-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+          >
             Delete
-          </Button>
+          </button>
         </div>
         <EnableCampaignModal
           open={enableOpen}
@@ -427,16 +456,20 @@ function VerificationCell({
 }): ReactNode {
   if (verification === 'pending') {
     return (
-      <span className="inline-flex items-center gap-2 text-muted-foreground">
+      <span className="inline-flex items-center gap-2 text-gray-400 text-xs">
         <Spinner /> scanning Redis…
       </span>
     );
   }
   if (!verification) {
     return (
-      <Button size="sm" variant="outline" onClick={onVerify}>
+      <button
+        type="button"
+        onClick={onVerify}
+        className="rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+      >
         Verify
-      </Button>
+      </button>
     );
   }
 
@@ -450,7 +483,7 @@ function VerificationCell({
         <Badge tone="success">
           {verification.redisCount.toLocaleString()} / {verification.segmentCount.toLocaleString()} ✓
         </Badge>
-        <span className="text-xs text-muted-foreground">
+        <span className="text-xs text-gray-400">
           verified {formatDateTime(verification.verifiedAt)}
         </span>
       </div>
@@ -463,14 +496,19 @@ function VerificationCell({
         <Badge tone="danger">
           {verification.redisCount.toLocaleString()} Redis · {verification.segmentCount.toLocaleString()} CP
         </Badge>
-        <span className="text-xs text-destructive">
+        <span className="text-xs text-red-500">
           {missing > 0 ? `+${missing} missing` : null}
           {missing > 0 && extras > 0 ? ' · ' : null}
           {extras > 0 ? `−${extras} extra` : null}
         </span>
       </div>
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={onReconcile} disabled={reconcilePending}>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={onReconcile}
+          disabled={reconcilePending}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 text-white px-2.5 py-1.5 text-xs font-medium hover:bg-blue-700 transition-colors disabled:opacity-50"
+        >
           {reconcilePending ? (
             <span className="inline-flex items-center gap-2">
               <Spinner /> rebuilding…
@@ -478,10 +516,14 @@ function VerificationCell({
           ) : (
             'Rebuild segment'
           )}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onVerify}>
+        </button>
+        <button
+          type="button"
+          onClick={onVerify}
+          className="rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
+        >
           Re-verify
-        </Button>
+        </button>
       </div>
     </div>
   );

@@ -77,8 +77,8 @@ LAMBDA_FUNCTION_ARN: Final = os.environ.get("LAMBDA_FUNCTION_ARN", "")
 # Pre-start window: create next-bucket campaigns this many minutes before expiry
 _PRESTART_MINUTES: Final = 5
 
-# Daily hard-stop hour in Eastern time (America/New_York). All running plans are force-finished past this.
-_DAILY_CUTOFF_HOUR_EST: Final = 19  # 7 PM Eastern
+# Daily hard-stop hour in COT (UTC-5 fixed, consistent with all other time guards in tick()).
+_DAILY_CUTOFF_HOUR: Final = 19  # 7 PM COT = 00:00 UTC
 
 # Runs active longer than this many hours without completing are flagged as stuck.
 _STUCK_RUN_HOURS: Final = 4
@@ -436,42 +436,63 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
 
 def abort_run(plan_id: str, run_id: str) -> dict:
-    run = get_run(plan_id, run_id)
-    if not run:
-        raise ValueError(f"Run {run_id} not found in plan {plan_id}")
-    if run["status"] != "running":
-        raise ValueError(f"Run {run_id} is not running (status={run['status']})")
+    """Abort a running run, stopping all active campaigns.
 
-    now = _now_iso()
+    Retries up to 3 times on ConcurrentWriteError. unlock_plan_run is called exactly
+    once: on success, on the last ConcurrentWriteError retry, or on any other exception
+    from save_run — matching the original finally semantics but without unlocking on
+    validation errors or on intermediate retries.
+    """
+    _MAX_RETRIES = 3
+    for attempt in range(_MAX_RETRIES):
+        run = get_run(plan_id, run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found in plan {plan_id}")
+        if run["status"] != "running":
+            if run["status"] == "aborted":
+                return run
+            raise ValueError(f"Run {run_id} is not running (status={run['status']})")
 
-    # Stop/cancel ALL buckets — parallel buckets may have multiple active buckets simultaneously
-    for bi, bs in enumerate(run["bucketStates"]):
-        if bs["status"] not in ("running", "warming", "queued"):
+        now = _now_iso()
+
+        # Stop/cancel ALL buckets — parallel buckets may have multiple active simultaneously
+        for bi, bs in enumerate(run["bucketStates"]):
+            if bs["status"] not in ("running", "warming", "queued"):
+                continue
+            for cs in bs["campaignStates"]:
+                if cs["status"] == "running" and cs.get("connectCampaignId"):
+                    _safe_stop_campaign(cs["connectCampaignId"])
+                if cs["status"] == "warming" and cs.get("connectCampaignId"):
+                    _safe_stop_campaign(cs["connectCampaignId"])
+                    _safe_delete_campaign(cs["connectCampaignId"])
+                    if cs.get("segmentName"):
+                        _safe_delete_segment(cs["segmentName"])
+                if cs["status"] in ("running", "warming", "queued", "creating"):
+                    cs["status"] = "cancelled"
+                    cs["exitReason"] = REASON_ABORTED
+                    cs["completedAt"] = now
+            _delete_bucket_schedule_safe(run, bi)
+            bs["status"] = "completed"
+            bs["completedAt"] = now
+
+        run["status"] = "aborted"
+        run["completedAt"] = now
+        try:
+            save_run(run)
+            update_plan_pending_warmup(run["planId"], None)
+        except ConcurrentWriteError:
+            if attempt == _MAX_RETRIES - 1:
+                unlock_plan_run(plan_id)
+                raise
+            logger.info("abort_run: concurrent write on attempt %d — retrying", attempt + 1)
             continue
-        for cs in bs["campaignStates"]:
-            if cs["status"] == "running" and cs.get("connectCampaignId"):
-                _safe_stop_campaign(cs["connectCampaignId"])
-            if cs["status"] == "warming" and cs.get("connectCampaignId"):
-                _safe_stop_campaign(cs["connectCampaignId"])
-                _safe_delete_campaign(cs["connectCampaignId"])
-                if cs.get("segmentName"):
-                    _safe_delete_segment(cs["segmentName"])
-            if cs["status"] in ("running", "warming", "queued", "creating"):
-                cs["status"] = "cancelled"
-                cs["exitReason"] = REASON_ABORTED
-                cs["completedAt"] = now
-        _delete_bucket_schedule_safe(run, bi)
-        bs["status"] = "completed"
-        bs["completedAt"] = now
+        except Exception:
+            unlock_plan_run(plan_id)
+            raise
+        unlock_plan_run(plan_id)
+        return run
 
-    run["status"] = "aborted"
-    run["completedAt"] = now
-    try:
-        save_run(run)
-        update_plan_pending_warmup(run["planId"], None)
-    finally:
-        unlock_plan_run(run["planId"])
-    return run
+    raise ConcurrentWriteError(f"abort_run exhausted {_MAX_RETRIES} retries")  # unreachable
 
 
 def _force_finish_internal(run: dict, plan: dict) -> None:
@@ -515,15 +536,30 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
 
 
 def force_finish_run(plan_id: str, run_id: str) -> dict:
-    """Operator-initiated force-finish: stops campaigns and marks run completed."""
-    run = get_run(plan_id, run_id)
-    if not run:
-        raise ValueError(f"Run {run_id} not found in plan {plan_id}")
-    if run["status"] != "running":
-        raise ValueError(f"Run {run_id} is not running (status={run['status']})")
-    plan = run.get("planSnapshot") or get_plan(plan_id) or {}
-    _force_finish_internal(run, plan)
-    return run
+    """Operator-initiated force-finish: stops campaigns and marks run completed.
+
+    Retries up to 3 times on ConcurrentWriteError. _force_finish_internal unlocks the
+    plan in its own finally, so unlock is guaranteed on each attempt.
+    """
+    _MAX_RETRIES = 3
+    for attempt in range(_MAX_RETRIES):
+        run = get_run(plan_id, run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found in plan {plan_id}")
+        if run["status"] != "running":
+            if run["status"] in ("completed", "aborted"):
+                return run
+            raise ValueError(f"Run {run_id} is not running (status={run['status']})")
+        plan = run.get("planSnapshot") or get_plan(plan_id) or {}
+        try:
+            _force_finish_internal(run, plan)
+            return run
+        except ConcurrentWriteError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            logger.info("force_finish_run: concurrent write on attempt %d — retrying", attempt + 1)
+
+    raise ConcurrentWriteError(f"force_finish_run exhausted {_MAX_RETRIES} retries")  # unreachable
 
 
 def force_start_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
@@ -639,28 +675,61 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
     # Reset cascade-cancelled descendants so they can auto-start after this campaign completes
     _reset_cascade_cancelled_children(run, plan, cs["campaignId"])
 
-    # Phase 1: claim BEFORE cleaning up stale Connect campaign.
-    # If save_run fails, the old connectCampaignId still exists in Connect (safe — no orphan).
+    # Phase 1: claim. Clear connectCampaignId in this save so that if Phase 3 creates a Connect
+    # campaign but the final save_run crashes, tick recovery sees null and safely resets to queued
+    # (no stale ID pointing at a deleted campaign, which would cause a spurious error state).
+    old_connect_id = cs.get("connectCampaignId")
     cs["status"] = "creating"
+    cs["creatingAt"] = _now_iso()
     cs["exitReason"] = None
     cs["errorDetail"] = None
     cs["completedAt"] = None
     cs["startedAt"] = None
+    cs["connectCampaignId"] = None
+    cs["segmentArn"] = None
+    cs["segmentName"] = None
     save_run(run)  # raises ConcurrentWriteError if another tick already updated
 
     # Phase 2: clean up stale Connect campaign AFTER claim is persisted.
-    if cs.get("connectCampaignId"):
-        _safe_stop_campaign(cs["connectCampaignId"])
-        _safe_delete_campaign(cs["connectCampaignId"])
-        cs["connectCampaignId"] = None
-        cs["segmentArn"] = None
-        cs["segmentName"] = None
+    if old_connect_id:
+        _safe_stop_campaign(old_connect_id)
+        _safe_delete_campaign(old_connect_id)
 
     # Phase 3: create new Connect campaign
     cs["status"] = "queued"  # _start_one_campaign expects "queued"
     _start_one_campaign(run, plan, bucket_index, campaign_index)
-    save_run(run)
-    return run
+
+    # Snapshot the outcome _start_one_campaign wrote so we can re-apply it if the
+    # final save races with a concurrent tick and we must re-read run from DDB.
+    _snap = {k: cs.get(k) for k in (
+        "status", "connectCampaignId", "segmentName", "segmentArn",
+        "startedAt", "exitReason", "errorDetail", "completedAt", "reconcileRetries",
+    )}
+
+    _FINAL_SAVE_RETRIES = 3
+    for _attempt in range(_FINAL_SAVE_RETRIES):
+        try:
+            save_run(run)
+            return run
+        except ConcurrentWriteError:
+            if _attempt == _FINAL_SAVE_RETRIES - 1:
+                raise
+            logger.info(
+                "force_start_campaign: concurrent write on final save attempt %d — retrying",
+                _attempt + 1,
+            )
+            run = get_run(plan_id, run_id)
+            if not run:
+                raise ValueError(f"Run {run_id} not found after force_start_campaign retry")
+            bs = run["bucketStates"][bucket_index]
+            cs = bs["campaignStates"][campaign_index]
+            if cs["status"] == "running" and cs.get("connectCampaignId") == _snap["connectCampaignId"]:
+                return run  # concurrent tick already adopted this Connect campaign
+            cs.update(_snap)
+            if _snap["status"] != "creating":
+                cs.pop("creatingAt", None)
+
+    raise ConcurrentWriteError("force_start_campaign exhausted retries on final save")  # unreachable
 
 
 def _reset_cascade_cancelled_children(run: dict, plan: dict, campaign_id: str) -> None:
@@ -689,75 +758,104 @@ def skip_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: 
     exitReason='skipped' so downstream dependsOn campaigns are NOT cascade-cancelled.
     If the campaign is actively running in Connect it is stopped first.
     Only works on non-terminal campaigns (queued, running, warming).
+
+    Retries up to 3 times on ConcurrentWriteError (tick racing with this HTTP call).
+    On retry the run is re-read; if the tick already advanced the campaign to a terminal
+    state the skip is treated as a no-op success rather than raising ValueError.
     """
-    run = get_run(plan_id, run_id)
-    if not run:
-        raise ValueError(f"Run {run_id} not found")
-    if run["status"] != "running":
-        raise ValueError(f"Run {run_id} is not running")
-    if bucket_index >= len(run["bucketStates"]):
-        raise ValueError(f"Bucket index {bucket_index} out of range")
-    bs = run["bucketStates"][bucket_index]
-    if campaign_index >= len(bs["campaignStates"]):
-        raise ValueError(f"Campaign index {campaign_index} out of range")
-    cs = bs["campaignStates"][campaign_index]
+    _MAX_RETRIES = 3
+    for attempt in range(_MAX_RETRIES):
+        run = get_run(plan_id, run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found")
+        if run["status"] != "running":
+            raise ValueError(f"Run {run_id} is not running")
+        if bucket_index >= len(run["bucketStates"]):
+            raise ValueError(f"Bucket index {bucket_index} out of range")
+        bs = run["bucketStates"][bucket_index]
+        if campaign_index >= len(bs["campaignStates"]):
+            raise ValueError(f"Campaign index {campaign_index} out of range")
+        cs = bs["campaignStates"][campaign_index]
 
-    if cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
-        raise ValueError(
-            f"Campaign is already terminal ({cs['status']}) — cannot skip. "
-            "Use force-start to restart it instead."
-        )
+        if cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
+            if attempt > 0:
+                # A concurrent tick advanced this campaign between attempts — treat as success.
+                return run
+            raise ValueError(
+                f"Campaign is already terminal ({cs['status']}) — cannot skip. "
+                "Use force-start to restart it instead."
+            )
 
-    if cs.get("connectCampaignId") and cs["status"] == "running":
-        _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("connectCampaignId") and cs["status"] == "running":
+            _safe_stop_campaign(cs["connectCampaignId"])
 
-    now_iso = _now_iso()
-    cs["status"] = "cancelled"
-    cs["exitReason"] = "skipped"
-    cs["completedAt"] = now_iso
+        cs["status"] = "cancelled"
+        cs["exitReason"] = "skipped"
+        cs["completedAt"] = _now_iso()
 
-    plan = run.get("planSnapshot") or get_plan(plan_id) or {}
-    changed = True
-    while changed:
-        changed = _dispatch_ready_campaigns(run, plan, bucket_index)
+        plan = run.get("planSnapshot") or get_plan(plan_id) or {}
+        try:
+            changed = True
+            while changed:
+                changed = _dispatch_ready_campaigns(run, plan, bucket_index)
 
-    if _all_campaigns_terminal(run, bucket_index):
-        _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
-    else:
-        save_run(run)
-    return run
+            if _all_campaigns_terminal(run, bucket_index):
+                _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
+            else:
+                save_run(run)
+            return run
+        except ConcurrentWriteError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            logger.info("skip_campaign: concurrent write on attempt %d — retrying", attempt + 1)
+
+    raise ConcurrentWriteError(f"skip_campaign exhausted {_MAX_RETRIES} retries")  # unreachable
 
 
 def force_stop_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: int) -> dict:
-    """Manually stop a running campaign and mark it expired."""
-    run = get_run(plan_id, run_id)
-    if not run:
-        raise ValueError(f"Run {run_id} not found")
-    if run["status"] != "running":
-        raise ValueError(f"Run {run_id} is not running")
-    if bucket_index >= len(run["bucketStates"]):
-        raise ValueError(f"Bucket index {bucket_index} out of range")
-    bs = run["bucketStates"][bucket_index]
-    if campaign_index >= len(bs["campaignStates"]):
-        raise ValueError(f"Campaign index {campaign_index} out of range")
-    cs = bs["campaignStates"][campaign_index]
-    if cs["status"] != "running":
-        raise ValueError(f"Campaign is {cs['status']} — can only stop running campaigns")
+    """Manually stop a running campaign and mark it expired.
 
-    now_iso = _now_iso()
-    if cs.get("connectCampaignId"):
-        _safe_stop_campaign(cs["connectCampaignId"])
-    cs["status"] = "expired"
-    cs["exitReason"] = "manually_stopped"
-    cs["completedAt"] = now_iso
+    Retries up to 3 times on ConcurrentWriteError (tick racing with this HTTP call).
+    On retry the run is re-read; if the tick already stopped the campaign the stop is
+    treated as a no-op success.
+    """
+    _MAX_RETRIES = 3
+    for attempt in range(_MAX_RETRIES):
+        run = get_run(plan_id, run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found")
+        if run["status"] != "running":
+            raise ValueError(f"Run {run_id} is not running")
+        if bucket_index >= len(run["bucketStates"]):
+            raise ValueError(f"Bucket index {bucket_index} out of range")
+        bs = run["bucketStates"][bucket_index]
+        if campaign_index >= len(bs["campaignStates"]):
+            raise ValueError(f"Campaign index {campaign_index} out of range")
+        cs = bs["campaignStates"][campaign_index]
+        if cs["status"] != "running":
+            if attempt > 0 and cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
+                return run
+            raise ValueError(f"Campaign is {cs['status']} — can only stop running campaigns")
 
-    plan = run.get("planSnapshot") or get_plan(plan_id) or {}
-    # Check if all campaigns in this bucket are now terminal
-    if _all_campaigns_terminal(run, bucket_index):
-        _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
-    else:
-        save_run(run)
-    return run
+        if cs.get("connectCampaignId"):
+            _safe_stop_campaign(cs["connectCampaignId"])
+        cs["status"] = "expired"
+        cs["exitReason"] = "manually_stopped"
+        cs["completedAt"] = _now_iso()
+
+        plan = run.get("planSnapshot") or get_plan(plan_id) or {}
+        try:
+            if _all_campaigns_terminal(run, bucket_index):
+                _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
+            else:
+                save_run(run)
+            return run
+        except ConcurrentWriteError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            logger.info("force_stop_campaign: concurrent write on attempt %d — retrying", attempt + 1)
+
+    raise ConcurrentWriteError(f"force_stop_campaign exhausted {_MAX_RETRIES} retries")  # unreachable
 
 
 # ── Bucket lifecycle ──────────────────────────────────────────────────────────
@@ -911,6 +1009,16 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
     next_bucket_state["status"] = "warming"
     logger.info("_prestart_next_bucket: warming bucket %d", next_index)
 
+    # Claim save: persist "warming" before creating any Connect campaigns.
+    # Without this, a crash between _create_campaign_only and the caller's save_run
+    # would leave the bucket as "queued" in DDB, causing a duplicate campaign next tick.
+    try:
+        save_run(run)
+    except Exception as _claim_exc:
+        next_bucket_state["status"] = "queued"
+        logger.warning("_prestart_next_bucket: claim save failed, reverting to queued: %s", _claim_exc)
+        return
+
     next_bucket = plan["buckets"][next_index]
     for ci, campaign in enumerate(next_bucket.get("campaigns", [])):
         if not campaign.get("dependsOn"):
@@ -925,14 +1033,32 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     cs["segmentName"] = seg_name
                     cs["segmentArn"] = seg_arn
                     cs["warmupStarted"] = warmup_started
+                    # Mid-flight save: persist connectCampaignId so that if a crash occurs
+                    # before the outer save_run, the campaign can be recovered next tick.
+                    try:
+                        save_run(run)
+                    except Exception as _mid_exc:
+                        logger.warning(
+                            "_prestart_next_bucket campaign %d: mid-flight save failed: %s",
+                            ci, _mid_exc,
+                        )
                 except _RedisRebuildingError as exc:
                     # Transient — leave queued so the next tick retries.
                     logger.warning("_prestart_next_bucket campaign %d: Redis rebuilding, will retry next tick: %s", ci, exc)
                 except _EmptySegmentError as exc:
-                    logger.info("_prestart_next_bucket campaign %d: empty segment: %s", ci, exc)
-                    cs["status"] = "cancelled"
-                    cs["exitReason"] = REASON_SKIPPED_EMPTY
-                    cs["completedAt"] = _now_iso()
+                    empty_retries = cs.get("reconcileRetries") or 0
+                    retry_limit = int(next_bucket.get("reconcileRetryLimit", 2))
+                    if empty_retries < retry_limit:
+                        cs["reconcileRetries"] = empty_retries + 1
+                        logger.warning(
+                            "_prestart_next_bucket campaign %d: empty segment (retry %d/%d), will retry next tick: %s",
+                            ci, empty_retries + 1, retry_limit, exc,
+                        )
+                    else:
+                        logger.info("_prestart_next_bucket campaign %d: empty segment after %d retries — cancelling: %s", ci, empty_retries, exc)
+                        cs["status"] = "cancelled"
+                        cs["exitReason"] = REASON_SKIPPED_EMPTY
+                        cs["completedAt"] = _now_iso()
                 except Exception as exc:
                     logger.error("_prestart_next_bucket campaign %d: %s", ci, exc)
                     cs["status"] = "error"
@@ -1368,6 +1494,7 @@ def _dispatch_cross_bucket_ready(run: dict, plan: dict, current_bucket_index: in
                     bs["startedAt"] = now_iso
                     bs["scheduleName"] = sched
                 cs["status"] = "creating"
+                cs["creatingAt"] = now_iso
                 claimed.append((bi, ci))
                 changed = True
 
@@ -1402,7 +1529,50 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
     # Phase 1 — Recovery
     for cs in bucket_state["campaignStates"]:
         if cs["status"] == "creating":
-            cs["status"] = "queued"
+            existing_id = cs.get("connectCampaignId")
+            if existing_id:
+                # Mid-flight marker: a Connect campaign was created but Lambda crashed
+                # before the confirm save. Poll Connect instead of blindly resetting to
+                # queued — which would cause a duplicate campaign to be created.
+                try:
+                    state = _get_campaign_state(existing_id)
+                    if state in _CONNECT_TERMINAL:
+                        cs["connectCampaignId"] = None
+                        cs["segmentArn"] = None
+                        cs["segmentName"] = None
+                        cs["status"] = "queued"
+                    else:
+                        cs["status"] = "running"
+                        logger.info(
+                            "_dispatch_ready_campaigns: recovered %s from creating → running (Connect state: %s)",
+                            existing_id, state,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "_dispatch_ready_campaigns: cannot check Connect state for %s: %s — resetting to queued",
+                        existing_id, exc,
+                    )
+                    cs["connectCampaignId"] = None
+                    cs["segmentArn"] = None
+                    cs["segmentName"] = None
+                    cs["status"] = "queued"
+            else:
+                # No conn_id: the claim was made but Connect was never called.
+                # Only reset if the claim is stale (> 5 min) — a fresh claim means a
+                # concurrent force_start_campaign Lambda is still in progress and owns
+                # this slot. Resetting it early would cause a duplicate Connect campaign.
+                _creating_at = cs.get("creatingAt")
+                _age_seconds = (
+                    (_now_utc() - datetime.fromisoformat(_creating_at)).total_seconds()
+                    if _creating_at else 999
+                )
+                if _age_seconds > 300:
+                    cs["status"] = "queued"
+                else:
+                    logger.info(
+                        "_dispatch_ready_campaigns: skipping fresh creating claim for %s (age=%.0fs) — concurrent force_start likely active",
+                        cs.get("campaignId"), _age_seconds,
+                    )
 
     newly_ready: list[int] = []
     cascade_changed = False
@@ -1445,8 +1615,10 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
 
     # Phase 3 — Claim: save BEFORE Connect API so a failed save leaves no orphan campaigns
     if newly_ready:
+        _claim_ts = _now_iso()
         for ci in newly_ready:
             bucket_state["campaignStates"][ci]["status"] = "creating"
+            bucket_state["campaignStates"][ci]["creatingAt"] = _claim_ts
         save_run(run)  # raises ConcurrentWriteError on conflict → Connect never called
     elif cascade_changed:
         save_run(run)  # persist cascade-cancel state only
@@ -1581,12 +1753,24 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
                 )
                 return
             except _EmptySegmentError as exc:
+                # Redis may still be partially rebuilding: other-state leads arrive first,
+                # making is_ready() pass while the target state hasn't loaded yet.
+                # Retry across ticks (not within the same tick) to avoid false permanence.
+                empty_retries = cs.get("reconcileRetries") or 0
+                if empty_retries < reconcile_retry_limit:
+                    cs["status"] = "queued"
+                    cs["reconcileRetries"] = empty_retries + 1
+                    logger.warning(
+                        "_start_one_campaign[%d/%d]: empty segment (retry %d/%d), will retry next tick: %s",
+                        bucket_index, campaign_index, empty_retries + 1, reconcile_retry_limit, exc,
+                    )
+                    return
                 last_exc = exc
                 logger.info(
-                    "_start_one_campaign[%d/%d]: empty segment: %s",
-                    bucket_index, campaign_index, exc,
+                    "_start_one_campaign[%d/%d]: empty segment after %d retries — cancelling: %s",
+                    bucket_index, campaign_index, empty_retries, exc,
                 )
-                break  # Empty segment is definitive — no retries
+                break
             except Exception as exc:
                 last_exc = exc
                 if attempt < reconcile_retry_limit:
@@ -1616,6 +1800,41 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
     try:
         connect_id, campaign_name = _create_and_start_campaign(bucket, campaign, segment_arn, segment_name, now)
         cs["connectCampaignId"] = connect_id
+        # Mid-flight save: persist {creating, connectCampaignId} so Phase-1 recovery in
+        # _dispatch_ready_campaigns can poll Connect and restore to "running" — no duplicate
+        # campaign is ever created even if Lambda crashes before Phase-5 confirms.
+        # Retry up to 3 times on ConcurrentWriteError: the typical cause is a concurrent
+        # tick for a different bucket — bumping the version resolves it without losing any
+        # in-memory Phase-4 state.  If all retries fail, Phase-5 outer save is the last line
+        # of defence; if that also fails, {creating, null} in DDB triggers a new campaign
+        # after 5 min (S10-D threshold) — this is the S10-F residual risk.
+        cs["status"] = "creating"
+        for _mf_attempt in range(3):
+            try:
+                save_run(run)
+                break
+            except ConcurrentWriteError:
+                if _mf_attempt == 2:
+                    logger.warning(
+                        "_start_one_campaign[%d/%d]: mid-flight save failed after 3 attempts — "
+                        "outer Phase-5 will confirm; orphan possible if Phase-5 also fails (campaign=%s)",
+                        bucket_index, campaign_index, connect_id,
+                    )
+                    break
+                logger.info(
+                    "_start_one_campaign[%d/%d]: mid-flight save attempt %d — refreshing version",
+                    bucket_index, campaign_index, _mf_attempt + 1,
+                )
+                fresh = get_run(run["planId"], run["runId"])
+                if not fresh:
+                    break
+                run["_version"] = fresh["_version"]
+            except Exception as _mid_exc:
+                logger.warning(
+                    "_start_one_campaign[%d/%d]: mid-flight save failed — outer save will confirm: %s",
+                    bucket_index, campaign_index, _mid_exc,
+                )
+                break
         cs["status"] = "running"
     except _EmptySegmentError:
         logger.info("_start_one_campaign[%d/%d]: segment empty after creation", bucket_index, campaign_index)
@@ -1657,6 +1876,16 @@ def _create_campaign_only(
     start_time = start_dt.isoformat()
     run_type = campaign.get("run_type", "full")
     end_time = _campaign_end_time(start_dt, campaign, run_type)
+
+    # Guard: Connect rejects campaigns where startTime >= endTime.
+    # This can happen in the last few minutes before the daily cutoff when the 6-min
+    # warmup window pushes startTime past the end-time cap.
+    end_dt = datetime.fromisoformat(end_time)
+    if start_dt >= end_dt:
+        raise ValueError(
+            f"Campaign start {start_time} >= end {end_time} — too close to daily cutoff, skipping"
+        )
+
     campaign_name = segment_name if pinned_arn else build_segment_name(bucket, campaign)
 
     instance_arn = f"arn:aws:connect:us-east-1:{_account_id()}:instance/{CONNECT_INSTANCE_ID}"
@@ -1973,7 +2202,7 @@ def _safe_delete_campaign(campaign_id: str) -> None:
 
     try:
         state = _get_campaign_state(campaign_id)
-        if state not in ("Stopped", "Failed", "Created"):
+        if state not in ("Stopped", "Failed", "Created", "Completed"):
             build_oc().stop_campaign(campaign_id)
         build_oc().delete_campaign(campaign_id)
     except Exception as exc:
@@ -2021,27 +2250,27 @@ def _campaign_end_time(now: datetime, campaign: dict, run_type: str) -> str:
 
 
 def _daily_cutoff_iso(now: datetime) -> str:
-    """Return the next 7 PM Eastern (America/New_York) as UTC ISO string (campaign end-time cap)."""
-    try:
-        from zoneinfo import ZoneInfo
-        est = ZoneInfo("America/New_York")
-        est_now = now.astimezone(est)
-        end_est = est_now.replace(hour=_DAILY_CUTOFF_HOUR_EST, minute=0, second=0, microsecond=0)
-        if end_est <= est_now:
-            end_est += timedelta(days=1)
-        return end_est.astimezone(timezone.utc).isoformat()
-    except Exception:
-        return (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+    """Return the next 7 PM COT (UTC-5) as UTC ISO string (campaign end-time cap).
+
+    Uses COT consistently with all other time guards in tick() (workingHours, loop.endTime).
+    7 PM COT = 00:00 UTC, giving campaigns the full window before midnight UTC.
+    """
+    _COT = timezone(timedelta(hours=-5))
+    cot_now = now.astimezone(_COT)
+    end_cot = cot_now.replace(hour=_DAILY_CUTOFF_HOUR, minute=0, second=0, microsecond=0)
+    if end_cot <= cot_now:
+        end_cot += timedelta(days=1)
+    return end_cot.astimezone(timezone.utc).isoformat()
 
 
 def _past_daily_cutoff(now: datetime) -> bool:
-    """True if current Eastern time (America/New_York) is at or past the daily cutoff (7 PM)."""
-    try:
-        from zoneinfo import ZoneInfo
-        est_now = now.astimezone(ZoneInfo("America/New_York"))
-        return est_now.hour >= _DAILY_CUTOFF_HOUR_EST
-    except Exception:
-        return False
+    """True if current COT time (UTC-5) is at or past the daily cutoff (7 PM).
+
+    Uses COT consistently with all other time guards in tick().
+    """
+    _COT = timezone(timedelta(hours=-5))
+    cot_now = now.astimezone(_COT)
+    return cot_now.hour >= _DAILY_CUTOFF_HOUR
 
 
 _COT_TZ = timezone(timedelta(hours=-5))

@@ -568,7 +568,8 @@ def test_prestart_sets_next_bucket_to_warming():
         _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
     ])
 
-    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn:seg-w", True)):
+    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn:seg-w", True)), \
+         patch("executor.save_run"):
         executor._prestart_next_bucket(run, plan, 0)
 
     assert run["bucketStates"][1]["status"] == "warming"
@@ -586,7 +587,8 @@ def test_prestart_only_creates_stage1_campaigns():
         _bucket_state("b1", [_campaign_state("c1"), _campaign_state("c2")], status="queued"),
     ])
 
-    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn-w", True)) as create:
+    with patch("executor._create_campaign_only", return_value=("conn-w", "seg-w", "arn-w", True)) as create, \
+         patch("executor.save_run"):
         executor._prestart_next_bucket(run, plan, 0)
 
     # Only c1 has no dependsOn → only 1 create call
@@ -607,10 +609,90 @@ def test_prestart_skips_if_next_bucket_already_warming():
         _bucket_state("b1", [_campaign_state("c1")], status="warming"),
     ])
 
-    with patch("executor._create_campaign_only") as create:
+    with patch("executor._create_campaign_only") as create, \
+         patch("executor.save_run"):
         executor._prestart_next_bucket(run, plan, 0)
 
     create.assert_not_called()
+
+
+def test_prestart_claim_save_persists_warming_before_campaigns():
+    """_prestart_next_bucket saves 'warming' to DDB before creating any Connect campaigns."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1")], status="queued"),
+    ])
+
+    call_order = []
+
+    def track_save(_run):
+        call_order.append(("save", _run["bucketStates"][1]["status"]))
+
+    def track_create(*_args, **_kwargs):
+        call_order.append(("create",))
+        return ("conn-w", "seg-w", "arn-w", True)
+
+    with patch("executor.save_run", side_effect=track_save), \
+         patch("executor._create_campaign_only", side_effect=track_create):
+        executor._prestart_next_bucket(run, plan, 0)
+
+    # Claim save ("warming") must come before the create call
+    assert call_order[0] == ("save", "warming")
+    assert ("create",) in call_order
+    claim_idx = call_order.index(("save", "warming"))
+    create_idx = call_order.index(("create",))
+    assert claim_idx < create_idx
+
+
+def test_prestart_mid_flight_save_persists_connect_id():
+    """_prestart_next_bucket saves connectCampaignId immediately after _create_campaign_only."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1")], status="queued"),
+    ])
+
+    saved_ids = []
+
+    def track_save(_run):
+        cs = _run["bucketStates"][1]["campaignStates"][0]
+        saved_ids.append(cs.get("connectCampaignId"))
+
+    with patch("executor.save_run", side_effect=track_save), \
+         patch("executor._create_campaign_only", return_value=("conn-warm", "seg-w", "arn-w", True)):
+        executor._prestart_next_bucket(run, plan, 0)
+
+    # Second save (mid-flight) must have the connect ID
+    assert "conn-warm" in saved_ids
+
+
+def test_prestart_claim_save_failure_reverts_to_queued():
+    """_prestart_next_bucket reverts bucket to 'queued' and does not create campaigns if claim save fails."""
+    import executor
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+        _bucket_def("b1", [_campaign_def("c1")]),
+    ])
+    run = _make_run(plan, [
+        _bucket_state("b0", [_campaign_state("c0", "running")]),
+        _bucket_state("b1", [_campaign_state("c1")], status="queued"),
+    ])
+
+    with patch("executor.save_run", side_effect=Exception("DDB timeout")), \
+         patch("executor._create_campaign_only") as create:
+        executor._prestart_next_bucket(run, plan, 0)
+
+    create.assert_not_called()
+    assert run["bucketStates"][1]["status"] == "queued"
 
 
 # ── _expire_bucket ────────────────────────────────────────────────────────────
@@ -1264,21 +1346,37 @@ def test_start_one_campaign_retries_generic_exception_before_succeeding():
     assert cs["status"] == "running", "Campaign must be running after eventual success"
 
 
-def test_start_one_campaign_cancels_immediately_on_empty_segment():
-    """_EmptySegmentError cancels the campaign immediately — no retries.
+def test_start_one_campaign_retries_empty_segment_before_cancelling():
+    """_EmptySegmentError retries up to reconcileRetryLimit times across ticks before permanent cancel.
 
-    Empty segment is now always genuine (Redis rebuilding is a distinct error class).
+    On first attempt: status stays 'queued' with reconcileRetries=1 (will retry next tick).
+    After exhausting retries: permanent cancel with skipped_empty.
+
+    This handles partial Redis rebuilds where other-state leads arrive first — state-filtered
+    queries return empty before all leads have been indexed.
     """
     import executor
 
     bucket = _bucket_def("b0", [_campaign_def("c0")])
+
+    # First attempt: queued for retry
     cs = _campaign_state("c0", "queued")
     run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
-
     with patch("executor._create_segment", side_effect=executor._EmptySegmentError("No leads")):
         executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+    assert cs["status"] == "queued", "First empty segment: campaign stays queued for next tick"
+    assert cs.get("reconcileRetries") == 1
 
-    assert cs["status"] == "cancelled", "Empty segment must cancel immediately"
+    # Second attempt: queued again (reconcileRetryLimit default=2, so 1 < 2)
+    with patch("executor._create_segment", side_effect=executor._EmptySegmentError("No leads")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+    assert cs["status"] == "queued"
+    assert cs.get("reconcileRetries") == 2
+
+    # Third attempt: retries exhausted (2 >= 2) → permanent cancel
+    with patch("executor._create_segment", side_effect=executor._EmptySegmentError("No leads")):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+    assert cs["status"] == "cancelled", "Empty segment after exhausting retries must cancel"
     assert cs["exitReason"] == "skipped_empty"
 
 
@@ -1452,6 +1550,176 @@ def test_skip_terminal_campaign_raises():
              patch("executor.get_plan", return_value=plan):
             with pytest.raises(ValueError, match="terminal"):
                 executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+
+def test_skip_retries_on_concurrent_write():
+    """skip_campaign must retry on ConcurrentWriteError and succeed on the next attempt."""
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+
+    save_n = {"n": 0}
+
+    def fresh_run(*_a, **_k):
+        # Return a new dict each time so the retry starts with unmodified state.
+        cs = _campaign_state("c0", "queued")
+        return _make_run(plan, [_bucket_state("b0", [cs])])
+
+    def save_once_then_succeed(r):
+        save_n["n"] += 1
+        if save_n["n"] == 1:
+            raise ConcurrentWriteError("simulated conflict")
+
+    # Patch _all_campaigns_terminal to False so skip_campaign calls save_run directly
+    # (rather than delegating to _advance_bucket which would swallow the mock).
+    with patch("executor.get_run", side_effect=fresh_run), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor.save_run", side_effect=save_once_then_succeed), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._all_campaigns_terminal", return_value=False):
+        result = executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    assert result is not None
+    assert save_n["n"] == 2, "Must have retried once after ConcurrentWriteError"
+
+
+def test_skip_retry_succeeds_silently_when_tick_already_advanced():
+    """On retry, if the tick already set campaign to terminal, skip_campaign returns without error."""
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs_queued = _campaign_state("c0", "queued")
+    cs_completed = _campaign_state("c0", "completed")
+    run_first = _make_run(plan, [_bucket_state("b0", [cs_queued])])
+    run_second = _make_run(plan, [_bucket_state("b0", [cs_completed])])
+
+    reads = iter([run_first, run_second])
+
+    # First attempt: _advance_bucket raises ConcurrentWriteError → retry
+    # Second attempt: campaign is already completed (tick advanced it) → return silently
+    with patch("executor.get_run", side_effect=reads), \
+         patch("executor.get_plan", return_value=plan), \
+         patch("executor._dispatch_ready_campaigns", return_value=False), \
+         patch("executor._all_campaigns_terminal", return_value=True), \
+         patch("executor._advance_bucket", side_effect=ConcurrentWriteError("tick won")), \
+         patch("executor._safe_stop_campaign"):
+        result = executor.skip_campaign("plan-1", "run-1", 0, 0)
+
+    assert result is run_second
+
+
+def test_dispatch_recovery_adopts_running_connect_campaign():
+    """Phase 1 recovery with connectCampaignId must poll Connect and restore to running, not queue."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "creating")
+    cs["connectCampaignId"] = "conn-orphan"
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    with patch("executor._get_campaign_state", return_value="Running"), \
+         patch("executor.save_run"), \
+         patch("executor._schedule_tick", return_value="sched-1"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert cs["status"] == "running", "Recovery must adopt the running Connect campaign, not reset to queued"
+    assert cs["connectCampaignId"] == "conn-orphan", "connectCampaignId must be preserved"
+
+
+def test_dispatch_recovery_resets_to_queued_when_connect_terminated():
+    """Phase 1 recovery must reset to queued if the Connect campaign already terminated."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "creating")
+    cs["connectCampaignId"] = "conn-deleted"
+    cs["segmentArn"] = "old-arn"
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    with patch("executor._get_campaign_state", return_value="Deleted"), \
+         patch("executor.save_run"), \
+         patch("executor._start_one_campaign"), \
+         patch("executor._schedule_tick", return_value="sched-1"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert cs["status"] == "queued", "Terminated Connect campaign must trigger clean reset to queued"
+    assert cs["connectCampaignId"] is None
+    assert cs["segmentArn"] is None
+
+
+def test_dispatch_recovery_skips_fresh_creating_claim_no_conn_id():
+    """Phase 1 recovery must NOT reset a 'creating' campaign when the claim is fresh (< 5 min).
+
+    Root cause of the force_start duplicate bug: force_start Phase 1 saves {creating, null},
+    then a concurrent tick's Phase 1 Recovery resets it to 'queued', then Phase 2 sees LI
+    completed and re-dispatches NJ → duplicate Connect campaign.
+    The fix: creatingAt timestamp gates the reset — fresh claims are skipped.
+    """
+    import executor
+    from datetime import datetime, timezone, timedelta
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1", depends_on=["c0"])]),
+    ])
+    # c1 is "creating" with no conn_id but a fresh timestamp (force_start in progress)
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "creating")
+    c1["creatingAt"] = datetime.now(timezone.utc).isoformat()  # just now
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1], status="running")])
+
+    with patch("executor.save_run"), \
+         patch("executor._start_one_campaign") as start:
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    # c1 must remain "creating" — force_start is still in flight
+    assert c1["status"] == "creating", "Fresh creating claim must not be reset by Phase 1 Recovery"
+    start.assert_not_called()
+
+
+def test_dispatch_recovery_resets_stale_creating_claim_no_conn_id():
+    """Phase 1 recovery DOES reset a 'creating' campaign when the claim is stale (> 5 min).
+
+    If force_start crashed before the mid-flight save, the claim will be old enough to reset.
+    """
+    import executor
+    from datetime import datetime, timezone, timedelta
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "creating")
+    # Claim from 10 minutes ago — stale
+    c1["creatingAt"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1], status="running")])
+
+    with patch("executor.save_run"), \
+         patch("executor._start_one_campaign") as start:
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    # c1 should be reset to queued and then re-dispatched
+    start.assert_called_once()
+
+
+def test_dispatch_recovery_resets_creating_no_conn_id_when_no_timestamp():
+    """Phase 1 recovery resets 'creating + no conn_id' when creatingAt is absent (legacy records)."""
+    import executor
+
+    plan = _make_plan([
+        _bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1", depends_on=["c0"])]),
+    ])
+    c0 = _campaign_state("c0", "completed")
+    c1 = _campaign_state("c1", "creating")
+    # No creatingAt field — old record, treat as stale
+    run = _make_run(plan, [_bucket_state("b0", [c0, c1], status="running")])
+
+    with patch("executor.save_run"), \
+         patch("executor._start_one_campaign") as start:
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    start.assert_called_once()
 
 
 def test_tick_force_finishes_when_working_hours_end_reached():
@@ -1720,14 +1988,17 @@ def test_force_finish_unlocks_on_save_failure():
 
 
 def test_abort_run_unlocks_on_save_failure():
-    """unlock_plan_run is called even when save_run raises in abort_run."""
+    """unlock_plan_run is called exactly once when all save_run attempts raise ConcurrentWriteError."""
     import executor
     from store import ConcurrentWriteError
 
     plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
-    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "running", connect_id="conn-1")])])
 
-    with patch("executor.get_run", return_value=run), \
+    def fresh_run(*_a, **_k):
+        # Return a fresh dict each time so the retry sees status="running" unmodified.
+        return _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "running", connect_id="conn-1")])])
+
+    with patch("executor.get_run", side_effect=fresh_run), \
          patch("executor.save_run", side_effect=ConcurrentWriteError("race")), \
          patch("executor.unlock_plan_run") as mock_unlock, \
          patch("executor.update_plan_pending_warmup"), \
@@ -1762,8 +2033,12 @@ def test_start_bucket_raises_when_schedule_fails():
 
 # B2-A: Redis rebuilding and empty segment behavior
 
-def test_start_one_campaign_empty_segment_cancels_immediately():
-    """_EmptySegmentError cancels immediately — no time.sleep, no retries."""
+def test_start_one_campaign_empty_segment_retries_then_cancels():
+    """_EmptySegmentError retries up to reconcileRetryLimit times then cancels permanently.
+
+    This protects against partial Redis rebuilds where some states load before others.
+    reconcileRetryLimit default = 2, so 3rd attempt cancels.
+    """
     import executor
 
     bucket = _bucket_def("b0", [_campaign_def("c0")])
@@ -1776,11 +2051,13 @@ def test_start_one_campaign_empty_segment_cancels_immediately():
         call_count["n"] += 1
         raise executor._EmptySegmentError("No leads")
 
-    with patch("executor._create_segment", side_effect=_count_calls):
-        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+    # Simulate 3 tick invocations (each tick calls _start_one_campaign once)
+    for _ in range(3):
+        with patch("executor._create_segment", side_effect=_count_calls):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
 
-    assert call_count["n"] == 1, "_EmptySegmentError must not be retried"
-    assert cs["status"] == "cancelled"
+    assert call_count["n"] == 3, "_EmptySegmentError should be called once per tick across 3 ticks"
+    assert cs["status"] == "cancelled", "After 3 attempts, must permanently cancel"
     assert cs["exitReason"] == "skipped_empty"
 
 
@@ -1859,10 +2136,148 @@ def test_force_start_resets_started_at():
     assert bs["status"] == "running"
 
 
+# Bug: force_start Phase 1 must clear connectCampaignId to prevent duplicate Connect campaigns
+
+def test_force_start_clears_connect_campaign_id_in_phase1_save():
+    """Phase 1 claim save must clear connectCampaignId.
+
+    If Phase 3 creates a Connect campaign but the final save_run crashes, tick recovery
+    sees creating + null connectCampaignId and safely resets to queued. Without this fix,
+    recovery would see the stale old connectCampaignId, try to restart a deleted campaign,
+    set the campaign to error, and a subsequent force-start would create a duplicate in Connect.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "error")
+    cs["connectCampaignId"] = "old-connect-id"
+    cs["segmentArn"] = "old-segment-arn"
+    cs["segmentName"] = "old-segment-name"
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    saved_states: list[dict] = []
+
+    def capture_save(r):
+        import copy
+        saved_states.append(copy.deepcopy(r["bucketStates"][0]["campaignStates"][0]))
+
+    with patch("executor.get_run", return_value=run), \
+         patch("executor.save_run", side_effect=capture_save), \
+         patch("executor._safe_stop_campaign"), \
+         patch("executor._safe_delete_campaign"), \
+         patch("executor._start_one_campaign"), \
+         patch("executor._reset_cascade_cancelled_children"):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    # Phase 1 save (first call) must have connectCampaignId cleared
+    phase1_save = saved_states[0]
+    assert phase1_save["status"] == "creating"
+    assert phase1_save["connectCampaignId"] is None, (
+        "Phase 1 must save connectCampaignId=None so that if Phase 3 Connect call succeeds "
+        "but final save_run crashes, tick recovery can safely reset to queued"
+    )
+    assert phase1_save["segmentArn"] is None
+    assert phase1_save["segmentName"] is None
+
+
+# S10-E: force_start_campaign final-save retry loop
+
+def test_force_start_final_save_retries_on_concurrent_write():
+    """force_start_campaign retries the final save on ConcurrentWriteError and succeeds on second attempt.
+
+    The first save_run fails (tick raced), then get_run returns fresh state and the second save_run succeeds.
+    The campaign must end up in 'running' state.
+    """
+    import executor
+    from executor import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    # After _start_one_campaign, cs is modified in-place to "running"
+    def fake_start(r, p, bi, ci):
+        r["bucketStates"][bi]["campaignStates"][ci]["status"] = "running"
+        r["bucketStates"][bi]["campaignStates"][ci]["connectCampaignId"] = "conn-new"
+        r["bucketStates"][bi]["campaignStates"][ci]["startedAt"] = "2026-05-19T10:00:00+00:00"
+
+    # Fresh run returned by get_run after the concurrent write (still "creating", DDB version advanced)
+    def make_fresh_run():
+        fresh_cs = _campaign_state("c0", "creating")
+        fresh_cs["creatingAt"] = "2026-05-19T09:59:50+00:00"
+        fresh_cs["connectCampaignId"] = None
+        fresh_run = _make_run(plan, [_bucket_state("b0", [fresh_cs], status="running")])
+        fresh_run["_version"] = 99  # advanced by the concurrent tick
+        return fresh_run
+
+    save_calls = []
+
+    def fake_save(r):
+        save_calls.append(1)
+        if len(save_calls) == 2:  # Phase 1 save succeeds; only Phase 3 first attempt fails
+            raise ConcurrentWriteError("concurrent write")
+
+    with patch("executor.get_run", side_effect=[run, make_fresh_run()]), \
+         patch("executor.save_run", side_effect=fake_save), \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor._start_one_campaign", side_effect=fake_start), \
+         patch("executor._reset_cascade_cancelled_children"):
+        result = executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    final_cs = result["bucketStates"][0]["campaignStates"][0]
+    assert final_cs["status"] == "running"
+    assert final_cs["connectCampaignId"] == "conn-new"
+    assert "creatingAt" not in final_cs or final_cs.get("creatingAt") is None
+
+
+def test_force_start_final_save_returns_early_when_tick_already_adopted():
+    """force_start_campaign returns success when a concurrent tick already set status=running with the same ID.
+
+    After the first final save_run fails, get_run returns state where the tick already
+    adopted the campaign to 'running' with the expected connectCampaignId — no re-apply needed.
+    """
+    import executor
+    from executor import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    def fake_start(r, p, bi, ci):
+        r["bucketStates"][bi]["campaignStates"][ci]["status"] = "running"
+        r["bucketStates"][bi]["campaignStates"][ci]["connectCampaignId"] = "conn-adopted"
+
+    # Fresh run from DDB: tick already set status=running with the same connectCampaignId
+    def make_tick_adopted_run():
+        adopted_cs = _campaign_state("c0", "running", connect_id="conn-adopted")
+        return _make_run(plan, [_bucket_state("b0", [adopted_cs], status="running")])
+
+    phase1_calls = [False]
+
+    def fake_save(r):
+        if not phase1_calls[0]:
+            phase1_calls[0] = True
+            return  # Phase 1 save succeeds
+        raise ConcurrentWriteError("concurrent write on final save")
+
+    with patch("executor.get_run", side_effect=[run, make_tick_adopted_run()]), \
+         patch("executor.save_run", side_effect=fake_save), \
+         patch("executor._schedule_tick", return_value="sched-1"), \
+         patch("executor._start_one_campaign", side_effect=fake_start), \
+         patch("executor._reset_cascade_cancelled_children"):
+        result = executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    final_cs = result["bucketStates"][0]["campaignStates"][0]
+    assert final_cs["status"] == "running"
+    assert final_cs["connectCampaignId"] == "conn-adopted"
+
+
 # B3-A: _get_campaign_state distinguishes 404
 
 def test_get_campaign_state_returns_deleted_on_404():
     """ResourceNotFoundException from Connect must return 'Deleted', not 'Unknown'."""
+    import sys
+    from unittest.mock import MagicMock
     import executor
     from botocore.exceptions import ClientError
 
@@ -1871,13 +2286,28 @@ def test_get_campaign_state_returns_deleted_on_404():
         "GetCampaignState",
     )
 
-    with patch("executor._get_campaign_state.__wrapped__", create=True):
-        pass  # just verify import
-
     oc_mock = type("OC", (), {"get_campaign_state": lambda self, cid: (_ for _ in ()).throw(not_found)})()
 
-    with patch("vip_shared.infrastructure.persistence.outbound_campaigns_client.build", return_value=oc_mock):
+    modules_to_stub = [
+        "vip_shared",
+        "vip_shared.infrastructure",
+        "vip_shared.infrastructure.persistence",
+        "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+    ]
+    vip_stub = MagicMock()
+    originals = {m: sys.modules.get(m) for m in modules_to_stub}
+    for m in modules_to_stub:
+        sys.modules[m] = vip_stub
+    vip_stub.build = MagicMock(return_value=oc_mock)
+
+    try:
         result = executor._get_campaign_state("camp-deleted")
+    finally:
+        for m, orig in originals.items():
+            if orig is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = orig
 
     assert result == "Deleted"
 
@@ -1901,3 +2331,285 @@ def test_within_working_hours_inclusive_end():
         result = executor._within_working_hours(plan)
 
     assert result is True, "Plan must be within working hours at 23:59 when endTime is unset"
+
+
+# ── Timezone fix tests (2026-05-19 Session 7) ────────────────────────────────
+# Regression: _daily_cutoff_iso and _past_daily_cutoff previously used
+# America/New_York (EDT = UTC-4 in summer), which caused schedule errors.
+# These tests verify both functions use COT (UTC-5 fixed) consistently.
+
+
+def test_daily_cutoff_iso_uses_cot_not_eastern():
+    """At 22:56 UTC (17:56 COT), end_time must be 00:00 UTC next day, NOT 23:00 UTC.
+
+    With America/New_York in summer (EDT = UTC-4):
+      22:56 UTC → 18:56 EDT → 7 PM EDT would be 23:00 UTC  ← the broken value
+    With COT (UTC-5):
+      22:56 UTC → 17:56 COT → 7 PM COT = 00:00 UTC next day  ← correct
+    """
+    import executor
+
+    # 2026-05-19 22:56 UTC = 17:56 COT (still before 19:00 cutoff)
+    now_utc = datetime(2026, 5, 19, 22, 56, 0, tzinfo=timezone.utc)
+    result = executor._daily_cutoff_iso(now_utc)
+
+    # Expected: 2026-05-20 00:00:00 UTC
+    expected = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+    assert result == expected, (
+        f"Expected 2026-05-20T00:00:00+00:00 (7 PM COT) but got {result!r} — "
+        "timezone mismatch: should use COT (UTC-5), not America/New_York"
+    )
+
+
+def test_daily_cutoff_iso_returns_same_day_before_cutoff():
+    """At 15:00 UTC (10:00 COT), end_time is today's 7 PM COT = 00:00 UTC next day."""
+    import executor
+
+    now_utc = datetime(2026, 5, 19, 15, 0, 0, tzinfo=timezone.utc)
+    result = executor._daily_cutoff_iso(now_utc)
+
+    expected = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+    assert result == expected
+
+
+def test_daily_cutoff_iso_advances_to_next_day_when_past_cutoff():
+    """At 19:30 COT (00:30 UTC next day), end_time advances to the following day's 00:00 UTC."""
+    import executor
+
+    _COT = timezone(timedelta(hours=-5))
+    # 19:30 COT on May 19 = 00:30 UTC on May 20
+    now_utc = datetime(2026, 5, 20, 0, 30, 0, tzinfo=timezone.utc)
+    result = executor._daily_cutoff_iso(now_utc)
+
+    expected = datetime(2026, 5, 21, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+    assert result == expected, (
+        f"When past daily cutoff, end_time must advance to next day. Got {result!r}"
+    )
+
+
+def test_past_daily_cutoff_false_at_1800_cot():
+    """18:00 COT must NOT trigger the cutoff — old bug with Eastern fired 1 hour early here."""
+    import executor
+
+    _COT = timezone(timedelta(hours=-5))
+    # 18:00 COT = 23:00 UTC
+    now_utc = datetime(2026, 5, 19, 23, 0, 0, tzinfo=timezone.utc)
+    assert executor._past_daily_cutoff(now_utc) is False, (
+        "18:00 COT is before the 19:00 cutoff — must return False"
+    )
+
+
+def test_past_daily_cutoff_true_at_1900_cot():
+    """19:00 COT (00:00 UTC) must trigger the cutoff."""
+    import executor
+
+    # 19:00 COT = 00:00 UTC next day
+    now_utc = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc)
+    assert executor._past_daily_cutoff(now_utc) is True, (
+        "19:00 COT is the cutoff boundary — must return True"
+    )
+
+
+def test_past_daily_cutoff_true_at_2000_cot():
+    """20:00 COT (01:00 UTC) is past the cutoff."""
+    import executor
+
+    now_utc = datetime(2026, 5, 20, 1, 0, 0, tzinfo=timezone.utc)
+    assert executor._past_daily_cutoff(now_utc) is True
+
+
+# S10-F: _start_one_campaign mid-flight save retry on ConcurrentWriteError
+
+
+def test_start_one_campaign_mid_flight_save_retries_on_concurrent_write():
+    """Mid-flight save retries when first attempt hits ConcurrentWriteError.
+
+    Scenario: Phase-3 claim wrote {creating, null}.  _create_and_start_campaign
+    creates campaign 'conn-new'.  First mid-flight save raises ConcurrentWriteError
+    (concurrent tick bumped version).  get_run returns fresh run at version+1.
+    Second mid-flight save succeeds — DDB now has {creating, conn-new}.
+    Phase-5 outer save then writes {running, conn-new}.
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")], cleanup=False)])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "creating")])])
+    run["_version"] = 10
+
+    fresh_run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "creating")])])
+    fresh_run["_version"] = 11
+
+    save_calls = []
+
+    def mock_save(_run):
+        save_calls.append(_run["_version"])
+        if len(save_calls) == 1:
+            raise ConcurrentWriteError("version conflict")
+        # second call succeeds
+
+    with patch("executor._create_and_start_campaign", return_value=("conn-new", "seg-name")), \
+         patch("executor._create_segment", return_value=("seg-name", "arn:seg")), \
+         patch("executor.save_run", side_effect=mock_save), \
+         patch("executor.get_run", return_value=fresh_run):
+        executor._start_one_campaign(run, plan, 0, 0)
+
+    # Two mid-flight save attempts were made
+    assert len(save_calls) == 2
+    # Version was refreshed before the retry
+    assert save_calls[1] == 11
+    # Final status is running and connect ID is set
+    cs = run["bucketStates"][0]["campaignStates"][0]
+    assert cs["status"] == "running"
+    assert cs["connectCampaignId"] == "conn-new"
+
+
+def test_start_one_campaign_mid_flight_save_exhausts_retries_logs_warning():
+    """Mid-flight save logs warning after exhausting all 3 ConcurrentWriteError retries.
+
+    The campaign still transitions to status=running in memory so the outer
+    Phase-5 save has a chance to persist the Connect campaign ID.
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")], cleanup=False)])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "creating")])])
+    run["_version"] = 10
+
+    fresh_run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "creating")])])
+    fresh_run["_version"] = 11
+
+    with patch("executor._create_and_start_campaign", return_value=("conn-new", "seg-name")), \
+         patch("executor._create_segment", return_value=("seg-name", "arn:seg")), \
+         patch("executor.save_run", side_effect=ConcurrentWriteError("always fails")), \
+         patch("executor.get_run", return_value=fresh_run):
+        executor._start_one_campaign(run, plan, 0, 0)
+
+    # Despite all mid-flight saves failing, status is running and ID is in memory
+    # so Phase-5 outer save can still persist it
+    cs = run["bucketStates"][0]["campaignStates"][0]
+    assert cs["status"] == "running"
+    assert cs["connectCampaignId"] == "conn-new"
+
+
+# _safe_delete_campaign: Completed campaigns must not trigger stop before delete
+
+
+def _stub_vip_delete_client(oc):
+    """Return (originals, vip_stub) with sys.modules patched for _safe_delete_campaign."""
+    import sys
+    from unittest.mock import MagicMock
+    vip_stub = MagicMock()
+    vip_stub.build.return_value = oc
+    modules = [
+        "vip_shared",
+        "vip_shared.infrastructure",
+        "vip_shared.infrastructure.persistence",
+        "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+    ]
+    originals = {m: sys.modules.get(m) for m in modules}
+    for m in modules:
+        sys.modules[m] = vip_stub
+    return originals
+
+
+def _restore_vip_modules(originals):
+    import sys
+    for m, orig in originals.items():
+        if orig is None:
+            sys.modules.pop(m, None)
+        else:
+            sys.modules[m] = orig
+
+
+def test_safe_delete_campaign_skips_stop_for_completed():
+    """_safe_delete_campaign must NOT call stop_campaign for a COMPLETED campaign.
+
+    Previously, 'Completed' was not in the skip-stop list, so stop_campaign raised
+    ConflictException which short-circuited delete_campaign — campaigns were never
+    actually deleted (delete-after-run silent failure).
+    """
+    import executor
+    from unittest.mock import MagicMock
+
+    oc = MagicMock()
+    originals = _stub_vip_delete_client(oc)
+    try:
+        with patch("executor._get_campaign_state", return_value="Completed"):
+            executor._safe_delete_campaign("camp-completed")
+    finally:
+        _restore_vip_modules(originals)
+
+    oc.stop_campaign.assert_not_called()
+    oc.delete_campaign.assert_called_once_with("camp-completed")
+
+
+def test_safe_delete_campaign_stops_before_delete_for_running():
+    """_safe_delete_campaign calls stop_campaign then delete_campaign for Running campaigns."""
+    import executor
+    from unittest.mock import MagicMock
+
+    oc = MagicMock()
+    originals = _stub_vip_delete_client(oc)
+    try:
+        with patch("executor._get_campaign_state", return_value="Running"):
+            executor._safe_delete_campaign("camp-running")
+    finally:
+        _restore_vip_modules(originals)
+
+    oc.stop_campaign.assert_called_once_with("camp-running")
+    oc.delete_campaign.assert_called_once_with("camp-running")
+
+
+def test_create_campaign_only_guard_raises_when_start_gte_end():
+    """_create_campaign_only must raise ValueError when startTime >= endTime.
+
+    Simulates the scenario where _campaign_end_time returns a time <= start_time
+    (e.g., a stale Eastern-based end_time, or any regression in end-time computation).
+    The guard must catch this before passing invalid params to Connect.
+    """
+    import sys
+    from unittest.mock import MagicMock
+    import executor
+
+    bucket = {
+        "id": "B1",
+        "name": "B1",
+        "duration": 60,
+        "campaigns": [],
+        "segmentFilters": {"state": ["TX"]},
+    }
+    campaign = {"id": "c1", "name": "TX-NL", "states": ["TX"], "groups": [], "dependsOn": []}
+
+    run = {"runId": "r1", "planId": "p1", "campaigns": []}
+
+    now_utc = datetime(2026, 5, 19, 22, 56, 0, tzinfo=timezone.utc)
+    # start_dt = now + 6min = 23:02 UTC
+    # Simulate the OLD Eastern bug: _campaign_end_time returns 23:00 UTC (before start)
+    stale_end_time = datetime(2026, 5, 19, 23, 0, 0, tzinfo=timezone.utc).isoformat()
+
+    # Stub vip_shared into sys.modules so the local import inside _create_campaign_only succeeds
+    vip_stub = MagicMock()
+    modules_to_stub = [
+        "vip_shared",
+        "vip_shared.infrastructure",
+        "vip_shared.infrastructure.persistence",
+        "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+    ]
+    originals = {m: sys.modules.get(m) for m in modules_to_stub}
+    for m in modules_to_stub:
+        sys.modules[m] = vip_stub
+
+    try:
+        with patch("executor._now_utc", return_value=now_utc), \
+             patch("executor._create_segment", return_value=("seg-name", "arn:seg")), \
+             patch("executor._campaign_end_time", return_value=stale_end_time):
+            with pytest.raises(ValueError, match="too close to daily cutoff"):
+                executor._create_campaign_only(bucket, campaign, run)
+    finally:
+        for m, orig in originals.items():
+            if orig is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = orig
