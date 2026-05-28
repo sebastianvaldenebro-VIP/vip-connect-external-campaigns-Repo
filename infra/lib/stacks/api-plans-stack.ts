@@ -6,7 +6,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
 
@@ -58,6 +58,15 @@ export class ApiPlansStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       deletionProtection: true,
     });
+
+    // ── SNS alerts topic ─────────────────────────────────────────────
+    // Topic created manually (CFN exec role lacks SNS:GetTopicAttributes within
+    // the EngineeringPermissionBoundary). Import by ARN so CDK can wire IAM
+    // and inject the ARN env var without managing lifecycle.
+    // Subscribe team email addresses via the AWS Console or CLI.
+    const alertsTopicArn = `arn:aws:sns:${this.region}:${this.account}:vip-plans-alerts`;
+    const alertsTopic = sns.Topic.fromTopicArn(this, 'PlansAlertsTopic', alertsTopicArn);
+    new cdk.CfnOutput(this, 'AlertsTopicArn', { value: alertsTopic.topicArn });
 
     // ── Lambda log group ─────────────────────────────────────────────
     const logGroup = new logs.LogGroup(this, 'ApiPlansLogs', {
@@ -219,9 +228,13 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
+    // SNS — publish operational alerts
+    alertsTopic.grantPublish(role);
+
     props.dataKey.grantEncryptDecrypt(role);
 
     // ── Lambda function ──────────────────────────────────────────────
+    const sharedLayer = buildSharedLayer(this);
     this.lambdaFunction = new lambda.Function(this, 'FunctionPlans', {
       functionName: 'vip-admin-ui-api-plans',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -229,7 +242,7 @@ export class ApiPlansStack extends cdk.Stack {
       code: lambda.Code.fromAsset(
         path.join(__dirname, '../../../services/api-plans/src'),
       ),
-      layers: [buildSharedLayer(this)],
+      layers: [sharedLayer],
       memorySize: 1024,
       // Redis scan of large lists can take tens of seconds; 5 min matches segments.
       timeout: cdk.Duration.minutes(5),
@@ -256,6 +269,7 @@ export class ApiPlansStack extends cdk.Stack {
         REDIS_PORT: String(props.redis.port),
         TEAM: props.redis.team,
         // LAMBDA_FUNCTION_ARN is set post-creation via addEnvironment
+        SNS_ALERTS_TOPIC_ARN: alertsTopic.topicArn,
         LOG_LEVEL: 'INFO',
         POWERTOOLS_SERVICE_NAME: 'api-plans',
       },
@@ -272,95 +286,14 @@ export class ApiPlansStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'PlansTableArn', { value: this.plansTable.tableArn });
 
     // ── Campaign exporter Lambda ─────────────────────────────────────
-    // Separate function so the heavy awswrangler/Pandas layer does not
-    // affect cold-start of the latency-sensitive HTTP API function.
-    // EventBridge daily rule created manually (CFN role lacks events:DescribeRule).
-    const dataExportBucket = s3.Bucket.fromBucketName(
+    // Deployed and managed outside CloudFormation (CFN exec role lacks the
+    // permissions needed to create the log group and the function already
+    // exists). Import by name so the property is still usable by callers.
+    this.exporterFunction = lambda.Function.fromFunctionName(
       this,
-      'CampaignDataExportBucket',
-      'amazon-glue-etl-files',
-    );
-
-    const exporterLogGroup = new logs.LogGroup(this, 'CampaignExporterLogs', {
-      logGroupName: '/aws/lambda/vip-admin-ui-campaign-exporter',
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: props.dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
-
-    const exporterRole = new iam.Role(this, 'CampaignExporterRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role for campaign-exporter Lambda',
-    });
-    exporterLogGroup.grantWrite(exporterRole);
-
-    // DynamoDB — read plans table for historical campaign context
-    this.plansTable.grantReadData(exporterRole);
-    props.dataKey.grantEncryptDecrypt(exporterRole);
-
-    // Connect Campaigns V2 — read-only for export
-    exporterRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'ConnectCampaignsExportRead',
-      actions: [
-        'connect-campaigns:ListCampaigns',
-        'connect-campaigns:GetCampaignState',
-        'connect-campaigns:DescribeCampaign',
-      ],
-      resources: [
-        `arn:aws:connect-campaigns:${this.region}:${this.account}:campaign/*`,
-        `arn:aws:connect-campaigns:${this.region}:${this.account}:*`,
-      ],
-    }));
-
-    // CloudWatch — lead count metrics per campaign
-    exporterRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'CloudWatchGetMetrics',
-      actions: ['cloudwatch:GetMetricData'],
-      resources: ['*'],
-    }));
-
-    // S3 ETL bucket — write Parquet snapshots
-    dataExportBucket.grantReadWrite(exporterRole);
-
-    // Glue — trigger Snowflake loader after each export
-    exporterRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'GlueStartSnowflakeLoader',
-      actions: ['glue:StartJobRun'],
-      resources: [
-        `arn:aws:glue:${this.region}:${this.account}:job/specialOps-prod-snowflake-loader-glue`,
-      ],
-    }));
-
-    const awsSdkPandasLayer = lambda.LayerVersion.fromLayerVersionArn(
-      this,
-      'AwsSdkPandasLayer',
-      `arn:aws:lambda:${this.region}:336392948345:layer:AWSSDKPandas-Python312:24`,
-    );
-
-    this.exporterFunction = new lambda.Function(this, 'CampaignExporterFunction', {
-      functionName: 'vip-admin-ui-campaign-exporter',
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: 'campaign_exporter_handler.lambda_handler',
-      code: lambda.Code.fromAsset(
-        path.join(__dirname, '../../../services/api-plans/src'),
-      ),
-      layers: [buildSharedLayer(this), awsSdkPandasLayer],
-      memorySize: 1024,
-      timeout: cdk.Duration.minutes(10),
-      role: exporterRole,
-      logGroup: exporterLogGroup,
-      reservedConcurrentExecutions: 1,
-      environment: {
-        PLANS_TABLE_NAME: this.plansTable.tableName,
-        DATA_EXPORT_BUCKET: dataExportBucket.bucketName,
-        GLUE_JOB_NAME: 'specialOps-prod-snowflake-loader-glue',
-        SF_DATABASE: 'PRD_RAW_DB',
-        SF_SCHEMA: 'AMAZON_CONNECT',
-        SF_SRC_CFG_URI: 's3://config-json-etl-jobs/vip-connect/campaign_mapping_cfg.json',
-        LOG_LEVEL: 'INFO',
-        POWERTOOLS_SERVICE_NAME: 'campaign-exporter',
-      },
-    });
+      'CampaignExporterFunction',
+      'vip-admin-ui-campaign-exporter',
+    ) as lambda.Function;
 
     new cdk.CfnOutput(this, 'ExporterFunctionArn', { value: this.exporterFunction.functionArn });
   }
