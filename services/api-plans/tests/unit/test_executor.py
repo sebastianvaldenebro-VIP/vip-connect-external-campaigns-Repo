@@ -1,4 +1,5 @@
 """Tests for executor.py — residual v1 edge-case coverage (pre-schema behaviour)."""
+
 from __future__ import annotations
 
 import sys
@@ -30,8 +31,11 @@ def _make_run_v1(status="running", bucket_index=0):
 def test_tick_not_running_is_skipped():
     run = _make_run_v1(status="completed")
     import executor
-    with patch("executor.get_run", return_value=run), \
-         patch("executor._delete_schedule_safe") as del_sched:
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor._delete_schedule_safe") as del_sched,
+    ):
         result = executor.tick("plan-1", "run-1", 0)
     assert result.get("reason") == "already_terminal"
     del_sched.assert_called_once()
@@ -40,6 +44,7 @@ def test_tick_not_running_is_skipped():
 def test_abort_run_not_running_raises():
     import executor
     import pytest
+
     with patch("executor.get_run", return_value=_make_run_v1(status="completed")):
         with pytest.raises(ValueError, match="not running"):
             executor.abort_run("plan-1", "run-1")

@@ -15,12 +15,14 @@ Backward compat:
   - Old plan buckets without a ``campaigns`` array are silently migrated to a
     single-campaign array so the executor can handle both schemas uniformly.
 """
+
 from __future__ import annotations
 
 import os
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -48,6 +50,7 @@ def _table():
 
 def list_plans() -> list[dict]:
     from boto3.dynamodb.conditions import Attr
+
     items: list[dict] = []
     kwargs: dict = {"FilterExpression": Attr("sk").eq("META")}
     while True:
@@ -78,7 +81,7 @@ def put_plan(plan: dict) -> dict:
         "trigger": plan.get("trigger", {"type": "manual"}),
         "loop": plan.get("loop") or None,
         "workingHours": plan.get("workingHours") or None,
-        "buckets": plan.get("buckets", []),
+        "buckets": _normalize(plan.get("buckets", [])),
         "isTemplate": plan.get("isTemplate", plan.get("is_template", False)),
         "isDefault": plan.get("isDefault", plan.get("is_default", False)),
         "createdAt": plan.get("createdAt", now),
@@ -128,6 +131,7 @@ def lock_plan_run(plan_id: str, run_id: str) -> None:
     Uses attribute_not_exists so only one concurrent caller wins.
     """
     from botocore.exceptions import ClientError
+
     try:
         _table().update_item(
             Key={"pk": f"PLAN#{plan_id}", "sk": "META"},
@@ -137,7 +141,9 @@ def lock_plan_run(plan_id: str, run_id: str) -> None:
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            raise ValueError(f"Plan {plan_id} already has an active run (concurrent trigger rejected)")
+            raise ValueError(
+                f"Plan {plan_id} already has an active run (concurrent trigger rejected)"
+            )
         raise
 
 
@@ -155,6 +161,7 @@ def find_plans_by_trigger_planid(upstream_plan_id: str) -> list[dict]:
     Uses a full scan since the plan table is small (< 100 items).
     """
     from boto3.dynamodb.conditions import Attr
+
     items: list[dict] = []
     kwargs: dict = {"FilterExpression": Attr("sk").eq("META")}
     while True:
@@ -178,7 +185,9 @@ def find_plans_by_trigger_planid(upstream_plan_id: str) -> list[dict]:
 # ── Runs ──────────────────────────────────────────────────────────────────────
 
 
-def create_run(plan_id: str, plan: dict, triggered_by: str = "manual", run_id: str | None = None) -> dict:
+def create_run(
+    plan_id: str, plan: dict, triggered_by: str = "manual", run_id: str | None = None
+) -> dict:
     """Create a new run record with full plan snapshot and nested campaign states."""
     now = _now_iso()
     if run_id is None:
@@ -209,16 +218,15 @@ def create_run(plan_id: str, plan: dict, triggered_by: str = "manual", run_id: s
 
 
 def get_run(plan_id: str, run_id: str) -> dict | None:
-    result = _table().get_item(
-        Key={"pk": f"PLAN#{plan_id}", "sk": f"RUN#{run_id}"}
-    )
+    result = _table().get_item(Key={"pk": f"PLAN#{plan_id}", "sk": f"RUN#{run_id}"})
     item = result.get("Item")
     return _run_from_item(item) if item else None
 
 
 def get_latest_run(plan_id: str) -> dict | None:
     result = _table().query(
-        KeyConditionExpression=Key("pk").eq(f"PLAN#{plan_id}") & Key("sk").begins_with("RUN#"),
+        KeyConditionExpression=Key("pk").eq(f"PLAN#{plan_id}")
+        & Key("sk").begins_with("RUN#"),
         ScanIndexForward=False,
         Limit=1,
     )
@@ -228,7 +236,8 @@ def get_latest_run(plan_id: str) -> dict | None:
 
 def list_runs(plan_id: str, limit: int = 20) -> list[dict]:
     result = _table().query(
-        KeyConditionExpression=Key("pk").eq(f"PLAN#{plan_id}") & Key("sk").begins_with("RUN#"),
+        KeyConditionExpression=Key("pk").eq(f"PLAN#{plan_id}")
+        & Key("sk").begins_with("RUN#"),
         ScanIndexForward=False,
         Limit=limit,
     )
@@ -277,9 +286,11 @@ def _initial_bucket_state(bucket: dict, index: int) -> dict:
 
 def _initial_campaign_state(campaign: dict) -> dict:
     return {
-        "campaignId": campaign.get("id") or campaign.get("campaignId") or str(uuid.uuid4()),
+        "campaignId": campaign.get("id")
+        or campaign.get("campaignId")
+        or str(uuid.uuid4()),
         "name": campaign.get("name", ""),
-        "status": "queued",         # queued | warming | running | completed | cancelled | error | expired
+        "status": "queued",  # queued | warming | running | completed | cancelled | error | expired
         "connectCampaignId": None,
         "segmentName": None,
         "segmentArn": None,
@@ -296,16 +307,18 @@ def _ensure_campaigns(bucket: dict) -> list[dict]:
     if "campaigns" in bucket and bucket["campaigns"]:
         return bucket["campaigns"]
     # Legacy schema: bucket has segmentFilters + campaignConfig directly
-    return [{
-        "id": bucket.get("bucketId", str(uuid.uuid4())),
-        "name": bucket.get("name", "Campaign"),
-        "states": bucket.get("segmentFilters", {}).get("state", []),
-        "group": "",
-        "attempts": [],
-        "run_type": "full",
-        "dependsOn": [],
-        "_legacyBucket": True,
-    }]
+    return [
+        {
+            "id": bucket.get("bucketId", str(uuid.uuid4())),
+            "name": bucket.get("name", "Campaign"),
+            "states": bucket.get("segmentFilters", {}).get("state", []),
+            "group": "",
+            "attempts": [],
+            "run_type": "full",
+            "dependsOn": [],
+            "_legacyBucket": True,
+        }
+    ]
 
 
 def _run_from_item(item: dict) -> dict:
@@ -345,7 +358,9 @@ def _migrate_old_bucket_state(bs: dict) -> dict:
     return {
         "campaignId": bs.get("bucketId", "legacy"),
         "name": bs.get("campaignName") or bs.get("bucketId", ""),
-        "status": _map_old_bucket_status(bs.get("status", "queued"), bs.get("exitReason")),
+        "status": _map_old_bucket_status(
+            bs.get("status", "queued"), bs.get("exitReason")
+        ),
         "connectCampaignId": bs.get("campaignId"),
         "segmentName": bs.get("segmentName"),
         "segmentArn": bs.get("segmentArn"),
@@ -377,7 +392,7 @@ def _plan_from_item(item: dict) -> dict:
         "trigger": item.get("trigger", {"type": "manual"}),
         "loop": item.get("loop"),
         "workingHours": item.get("workingHours"),
-        "buckets": item.get("buckets", []),
+        "buckets": _normalize(item.get("buckets", [])),
         "isTemplate": item.get("isTemplate", False),
         "isDefault": item.get("isDefault", False),
         "createdAt": item.get("createdAt"),
@@ -388,6 +403,54 @@ def _plan_from_item(item: dict) -> dict:
     out["is_template"] = out["isTemplate"]
     out["is_default"] = out["isDefault"]
     return out
+
+
+def apply_plan_to_run(plan_id: str, run_id: str, live_plan: dict) -> dict:
+    """Merge live plan definition into an active run's planSnapshot.
+
+    Only queued (not-yet-started) buckets are updated — running/completed
+    buckets keep their original snapshot config. Plan-level workingHours and
+    loop are always updated since they control when future buckets can run.
+    """
+    run = get_run(plan_id, run_id)
+    if not run:
+        raise ValueError(f"Run {run_id} not found")
+    if run.get("status") != "running":
+        raise ValueError(f"Run {run_id} is not running (status={run.get('status')})")
+
+    snapshot = run.get("planSnapshot") or {}
+    old_buckets = list(snapshot.get("buckets", []))
+    new_buckets = live_plan.get("buckets", [])
+
+    merged_buckets = list(old_buckets)
+    for bi, bs in enumerate(run.get("bucketStates", [])):
+        if bs.get("status") == "queued" and bi < len(new_buckets):
+            merged_buckets[bi] = _normalize(new_buckets[bi])
+
+    run["planSnapshot"] = {
+        **snapshot,
+        "buckets": merged_buckets,
+        "workingHours": live_plan.get("workingHours"),
+        "loop": live_plan.get("loop"),
+    }
+    save_run(run)
+    return run
+
+
+def _normalize(obj: Any) -> Any:
+    """Recursively convert Decimal → int/float so json.dumps never serializes numbers as strings.
+
+    boto3's DynamoDB resource returns all numeric attributes as Decimal.
+    vip_shared.json_response uses default=str, which would turn Decimal('30') into "30".
+    Normalizing on read and write prevents numeric fields from round-tripping as strings.
+    """
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == obj.to_integral_value() else float(obj)
+    if isinstance(obj, dict):
+        return {k: _normalize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize(v) for v in obj]
+    return obj
 
 
 def _now_iso() -> str:

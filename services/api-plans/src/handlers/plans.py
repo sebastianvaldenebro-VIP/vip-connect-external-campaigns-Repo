@@ -1,4 +1,5 @@
 """CRUD handlers for plan definitions."""
+
 from __future__ import annotations
 
 import uuid
@@ -26,14 +27,24 @@ def list_plans(event: dict, _path_params: dict) -> dict:
 def list_templates(event: dict, _path_params: dict) -> dict:
     plans = store.list_plans()
     templates = [p for p in plans if p.get("isTemplate") or p.get("is_template")]
-    return json_response(200, {"plans": sorted(templates, key=lambda p: p.get("updatedAt") or "", reverse=True)})
+    return json_response(
+        200,
+        {
+            "plans": sorted(
+                templates, key=lambda p: p.get("updatedAt") or "", reverse=True
+            )
+        },
+    )
 
 
 def get_plan(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     plan = store.get_plan(plan_id)
     if not plan:
-        return json_response(404, {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}})
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}},
+        )
     latest = store.get_latest_run(plan_id)
     return json_response(200, {"plan": plan, "latestRun": latest})
 
@@ -56,11 +67,15 @@ def _regenerate_bucket_ids(buckets: list) -> list:
         new_campaigns = []
         for campaign in bucket.get("campaigns", []):
             new_id = old_to_new.get(campaign.get("id", ""), str(uuid.uuid4()))
-            new_campaigns.append({
-                **campaign,
-                "id": new_id,
-                "dependsOn": [old_to_new.get(d, d) for d in campaign.get("dependsOn", [])],
-            })
+            new_campaigns.append(
+                {
+                    **campaign,
+                    "id": new_id,
+                    "dependsOn": [
+                        old_to_new.get(d, d) for d in campaign.get("dependsOn", [])
+                    ],
+                }
+            )
         bucket_copy["campaigns"] = new_campaigns
         result.append(bucket_copy)
     return result
@@ -75,7 +90,15 @@ def create_plan(event: dict, _path_params: dict) -> dict:
     if duplicate_from_id:
         source = store.get_plan(duplicate_from_id)
         if not source:
-            return json_response(404, {"error": {"code": "NOT_FOUND", "message": f"Source plan {duplicate_from_id} not found"}})
+            return json_response(
+                404,
+                {
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"Source plan {duplicate_from_id} not found",
+                    }
+                },
+            )
         body = {
             "name": body.get("name") or f"{source['name']} (copy)",
             "description": source.get("description", ""),
@@ -104,9 +127,13 @@ def create_plan(event: dict, _path_params: dict) -> dict:
         scheduler_manager.upsert_schedule(plan["planId"], plan["schedule"])
 
     build_audit().record(
-        entity_type="plan", entity_id=plan["planId"], action="create",
-        actor_sub=caller.sub, actor_email=caller.email,
-        ip_address=caller.ip_address, user_agent=caller.user_agent,
+        entity_type="plan",
+        entity_id=plan["planId"],
+        action="create",
+        actor_sub=caller.sub,
+        actor_email=caller.email,
+        ip_address=caller.ip_address,
+        user_agent=caller.user_agent,
         after={"name": plan["name"], "bucketCount": len(plan["buckets"])},
     )
     return json_response(201, plan)
@@ -119,7 +146,10 @@ def update_plan(event: dict, path_params: dict) -> dict:
 
     existing = store.get_plan(plan_id)
     if not existing:
-        return json_response(404, {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}})
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}},
+        )
 
     trigger = body.get("trigger") or existing.get("trigger", {"type": "manual"})
     if trigger.get("type") == "on_plan_complete":
@@ -129,7 +159,17 @@ def update_plan(event: dict, path_params: dict) -> dict:
     if "buckets" in body:
         _validate_dag(body["buckets"])
 
-    allowed = ("name", "description", "buckets", "trigger", "loop", "workingHours", "isTemplate", "isDefault", "schedule")
+    allowed = (
+        "name",
+        "description",
+        "buckets",
+        "trigger",
+        "loop",
+        "workingHours",
+        "isTemplate",
+        "isDefault",
+        "schedule",
+    )
     updated = {**existing, **{k: v for k, v in body.items() if k in allowed}}
     plan = store.put_plan(updated)
 
@@ -149,9 +189,13 @@ def update_plan(event: dict, path_params: dict) -> dict:
             scheduler_manager.delete_schedule(plan_id)
 
     build_audit().record(
-        entity_type="plan", entity_id=plan_id, action="update",
-        actor_sub=caller.sub, actor_email=caller.email,
-        ip_address=caller.ip_address, user_agent=caller.user_agent,
+        entity_type="plan",
+        entity_id=plan_id,
+        action="update",
+        actor_sub=caller.sub,
+        actor_email=caller.email,
+        ip_address=caller.ip_address,
+        user_agent=caller.user_agent,
         after={"name": plan["name"]},
     )
     return json_response(200, plan)
@@ -163,7 +207,10 @@ def delete_plan(event: dict, path_params: dict) -> dict:
 
     existing = store.get_plan(plan_id)
     if not existing:
-        return json_response(404, {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}})
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Plan {plan_id} not found"}},
+        )
 
     store.delete_plan(plan_id)
     scheduler_manager.delete_schedule(plan_id)
@@ -173,9 +220,13 @@ def delete_plan(event: dict, path_params: dict) -> dict:
         store.update_plan_trigger(downstream["planId"], {"type": "manual"})
 
     build_audit().record(
-        entity_type="plan", entity_id=plan_id, action="delete",
-        actor_sub=caller.sub, actor_email=caller.email,
-        ip_address=caller.ip_address, user_agent=caller.user_agent,
+        entity_type="plan",
+        entity_id=plan_id,
+        action="delete",
+        actor_sub=caller.sub,
+        actor_email=caller.email,
+        ip_address=caller.ip_address,
+        user_agent=caller.user_agent,
         before={"name": existing["name"]},
     )
     return json_response(204, {})
@@ -189,9 +240,20 @@ def clone_from_template(event: dict, path_params: dict) -> dict:
 
     template = store.get_plan(tid)
     if not template:
-        return json_response(404, {"error": {"code": "NOT_FOUND", "message": f"Template {tid} not found"}})
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Template {tid} not found"}},
+        )
     if not (template.get("isTemplate") or template.get("is_template")):
-        return json_response(400, {"error": {"code": "NOT_A_TEMPLATE", "message": f"Plan {tid} is not a template"}})
+        return json_response(
+            400,
+            {
+                "error": {
+                    "code": "NOT_A_TEMPLATE",
+                    "message": f"Plan {tid} is not a template",
+                }
+            },
+        )
 
     new_plan = {
         "name": body.get("name") or f"{template['name']} (copy)",
@@ -204,9 +266,13 @@ def clone_from_template(event: dict, path_params: dict) -> dict:
     plan = store.put_plan(new_plan)
 
     build_audit().record(
-        entity_type="plan", entity_id=plan["planId"], action="clone_template",
-        actor_sub=caller.sub, actor_email=caller.email,
-        ip_address=caller.ip_address, user_agent=caller.user_agent,
+        entity_type="plan",
+        entity_id=plan["planId"],
+        action="clone_template",
+        actor_sub=caller.sub,
+        actor_email=caller.email,
+        ip_address=caller.ip_address,
+        user_agent=caller.user_agent,
         after={"name": plan["name"], "sourceTemplateId": tid},
     )
     return json_response(201, plan)
@@ -221,7 +287,9 @@ def _require(body: dict, fields: tuple[str, ...]) -> None:
         raise ValueError(f"Missing required fields: {', '.join(missing)}")
 
 
-_MIN_TIME_BASED_DURATION = 10  # must be > 2 × PRESTART_MINUTES (5) to avoid instant pre-warm
+_MIN_TIME_BASED_DURATION = (
+    10  # must be > 2 × PRESTART_MINUTES (5) to avoid instant pre-warm
+)
 
 
 def _validate_dag(buckets: list[dict]) -> None:
@@ -232,7 +300,7 @@ def _validate_dag(buckets: list[dict]) -> None:
     """
     for bi, bucket in enumerate(buckets):
         if bucket.get("run_mode") in ("time_based", "time-based"):
-            duration = bucket.get("duration_minutes") or 0
+            duration = int(bucket.get("duration_minutes") or 0)
             if duration < _MIN_TIME_BASED_DURATION:
                 raise ValueError(
                     f"Bucket {bi} duration_minutes={duration} is too short — "
@@ -257,9 +325,7 @@ def _validate_dag(buckets: list[dict]) -> None:
                 continue
             for parent_id in campaign.get("dependsOn", []):
                 if parent_id == cid:
-                    raise ValueError(
-                        f"Campaign '{cid}' cannot depend on itself"
-                    )
+                    raise ValueError(f"Campaign '{cid}' cannot depend on itself")
                 if parent_id not in all_ids:
                     raise ValueError(
                         f"Campaign '{cid}' depends on unknown campaign '{parent_id}'"
@@ -290,7 +356,9 @@ def _validate_dag(buckets: list[dict]) -> None:
                     queue.append(cid)
 
     if visited != len(all_ids):
-        raise ValueError("Plan contains a dependency cycle in campaign dependsOn references")
+        raise ValueError(
+            "Plan contains a dependency cycle in campaign dependsOn references"
+        )
 
 
 def _validate_trigger_no_cycle(

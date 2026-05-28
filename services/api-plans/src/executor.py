@@ -20,8 +20,9 @@ Dependency semantics (AND, cross-bucket supported)
   dependsOn = []            → waits for entire PREVIOUS bucket to complete
   dependsOn = [c1, c2, ...]  → waits for ALL listed campaigns (any bucket)
 
-Cascade-cancel: if any parent is cancelled / error / expired
-  → immediate cascade to all dependents
+Dependents always proceed regardless of parent exit status (no cascade-cancel).
+A cancelled or errored parent is treated as "done" — the dependent will attempt
+to start and will skip/error on its own if there are no leads or other issues.
 
 Pre-start warming (prestart_next = true, time_based buckets only)
 ─────────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ on_plan_complete chaining
 After the last bucket advances: call start_run_chained(plan_id) which
 finds all plans triggered by this plan and fires them.
 """
+
 from __future__ import annotations
 
 import logging
@@ -47,11 +49,13 @@ import boto3
 from botocore.exceptions import ClientError
 
 from builders import (
+    _JOURNEY_FLOW_NAME,
     build_campaign_params,
     build_segment_name,
     campaign_to_segment_filters,
     locations_for_state_codes,
     resolve_campaign_flow_arn,
+    resolve_journey_flow_arn,
 )
 from store import (
     ConcurrentWriteError,
@@ -70,9 +74,30 @@ from store import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from vip_shared.infrastructure.telemetry.structured_logger import (
+        StructuredLogger as _SL,
+    )
+
+    _slog = _SL(service="api-plans")
+except ImportError:
+
+    class _NoopLogger:  # pragma: no cover
+        def info(self, *a, **k):
+            pass
+
+        def warn(self, *a, **k):
+            pass
+
+        def error(self, *a, **k):
+            pass
+
+    _slog = _NoopLogger()  # type: ignore[assignment]
+
 CONNECT_INSTANCE_ID: Final = os.environ.get("CONNECT_INSTANCE_ID", "")
 PROFILES_DOMAIN_NAME: Final = os.environ.get("PROFILES_DOMAIN_NAME", "")
 LAMBDA_FUNCTION_ARN: Final = os.environ.get("LAMBDA_FUNCTION_ARN", "")
+SNS_ALERTS_TOPIC_ARN: Final = os.environ.get("SNS_ALERTS_TOPIC_ARN", "")
 
 # Pre-start window: create next-bucket campaigns this many minutes before expiry
 _PRESTART_MINUTES: Final = 5
@@ -108,15 +133,15 @@ _CAMPAIGN_TERMINAL_STATUSES: Final = frozenset(
     {"completed", "cancelled", "error", "expired"}
 )
 
-_CAMPAIGN_CANCEL_STATUSES: Final = frozenset(
-    {"cancelled", "error", "expired"}
-)
+_CAMPAIGN_CANCEL_STATUSES: Final = frozenset({"cancelled", "error", "expired"})
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def start_run(plan_id: str, triggered_by: str = "manual", start_bucket_index: int | None = None) -> dict:
+def start_run(
+    plan_id: str, triggered_by: str = "manual", start_bucket_index: int | None = None
+) -> dict:
     plan = get_plan(plan_id)
     if not plan:
         raise ValueError(f"Plan {plan_id} not found")
@@ -130,14 +155,18 @@ def start_run(plan_id: str, triggered_by: str = "manual", start_bucket_index: in
     # Optimistic check before the atomic lock (avoids unnecessary lock contention)
     latest = get_latest_run(plan_id)
     if latest and latest.get("status") == "running":
-        raise ValueError(f"Plan {plan_id} already has an active run ({latest['runId']})")
+        raise ValueError(
+            f"Plan {plan_id} already has an active run ({latest['runId']})"
+        )
 
     # Generate run_id locally so we can lock BEFORE creating the DynamoDB run record.
     # If lock fails, no orphan run is created in the table.
     _run_id = f"{int(time.time() * 1000)}-{str(uuid.uuid4())[:8]}"
 
     # Atomic lock — rejects concurrent triggers that slipped past the optimistic check
-    lock_plan_run(plan_id, _run_id)  # raises ValueError if already locked — no orphan created
+    lock_plan_run(
+        plan_id, _run_id
+    )  # raises ValueError if already locked — no orphan created
 
     run = create_run(plan_id, plan, triggered_by=triggered_by, run_id=_run_id)
 
@@ -155,7 +184,11 @@ def start_run(plan_id: str, triggered_by: str = "manual", start_bucket_index: in
     if pending and first_bucket == 0:
         for cs in run["bucketStates"][0]["campaignStates"]:
             match = next(
-                (p for p in pending.get("campaigns", []) if p.get("campaignId") == cs.get("campaignId")),
+                (
+                    p
+                    for p in pending.get("campaigns", [])
+                    if p.get("campaignId") == cs.get("campaignId")
+                ),
                 None,
             )
             if match and match.get("connectCampaignId"):
@@ -183,7 +216,10 @@ def start_run_chained(upstream_plan_id: str) -> None:
     chained = find_plans_by_trigger_planid(upstream_plan_id)
     for plan in chained:
         trigger = plan.get("trigger", {})
-        if trigger.get("afterBucket") is not None or trigger.get("afterCampaign") is not None:
+        if (
+            trigger.get("afterBucket") is not None
+            or trigger.get("afterCampaign") is not None
+        ):
             continue  # handled by _fire_bucket_chains / _fire_campaign_chains
         if not _within_working_hours(plan):
             logger.info(
@@ -212,7 +248,10 @@ def _fire_bucket_chains(upstream_plan_id: str, completed_bucket_index: int) -> N
         if plan.get("isTemplate") or plan.get("is_template"):
             continue
         if not _within_working_hours(plan):
-            logger.info("_fire_bucket_chains: plan %s outside working hours, skipping", plan["planId"])
+            logger.info(
+                "_fire_bucket_chains: plan %s outside working hours, skipping",
+                plan["planId"],
+            )
             continue
         trigger = plan.get("trigger", {})
         raw_ab = trigger.get("afterBucket")
@@ -235,7 +274,8 @@ def scheduled_run(plan_id: str) -> dict:
     if latest and latest.get("status") == "running":
         logger.info(
             "scheduled_run: plan %s already running (%s), skipping",
-            plan_id, latest["runId"],
+            plan_id,
+            latest["runId"],
         )
         return {"ok": True, "reason": "already_running"}
     plan = get_plan(plan_id)
@@ -262,12 +302,21 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
         return {"ok": False, "reason": "run_not_found"}
 
     if run["status"] != "running":
-        logger.info("tick: run %s/%s terminal (status=%s)", plan_id, run_id, run["status"])
+        logger.info(
+            "tick: run %s/%s terminal (status=%s)", plan_id, run_id, run["status"]
+        )
         _delete_bucket_schedule_safe(run, bucket_index)
         return {"ok": True, "reason": "already_terminal"}
 
-    bucket_state_check = run["bucketStates"][bucket_index] if bucket_index < len(run["bucketStates"]) else None
-    if not bucket_state_check or bucket_state_check["status"] not in ("running", "warming"):
+    bucket_state_check = (
+        run["bucketStates"][bucket_index]
+        if bucket_index < len(run["bucketStates"])
+        else None
+    )
+    if not bucket_state_check or bucket_state_check["status"] not in (
+        "running",
+        "warming",
+    ):
         logger.info(
             "tick: bucket %d not active (status=%s), skipping",
             bucket_index,
@@ -289,7 +338,11 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     if _wh_end:
         _end_h, _end_m = (int(x) for x in _wh_end.split(":"))
         if _now_hhmm >= _end_h * 60 + _end_m:
-            logger.info("tick: working hours end-time %s COT reached, force-finishing run %s", _wh_end, run_id)
+            logger.info(
+                "tick: working hours end-time %s COT reached, force-finishing run %s",
+                _wh_end,
+                run_id,
+            )
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "working_hours_cutoff"}
 
@@ -298,7 +351,11 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     if _loop_end:
         _end_h, _end_m = (int(x) for x in _loop_end.split(":"))
         if _now_hhmm >= _end_h * 60 + _end_m:
-            logger.info("tick: loop end-time %s COT reached, force-finishing run %s", _loop_end, run_id)
+            logger.info(
+                "tick: loop end-time %s COT reached, force-finishing run %s",
+                _loop_end,
+                run_id,
+            )
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "loop_cutoff"}
 
@@ -316,7 +373,8 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     # ── 1. Poll running campaigns ─────────────────────────────────────────────
     # Snapshot completed campaign IDs before polling (to detect newly-completed)
     prev_completed = {
-        cs["campaignId"] for cs in bucket_state["campaignStates"]
+        cs["campaignId"]
+        for cs in bucket_state["campaignStates"]
         if cs["status"] == "completed"
     }
 
@@ -325,34 +383,50 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
             _poll_campaign_state(cs)
             if cs["status"] == "running":
                 _campaign_def = next(
-                    (c for c in bucket.get("campaigns", []) if c["id"] == cs["campaignId"]),
+                    (
+                        c
+                        for c in bucket.get("campaigns", [])
+                        if c["id"] == cs["campaignId"]
+                    ),
                     {},
                 )
-                _dur = int(_campaign_def.get("run_duration_minutes") or _campaign_def.get("duration_minutes") or 0)
+                _dur = int(
+                    _campaign_def.get("run_duration_minutes")
+                    or _campaign_def.get("duration_minutes")
+                    or 0
+                )
                 _cs_started = cs.get("startedAt") or bucket_state.get("startedAt")
                 if _dur > 0 and _cs_started:
-                    _elapsed = (_now_utc() - datetime.fromisoformat(_cs_started)).total_seconds() / 60
+                    _elapsed = (
+                        _now_utc() - datetime.fromisoformat(_cs_started)
+                    ).total_seconds() / 60
                     # Pre-warm afterCampaign-triggered plans when this campaign is 5 min from ending
-                    if (
-                        _elapsed >= _dur - _PRESTART_MINUTES
-                        and not cs.get("afterCampaignPrewarmed")
+                    if _elapsed >= _dur - _PRESTART_MINUTES and not cs.get(
+                        "afterCampaignPrewarmed"
                     ):
                         try:
                             _prestart_after_campaign(plan_id, cs["campaignId"])
                             cs["afterCampaignPrewarmed"] = True
                         except Exception as _exc:
-                            logger.error("tick: _prestart_after_campaign %s failed: %s", cs["campaignId"], _exc)
+                            logger.error(
+                                "tick: _prestart_after_campaign %s failed: %s",
+                                cs["campaignId"],
+                                _exc,
+                            )
                     # Force-stop if Connect hasn't transitioned after duration elapsed
                     if _elapsed > _dur + 2:
                         logger.warning(
                             "tick: campaign %s still Running after %.1f min (limit=%d) — force stopping",
-                            cs["connectCampaignId"], _elapsed, _dur,
+                            cs["connectCampaignId"],
+                            _elapsed,
+                            _dur,
                         )
                         _safe_stop_campaign(cs["connectCampaignId"])
 
     # Fire plans triggered by a specific campaign completing
     newly_completed = {
-        cs["campaignId"] for cs in bucket_state["campaignStates"]
+        cs["campaignId"]
+        for cs in bucket_state["campaignStates"]
         if cs["status"] == "completed"
     } - prev_completed
     if newly_completed:
@@ -363,11 +437,13 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
     # ── 2. Time-based: pre-start + expiry ────────────────────────────────────
     if is_time_based:
-        duration_min = int(bucket.get("duration_minutes") or bucket.get("durationMinutes", 30))
+        duration_min = int(
+            bucket.get("duration_minutes") or bucket.get("durationMinutes", 30)
+        )
         started_iso = bucket_state.get("startedAt") or run.get("startedAt")
         elapsed_min = (
-            (_now_utc() - datetime.fromisoformat(started_iso)).total_seconds() / 60
-        )
+            _now_utc() - datetime.fromisoformat(started_iso)
+        ).total_seconds() / 60
 
         # Pre-start within-plan: warm next bucket
         if (
@@ -390,7 +466,12 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
         # Expiry
         if elapsed_min >= duration_min:
-            logger.info("tick: bucket %d expired (elapsed=%.1f/%.0f min)", bucket_index, elapsed_min, duration_min)
+            logger.info(
+                "tick: bucket %d expired (elapsed=%.1f/%.0f min)",
+                bucket_index,
+                elapsed_min,
+                duration_min,
+            )
             _expire_bucket(run, plan, bucket_index)
             return {"ok": True, "reason": "expired"}
 
@@ -403,19 +484,29 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     if not is_time_based and bucket_index == len(plan["buckets"]) - 1:
         _campaigns = bucket.get("campaigns", [])
         _effective_duration = max(
-            (int(c.get("run_duration_minutes") or c.get("duration_minutes") or c.get("durationMinutes") or 0) for c in _campaigns),
+            (
+                int(
+                    c.get("run_duration_minutes")
+                    or c.get("duration_minutes")
+                    or c.get("durationMinutes")
+                    or 0
+                )
+                for c in _campaigns
+            ),
             default=0,
         )
         if _effective_duration > 0:
             _started_iso = bucket_state.get("startedAt") or run.get("startedAt")
             _elapsed_min = (
-                (_now_utc() - datetime.fromisoformat(_started_iso)).total_seconds() / 60
-            )
+                _now_utc() - datetime.fromisoformat(_started_iso)
+            ).total_seconds() / 60
             if _elapsed_min >= _effective_duration - _PRESTART_MINUTES:
                 try:
                     _prestart_chained_runs(run, plan, bucket_index)
                 except Exception as exc:
-                    logger.error("tick: _prestart_chained_runs (status_based) failed: %s", exc)
+                    logger.error(
+                        "tick: _prestart_chained_runs (status_based) failed: %s", exc
+                    )
 
     # ── 3. Dispatch newly-unblocked campaigns (fixed-point until stable) ──────
     changed = True
@@ -428,6 +519,41 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
     # ── 4. Advance if all campaigns terminal ──────────────────────────────────
     if _all_campaigns_terminal(run, bucket_index):
+        _cs_list = run["bucketStates"][bucket_index]["campaignStates"]
+        _n_completed = sum(1 for cs in _cs_list if cs["status"] == "completed")
+        _n_deleted = sum(
+            1 for cs in _cs_list if cs.get("exitReason") == "connect_deleted"
+        )
+        if _n_deleted > 0 and _n_completed == 0:
+            # All campaigns were externally deleted from Connect before any completed.
+            # Advancing would falsely trigger downstream chain plans — abort instead.
+            logger.error(
+                "tick[%s/%s]: bucket %d — %d campaign(s) externally deleted, 0 completed; "
+                "aborting run to prevent false chain trigger",
+                plan_id,
+                run_id,
+                bucket_index,
+                _n_deleted,
+            )
+            run["status"] = "aborted"
+            run["completedAt"] = _now_iso()
+            run["abortReason"] = "external_campaign_deletion"
+            save_run(run)
+            unlock_plan_run(plan_id)
+            _notify_sns(
+                subject=f"[VIP Plans] Run ABORTED — campaigns deleted externally (plan={plan_id[:8]})",
+                detail=(
+                    f"Plan {plan_id} / Run {run_id}: bucket {bucket_index} had {_n_deleted} "
+                    f"campaign(s) deleted from Connect before completing. "
+                    f"Run was aborted to prevent a false chain trigger."
+                ),
+                attributes={
+                    "alertType": "run_aborted",
+                    "planId": plan_id,
+                    "runId": run_id,
+                },
+            )
+            return {"ok": False, "reason": "aborted_external_deletion"}
         _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
         return {"ok": True, "reason": "advanced"}
 
@@ -484,7 +610,9 @@ def abort_run(plan_id: str, run_id: str) -> dict:
             if attempt == _MAX_RETRIES - 1:
                 unlock_plan_run(plan_id)
                 raise
-            logger.info("abort_run: concurrent write on attempt %d — retrying", attempt + 1)
+            logger.info(
+                "abort_run: concurrent write on attempt %d — retrying", attempt + 1
+            )
             continue
         except Exception:
             unlock_plan_run(plan_id)
@@ -492,7 +620,9 @@ def abort_run(plan_id: str, run_id: str) -> dict:
         unlock_plan_run(plan_id)
         return run
 
-    raise ConcurrentWriteError(f"abort_run exhausted {_MAX_RETRIES} retries")  # unreachable
+    raise ConcurrentWriteError(
+        f"abort_run exhausted {_MAX_RETRIES} retries"
+    )  # unreachable
 
 
 def _force_finish_internal(run: dict, plan: dict) -> None:
@@ -514,7 +644,7 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
                 cs["exitReason"] = "force_finished"
                 cs["completedAt"] = now
         _delete_bucket_schedule_safe(run, bi)
-        if bucket_def := (plan.get("buckets") or [])[bi:bi + 1]:
+        if bucket_def := (plan.get("buckets") or [])[bi : bi + 1]:
             if bucket_def[0].get("cleanup", bucket_def[0].get("deleteAfter", True)):
                 for cs in bs["campaignStates"]:
                     if cs.get("connectCampaignId"):
@@ -557,9 +687,14 @@ def force_finish_run(plan_id: str, run_id: str) -> dict:
         except ConcurrentWriteError:
             if attempt == _MAX_RETRIES - 1:
                 raise
-            logger.info("force_finish_run: concurrent write on attempt %d — retrying", attempt + 1)
+            logger.info(
+                "force_finish_run: concurrent write on attempt %d — retrying",
+                attempt + 1,
+            )
 
-    raise ConcurrentWriteError(f"force_finish_run exhausted {_MAX_RETRIES} retries")  # unreachable
+    raise ConcurrentWriteError(
+        f"force_finish_run exhausted {_MAX_RETRIES} retries"
+    )  # unreachable
 
 
 def force_start_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
@@ -573,7 +708,9 @@ def force_start_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
         raise ValueError(f"Bucket index {bucket_index} out of range")
     bs = run["bucketStates"][bucket_index]
     if bs["status"] not in ("queued", "warming"):
-        raise ValueError(f"Bucket {bucket_index} is {bs['status']} — cannot force-start")
+        raise ValueError(
+            f"Bucket {bucket_index} is {bs['status']} — cannot force-start"
+        )
 
     # Reset warming campaigns to queued so _start_bucket creates them fresh
     if bs["status"] == "warming":
@@ -582,7 +719,14 @@ def force_start_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _safe_stop_campaign(cs["connectCampaignId"])
                 _safe_delete_campaign(cs["connectCampaignId"])
             if cs["status"] in ("warming", "queued"):
-                cs.update({"status": "queued", "connectCampaignId": None, "segmentName": None, "segmentArn": None})
+                cs.update(
+                    {
+                        "status": "queued",
+                        "connectCampaignId": None,
+                        "segmentName": None,
+                        "segmentArn": None,
+                    }
+                )
         bs["status"] = "queued"
 
     _start_bucket(run, bucket_index)
@@ -606,7 +750,9 @@ def force_stop_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
     return run
 
 
-def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: int) -> dict:
+def force_start_campaign(
+    plan_id: str, run_id: str, bucket_index: int, campaign_index: int
+) -> dict:
     """Manually start a single queued, cancelled, or error campaign, bypassing dependency checks.
 
     When the campaign is parent_cancelled and its bucket already completed (siblings all done),
@@ -625,14 +771,27 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
         raise ValueError(f"Campaign index {campaign_index} out of range")
     cs = bs["campaignStates"][campaign_index]
     if cs["status"] not in ("queued", "cancelled", "error"):
-        raise ValueError(f"Campaign is {cs['status']} — can only force-start queued, cancelled, or error campaigns")
+        raise ValueError(
+            f"Campaign is {cs['status']} — can only force-start queued, cancelled, or error campaigns"
+        )
 
-    # Completed bucket: only allowed when recovering a parent_cancelled campaign.
+    # Completed bucket: allowed for cancelled or queued campaigns.
+    # "queued" in a completed bucket is an inconsistent state that occurs when a
+    # cascade-cancel save_run lost a ConcurrentWriteError race — the campaign stayed
+    # "queued" in DDB while the bucket advanced. Treat it identically to "cancelled".
     if bs["status"] == "completed":
-        if cs["status"] != "cancelled":
+        if cs["status"] not in ("cancelled", "queued"):
             raise ValueError(
                 f"Bucket {bucket_index} is already completed — "
-                f"force-start only allowed for cancelled campaigns in a completed bucket"
+                f"force-start only allowed for cancelled or queued campaigns in a completed bucket"
+            )
+        if cs["status"] == "queued":
+            logger.warning(
+                "force_start_campaign: campaign %d/%d is 'queued' in completed bucket %d "
+                "— inconsistent state, proceeding with force-start",
+                bucket_index,
+                campaign_index,
+                bucket_index,
             )
         # Reactivate bucket so tick will poll the restarted campaign.
         # Reset startedAt so elapsed_min starts fresh — time-based buckets would otherwise
@@ -641,10 +800,16 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
         bs["completedAt"] = None
         bs["startedAt"] = _now_iso()
         try:
-            sched = _schedule_tick(plan_id=plan_id, run_id=run_id, bucket_index=bucket_index)
+            sched = _schedule_tick(
+                plan_id=plan_id, run_id=run_id, bucket_index=bucket_index
+            )
             bs["scheduleName"] = sched
         except Exception as exc:
-            logger.error("force_start_campaign: failed to schedule tick for reactivated bucket %d: %s", bucket_index, exc)
+            logger.error(
+                "force_start_campaign: failed to schedule tick for reactivated bucket %d: %s",
+                bucket_index,
+                exc,
+            )
     elif bs["status"] not in ("running", "warming", "queued"):
         raise ValueError(
             f"Bucket {bucket_index} is '{bs['status']}' — "
@@ -659,18 +824,33 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
         if bs["status"] == "warming":
             # Clean up any warming campaigns in this bucket
             for other_cs in bs["campaignStates"]:
-                if other_cs["status"] == "warming" and other_cs.get("connectCampaignId"):
+                if other_cs["status"] == "warming" and other_cs.get(
+                    "connectCampaignId"
+                ):
                     _safe_stop_campaign(other_cs["connectCampaignId"])
                     _safe_delete_campaign(other_cs["connectCampaignId"])
                 if other_cs["status"] in ("warming", "queued"):
-                    other_cs.update({"status": "queued", "connectCampaignId": None, "segmentName": None, "segmentArn": None})
+                    other_cs.update(
+                        {
+                            "status": "queued",
+                            "connectCampaignId": None,
+                            "segmentName": None,
+                            "segmentArn": None,
+                        }
+                    )
         bs["status"] = "running"
         bs["startedAt"] = now_iso
         try:
-            sched = _schedule_tick(plan_id=plan_id, run_id=run_id, bucket_index=bucket_index)
+            sched = _schedule_tick(
+                plan_id=plan_id, run_id=run_id, bucket_index=bucket_index
+            )
             bs["scheduleName"] = sched
         except Exception as exc:
-            logger.error("force_start_campaign: failed to schedule tick for bucket %d: %s", bucket_index, exc)
+            logger.error(
+                "force_start_campaign: failed to schedule tick for bucket %d: %s",
+                bucket_index,
+                exc,
+            )
 
     # Reset cascade-cancelled descendants so they can auto-start after this campaign completes
     _reset_cascade_cancelled_children(run, plan, cs["campaignId"])
@@ -701,10 +881,20 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
 
     # Snapshot the outcome _start_one_campaign wrote so we can re-apply it if the
     # final save races with a concurrent tick and we must re-read run from DDB.
-    _snap = {k: cs.get(k) for k in (
-        "status", "connectCampaignId", "segmentName", "segmentArn",
-        "startedAt", "exitReason", "errorDetail", "completedAt", "reconcileRetries",
-    )}
+    _snap = {
+        k: cs.get(k)
+        for k in (
+            "status",
+            "connectCampaignId",
+            "segmentName",
+            "segmentArn",
+            "startedAt",
+            "exitReason",
+            "errorDetail",
+            "completedAt",
+            "reconcileRetries",
+        )
+    }
 
     _FINAL_SAVE_RETRIES = 3
     for _attempt in range(_FINAL_SAVE_RETRIES):
@@ -720,16 +910,23 @@ def force_start_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_
             )
             run = get_run(plan_id, run_id)
             if not run:
-                raise ValueError(f"Run {run_id} not found after force_start_campaign retry")
+                raise ValueError(
+                    f"Run {run_id} not found after force_start_campaign retry"
+                )
             bs = run["bucketStates"][bucket_index]
             cs = bs["campaignStates"][campaign_index]
-            if cs["status"] == "running" and cs.get("connectCampaignId") == _snap["connectCampaignId"]:
+            if (
+                cs["status"] == "running"
+                and cs.get("connectCampaignId") == _snap["connectCampaignId"]
+            ):
                 return run  # concurrent tick already adopted this Connect campaign
             cs.update(_snap)
             if _snap["status"] != "creating":
                 cs.pop("creatingAt", None)
 
-    raise ConcurrentWriteError("force_start_campaign exhausted retries on final save")  # unreachable
+    raise ConcurrentWriteError(
+        "force_start_campaign exhausted retries on final save"
+    )  # unreachable
 
 
 def _reset_cascade_cancelled_children(run: dict, plan: dict, campaign_id: str) -> None:
@@ -744,14 +941,20 @@ def _reset_cascade_cancelled_children(run: dict, plan: dict, campaign_id: str) -
             if campaign_id not in campaign.get("dependsOn", []):
                 continue
             cs = _find_campaign_state(run, campaign["id"])
-            if cs and cs["status"] == "cancelled" and cs.get("exitReason") == REASON_PARENT_CANCELLED:
+            if (
+                cs
+                and cs["status"] == "cancelled"
+                and cs.get("exitReason") == REASON_PARENT_CANCELLED
+            ):
                 cs["status"] = "queued"
                 cs["exitReason"] = None
                 cs["completedAt"] = None
                 _reset_cascade_cancelled_children(run, plan, campaign["id"])
 
 
-def skip_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: int) -> dict:
+def skip_campaign(
+    plan_id: str, run_id: str, bucket_index: int, campaign_index: int
+) -> dict:
     """Mark a campaign as skipped — transparent to cascade-cancel, does not block children.
 
     Unlike force_stop_campaign (exitReason=stopped/manually_stopped), skip sets
@@ -807,12 +1010,18 @@ def skip_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: 
         except ConcurrentWriteError:
             if attempt == _MAX_RETRIES - 1:
                 raise
-            logger.info("skip_campaign: concurrent write on attempt %d — retrying", attempt + 1)
+            logger.info(
+                "skip_campaign: concurrent write on attempt %d — retrying", attempt + 1
+            )
 
-    raise ConcurrentWriteError(f"skip_campaign exhausted {_MAX_RETRIES} retries")  # unreachable
+    raise ConcurrentWriteError(
+        f"skip_campaign exhausted {_MAX_RETRIES} retries"
+    )  # unreachable
 
 
-def force_stop_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_index: int) -> dict:
+def force_stop_campaign(
+    plan_id: str, run_id: str, bucket_index: int, campaign_index: int
+) -> dict:
     """Manually stop a running campaign and mark it expired.
 
     Retries up to 3 times on ConcurrentWriteError (tick racing with this HTTP call).
@@ -835,7 +1044,9 @@ def force_stop_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_i
         if cs["status"] != "running":
             if attempt > 0 and cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
                 return run
-            raise ValueError(f"Campaign is {cs['status']} — can only stop running campaigns")
+            raise ValueError(
+                f"Campaign is {cs['status']} — can only stop running campaigns"
+            )
 
         if cs.get("connectCampaignId"):
             _safe_stop_campaign(cs["connectCampaignId"])
@@ -853,9 +1064,14 @@ def force_stop_campaign(plan_id: str, run_id: str, bucket_index: int, campaign_i
         except ConcurrentWriteError:
             if attempt == _MAX_RETRIES - 1:
                 raise
-            logger.info("force_stop_campaign: concurrent write on attempt %d — retrying", attempt + 1)
+            logger.info(
+                "force_stop_campaign: concurrent write on attempt %d — retrying",
+                attempt + 1,
+            )
 
-    raise ConcurrentWriteError(f"force_stop_campaign exhausted {_MAX_RETRIES} retries")  # unreachable
+    raise ConcurrentWriteError(
+        f"force_stop_campaign exhausted {_MAX_RETRIES} retries"
+    )  # unreachable
 
 
 # ── Bucket lifecycle ──────────────────────────────────────────────────────────
@@ -899,7 +1115,10 @@ def _start_bucket(run: dict, index: int) -> None:
     if next_index < len(plan["buckets"]):
         next_bucket = plan["buckets"][next_index]
         next_bucket_state = run["bucketStates"][next_index]
-        if next_bucket.get("parallel", False) and next_bucket_state["status"] == "queued":
+        if (
+            next_bucket.get("parallel", False)
+            and next_bucket_state["status"] == "queued"
+        ):
             logger.info("_start_bucket: chain-starting parallel bucket %d", next_index)
             _start_bucket(run, next_index)
 
@@ -930,41 +1149,82 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
         )
         bucket_state["scheduleName"] = schedule_name
     except Exception as exc:
-        logger.error("_activate_warming_bucket[%d]: scheduler failed: %s", bucket_index, exc)
+        logger.error(
+            "_activate_warming_bucket[%d]: scheduler failed: %s", bucket_index, exc
+        )
         raise
 
     # Start all warming campaigns
     bucket = plan["buckets"][bucket_index]
     for ci, cs in enumerate(bucket_state["campaignStates"]):
         if cs["status"] == "warming" and cs.get("connectCampaignId"):
+            seg_name = cs.get("segmentName", "?")
             if cs.get("warmupStarted"):
                 # StartCampaign was already called during warmup — campaign is Running in Connect,
                 # waiting to dial at the pre-scheduled startTime. Just sync our state.
                 cs["status"] = "running"
                 cs["startedAt"] = now_iso
                 cs.pop("warmupStarted", None)
+                _slog.info(
+                    "activate_warming_campaign_prewarmed",
+                    plan_id=run["planId"],
+                    run_id=run["runId"],
+                    bucket_index=bucket_index,
+                    campaign_index=ci,
+                    segment_name=seg_name,
+                    connect_campaign_id=cs["connectCampaignId"],
+                )
             else:
                 # StartCampaign was not called during warmup (failed or cross-plan warmup without start).
                 # Refresh the schedule to avoid "start time has already passed", then start.
                 try:
-                    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+                    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+                        build as build_oc,
+                    )
+
                     oc = build_oc()
                     now_activate = _now_utc()
-                    campaign_def = bucket.get("campaigns", [])[ci] if ci < len(bucket.get("campaigns", [])) else {}
+                    campaign_def = (
+                        bucket.get("campaigns", [])[ci]
+                        if ci < len(bucket.get("campaigns", []))
+                        else {}
+                    )
                     run_type = campaign_def.get("run_type", "full")
-                    new_end_time = _campaign_end_time(now_activate, campaign_def, run_type)
+                    new_end_time = _campaign_end_time(
+                        now_activate, campaign_def, run_type
+                    )
                     new_start_time = (now_activate + timedelta(seconds=60)).isoformat()
-                    oc.update_campaign_schedule(cs["connectCampaignId"], {
-                        "startTime": new_start_time,
-                        "endTime": new_end_time,
-                    })
+                    oc.update_campaign_schedule(
+                        cs["connectCampaignId"],
+                        {
+                            "startTime": new_start_time,
+                            "endTime": new_end_time,
+                        },
+                    )
                     oc.start_campaign(cs["connectCampaignId"])
                     cs["status"] = "running"
                     cs["startedAt"] = now_iso
+                    _slog.info(
+                        "activate_warming_campaign_cold_started",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=bucket_index,
+                        campaign_index=ci,
+                        segment_name=seg_name,
+                        connect_campaign_id=cs["connectCampaignId"],
+                        new_start_time=new_start_time,
+                    )
                 except Exception as exc:
-                    logger.error(
-                        "_activate_warming_bucket: start campaign %s failed: %s",
-                        cs["connectCampaignId"], exc,
+                    _slog.error(
+                        "activate_warming_campaign_failed",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=bucket_index,
+                        campaign_index=ci,
+                        segment_name=seg_name,
+                        connect_campaign_id=cs.get("connectCampaignId"),
+                        error=str(exc),
+                        error_type=type(exc).__name__,
                     )
                     cs["status"] = "error"
                     cs["exitReason"] = REASON_CREATION_FAILED
@@ -992,7 +1252,10 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
         next_bucket = plan["buckets"][next_index]
         next_bs = run["bucketStates"][next_index]
         if next_bucket.get("parallel", False) and next_bs["status"] == "queued":
-            logger.info("_activate_warming_bucket: chain-starting parallel bucket %d", next_index)
+            logger.info(
+                "_activate_warming_bucket: chain-starting parallel bucket %d",
+                next_index,
+            )
             _start_bucket(run, next_index)
 
 
@@ -1007,7 +1270,13 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
         return  # Already warming or running
 
     next_bucket_state["status"] = "warming"
-    logger.info("_prestart_next_bucket: warming bucket %d", next_index)
+    _slog.info(
+        "prestart_next_bucket_start",
+        plan_id=run["planId"],
+        run_id=run["runId"],
+        current_bucket=current_index,
+        next_bucket=next_index,
+    )
 
     # Claim save: persist "warming" before creating any Connect campaigns.
     # Without this, a crash between _create_campaign_only and the caller's save_run
@@ -1016,23 +1285,41 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
         save_run(run)
     except Exception as _claim_exc:
         next_bucket_state["status"] = "queued"
-        logger.warning("_prestart_next_bucket: claim save failed, reverting to queued: %s", _claim_exc)
+        _slog.error(
+            "prestart_next_bucket_claim_failed",
+            plan_id=run["planId"],
+            run_id=run["runId"],
+            next_bucket=next_index,
+            error=str(_claim_exc),
+        )
         return
 
     next_bucket = plan["buckets"][next_index]
     for ci, campaign in enumerate(next_bucket.get("campaigns", [])):
         if not campaign.get("dependsOn"):
             cs = next_bucket_state["campaignStates"][ci]
+            camp_name = campaign.get("name") or campaign.get("id", "?")
             if cs["status"] == "queued":
                 try:
-                    connect_id, seg_name, seg_arn, warmup_started = _create_campaign_only(
-                        next_bucket, campaign, run
+                    connect_id, seg_name, seg_arn, warmup_started = (
+                        _create_campaign_only(next_bucket, campaign, run)
                     )
                     cs["status"] = "warming"
                     cs["connectCampaignId"] = connect_id
                     cs["segmentName"] = seg_name
                     cs["segmentArn"] = seg_arn
                     cs["warmupStarted"] = warmup_started
+                    _slog.info(
+                        "prestart_next_bucket_campaign_ok",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=next_index,
+                        campaign_index=ci,
+                        campaign=camp_name,
+                        connect_campaign_id=connect_id,
+                        segment_name=seg_name,
+                        warmup_started=warmup_started,
+                    )
                     # Mid-flight save: persist connectCampaignId so that if a crash occurs
                     # before the outer save_run, the campaign can be recovered next tick.
                     try:
@@ -1040,27 +1327,86 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     except Exception as _mid_exc:
                         logger.warning(
                             "_prestart_next_bucket campaign %d: mid-flight save failed: %s",
-                            ci, _mid_exc,
+                            ci,
+                            _mid_exc,
                         )
                 except _RedisRebuildingError as exc:
                     # Transient — leave queued so the next tick retries.
-                    logger.warning("_prestart_next_bucket campaign %d: Redis rebuilding, will retry next tick: %s", ci, exc)
+                    _slog.warn(
+                        "prestart_next_bucket_redis_rebuilding",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=next_index,
+                        campaign_index=ci,
+                        campaign=camp_name,
+                        error=str(exc),
+                    )
                 except _EmptySegmentError as exc:
                     empty_retries = cs.get("reconcileRetries") or 0
-                    retry_limit = int(next_bucket.get("reconcileRetryLimit", 2))
+                    retry_limit = int(next_bucket.get("reconcileRetryLimit", 5))
                     if empty_retries < retry_limit:
                         cs["reconcileRetries"] = empty_retries + 1
-                        logger.warning(
-                            "_prestart_next_bucket campaign %d: empty segment (retry %d/%d), will retry next tick: %s",
-                            ci, empty_retries + 1, retry_limit, exc,
+                        _slog.warn(
+                            "prestart_next_bucket_empty_segment_retry",
+                            plan_id=run["planId"],
+                            run_id=run["runId"],
+                            bucket_index=next_index,
+                            campaign_index=ci,
+                            campaign=camp_name,
+                            retry=empty_retries + 1,
+                            retry_limit=retry_limit,
+                            error=str(exc),
                         )
                     else:
-                        logger.info("_prestart_next_bucket campaign %d: empty segment after %d retries — cancelling: %s", ci, empty_retries, exc)
-                        cs["status"] = "cancelled"
-                        cs["exitReason"] = REASON_SKIPPED_EMPTY
-                        cs["completedAt"] = _now_iso()
+                        # Final check: same rebuild-detection fallback as _start_one_campaign.
+                        if not _check_redis_ready():
+                            cs["reconcileRetries"] = 0
+                            _slog.warn(
+                                "prestart_next_bucket_redis_not_ready_reset",
+                                plan_id=run["planId"],
+                                run_id=run["runId"],
+                                bucket_index=next_index,
+                                campaign_index=ci,
+                                campaign=camp_name,
+                                retries_exhausted=empty_retries,
+                            )
+                        else:
+                            _slog.warn(
+                                "prestart_next_bucket_empty_segment_cancelled",
+                                plan_id=run["planId"],
+                                run_id=run["runId"],
+                                bucket_index=next_index,
+                                campaign_index=ci,
+                                campaign=camp_name,
+                                retries_exhausted=empty_retries,
+                                error=str(exc),
+                            )
+                            cs["status"] = "cancelled"
+                            cs["exitReason"] = REASON_SKIPPED_EMPTY
+                            cs["completedAt"] = _now_iso()
+                except _CutoffTooCloseError as exc:
+                    # Warmup attempted too close to daily cutoff — leave queued so that
+                    # _start_one_campaign handles it as expired when the bucket activates.
+                    _slog.warn(
+                        "prestart_next_bucket_cutoff_too_close",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=next_index,
+                        campaign_index=ci,
+                        campaign=camp_name,
+                        error=str(exc),
+                    )
                 except Exception as exc:
-                    logger.error("_prestart_next_bucket campaign %d: %s", ci, exc)
+                    _slog.error(
+                        "prestart_next_bucket_campaign_failed",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=next_index,
+                        campaign_index=ci,
+                        campaign=camp_name,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
                     cs["status"] = "error"
                     cs["exitReason"] = REASON_CREATION_FAILED
                     cs["errorDetail"] = str(exc)
@@ -1094,6 +1440,15 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
     _delete_bucket_schedule_safe(run, bucket_index)
 
     try:
+        # Persist terminal campaign states BEFORE deleting resources from Connect.
+        # bucket_state["status"] stays "running" so that a ConcurrentWriteError here
+        # leaves the bucket re-tryable (stale_tick guard skips only "completed"/"cancelled"
+        # buckets). Without this save, a failed final save_run lets the next tick
+        # re-poll Connect, find campaigns "Deleted", and overwrite the correct terminal
+        # statuses with connect_deleted — which the S-11-A guard then misreads as an
+        # external deletion and aborts a run that legitimately completed.
+        save_run(run)
+
         # Cleanup Connect campaigns + CP segments if requested
         if bucket.get("cleanup", bucket.get("deleteAfter", True)):
             for cs in bucket_state["campaignStates"]:
@@ -1131,11 +1486,17 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
                     if not next_bucket_state.get("scheduleName"):
                         try:
                             sched = _schedule_tick(
-                                plan_id=run["planId"], run_id=run["runId"], bucket_index=next_index,
+                                plan_id=run["planId"],
+                                run_id=run["runId"],
+                                bucket_index=next_index,
                             )
                             next_bucket_state["scheduleName"] = sched
                         except Exception as exc:
-                            logger.error("_advance_bucket: rescue tick for bucket %d failed: %s", next_index, exc)
+                            logger.error(
+                                "_advance_bucket: rescue tick for bucket %d failed: %s",
+                                next_index,
+                                exc,
+                            )
                     changed = True
                     while changed:
                         changed = _dispatch_ready_campaigns(run, plan, next_index)
@@ -1151,6 +1512,29 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
             save_run(run)
             unlock_plan_run(run["planId"])
             _maybe_loop(run["planId"])
+            # Notify if any campaign ended with error or connect_deleted
+            _error_campaigns = [
+                cs
+                for bs in run["bucketStates"]
+                for cs in bs.get("campaignStates", [])
+                if cs.get("status") in ("error",)
+                or cs.get("exitReason") == "connect_deleted"
+            ]
+            if _error_campaigns:
+                _names = ", ".join(
+                    cs.get("name", cs["campaignId"]) for cs in _error_campaigns[:5]
+                )
+                _notify_sns(
+                    subject=f"[VIP Plans] Run completed with errors (plan={run['planId'][:8]})",
+                    detail=(
+                        f"Plan {run['planId']} / Run {run['runId']} completed but "
+                        f"{len(_error_campaigns)} campaign(s) ended with errors:\n{_names}"
+                    ),
+                    attributes={
+                        "alertType": "run_completed_with_errors",
+                        "planId": run["planId"],
+                    },
+                )
             try:
                 start_run_chained(run["planId"])
             except Exception as exc:
@@ -1162,7 +1546,9 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
         # The EventBridge rule was already deleted above. Reschedule it so the bucket
         # is not stranded forever with no tick to drive it forward.
         try:
-            _schedule_tick(plan_id=run["planId"], run_id=run["runId"], bucket_index=bucket_index)
+            _schedule_tick(
+                plan_id=run["planId"], run_id=run["runId"], bucket_index=bucket_index
+            )
             logger.info(
                 "_advance_bucket[%d]: ConcurrentWriteError — rescheduled tick for retry",
                 bucket_index,
@@ -1170,7 +1556,8 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
         except Exception as _exc:
             logger.error(
                 "_advance_bucket[%d]: ConcurrentWriteError and reschedule failed: %s",
-                bucket_index, _exc,
+                bucket_index,
+                _exc,
             )
         raise
 
@@ -1183,14 +1570,16 @@ def _prestart_plan(target_plan_id: str) -> None:
 
     Results are stored on the plan META item as `pendingWarmup`.
     When `start_run` fires, it consumes this data and skips campaign creation.
+
+    Retry-aware: if a previous call only partially warmed the bucket (some campaigns
+    failed), subsequent calls from prestart_check will retry the missing ones and merge
+    the results — so all stage-1 campaigns get a chance to warm within the 4–6 min window.
     """
     target_plan = get_plan(target_plan_id)
     if not target_plan:
         return
     if target_plan.get("isTemplate") or target_plan.get("is_template"):
         return
-    if target_plan.get("pendingWarmup"):
-        return  # Already pre-warmed; don't overwrite
 
     # Skip if plan is already running
     latest = get_latest_run(target_plan_id)
@@ -1202,24 +1591,74 @@ def _prestart_plan(target_plan_id: str) -> None:
         return
 
     bucket = buckets[0]
-    warmed: list[dict] = []
-    for campaign in bucket.get("campaigns", []):
-        if campaign.get("dependsOn"):
-            continue  # only stage-1 (no deps)
-        try:
-            connect_id, seg_name, seg_arn, warmup_started = _create_campaign_only(bucket, campaign, {})
-            warmed.append({
-                "campaignId": campaign.get("id") or campaign.get("campaignId"),
-                "connectCampaignId": connect_id,
-                "segmentName": seg_name,
-                "segmentArn": seg_arn,
-                "warmupStarted": warmup_started,
-            })
-            logger.info("_prestart_plan[%s]: pre-warmed campaign %s", target_plan_id, campaign.get("name"))
-        except Exception as exc:
-            logger.error("_prestart_plan[%s]: campaign %s failed: %s", target_plan_id, campaign.get("name"), exc)
-            # Partial warmup is acceptable — _activate_warming_bucket recovery handles the rest
+    stage1_campaigns = [
+        c for c in bucket.get("campaigns", []) if not c.get("dependsOn")
+    ]
 
+    # Merge with any existing pendingWarmup so retries only attempt missing campaigns.
+    existing_warmup = target_plan.get("pendingWarmup") or {}
+    already_warmed: dict[str, dict] = {
+        c["campaignId"]: c for c in existing_warmup.get("campaigns", [])
+    }
+
+    # All stage-1 campaigns already covered — nothing to do.
+    if already_warmed and all(
+        (c.get("id") or c.get("campaignId")) in already_warmed for c in stage1_campaigns
+    ):
+        return
+
+    warmed: list[dict] = list(
+        already_warmed.values()
+    )  # carry over successes from prior calls
+    attempted = 0
+    for campaign in stage1_campaigns:
+        camp_id = campaign.get("id") or campaign.get("campaignId")
+        if camp_id in already_warmed:
+            continue  # already warmed in a previous prestart_check tick — skip
+        attempted += 1
+        camp_name = campaign.get("name") or camp_id or "?"
+        try:
+            connect_id, seg_name, seg_arn, warmup_started = _create_campaign_only(
+                bucket, campaign, {}
+            )
+            warmed.append(
+                {
+                    "campaignId": camp_id,
+                    "connectCampaignId": connect_id,
+                    "segmentName": seg_name,
+                    "segmentArn": seg_arn,
+                    "warmupStarted": warmup_started,
+                }
+            )
+            _slog.info(
+                "prestart_plan_campaign_ok",
+                plan_id=target_plan_id,
+                campaign=camp_name,
+                connect_campaign_id=connect_id,
+                segment_name=seg_name,
+                warmup_started=warmup_started,
+            )
+        except Exception as exc:
+            _slog.error(
+                "prestart_plan_campaign_failed",
+                plan_id=target_plan_id,
+                campaign=camp_name,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            # Will be retried on the next prestart_check tick (runs every minute)
+
+    newly_warmed = len(warmed) - len(already_warmed)
+    _slog.info(
+        "prestart_plan_summary",
+        plan_id=target_plan_id,
+        attempted=attempted,
+        newly_warmed=newly_warmed,
+        total_warmed=len(warmed),
+        total_stage1=len(stage1_campaigns),
+        failed=attempted - newly_warmed,
+        all_covered=len(warmed) == len(stage1_campaigns),
+    )
     if warmed:
         update_plan_pending_warmup(target_plan_id, {"campaigns": warmed})
 
@@ -1239,7 +1678,11 @@ def _prestart_chained_runs(run: dict, plan: dict, bucket_index: int) -> None:
         try:
             _prestart_plan(downstream["planId"])
         except Exception as exc:
-            logger.error("_prestart_chained_runs: pre-warm %s failed: %s", downstream["planId"], exc)
+            logger.error(
+                "_prestart_chained_runs: pre-warm %s failed: %s",
+                downstream["planId"],
+                exc,
+            )
 
     # 2. Loop: same plan restarts if the loop window will still be open
     loop = plan.get("loop") or {}
@@ -1253,7 +1696,11 @@ def _prestart_chained_runs(run: dict, plan: dict, bucket_index: int) -> None:
             try:
                 _prestart_plan(plan_id)
             except Exception as exc:
-                logger.error("_prestart_chained_runs: loop self-pre-warm for %s failed: %s", plan_id, exc)
+                logger.error(
+                    "_prestart_chained_runs: loop self-pre-warm for %s failed: %s",
+                    plan_id,
+                    exc,
+                )
 
 
 def _prestart_after_campaign(upstream_plan_id: str, campaign_id: str) -> None:
@@ -1266,12 +1713,14 @@ def _prestart_after_campaign(upstream_plan_id: str, campaign_id: str) -> None:
             _prestart_plan(downstream["planId"])
             logger.info(
                 "_prestart_after_campaign: pre-warmed %s (afterCampaign=%s)",
-                downstream["planId"], campaign_id,
+                downstream["planId"],
+                campaign_id,
             )
         except Exception as exc:
             logger.error(
                 "_prestart_after_campaign: failed to pre-warm %s: %s",
-                downstream["planId"], exc,
+                downstream["planId"],
+                exc,
             )
 
 
@@ -1301,12 +1750,25 @@ def prestart_check() -> dict:
             # Pre-warm if trigger is 4–6 minutes away (5 ± 1 tolerance)
             delta = trigger_hhmm - now_hhmm
             if 4 <= delta <= 6:
+                _slog.info(
+                    "prestart_check_warming_plan",
+                    plan_id=plan["planId"],
+                    plan_name=plan.get("name"),
+                    trigger_time=time_str,
+                    delta_minutes=delta,
+                )
                 _prestart_plan(plan["planId"])
                 warmed.append(plan["planId"])
         except Exception as exc:
-            logger.error("prestart_check: plan %s failed: %s", plan.get("planId"), exc)
+            _slog.error(
+                "prestart_check_plan_failed",
+                plan_id=plan.get("planId"),
+                plan_name=plan.get("name"),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
-    logger.info("prestart_check: pre-warmed %d plan(s): %s", len(warmed), warmed)
+    _slog.info("prestart_check_done", warmed_count=len(warmed), warmed_plan_ids=warmed)
 
     # ── Stuck run detection ───────────────────────────────────────────────────
     # Emit a CloudWatch metric for any run that has been "running" longer than
@@ -1331,21 +1793,27 @@ def prestart_check() -> dict:
             run_id = latest.get("runId", "unknown")
             logger.warning(
                 "prestart_check: stuck run detected plan=%s run=%s hours=%.1f",
-                plan_id, run_id, hours,
+                plan_id,
+                run_id,
+                hours,
             )
             stuck.append(plan_id)
             try:
                 cw.put_metric_data(
                     Namespace="VIPPlans",
-                    MetricData=[{
-                        "MetricName": "StuckRun",
-                        "Value": 1,
-                        "Unit": "Count",
-                        "Dimensions": [{"Name": "PlanId", "Value": plan_id}],
-                    }],
+                    MetricData=[
+                        {
+                            "MetricName": "StuckRun",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [{"Name": "PlanId", "Value": plan_id}],
+                        }
+                    ],
                 )
             except Exception as exc:
-                logger.error("prestart_check: CloudWatch metric failed for %s: %s", plan_id, exc)
+                logger.error(
+                    "prestart_check: CloudWatch metric failed for %s: %s", plan_id, exc
+                )
 
     if stuck:
         logger.warning("prestart_check: %d stuck run(s): %s", len(stuck), stuck)
@@ -1370,7 +1838,10 @@ def _fire_campaign_chains(
         if plan.get("isTemplate") or plan.get("is_template"):
             continue
         if not _within_working_hours(plan):
-            logger.info("_fire_campaign_chains: plan %s outside working hours, skipping", plan["planId"])
+            logger.info(
+                "_fire_campaign_chains: plan %s outside working hours, skipping",
+                plan["planId"],
+            )
             continue
         trigger = plan.get("trigger", {})
         if trigger.get("type") != "on_plan_complete":
@@ -1389,7 +1860,11 @@ def _fire_campaign_chains(
             if not trigger.get("repeat", True):
                 update_plan_trigger(plan["planId"], {"type": "manual"})
         except Exception as exc:
-            logger.error("_fire_campaign_chains: failed to start plan %s: %s", plan["planId"], exc)
+            logger.error(
+                "_fire_campaign_chains: failed to start plan %s: %s",
+                plan["planId"],
+                exc,
+            )
 
 
 # ── Loop helper ───────────────────────────────────────────────────────────────
@@ -1440,7 +1915,9 @@ def _maybe_loop(plan_id: str) -> None:
 # ── Campaign dispatch ─────────────────────────────────────────────────────────
 
 
-def _dispatch_cross_bucket_ready(run: dict, plan: dict, current_bucket_index: int) -> bool:
+def _dispatch_cross_bucket_ready(
+    run: dict, plan: dict, current_bucket_index: int
+) -> bool:
     """Eagerly start campaigns in future buckets whose cross-bucket dependsOn are all satisfied.
 
     Only acts on campaigns with explicit dependsOn. Stage-1 (no deps) campaigns still wait
@@ -1485,10 +1962,16 @@ def _dispatch_cross_bucket_ready(run: dict, plan: dict, current_bucket_index: in
                     # "queued" — no orphaned "running" bucket with no EventBridge rule.
                     try:
                         sched = _schedule_tick(
-                            plan_id=run["planId"], run_id=run["runId"], bucket_index=bi,
+                            plan_id=run["planId"],
+                            run_id=run["runId"],
+                            bucket_index=bi,
                         )
                     except Exception as exc:
-                        logger.error("_dispatch_cross_bucket_ready[%d]: schedule failed, skipping: %s", bi, exc)
+                        logger.error(
+                            "_dispatch_cross_bucket_ready[%d]: schedule failed, skipping: %s",
+                            bi,
+                            exc,
+                        )
                         continue
                     bs["status"] = "running"
                     bs["startedAt"] = now_iso
@@ -1545,12 +2028,14 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
                         cs["status"] = "running"
                         logger.info(
                             "_dispatch_ready_campaigns: recovered %s from creating → running (Connect state: %s)",
-                            existing_id, state,
+                            existing_id,
+                            state,
                         )
                 except Exception as exc:
                     logger.warning(
                         "_dispatch_ready_campaigns: cannot check Connect state for %s: %s — resetting to queued",
-                        existing_id, exc,
+                        existing_id,
+                        exc,
                     )
                     cs["connectCampaignId"] = None
                     cs["segmentArn"] = None
@@ -1564,19 +2049,20 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
                 _creating_at = cs.get("creatingAt")
                 _age_seconds = (
                     (_now_utc() - datetime.fromisoformat(_creating_at)).total_seconds()
-                    if _creating_at else 999
+                    if _creating_at
+                    else 999
                 )
                 if _age_seconds > 300:
                     cs["status"] = "queued"
                 else:
                     logger.info(
-                        "_dispatch_ready_campaigns: skipping fresh creating claim for %s (age=%.0fs) — concurrent force_start likely active",
-                        cs.get("campaignId"), _age_seconds,
+                        "_dispatch_ready_campaigns: skipping fresh creating claim for %s "
+                        "(age=%.0fs) — concurrent force_start likely active",
+                        cs.get("campaignId"),
+                        _age_seconds,
                     )
 
     newly_ready: list[int] = []
-    cascade_changed = False
-
     # Phase 2 — Identify
     for ci, campaign in enumerate(bucket.get("campaigns", [])):
         cs = bucket_state["campaignStates"][ci]
@@ -1587,41 +2073,32 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
 
         if not depends_on:
             is_parallel = bucket.get("parallel", False)
-            if bucket_index == 0 or is_parallel or _bucket_completed(run, bucket_index - 1):
+            if (
+                bucket_index == 0
+                or is_parallel
+                or _bucket_completed(run, bucket_index - 1)
+            ):
                 newly_ready.append(ci)
         else:
             parent_states = [_find_campaign_state(run, cid) for cid in depends_on]
 
-            # Cascade-cancel: any parent genuinely cancelled (skipped parents are transparent)
-            if any(
-                s and s["status"] in _CAMPAIGN_CANCEL_STATUSES and s.get("exitReason") != "skipped"
-                for s in parent_states
-            ):
-                cs["status"] = "cancelled"
-                cs["exitReason"] = REASON_PARENT_CANCELLED
-                cs["completedAt"] = _now_iso()
-                cascade_changed = True
-                continue
-
-            # Start when all parents completed (skipped parents count as completed)
+            # Start when all parents are terminal — any outcome (completed, cancelled,
+            # error, expired) unblocks the dependent. Dependents always attempt to run;
+            # they will skip/error on their own merits if needed.
             if all(
-                s and (s["status"] == "completed" or s.get("exitReason") == "skipped")
-                for s in parent_states
+                s and s["status"] in _CAMPAIGN_TERMINAL_STATUSES for s in parent_states
             ):
                 newly_ready.append(ci)
 
-    if not newly_ready and not cascade_changed:
+    if not newly_ready:
         return False
 
     # Phase 3 — Claim: save BEFORE Connect API so a failed save leaves no orphan campaigns
-    if newly_ready:
-        _claim_ts = _now_iso()
-        for ci in newly_ready:
-            bucket_state["campaignStates"][ci]["status"] = "creating"
-            bucket_state["campaignStates"][ci]["creatingAt"] = _claim_ts
-        save_run(run)  # raises ConcurrentWriteError on conflict → Connect never called
-    elif cascade_changed:
-        save_run(run)  # persist cascade-cancel state only
+    _claim_ts = _now_iso()
+    for ci in newly_ready:
+        bucket_state["campaignStates"][ci]["status"] = "creating"
+        bucket_state["campaignStates"][ci]["creatingAt"] = _claim_ts
+    save_run(run)  # raises ConcurrentWriteError on conflict → Connect never called
 
     # Phase 4 — Start
     for ci in newly_ready:
@@ -1669,7 +2146,9 @@ def _next_bucket_warming(run: dict, current_index: int) -> bool:
 # ── Campaign start ────────────────────────────────────────────────────────────
 
 
-def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index: int) -> None:
+def _start_one_campaign(
+    run: dict, plan: dict, bucket_index: int, campaign_index: int
+) -> None:
     """Start a single campaign (creating segment + Connect campaign if not already warmed)."""
     bucket = plan["buckets"][bucket_index]
     campaigns = bucket.get("campaigns", [])
@@ -1688,33 +2167,46 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
             return
         # Pre-warmed but not yet started — refresh schedule to avoid "start time has already passed", then start.
         try:
-            from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+            from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+                build as build_oc,
+            )
+
             oc = build_oc()
             run_type = campaign.get("run_type", "full")
             new_end_time = _campaign_end_time(now, campaign, run_type)
             new_start_time = (now + timedelta(seconds=60)).isoformat()
-            oc.update_campaign_schedule(cs["connectCampaignId"], {
-                "startTime": new_start_time,
-                "endTime": new_end_time,
-            })
+            oc.update_campaign_schedule(
+                cs["connectCampaignId"],
+                {
+                    "startTime": new_start_time,
+                    "endTime": new_end_time,
+                },
+            )
             oc.start_campaign(cs["connectCampaignId"])
             cs["status"] = "running"
             return
         except Exception as exc:
-            if "start time has already passed" in str(exc).lower() or "already passed" in str(exc).lower():
+            if (
+                "start time has already passed" in str(exc).lower()
+                or "already passed" in str(exc).lower()
+            ):
                 # The pre-warmed campaign's start_time window expired before the plan ran.
                 # Delete the stale campaign and fall through to fresh start — the existing
                 # CP segment will be reused via the "already exists" recovery in _create_segment.
                 logger.warning(
                     "_start_one_campaign[%d/%d]: pre-warmed campaign %s start time passed — recreating",
-                    bucket_index, campaign_index, cs["connectCampaignId"],
+                    bucket_index,
+                    campaign_index,
+                    cs["connectCampaignId"],
                 )
                 _safe_stop_campaign(cs["connectCampaignId"])
                 _safe_delete_campaign(cs["connectCampaignId"])
                 cs["connectCampaignId"] = None
                 # Fall through to fresh start below
             else:
-                logger.error("_start_one_campaign: start warmed campaign failed: %s", exc)
+                logger.error(
+                    "_start_one_campaign: start warmed campaign failed: %s", exc
+                )
                 cs["status"] = "error"
                 cs["exitReason"] = REASON_CREATION_FAILED
                 cs["errorDetail"] = str(exc)
@@ -1731,10 +2223,12 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
         segment_name = pinned_segment_arn.rsplit("/", 1)[-1]
         logger.info(
             "_start_one_campaign[%d/%d]: using pinned segment %s",
-            bucket_index, campaign_index, segment_name,
+            bucket_index,
+            campaign_index,
+            segment_name,
         )
     else:
-        reconcile_retry_limit = int(bucket.get("reconcileRetryLimit", 2))
+        reconcile_retry_limit = int(bucket.get("reconcileRetryLimit", 5))
         on_exhausted = bucket.get("onReconcileExhausted", "continue")
 
         segment_name = segment_arn = None
@@ -1749,7 +2243,9 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
                 cs["status"] = "queued"
                 logger.warning(
                     "_start_one_campaign[%d/%d]: Redis rebuilding, will retry next tick: %s",
-                    bucket_index, campaign_index, exc,
+                    bucket_index,
+                    campaign_index,
+                    exc,
                 )
                 return
             except _EmptySegmentError as exc:
@@ -1762,13 +2258,20 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
                     cs["reconcileRetries"] = empty_retries + 1
                     logger.warning(
                         "_start_one_campaign[%d/%d]: empty segment (retry %d/%d), will retry next tick: %s",
-                        bucket_index, campaign_index, empty_retries + 1, reconcile_retry_limit, exc,
+                        bucket_index,
+                        campaign_index,
+                        empty_retries + 1,
+                        reconcile_retry_limit,
+                        exc,
                     )
                     return
                 last_exc = exc
                 logger.info(
                     "_start_one_campaign[%d/%d]: empty segment after %d retries — cancelling: %s",
-                    bucket_index, campaign_index, empty_retries, exc,
+                    bucket_index,
+                    campaign_index,
+                    empty_retries,
+                    exc,
                 )
                 break
             except Exception as exc:
@@ -1776,20 +2279,44 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
                 if attempt < reconcile_retry_limit:
                     logger.warning(
                         "_start_one_campaign[%d/%d]: segment attempt %d/%d failed (%s), retrying",
-                        bucket_index, campaign_index, attempt + 1, reconcile_retry_limit + 1, exc,
+                        bucket_index,
+                        campaign_index,
+                        attempt + 1,
+                        reconcile_retry_limit + 1,
+                        exc,
                     )
 
         if last_exc is not None:
             if isinstance(last_exc, _EmptySegmentError):
+                # Final check: if Redis just dropped to LLEN=0 between our last retry
+                # and now, we were hitting a partial-rebuild window, not genuine emptiness.
+                # Reset retries so the next tick gives the rebuild a fresh window.
+                if not _check_redis_ready():
+                    cs["status"] = "queued"
+                    cs["reconcileRetries"] = 0
+                    logger.warning(
+                        "_start_one_campaign[%d/%d]: Redis not ready on final check after %d retries"
+                        " — resetting for rebuild, will retry next tick",
+                        bucket_index,
+                        campaign_index,
+                        reconcile_retry_limit,
+                    )
+                    return
                 cs["status"] = "cancelled"
                 cs["exitReason"] = REASON_SKIPPED_EMPTY
                 cs["errorDetail"] = str(last_exc)
                 cs["completedAt"] = now_iso
                 return
-            reason = REASON_RECONCILE_FAILED if on_exhausted == "fail" else REASON_CREATION_FAILED
+            reason = (
+                REASON_RECONCILE_FAILED
+                if on_exhausted == "fail"
+                else REASON_CREATION_FAILED
+            )
             cs["status"] = "error"
             cs["exitReason"] = reason
-            cs["errorDetail"] = f"Segment creation failed after {reconcile_retry_limit + 1} attempts: {last_exc}"
+            cs["errorDetail"] = (
+                f"Segment creation failed after {reconcile_retry_limit + 1} attempts: {last_exc}"
+            )
             cs["completedAt"] = now_iso
             return
 
@@ -1798,7 +2325,9 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
 
     # Phase 2: create + start Connect campaign
     try:
-        connect_id, campaign_name = _create_and_start_campaign(bucket, campaign, segment_arn, segment_name, now)
+        connect_id, campaign_name = _create_and_start_campaign(
+            bucket, campaign, segment_arn, segment_name, now
+        )
         cs["connectCampaignId"] = connect_id
         # Mid-flight save: persist {creating, connectCampaignId} so Phase-1 recovery in
         # _dispatch_ready_campaigns can poll Connect and restore to "running" — no duplicate
@@ -1818,12 +2347,16 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
                     logger.warning(
                         "_start_one_campaign[%d/%d]: mid-flight save failed after 3 attempts — "
                         "outer Phase-5 will confirm; orphan possible if Phase-5 also fails (campaign=%s)",
-                        bucket_index, campaign_index, connect_id,
+                        bucket_index,
+                        campaign_index,
+                        connect_id,
                     )
                     break
                 logger.info(
                     "_start_one_campaign[%d/%d]: mid-flight save attempt %d — refreshing version",
-                    bucket_index, campaign_index, _mf_attempt + 1,
+                    bucket_index,
+                    campaign_index,
+                    _mf_attempt + 1,
                 )
                 fresh = get_run(run["planId"], run["runId"])
                 if not fresh:
@@ -1832,25 +2365,112 @@ def _start_one_campaign(run: dict, plan: dict, bucket_index: int, campaign_index
             except Exception as _mid_exc:
                 logger.warning(
                     "_start_one_campaign[%d/%d]: mid-flight save failed — outer save will confirm: %s",
-                    bucket_index, campaign_index, _mid_exc,
+                    bucket_index,
+                    campaign_index,
+                    _mid_exc,
                 )
                 break
         cs["status"] = "running"
     except _EmptySegmentError:
-        logger.info("_start_one_campaign[%d/%d]: segment empty after creation", bucket_index, campaign_index)
+        logger.info(
+            "_start_one_campaign[%d/%d]: segment empty after creation",
+            bucket_index,
+            campaign_index,
+        )
         if not pinned_segment_arn:
             _safe_delete_segment(segment_name)
         cs["status"] = "cancelled"
         cs["exitReason"] = REASON_SKIPPED_EMPTY
         cs["completedAt"] = now_iso
+    except _CutoffTooCloseError as exc:
+        logger.info(
+            "_start_one_campaign[%d/%d]: skipping — %s",
+            bucket_index,
+            campaign_index,
+            exc,
+        )
+        if not pinned_segment_arn and segment_name:
+            _safe_delete_segment(segment_name)
+        cs["status"] = "expired"
+        cs["exitReason"] = "cutoff_too_close"
+        cs["completedAt"] = now_iso
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code in ("ThrottlingException", "ServiceQuotaExceededException"):
+            # Transient — Connect API is throttled or at capacity. Revert to queued
+            # so the next tick retries automatically. Keep the segment (it was already
+            # created) so the retry can reuse it via _create_segment's "already exists"
+            # handling rather than re-creating it from scratch.
+            logger.warning(
+                "_start_one_campaign[%d/%d]: transient Connect error (%s) — reverting to queued: %s",
+                bucket_index,
+                campaign_index,
+                code,
+                exc,
+            )
+            cs["status"] = "queued"
+            cs.pop("connectCampaignId", None)
+            _notify_sns(
+                subject=f"[VIP Plans] Campaign throttled/quota exceeded: {cs.get('name', cs['campaignId'])}",
+                detail=(
+                    f"Campaign '{cs.get('name', '')}' hit a transient Connect error ({code}).\n"
+                    f"It will be retried on the next tick automatically.\n"
+                    f"campaignId={cs['campaignId']}, bucket={bucket_index}"
+                ),
+                attributes={
+                    "alertType": "throttle_or_quota",
+                    "campaignId": cs["campaignId"],
+                },
+            )
+        else:
+            logger.error(
+                "_start_one_campaign[%d/%d]: campaign creation failed (%s): %s",
+                bucket_index,
+                campaign_index,
+                code,
+                exc,
+            )
+            if not pinned_segment_arn and segment_name:
+                _safe_delete_segment(segment_name)
+            cs["status"] = "error"
+            cs["exitReason"] = REASON_CREATION_FAILED
+            cs["errorDetail"] = f"Campaign creation failed: {exc}"
+            cs["completedAt"] = now_iso
+            _notify_sns(
+                subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
+                detail=(
+                    f"Campaign '{cs.get('name', '')}' failed to start (Connect error {code}).\n"
+                    f"campaignId={cs['campaignId']}, bucket={bucket_index}\nError: {exc}"
+                ),
+                attributes={
+                    "alertType": "campaign_creation_failed",
+                    "campaignId": cs["campaignId"],
+                },
+            )
     except Exception as exc:
-        logger.error("_start_one_campaign[%d/%d]: campaign creation failed: %s", bucket_index, campaign_index, exc)
-        if not pinned_segment_arn:
+        logger.error(
+            "_start_one_campaign[%d/%d]: campaign creation failed: %s",
+            bucket_index,
+            campaign_index,
+            exc,
+        )
+        if not pinned_segment_arn and segment_name:
             _safe_delete_segment(segment_name)
         cs["status"] = "error"
         cs["exitReason"] = REASON_CREATION_FAILED
         cs["errorDetail"] = f"Campaign creation failed: {exc}"
         cs["completedAt"] = now_iso
+        _notify_sns(
+            subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
+            detail=(
+                f"Campaign '{cs.get('name', '')}' failed to start.\n"
+                f"campaignId={cs['campaignId']}, bucket={bucket_index}\nError: {exc}"
+            ),
+            attributes={
+                "alertType": "campaign_creation_failed",
+                "campaignId": cs["campaignId"],
+            },
+        )
 
 
 def _create_campaign_only(
@@ -1862,7 +2482,9 @@ def _create_campaign_only(
 
     Returns (connectCampaignId, segmentName, segmentArn).
     """
-    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+        build as build_oc,
+    )
 
     now = _now_utc()
     pinned_arn = campaign.get("pinnedSegmentArn")
@@ -1882,17 +2504,28 @@ def _create_campaign_only(
     # warmup window pushes startTime past the end-time cap.
     end_dt = datetime.fromisoformat(end_time)
     if start_dt >= end_dt:
-        raise ValueError(
+        raise _CutoffTooCloseError(
             f"Campaign start {start_time} >= end {end_time} — too close to daily cutoff, skipping"
         )
 
     campaign_name = segment_name if pinned_arn else build_segment_name(bucket, campaign)
 
-    instance_arn = f"arn:aws:connect:us-east-1:{_account_id()}:instance/{CONNECT_INSTANCE_ID}"
-    profiles_domain_arn = f"arn:aws:profile:us-east-1:{_account_id()}:domains/{PROFILES_DOMAIN_NAME}"
+    instance_arn = (
+        f"arn:aws:connect:us-east-1:{_account_id()}:instance/{CONNECT_INSTANCE_ID}"
+    )
+    profiles_domain_arn = (
+        f"arn:aws:profile:us-east-1:{_account_id()}:domains/{PROFILES_DOMAIN_NAME}"
+    )
 
-    state_codes = campaign.get("states") or bucket.get("segmentFilters", {}).get("state", [])
-    live_flow_arn = resolve_campaign_flow_arn(state_codes, CONNECT_INSTANCE_ID)
+    delivery_type = campaign.get("deliveryType", "campaign")
+    state_codes = campaign.get("states") or bucket.get("segmentFilters", {}).get(
+        "state", []
+    )
+
+    if delivery_type == "journey":
+        live_flow_arn = resolve_journey_flow_arn(CONNECT_INSTANCE_ID)
+    else:
+        live_flow_arn = resolve_campaign_flow_arn(state_codes, CONNECT_INSTANCE_ID)
 
     # Build a merged bucket view with the campaign's segment filters
     merged_bucket = dict(bucket)
@@ -1910,9 +2543,15 @@ def _create_campaign_only(
         campaign_name=campaign_name,
         campaign_flow_arn_override=live_flow_arn,
         campaign=campaign,
+        delivery_type=delivery_type,
     )
 
     if "connectCampaignFlowArn" not in params:
+        if delivery_type == "journey":
+            raise ValueError(
+                f"Journey flow '{_JOURNEY_FLOW_NAME}' not found in Connect instance — "
+                "create a CAMPAIGN-type flow with that exact name"
+            )
         raise ValueError(
             f"No campaign flow ARN available for states {state_codes!r} — "
             "add a CAMPAIGN-type flow named 'campaign-<STATE>' in Connect, "
@@ -1929,11 +2568,16 @@ def _create_campaign_only(
     try:
         oc.start_campaign(campaign_id)
         warmup_started = True
-        logger.info("_create_campaign_only: started campaign %s (startTime=%s)", campaign_id, start_time)
+        logger.info(
+            "_create_campaign_only: started campaign %s (startTime=%s)",
+            campaign_id,
+            start_time,
+        )
     except Exception as exc:
         logger.warning(
             "_create_campaign_only: start_campaign failed for %s — will retry at activation: %s",
-            campaign_id, exc,
+            campaign_id,
+            exc,
         )
 
     return campaign_id, segment_name, segment_arn, warmup_started
@@ -1950,10 +2594,22 @@ def _poll_campaign_state(cs: dict) -> None:
             cs["status"] = "error"
             cs["errorDetail"] = f"Connect campaign failed (state: {state})"
         else:
-            # Stopped / Deleted / unknown terminal → cancelled so downstream dependents cascade-cancel
             cs["status"] = "cancelled"
         cs["exitReason"] = exit_reason
         cs["completedAt"] = _now_iso()
+        if exit_reason == "connect_deleted":
+            _notify_sns(
+                subject=f"[VIP Plans] Campaign deleted externally: {cs.get('name', cs['campaignId'])}",
+                detail=(
+                    f"Campaign '{cs.get('name', '')}' (connectId={cs['connectCampaignId']}) "
+                    f"was not found in Connect — it may have been deleted manually.\n"
+                    f"campaignId={cs['campaignId']}"
+                ),
+                attributes={
+                    "alertType": "connect_deleted",
+                    "campaignId": cs["campaignId"],
+                },
+            )
 
 
 # ── AWS operations ────────────────────────────────────────────────────────────
@@ -1963,8 +2619,34 @@ class _EmptySegmentError(Exception):
     pass
 
 
+def _check_redis_ready() -> bool:
+    """Return True if the Redis lead list has data (LLEN > 0), False if mid-rebuild.
+
+    Called as a final pre-cancel check after _EmptySegmentError retries are
+    exhausted.  If LLEN just dropped to 0 between our last retry and now, the
+    campaign was failing due to a partial-rebuild window, not genuine emptiness —
+    reset retries and requeue instead of cancelling.  Falls back to True on any
+    exception so a connection error does not suppress a legitimate cancel.
+    """
+    try:
+        from vip_shared.infrastructure.persistence.redis_lead_source import (
+            build_from_env as build_redis,
+        )
+
+        return build_redis().is_ready()
+    except Exception:
+        return True  # assume ready → don't suppress cancel on unexpected errors
+
+
 class _RedisRebuildingError(Exception):
     """Redis lead list is empty due to in-progress rebuild — transient, retry."""
+
+    pass
+
+
+class _CutoffTooCloseError(Exception):
+    """start_time >= end_time because campaign creation is within 6 min of daily cutoff."""
+
     pass
 
 
@@ -1973,9 +2655,16 @@ _MAX_SEGMENT_MEMBERS = 3000
 
 def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
     from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
-    from vip_shared.domain.services.segment_groups_translator import SegmentGroupsTranslator, matches_group
-    from vip_shared.infrastructure.persistence.customer_profiles_client import build_from_env as build_cp
-    from vip_shared.infrastructure.persistence.redis_lead_source import build_from_env as build_redis
+    from vip_shared.domain.services.segment_groups_translator import (
+        SegmentGroupsTranslator,
+        matches_group,
+    )
+    from vip_shared.infrastructure.persistence.customer_profiles_client import (
+        build_from_env as build_cp,
+    )
+    from vip_shared.infrastructure.persistence.redis_lead_source import (
+        build_from_env as build_redis,
+    )
 
     # Resolve effective segment filters
     if campaign is not None and not campaign.get("_legacyBucket"):
@@ -1988,15 +2677,27 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
 
     rules: list = []
     if locations:
-        rules.append(FilterRule(field="location", operator=FilterOperator.IN, values=tuple(locations)))
+        rules.append(
+            FilterRule(
+                field="location", operator=FilterOperator.IN, values=tuple(locations)
+            )
+        )
 
     available = filters.get("available") or "True"
     if available in ("True", "False"):
-        rules.append(FilterRule(field="available", operator=FilterOperator.IN, values=(available,)))
+        rules.append(
+            FilterRule(
+                field="available", operator=FilterOperator.IN, values=(available,)
+            )
+        )
 
     all_groups = filters.get("groups", []) + filters.get("attempts", [])
     if all_groups:
-        rules.append(FilterRule(field="groups", operator=FilterOperator.IN, values=tuple(all_groups)))
+        rules.append(
+            FilterRule(
+                field="groups", operator=FilterOperator.IN, values=tuple(all_groups)
+            )
+        )
 
     redis_source = build_redis()
     if not redis_source.is_ready():
@@ -2027,7 +2728,9 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
     )
 
     state_str = "/".join(state_codes) if state_codes else "all"
-    display_name = f"{campaign.get('name') or bucket.get('name', 'campaign')} — {state_str}"
+    display_name = (
+        f"{campaign.get('name') or bucket.get('name', 'campaign')} — {state_str}"
+    )
 
     try:
         resp = cp.create_segment_definition(
@@ -2056,27 +2759,60 @@ def _create_and_start_campaign(
     segment_name: str,
     now: datetime,
 ) -> tuple[str, str]:
-    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+        build as build_oc,
+    )
 
     oc = build_oc()
-    start_time = (now + timedelta(minutes=6)).isoformat()
+    start_dt = now + timedelta(minutes=6)
+    start_time = start_dt.isoformat()
 
     # run_type → end_time override (full = daily cutoff; time_N = N min from now)
     run_type = (campaign or {}).get("run_type", "full")
-    end_time = _campaign_end_time(now, campaign if isinstance(campaign, dict) else {}, run_type)
+    end_time = _campaign_end_time(
+        now, campaign if isinstance(campaign, dict) else {}, run_type
+    )
 
-    instance_arn = f"arn:aws:connect:us-east-1:{_account_id()}:instance/{CONNECT_INSTANCE_ID}"
-    profiles_domain_arn = f"arn:aws:profile:us-east-1:{_account_id()}:domains/{PROFILES_DOMAIN_NAME}"
+    # Guard: Connect rejects campaigns where startTime >= endTime.
+    end_dt = datetime.fromisoformat(end_time)
+    if start_dt >= end_dt:
+        raise _CutoffTooCloseError(
+            f"Campaign start {start_time} >= end {end_time} — too close to daily cutoff, skipping"
+        )
 
+    instance_arn = (
+        f"arn:aws:connect:us-east-1:{_account_id()}:instance/{CONNECT_INSTANCE_ID}"
+    )
+    profiles_domain_arn = (
+        f"arn:aws:profile:us-east-1:{_account_id()}:domains/{PROFILES_DOMAIN_NAME}"
+    )
+
+    delivery_type = (campaign or {}).get("deliveryType", "campaign")
     state_codes = (
-        campaign.get("states", []) if campaign and not campaign.get("_legacyBucket")
+        campaign.get("states", [])
+        if campaign and not campaign.get("_legacyBucket")
         else bucket.get("segmentFilters", {}).get("state", [])
     )
-    live_flow_arn = resolve_campaign_flow_arn(state_codes, CONNECT_INSTANCE_ID)
-    if live_flow_arn:
-        logger.info("resolved flow %s for states %s", live_flow_arn, state_codes)
+
+    if delivery_type == "journey":
+        live_flow_arn = resolve_journey_flow_arn(CONNECT_INSTANCE_ID)
+        if live_flow_arn:
+            logger.info("resolved journey flow %s", live_flow_arn)
+        else:
+            logger.warning(
+                "journey flow '%s' not found in Connect", "Test-Journey-Flow"
+            )
     else:
-        logger.warning("no campaign flow found for states %s, falling back to stored ARN", state_codes)
+        live_flow_arn = resolve_campaign_flow_arn(state_codes, CONNECT_INSTANCE_ID)
+        if live_flow_arn:
+            logger.info(
+                "resolved campaign flow %s for states %s", live_flow_arn, state_codes
+            )
+        else:
+            logger.warning(
+                "no campaign flow found for states %s, falling back to stored ARN",
+                state_codes,
+            )
 
     # Merge campaign filters into bucket for build_campaign_params
     merged_bucket = dict(bucket)
@@ -2094,9 +2830,15 @@ def _create_and_start_campaign(
         campaign_name=segment_name,
         campaign_flow_arn_override=live_flow_arn,
         campaign=campaign,
+        delivery_type=delivery_type,
     )
 
     if "connectCampaignFlowArn" not in params:
+        if delivery_type == "journey":
+            raise ValueError(
+                f"Journey flow '{_JOURNEY_FLOW_NAME}' not found in Connect instance — "
+                "create a CAMPAIGN-type flow with that exact name"
+            )
         raise ValueError(
             f"No campaign flow ARN available for states {state_codes!r} — "
             "add a CAMPAIGN-type flow named 'campaign-<STATE>' in Connect, "
@@ -2113,12 +2855,14 @@ def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
     import json
 
     rule_name = f"vip-plan-{plan_id[:8]}-run-{run_id[:8]}-b{bucket_index}"
-    input_payload = json.dumps({
-        "action": "tick",
-        "planId": plan_id,
-        "runId": run_id,
-        "bucketIndex": bucket_index,
-    })
+    input_payload = json.dumps(
+        {
+            "action": "tick",
+            "planId": plan_id,
+            "runId": run_id,
+            "bucketIndex": bucket_index,
+        }
+    )
 
     events = boto3.client("events")
     events.put_rule(
@@ -2148,7 +2892,11 @@ def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
 
 def _delete_bucket_schedule_safe(run: dict, bucket_index: int) -> None:
     """Delete the EventBridge rule for a specific bucket."""
-    bucket_state = run["bucketStates"][bucket_index] if bucket_index < len(run["bucketStates"]) else {}
+    bucket_state = (
+        run["bucketStates"][bucket_index]
+        if bucket_index < len(run["bucketStates"])
+        else {}
+    )
     schedule_name = bucket_state.get("scheduleName") or run.get("scheduleName")
     _delete_schedule_safe(schedule_name)
     if bucket_state:
@@ -2163,7 +2911,9 @@ def _delete_schedule_safe(schedule_name: str | None) -> None:
     for call in (
         lambda: events.remove_targets(Rule=schedule_name, Ids=["lambda"]),
         lambda: events.delete_rule(Name=schedule_name),
-        lambda: lambda_client.remove_permission(FunctionName=LAMBDA_FUNCTION_ARN, StatementId=schedule_name),
+        lambda: lambda_client.remove_permission(
+            FunctionName=LAMBDA_FUNCTION_ARN, StatementId=schedule_name
+        ),
     ):
         try:
             call()
@@ -2174,7 +2924,9 @@ def _delete_schedule_safe(schedule_name: str | None) -> None:
 
 
 def _get_campaign_state(campaign_id: str) -> str:
-    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+        build as build_oc,
+    )
 
     try:
         resp = build_oc().get_campaign_state(campaign_id)
@@ -2187,7 +2939,9 @@ def _get_campaign_state(campaign_id: str) -> str:
 
 
 def _safe_stop_campaign(campaign_id: str) -> None:
-    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+        build as build_oc,
+    )
 
     try:
         state = _get_campaign_state(campaign_id)
@@ -2198,7 +2952,9 @@ def _safe_stop_campaign(campaign_id: str) -> None:
 
 
 def _safe_delete_campaign(campaign_id: str) -> None:
-    from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+    from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+        build as build_oc,
+    )
 
     try:
         state = _get_campaign_state(campaign_id)
@@ -2210,7 +2966,9 @@ def _safe_delete_campaign(campaign_id: str) -> None:
 
 
 def _safe_delete_segment(segment_name: str) -> None:
-    from vip_shared.infrastructure.persistence.customer_profiles_client import build_from_env as build_cp
+    from vip_shared.infrastructure.persistence.customer_profiles_client import (
+        build_from_env as build_cp,
+    )
 
     try:
         build_cp().delete_segment_definition(segment_name)
@@ -2229,12 +2987,37 @@ def _now_iso() -> str:
     return _now_utc().isoformat()
 
 
+def _notify_sns(subject: str, detail: str, attributes: dict | None = None) -> None:
+    """Fire-and-forget SNS publish. Never raises — alerting must not affect plan execution."""
+    if not SNS_ALERTS_TOPIC_ARN:
+        return
+    try:
+        msg_attrs: dict = {}
+        if attributes:
+            for k, v in attributes.items():
+                msg_attrs[k] = {"DataType": "String", "StringValue": str(v)}
+        boto3.client("sns").publish(
+            TopicArn=SNS_ALERTS_TOPIC_ARN,
+            Subject=subject[:100],
+            Message=detail,
+            MessageAttributes=msg_attrs,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_notify_sns: publish failed (topic=%s): %s", SNS_ALERTS_TOPIC_ARN, exc
+        )
+
+
 def _future_iso(base: datetime, minutes: int) -> str:
     return (base + timedelta(minutes=minutes)).isoformat()
 
 
 _LEGACY_RUN_TYPE_MINUTES: dict[str, int] = {
-    "time_30": 30, "time_45": 45, "time_60": 60, "time_90": 90, "time_120": 120
+    "time_30": 30,
+    "time_45": 45,
+    "time_60": 60,
+    "time_90": 90,
+    "time_120": 120,
 }
 
 
@@ -2257,7 +3040,9 @@ def _daily_cutoff_iso(now: datetime) -> str:
     """
     _COT = timezone(timedelta(hours=-5))
     cot_now = now.astimezone(_COT)
-    end_cot = cot_now.replace(hour=_DAILY_CUTOFF_HOUR, minute=0, second=0, microsecond=0)
+    end_cot = cot_now.replace(
+        hour=_DAILY_CUTOFF_HOUR, minute=0, second=0, microsecond=0
+    )
     if end_cot <= cot_now:
         end_cot += timedelta(days=1)
     return end_cot.astimezone(timezone.utc).isoformat()
@@ -2297,7 +3082,9 @@ def _within_working_hours(plan: dict) -> bool:
     if allowed_days and day_abbr not in allowed_days:
         return False
     start = wh.get("startTime", "00:00")
-    end = wh.get("endTime", "24:00")  # default runs through midnight; 24:00 = 1440 min > 23:59
+    end = wh.get(
+        "endTime", "24:00"
+    )  # default runs through midnight; 24:00 = 1440 min > 23:59
 
     def hhmm(s: str) -> int:
         h, m = (int(x) for x in s.split(":"))

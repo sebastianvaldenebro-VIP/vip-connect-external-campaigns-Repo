@@ -9,6 +9,7 @@ Mirrors the logic in:
   frontend/src/pages/SegmentNew.tsx  — name building
   services/api-campaigns/src/builders.py — campaign params
 """
+
 from __future__ import annotations
 
 import re
@@ -21,35 +22,77 @@ import boto3
 
 _STATE_LOCATIONS: dict[str, list[str]] = {
     "SCA": [
-        "CA - Arcadia", "CA - Encino", "CA - Huntington Beach", "CA - Irvine",
-        "CA - Long Beach", "CA - National City", "CA - Newport Beach", "CA - Poway",
-        "CA - San Diego", "CA - Temecula", "CA - Torrance", "California",
+        "CA - Arcadia",
+        "CA - Encino",
+        "CA - Huntington Beach",
+        "CA - Irvine",
+        "CA - Long Beach",
+        "CA - National City",
+        "CA - Newport Beach",
+        "CA - Poway",
+        "CA - San Diego",
+        "CA - Temecula",
+        "CA - Torrance",
+        "California",
     ],
     "NCA": ["CA - Palo Alto", "CA - Sacramento", "CA - San Jose"],
     "CT": ["Connecticut", "CT - Farmington", "CT - Hamden", "CT - Stamford"],
     "MD": ["DC", "Maryland", "MD - Bethesda", "MD - Bowie", "MD - Maple Lawn Office"],
     "NJ": [
-        "New Jersey", "NJ - Clifton", "NJ - Edgewater", "NJ - Harrison Office",
-        "NJ - Hoboken", "NJ - Marlton", "NJ - Morris County Office", "NJ - Morristown",
-        "NJ - Paramus", "NJ - Princeton", "NJ - Scotch Plains", "NJ - West Orange Office",
-        "NJ - West Orange Office (NEW)", "NJ - Woodbridge", "NJ - Woodland Park Office",
+        "New Jersey",
+        "NJ - Clifton",
+        "NJ - Edgewater",
+        "NJ - Harrison Office",
+        "NJ - Hoboken",
+        "NJ - Marlton",
+        "NJ - Morris County Office",
+        "NJ - Morristown",
+        "NJ - Paramus",
+        "NJ - Princeton",
+        "NJ - Scotch Plains",
+        "NJ - West Orange Office",
+        "NJ - West Orange Office (NEW)",
+        "NJ - Woodbridge",
+        "NJ - Woodland Park Office",
     ],
     "NY": [
-        "New York", "NY - Brighton Beach", "NY - Bronx", "NY - Forest Hills",
-        "NY - Hartsdale", "NY - Upper East Side", "NY - Yonkers",
-        "NYC - Astoria", "NYC - Bronx", "NYC - Brooklyn - Williamsburg",
-        "NYC - Downtown Brooklyn", "NYC - FiDi Manhattan", "NYC - Midtown Manhattan",
-        "NYC - Staten Island", "NYC - Williamsburg",
+        "New York",
+        "NY - Brighton Beach",
+        "NY - Bronx",
+        "NY - Forest Hills",
+        "NY - Hartsdale",
+        "NY - Upper East Side",
+        "NY - Yonkers",
+        "NYC - Astoria",
+        "NYC - Bronx",
+        "NYC - Brooklyn - Williamsburg",
+        "NYC - Downtown Brooklyn",
+        "NYC - FiDi Manhattan",
+        "NYC - Midtown Manhattan",
+        "NYC - Staten Island",
+        "NYC - Williamsburg",
     ],
     "LI": [
-        "Long Island", "NY - LI Hampton Bays", "NY - LI Jericho",
-        "NY - LI Port Jefferson", "NY - LI Rockville", "NY - LI West Islip",
+        "Long Island",
+        "NY - LI Hampton Bays",
+        "NY - LI Jericho",
+        "NY - LI Port Jefferson",
+        "NY - LI Rockville",
+        "NY - LI West Islip",
     ],
     "TX": [
-        "Texas", "TX - Addison", "TX - Arlington", "TX - Cedar Park",
-        "TX - Cibolo Creek", "TX - Dallas - Addison", "TX - Flower Mound",
-        "TX - Fort Worth", "TX - Kyle", "TX - Medical Center",
-        "TX - Spring Branch", "TX - Sugar Land",
+        "Texas",
+        "TX - Addison",
+        "TX - Arlington",
+        "TX - Cedar Park",
+        "TX - Cibolo Creek",
+        "TX - Dallas - Addison",
+        "TX - Flower Mound",
+        "TX - Fort Worth",
+        "TX - Kyle",
+        "TX - Medical Center",
+        "TX - Spring Branch",
+        "TX - Sugar Land",
     ],
 }
 
@@ -83,7 +126,9 @@ def campaign_to_segment_filters(campaign: dict) -> dict:
     groups = campaign.get("groups")
     if not groups:
         # Backward compat: old plans stored group + attempts separately
-        group_label = _GROUP_LABEL_MAP.get(campaign.get("group", ""), campaign.get("group", ""))
+        group_label = _GROUP_LABEL_MAP.get(
+            campaign.get("group", ""), campaign.get("group", "")
+        )
         attempts = campaign.get("attempts", [])
         groups = [
             f"{group_label} / {_ORDINAL[n]} Attempt"
@@ -165,7 +210,9 @@ def build_attempts_part(attempts: list[str]) -> str:
         elif len(nums) == 1:
             parts_out.append(f"{abbr}-{nums[0]}")
         else:
-            parts_out.append(f"{abbr}_{'–'.join(nums)}" if False else f"{abbr}_{ '-'.join(nums)}")
+            parts_out.append(
+                f"{abbr}_{'–'.join(nums)}" if False else f"{abbr}_{'-'.join(nums)}"
+            )
     return "_".join(parts_out)
 
 
@@ -212,9 +259,7 @@ def build_segment_groups(bucket: dict) -> dict[str, Any]:
 def _dimension(field: str, dim_type: str, values: list[str]) -> dict:
     return {
         "ProfileAttributes": {
-            "Attributes": {
-                field: {"DimensionType": dim_type, "Values": values}
-            }
+            "Attributes": {field: {"DimensionType": dim_type, "Values": values}}
         }
     }
 
@@ -230,7 +275,46 @@ _CANONICAL_FLOW_CONTENT = (
 )
 
 
-def resolve_campaign_flow_arn(state_codes: list[str], connect_instance_id: str) -> str | None:
+_JOURNEY_FLOW_NAME = "Test-Journey-Flow"
+
+
+def resolve_journey_flow_arn(connect_instance_id: str) -> str | None:
+    """Return the ARN of the canonical journey flow (Test-Journey-Flow).
+
+    Looks for a CAMPAIGN-type flow named exactly ``Test-Journey-Flow``.
+    Returns None if not found (caller's fail-fast guard fires).
+    Unlike campaign flows, this one is never auto-created — it must exist in Connect.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    connect = boto3.client("connect")
+    flows: list[dict] = []
+    kwargs: dict = {"InstanceId": connect_instance_id, "ContactFlowTypes": ["CAMPAIGN"]}
+    while True:
+        resp = connect.list_contact_flows(**kwargs)
+        flows.extend(resp.get("ContactFlowSummaryList", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+        kwargs["NextToken"] = token
+
+    match = next((f for f in flows if f["Name"] == _JOURNEY_FLOW_NAME), None)
+    if match:
+        return match["Arn"]
+
+    logger.error(
+        "journey flow '%s' not found in Connect instance %s",
+        _JOURNEY_FLOW_NAME,
+        connect_instance_id,
+    )
+    return None
+
+
+def resolve_campaign_flow_arn(
+    state_codes: list[str], connect_instance_id: str
+) -> str | None:
     """Return the canonical campaign-flow ARN for the given states.
 
     Looks for a flow named exactly ``campaign-<STATE>`` in the live Connect instance.
@@ -238,6 +322,7 @@ def resolve_campaign_flow_arn(state_codes: list[str], connect_instance_id: str) 
     Returns None only if creation also fails (caller's fail-fast guard fires).
     """
     import logging
+
     logger = logging.getLogger(__name__)
 
     connect = boto3.client("connect")
@@ -272,7 +357,9 @@ def resolve_campaign_flow_arn(state_codes: list[str], connect_instance_id: str) 
             resourceArn=flow_arn,
             tags={"do-not-delete": "true", "managed-by": "vip-plans"},
         )
-        logger.info("auto-created canonical campaign flow %s -> %s", canonical_name, flow_arn)
+        logger.info(
+            "auto-created canonical campaign flow %s -> %s", canonical_name, flow_arn
+        )
         return flow_arn
     except Exception as exc:
         logger.error("failed to auto-create campaign flow %s: %s", canonical_name, exc)
@@ -294,12 +381,17 @@ def build_campaign_params(
     campaign_name: str,
     campaign_flow_arn_override: str | None = None,
     campaign: dict | None = None,
+    delivery_type: str = "campaign",
 ) -> dict[str, Any]:
     """Build Connect outbound campaign creation params.
 
     ``campaign`` is an optional v2 Campaign dict. If provided its ``campaignConfig``
     (or the bucket-level ``campaignConfig``) is used for dialer settings.
     Campaign-level config fields override bucket-level when both present.
+
+    ``delivery_type`` controls the Connect campaign type:
+      - "campaign" (default) → MANAGED, uses campaign-<STATE> flow
+      - "journey"            → JOURNEY, uses Test-Journey-Flow
     """
     cfg = dict(bucket.get("campaignConfig", {}))
     if campaign:
@@ -322,6 +414,11 @@ def build_campaign_params(
                     "enableAnswerMachineDetection": bool(cfg.get("amdEnabled", True)),
                     "awaitAnswerMachinePrompt": bool(cfg.get("amdAwaitPrompt", True)),
                 },
+                **(
+                    {"ringTimeout": int(cfg["ringTimeout"])}
+                    if cfg.get("ringTimeout")
+                    else {}
+                ),
             },
         }
     }
@@ -336,6 +433,13 @@ def build_campaign_params(
             "localTimeZoneConfig": {"defaultTimeZone": "America/New_York"}
         },
     }
+
+    if delivery_type == "journey":
+        params["type"] = "JOURNEY"
+        params["communicationLimitsOverride"] = {
+            "allChannelSubtypes": {"communicationLimitsList": []},
+            "instanceLimitsHandling": "OPT_IN",
+        }
 
     flow_arn = campaign_flow_arn_override
     if flow_arn:

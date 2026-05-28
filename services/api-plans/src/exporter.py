@@ -37,6 +37,7 @@ Columns:
   triggered_by         — manual | loop | chained | scheduled | external
   extracted_at         — UTC timestamp of this export job
 """
+
 from __future__ import annotations
 
 import logging
@@ -93,33 +94,37 @@ def export_campaign_mappings() -> dict:
     for cid in all_ids:
         cc = connect_campaigns.get(cid, {})
         ctx = db_index.get(cid, {})
-        rows.append({
-            "connect_campaign_id": cid,
-            "connect_campaign_name": cc.get("name") or ctx.get("segment_name", ""),
-            "campaign_name": ctx.get("campaign_name") or cc.get("name", ""),
-            "segment_name": ctx.get("segment_name", ""),
-            "segment_arn": cc.get("segment_arn") or ctx.get("segment_arn", ""),
-            "campaign_status": ctx.get("campaign_status", ""),
-            "connect_state": cc.get("state", ""),
-            "exit_reason": ctx.get("exit_reason", ""),
-            "started_at": ctx.get("started_at"),
-            "completed_at": ctx.get("completed_at"),
-            "bucket_index": ctx.get("bucket_index"),
-            "bucket_id": ctx.get("bucket_id", ""),
-            "bucket_name": ctx.get("bucket_name", ""),
-            "plan_id": ctx.get("plan_id", ""),
-            "plan_name": ctx.get("plan_name", ""),
-            "run_id": ctx.get("run_id", ""),
-            "run_date": ctx.get("run_date", ""),
-            "triggered_by": ctx.get("triggered_by", "external" if not ctx else ""),
-            "extracted_at": extracted_at,
-        })
+        rows.append(
+            {
+                "connect_campaign_id": cid,
+                "connect_campaign_name": cc.get("name") or ctx.get("segment_name", ""),
+                "campaign_name": ctx.get("campaign_name") or cc.get("name", ""),
+                "segment_name": ctx.get("segment_name", ""),
+                "segment_arn": cc.get("segment_arn") or ctx.get("segment_arn", ""),
+                "campaign_status": ctx.get("campaign_status", ""),
+                "connect_state": cc.get("state", ""),
+                "exit_reason": ctx.get("exit_reason", ""),
+                "started_at": ctx.get("started_at"),
+                "completed_at": ctx.get("completed_at"),
+                "bucket_index": ctx.get("bucket_index"),
+                "bucket_id": ctx.get("bucket_id", ""),
+                "bucket_name": ctx.get("bucket_name", ""),
+                "plan_id": ctx.get("plan_id", ""),
+                "plan_name": ctx.get("plan_name", ""),
+                "run_id": ctx.get("run_id", ""),
+                "run_date": ctx.get("run_date", ""),
+                "triggered_by": ctx.get("triggered_by", "external" if not ctx else ""),
+                "extracted_at": extracted_at,
+            }
+        )
 
     import awswrangler as wr
     import pandas as pd
 
     df = pd.DataFrame(rows)
-    df["bucket_index"] = pd.to_numeric(df["bucket_index"], errors="coerce").astype("Int64")
+    df["bucket_index"] = pd.to_numeric(df["bucket_index"], errors="coerce").astype(
+        "Int64"
+    )
     for col in ("started_at", "completed_at", "extracted_at"):
         df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
     df["run_date"] = pd.to_datetime(df["run_date"], errors="coerce").dt.date
@@ -139,13 +144,20 @@ def export_campaign_mappings() -> dict:
 
     glue_run_id = _trigger_snowflake_load(dt_label)
 
-    return {"exported": len(rows), "s3_path": s3_path, "dt": dt_label, "glue_run_id": glue_run_id}
+    return {
+        "exported": len(rows),
+        "s3_path": s3_path,
+        "dt": dt_label,
+        "glue_run_id": glue_run_id,
+    }
 
 
 def _trigger_snowflake_load(dt_label: str) -> str | None:
     """Fire-and-forget: start the specialOps Glue Snowflake loader."""
     if not GLUE_JOB_NAME or not SF_SRC_CFG_URI:
-        logger.warning("exporter: GLUE_JOB_NAME or SF_SRC_CFG_URI not set — skipping Glue trigger")
+        logger.warning(
+            "exporter: GLUE_JOB_NAME or SF_SRC_CFG_URI not set — skipping Glue trigger"
+        )
         return None
     try:
         glue = boto3.client("glue")
@@ -183,7 +195,11 @@ def _list_connect_campaigns() -> dict[str, dict]:
     while True:
         resp = client.list_campaigns(**kwargs)
         for c in resp.get("campaignSummaryList", []):
-            campaigns[c["id"]] = {"name": c.get("name", ""), "segment_arn": "", "state": ""}
+            campaigns[c["id"]] = {
+                "name": c.get("name", ""),
+                "segment_arn": "",
+                "state": "",
+            }
         token = resp.get("nextToken")
         if not token:
             break
@@ -221,7 +237,9 @@ def _enrich_external_campaigns(
         try:
             resp = client.describe_campaign(id=cid)
             source = resp.get("campaign", {}).get("source", {})
-            connect_campaigns[cid]["segment_arn"] = source.get("customerProfilesSegmentArn", "")
+            connect_campaigns[cid]["segment_arn"] = source.get(
+                "customerProfilesSegmentArn", ""
+            )
             time.sleep(_DESCRIBE_THROTTLE_SLEEP)
         except Exception as exc:
             logger.warning("exporter: describe_campaign %s failed: %s", cid, exc)
@@ -249,19 +267,21 @@ def _get_lead_counts_cw(campaign_ids: list[str]) -> dict[str, int | None]:
     for i, cid in enumerate(campaign_ids):
         mid = f"m{i}"
         id_map[mid] = cid
-        metric_queries.append({
-            "Id": mid,
-            "MetricStat": {
-                "Metric": {
-                    "Namespace": "AWS/Connect/Campaigns",
-                    "MetricName": "Delivery",
-                    "Dimensions": [{"Name": "CampaignId", "Value": cid}],
+        metric_queries.append(
+            {
+                "Id": mid,
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/Connect/Campaigns",
+                        "MetricName": "Delivery",
+                        "Dimensions": [{"Name": "CampaignId", "Value": cid}],
+                    },
+                    "Period": period,
+                    "Stat": "Sum",
                 },
-                "Period": period,
-                "Stat": "Sum",
-            },
-            "ReturnData": True,
-        })
+                "ReturnData": True,
+            }
+        )
 
     counts: dict[str, int | None] = {cid: None for cid in campaign_ids}
 
@@ -269,7 +289,9 @@ def _get_lead_counts_cw(campaign_ids: list[str]) -> dict[str, int | None]:
     for batch_start in range(0, len(metric_queries), 500):
         batch = metric_queries[batch_start : batch_start + 500]
         try:
-            for page in paginator.paginate(MetricDataQueries=batch, StartTime=start, EndTime=now):
+            for page in paginator.paginate(
+                MetricDataQueries=batch, StartTime=start, EndTime=now
+            ):
                 for result in page.get("MetricDataResults", []):
                     cid = id_map.get(result["Id"])
                     if cid and result.get("Values"):
@@ -322,7 +344,11 @@ def _index_run(item: dict, index: dict[str, dict]) -> None:
             if not cid:
                 continue
             existing = index.get(cid)
-            if existing and existing.get("started_at", "") > _norm_ts(cs.get("startedAt")) or "":
+            if (
+                existing
+                and existing.get("started_at", "") > _norm_ts(cs.get("startedAt"))
+                or ""
+            ):
                 continue  # keep the more-recent run record
             index[cid] = {
                 "campaign_name": cs.get("name", ""),
@@ -351,8 +377,11 @@ def _norm_ts(val) -> str | None:
         return None
     try:
         from decimal import Decimal
+
         if isinstance(val, (int, float, Decimal)):
-            return datetime.fromtimestamp(float(val) / 1000, tz=timezone.utc).isoformat()
+            return datetime.fromtimestamp(
+                float(val) / 1000, tz=timezone.utc
+            ).isoformat()
         s = str(val).strip()
         if not s:
             return None
@@ -367,6 +396,7 @@ def _norm_ts(val) -> str | None:
 def _cot_date(val) -> str:
     try:
         from decimal import Decimal
+
         if isinstance(val, (int, float, Decimal)):
             dt = datetime.fromtimestamp(float(val) / 1000, tz=timezone.utc)
         else:

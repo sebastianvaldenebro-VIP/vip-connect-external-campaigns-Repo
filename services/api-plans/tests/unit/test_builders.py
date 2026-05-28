@@ -1,4 +1,5 @@
 """Tests for builders.py — segment name, SegmentGroups, and campaign params."""
+
 from __future__ import annotations
 
 import sys
@@ -6,7 +7,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
-from builders import (
+from builders import (  # noqa: E402
     _abbreviate,
     build_attempts_part,
     build_segment_groups,
@@ -40,19 +41,23 @@ def test_attempts_part_single():
 
 
 def test_attempts_part_multi():
-    result = build_attempts_part([
-        "Cancellation / 2nd Attempt",
-        "Cancellation / 4th Attempt",
-        "Cancellation / 6th Attempt",
-    ])
+    result = build_attempts_part(
+        [
+            "Cancellation / 2nd Attempt",
+            "Cancellation / 4th Attempt",
+            "Cancellation / 6th Attempt",
+        ]
+    )
     assert result == "Can_2-4-6"
 
 
 def test_attempts_part_mixed_types():
-    result = build_attempts_part([
-        "New Lead / 1st Attempt",
-        "No Show / 2nd Attempt",
-    ])
+    result = build_attempts_part(
+        [
+            "New Lead / 1st Attempt",
+            "No Show / 2nd Attempt",
+        ]
+    )
     assert "NL-1" in result
     assert "NS-2" in result
 
@@ -126,7 +131,9 @@ def test_available_filter_omitted_when_empty():
 
 
 def test_groups_filter_included():
-    groups = build_segment_groups(_bucket(state=("NY",), groups=["New Lead / 1st Attempt"]))
+    groups = build_segment_groups(
+        _bucket(state=("NY",), groups=["New Lead / 1st Attempt"])
+    )
     dims = groups["Groups"][0]["Dimensions"]
     attrs = {}
     for d in dims:
@@ -137,7 +144,9 @@ def test_groups_filter_included():
 
 def test_attempts_folded_into_groups():
     # v2: attempts are baked into groups values, not a separate dimension
-    groups = build_segment_groups(_bucket(state=("NY",), groups=["New Lead / 1st Attempt"]))
+    groups = build_segment_groups(
+        _bucket(state=("NY",), groups=["New Lead / 1st Attempt"])
+    )
     dims = groups["Groups"][0]["Dimensions"]
     attrs = {}
     for d in dims:
@@ -152,6 +161,7 @@ def test_attempts_folded_into_groups():
 
 def test_segment_name_no_special_chars():
     import re
+
     name = build_segment_name(_bucket(state=("NY",), groups=["New Lead / 1st Attempt"]))
     assert re.match(r"^[a-zA-Z0-9_-]+$", name), f"Invalid name: {name!r}"
 
@@ -166,7 +176,12 @@ def test_segment_name_contains_state_code():
 
 def _campaign_bucket():
     return {
-        "segmentFilters": {"state": ["NY"], "groups": [], "attempts": [], "available": ""},
+        "segmentFilters": {
+            "state": ["NY"],
+            "groups": [],
+            "attempts": [],
+            "available": "",
+        },
         "campaignConfig": {
             "queueId": "q-1",
             "contactFlowId": "cf-1",
@@ -212,13 +227,18 @@ def test_campaign_params_includes_flow_arn_via_override():
         campaign_name="test-campaign",
         campaign_flow_arn_override="arn:aws:connect:us-east-1:123:contact-flow/f",
     )
-    assert params["connectCampaignFlowArn"] == "arn:aws:connect:us-east-1:123:contact-flow/f"
+    assert (
+        params["connectCampaignFlowArn"]
+        == "arn:aws:connect:us-east-1:123:contact-flow/f"
+    )
 
 
 def test_campaign_params_ignores_stored_flow_arn_in_config():
     # campaignFlowArn in bucket campaignConfig is no longer used — resolver is sole source.
     bucket = _campaign_bucket()
-    bucket["campaignConfig"]["campaignFlowArn"] = "arn:aws:connect:us-east-1:123:contact-flow/stale"
+    bucket["campaignConfig"]["campaignFlowArn"] = (
+        "arn:aws:connect:us-east-1:123:contact-flow/stale"
+    )
     params = build_campaign_params(
         bucket,
         segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",

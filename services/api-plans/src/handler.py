@@ -4,6 +4,7 @@ Two event sources:
   1. API Gateway HTTP API → route via router.resolve()
   2. EventBridge Scheduler → tick payload: {"action": "tick", "planId", "runId", "bucketIndex"}
 """
+
 from __future__ import annotations
 
 from botocore.exceptions import ClientError
@@ -25,15 +26,28 @@ def lambda_handler(event: dict, context) -> dict:
         plan_id = event.get("planId", "")
         run_id = event.get("runId", "")
         bucket_index = int(event.get("bucketIndex", 0))
-        _logger.info("tick_received", plan_id=plan_id, run_id=run_id, bucket_index=bucket_index)
+        _logger.info(
+            "tick_received", plan_id=plan_id, run_id=run_id, bucket_index=bucket_index
+        )
         try:
             result = executor.tick(plan_id, run_id, bucket_index)
             return result
         except ConcurrentWriteError:
-            _logger.info("tick_concurrent_write", plan_id=plan_id, run_id=run_id, bucket_index=bucket_index)
+            _logger.info(
+                "tick_concurrent_write",
+                plan_id=plan_id,
+                run_id=run_id,
+                bucket_index=bucket_index,
+            )
             return {"ok": True, "reason": "concurrent_write"}
         except Exception as exc:
-            _logger.error("tick_unhandled_error", error=str(exc), plan_id=plan_id, run_id=run_id, bucket_index=bucket_index)
+            _logger.error(
+                "tick_unhandled_error",
+                error=str(exc),
+                plan_id=plan_id,
+                run_id=run_id,
+                bucket_index=bucket_index,
+            )
             return {"ok": False, "error": str(exc)}
 
     if action == "scheduled_run":
@@ -67,7 +81,9 @@ def lambda_handler(event: dict, context) -> dict:
             return {"ok": False, "error": str(exc)}
 
     # HTTP API event
-    route_key = event.get("routeKey") or event.get("requestContext", {}).get("routeKey", "")
+    route_key = event.get("routeKey") or event.get("requestContext", {}).get(
+        "routeKey", ""
+    )
     path_params = event.get("pathParameters") or {}
 
     _logger.info("request_received", route_key=route_key, path_params=path_params)
@@ -85,7 +101,11 @@ def lambda_handler(event: dict, context) -> dict:
 
     except ConcurrentWriteError as exc:
         _logger.warn("concurrent_write", error=str(exc), route_key=route_key)
-        return error_response(409, "CONCURRENT_WRITE", "Another operation is in progress — retry in a moment")
+        return error_response(
+            409,
+            "CONCURRENT_WRITE",
+            "Another operation is in progress — retry in a moment",
+        )
 
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
@@ -95,8 +115,12 @@ def lambda_handler(event: dict, context) -> dict:
 
     except Exception as exc:
         _logger.error("unhandled_error", error=str(exc), route_key=route_key)
-        return error_response(500, "INTERNAL_ERROR", "Unexpected error",
-                              request_id=context.aws_request_id if context else None)
+        return error_response(
+            500,
+            "INTERNAL_ERROR",
+            "Unexpected error",
+            request_id=context.aws_request_id if context else None,
+        )
 
 
 def _aws_status(code: str) -> int:

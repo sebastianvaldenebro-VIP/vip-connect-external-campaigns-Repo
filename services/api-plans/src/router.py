@@ -1,4 +1,5 @@
 """Route table for api-plans Lambda."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -29,6 +30,7 @@ ROUTES: dict[str, Handler] = {
     "POST /plans/{id}/runs/{runId}/buckets/{bucketIndex}/campaigns/{campaignIndex}/force-start": runs_handler.force_start_campaign,
     "POST /plans/{id}/runs/{runId}/buckets/{bucketIndex}/campaigns/{campaignIndex}/force-stop": runs_handler.force_stop_campaign,
     "POST /plans/{id}/runs/{runId}/buckets/{bucketIndex}/campaigns/{campaignIndex}/skip": runs_handler.skip_campaign,
+    "POST /plans/{id}/runs/{runId}/apply-snapshot": runs_handler.apply_plan_snapshot,
 }
 
 

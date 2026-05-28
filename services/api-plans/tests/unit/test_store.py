@@ -1,4 +1,5 @@
 """Tests for store.py — DynamoDB item transforms (no actual AWS calls)."""
+
 from __future__ import annotations
 
 import sys
@@ -7,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
-import store
+import store  # noqa: E402
 
 
 def _mock_table():
@@ -47,9 +48,13 @@ def test_get_plan_not_found_returns_none():
 
 def test_get_plan_found_returns_dict():
     fake_item = {
-        "pk": "PLAN#abc", "sk": "META",
-        "planId": "abc", "name": "My Plan",
-        "buckets": [], "createdAt": "2026-05-01T00:00:00", "updatedAt": "2026-05-01T00:00:00",
+        "pk": "PLAN#abc",
+        "sk": "META",
+        "planId": "abc",
+        "name": "My Plan",
+        "buckets": [],
+        "createdAt": "2026-05-01T00:00:00",
+        "updatedAt": "2026-05-01T00:00:00",
     }
     table = _mock_table()
     table.get_item.return_value = {"Item": fake_item}
@@ -69,8 +74,19 @@ def test_create_run_initializes_bucket_states():
         "planId": "plan-1",
         "name": "Test",
         "buckets": [
-            {"id": "b0", "name": "Bucket 0", "run_mode": "time_based", "duration_minutes": 10, "campaigns": []},
-            {"id": "b1", "name": "Bucket 1", "run_mode": "status_based", "campaigns": []},
+            {
+                "id": "b0",
+                "name": "Bucket 0",
+                "run_mode": "time_based",
+                "duration_minutes": 10,
+                "campaigns": [],
+            },
+            {
+                "id": "b1",
+                "name": "Bucket 1",
+                "run_mode": "status_based",
+                "campaigns": [],
+            },
         ],
     }
     with patch("store._table", return_value=table):
@@ -85,7 +101,11 @@ def test_create_run_initializes_bucket_states():
 
 def test_create_run_run_id_is_unique():
     table = _mock_table()
-    plan = {"planId": "plan-1", "name": "Test", "buckets": [{"id": "b0", "campaigns": []}]}
+    plan = {
+        "planId": "plan-1",
+        "name": "Test",
+        "buckets": [{"id": "b0", "campaigns": []}],
+    }
     with patch("store._table", return_value=table):
         run1 = store.create_run("plan-1", plan)
         run2 = store.create_run("plan-1", plan)
@@ -105,11 +125,16 @@ def test_get_latest_run_none_when_no_runs():
 
 def test_get_latest_run_returns_first_item():
     fake_item = {
-        "pk": "PLAN#p1", "sk": "RUN#1234-abc",
-        "planId": "p1", "runId": "1234-abc",
-        "status": "completed", "currentBucketIndex": 2,
-        "scheduleName": None, "bucketStates": [],
-        "startedAt": "2026-05-01T00:00:00", "completedAt": "2026-05-01T01:00:00",
+        "pk": "PLAN#p1",
+        "sk": "RUN#1234-abc",
+        "planId": "p1",
+        "runId": "1234-abc",
+        "status": "completed",
+        "currentBucketIndex": 2,
+        "scheduleName": None,
+        "bucketStates": [],
+        "startedAt": "2026-05-01T00:00:00",
+        "completedAt": "2026-05-01T01:00:00",
         "error": None,
     }
     table = _mock_table()
@@ -137,11 +162,17 @@ def test_run_from_item_returns_version():
     fail with ConcurrentWriteError.
     """
     item = {
-        "pk": "PLAN#p1", "sk": "RUN#1234-abc",
-        "planId": "p1", "runId": "1234-abc",
-        "status": "running", "currentBucketIndex": 0,
-        "bucketStates": [], "startedAt": "2026-05-01T00:00:00",
-        "completedAt": None, "error": None, "_version": 7,
+        "pk": "PLAN#p1",
+        "sk": "RUN#1234-abc",
+        "planId": "p1",
+        "runId": "1234-abc",
+        "status": "running",
+        "currentBucketIndex": 0,
+        "bucketStates": [],
+        "startedAt": "2026-05-01T00:00:00",
+        "completedAt": None,
+        "error": None,
+        "_version": 7,
     }
     result = store._run_from_item(item)
     assert "_version" in result, "_version must be present in the run dict"
@@ -151,11 +182,16 @@ def test_run_from_item_returns_version():
 def test_run_from_item_version_defaults_to_zero():
     """_run_from_item must default _version to 0 for runs created before versioning."""
     item = {
-        "pk": "PLAN#p1", "sk": "RUN#old-run",
-        "planId": "p1", "runId": "old-run",
-        "status": "completed", "currentBucketIndex": 0,
-        "bucketStates": [], "startedAt": "2026-01-01T00:00:00",
-        "completedAt": "2026-01-01T01:00:00", "error": None,
+        "pk": "PLAN#p1",
+        "sk": "RUN#old-run",
+        "planId": "p1",
+        "runId": "old-run",
+        "status": "completed",
+        "currentBucketIndex": 0,
+        "bucketStates": [],
+        "startedAt": "2026-01-01T00:00:00",
+        "completedAt": "2026-01-01T01:00:00",
+        "error": None,
         # No _version field — simulates pre-versioning run items
     }
     result = store._run_from_item(item)
@@ -172,16 +208,24 @@ def test_save_run_increments_version_and_uses_condition():
     """
     table = _mock_table()
     run = {
-        "planId": "p1", "runId": "r1",
-        "status": "running", "currentBucketIndex": 0,
-        "bucketStates": [], "startedAt": "now", "completedAt": None,
-        "triggeredBy": "manual", "error": None, "scheduleName": None,
+        "planId": "p1",
+        "runId": "r1",
+        "status": "running",
+        "currentBucketIndex": 0,
+        "bucketStates": [],
+        "startedAt": "now",
+        "completedAt": None,
+        "triggeredBy": "manual",
+        "error": None,
+        "scheduleName": None,
         "_version": 3,
     }
     with patch("store._table", return_value=table):
         store.save_run(run)
 
-    assert run["_version"] == 4, "save_run must increment _version in-memory after a successful write"
+    assert run["_version"] == 4, (
+        "save_run must increment _version in-memory after a successful write"
+    )
     call_kwargs = table.put_item.call_args[1]
     assert call_kwargs["ExpressionAttributeValues"][":current_v"] == 3, (
         "ConditionExpression must check the PRE-increment version to reject concurrent stale writers"

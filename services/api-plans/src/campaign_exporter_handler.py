@@ -5,6 +5,7 @@ Triggered by EventBridge daily rule: {"action": "campaign_export"}
 Separated from api-plans so the heavy awswrangler/Pandas layer does not
 add cold-start overhead to the latency-sensitive HTTP API function.
 """
+
 from __future__ import annotations
 
 from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
