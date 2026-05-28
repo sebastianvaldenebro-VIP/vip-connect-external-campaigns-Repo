@@ -1259,7 +1259,7 @@ export function PlanNew() {
       if (b.campaigns.length === 0) { setSaveError(`Bucket ${bi + 1} has no campaigns.`); return; }
       for (let ci = 0; ci < b.campaigns.length; ci++) {
         const c = b.campaigns[ci];
-        if (c.states.length === 0) { setSaveError(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} has no states selected.`); return; }
+        if (c.states.length === 0 && !c.pinnedSegmentArn) { setSaveError(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} has no states selected.`); return; }
         if (c.run_type === 'custom' && (!c.run_duration_minutes || c.run_duration_minutes < 1)) {
           setSaveError(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} needs a duration > 0 minutes.`); return;
         }
