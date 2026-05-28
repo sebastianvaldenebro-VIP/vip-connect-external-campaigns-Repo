@@ -279,11 +279,14 @@ _JOURNEY_FLOW_NAME = "Test-Journey-Flow"
 
 
 def resolve_journey_flow_arn(connect_instance_id: str) -> str | None:
-    """Return the ARN of the canonical journey flow (Test-Journey-Flow).
+    """Return the latest-version ARN of the canonical journey flow (Test-Journey-Flow).
 
-    Looks for a CAMPAIGN-type flow named exactly ``Test-Journey-Flow``.
-    Returns None if not found (caller's fail-fast guard fires).
-    Unlike campaign flows, this one is never auto-created — it must exist in Connect.
+    Journey campaigns require a versioned ARN (e.g. arn:...:contact-flow/{id}:{version}).
+    The base ARN from list_contact_flows lacks the version suffix and Connect rejects it
+    with ValidationException "due to missing version". We resolve the latest published
+    version via list_contact_flow_versions and append it.
+
+    Returns None if not found or versions unavailable (caller's fail-fast guard fires).
     """
     import logging
 
@@ -301,15 +304,40 @@ def resolve_journey_flow_arn(connect_instance_id: str) -> str | None:
         kwargs["NextToken"] = token
 
     match = next((f for f in flows if f["Name"] == _JOURNEY_FLOW_NAME), None)
-    if match:
-        return match["Arn"]
+    if not match:
+        logger.error(
+            "journey flow '%s' not found in Connect instance %s",
+            _JOURNEY_FLOW_NAME,
+            connect_instance_id,
+        )
+        return None
 
-    logger.error(
-        "journey flow '%s' not found in Connect instance %s",
-        _JOURNEY_FLOW_NAME,
-        connect_instance_id,
-    )
-    return None
+    # Extract flow ID from the base ARN and fetch the latest published version.
+    # Journey CreateCampaign requires a versioned ARN; the base ARN is rejected.
+    base_arn = match["Arn"]
+    flow_id = base_arn.rsplit("/", 1)[-1]
+    try:
+        versions: list[dict] = []
+        ver_kwargs: dict = {"InstanceId": connect_instance_id, "ContactFlowId": flow_id}
+        while True:
+            ver_resp = connect.list_contact_flow_versions(**ver_kwargs)
+            versions.extend(ver_resp.get("ContactFlowVersionSummaryList", []))
+            token = ver_resp.get("NextToken")
+            if not token:
+                break
+            ver_kwargs["NextToken"] = token
+
+        if versions:
+            latest = max(versions, key=lambda v: int(v.get("Version", 0)))
+            return latest["Arn"]
+    except Exception as exc:
+        logger.error(
+            "resolve_journey_flow_arn: failed to fetch versions for flow %s: %s",
+            flow_id,
+            exc,
+        )
+
+    return base_arn
 
 
 def resolve_campaign_flow_arn(
