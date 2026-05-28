@@ -174,3 +174,78 @@ Agregados al role del Lambda en la política `FunctionRoleDefaultPolicy41A10F9C`
 ---
 
 <!-- APPEND NUEVAS FEATURES ABAJO DE ESTA LÍNEA -->
+
+---
+
+## 2026-05-21 — Sesión 11: alertas operacionales SNS y UX del Scheduler
+
+### Alertas SNS operacionales (`_notify_sns`)
+
+Nueva función fire-and-forget en `executor.py` que publica mensajes al topic `vip-plans-alerts` (SNS). Nunca lanza excepción — los fallos de alerting no afectan la ejecución del plan.
+
+Puntos de emit:
+
+- Campaña detectada como `connect_deleted` externamente (guarda S-11-A)
+- Run abortado por borrado externo masivo (S-11-A abort)
+- Creación de campaña fallida (`creation_failed`)
+- Throttling / quota exceeded de Connect (revertida a `queued`)
+- Run completado con campañas en error
+
+**Infraestructura:** Topic `arn:aws:sns:us-east-1:165505826690:vip-plans-alerts` creado con KMS CMK. IAM `sns:Publish` en el role del Lambda. `SNS_ALERTS_TOPIC_ARN` env var inyectada via CDK. Para recibir alertas: `aws sns subscribe --topic-arn ... --protocol email --notification-endpoint <email>`.
+
+### Scheduler — planes enabled al tope de la lista
+
+`PlansScheduler.tsx`: `nonTemplatePlans` ahora se ordena con planes habilitados (`trigger.type !== 'manual'`) primero. Los planes desactivados (manual) van al final. El orden dentro de cada grupo es el original de la API.
+
+### "Apply to run" — aplicar cambios del plan a un run activo
+
+Nuevo botón **"Apply to run"** en PlanDetail. Aparece solo cuando el run está activo (`status === 'running'`) y el plan fue editado después de que el run inició (`planSnapshot.buckets` difiere del plan actual).
+
+Al presionarlo, llama `POST /plans/{id}/runs/{runId}/apply-snapshot`. El backend actualiza el `planSnapshot` del run **solo en buckets con `status: "queued"`** — los buckets ya iniciados (running, completed, cancelled) conservan su configuración original. El executor del próximo tick ya usa la nueva config para los buckets pendientes.
+
+**Infraestructura:**
+
+- `store.apply_plan_to_run()` — merge de planSnapshot con optimistic locking
+- `handlers/runs.apply_plan_snapshot` — endpoint POST, devuelve 409 si run no está activo o si hay write concurrente
+- `api.plans.applySnapshotV2()` — llamada desde el frontend
+
+### `_CutoffTooCloseError` — campaigns expiradas limpiamente cerca del corte diario
+
+Nueva excepción en `executor.py` que reemplaza el `ValueError` genérico en el path de creación de campaigns cuando `start_time >= end_time` (campaña creada dentro de los 6 min antes de las 7 PM COT). El campaign se marca `expired` con `exitReason=cutoff_too_close` en lugar de `error`, y no dispara alerta de fallo. En el path de warmup (`_prestart_next_bucket`) el campaign simplemente queda en `queued` sin modificarse — el próximo tick del siguiente día lo iniciará normalmente.
+
+### Fallback de rebuild en `_EmptySegmentError` exhaustion *(2026-05-26)*
+
+Cuando una campaña agota sus reintentos de `_EmptySegmentError`, el executor ahora hace un check final de `_check_redis_ready()` antes de cancelar:
+
+- Si `LLEN=0` (Redis en rebuild): resetea `reconcileRetries=0` y re-encola — no cancela.
+- Si `LLEN>0` (genuinamente vacío): cancela con `skipped_empty` como antes.
+
+Aplica en `_start_one_campaign` y `_prestart_next_bucket`. Evita falsos `skipped_empty` cuando un rebuild activo sucede exactamente entre el último retry y la decisión de cancelar.
+
+### `reconcileRetryLimit` default aumentado a 5 *(2026-05-25)*
+
+El default de reintentos para reconciliación de segmentos durante rebuilds de Redis aumentó de 2 a 5 (6 intentos totales, ~6 minutos de ventana). Reduce falsos `skipped_empty` cuando el pipeline de ingest está reconstruyendo la lista y los leads del estado aún no han sido cargados. Configurable por bucket con el campo `reconcileRetryLimit`.
+
+### CDK: SNS topic importado por ARN (no managed)
+
+`api-plans-stack.ts`: El topic se referencia con `sns.Topic.fromTopicArn()` para no depender de `SNS:GetTopicAttributes` en el CFN exec role (bloqueado por `EngineeringPermissionBoundary`). Fix adicional: `buildSharedLayer(this)` hoistado a `const sharedLayer` — antes se llamaba dos veces en el mismo scope y fallaba con "duplicate construct name".
+
+---
+
+## 2026-05-28 — Journey delivery type support
+
+### Journey campaigns from Plans
+
+Operators can now configure each campaign in a plan bucket as **Campaign** (default, MANAGED type) or **Journey** (JOURNEY type) directly from the Plan editor.
+
+**How it works:**
+- Each campaign in the BucketEditor has a new **Delivery type** dropdown: `Campaign` | `Journey`
+- Journey campaigns use the canonical `Test-Journey-Flow` contact flow (CAMPAIGN type) instead of the per-state `campaign-<STATE>` flow
+- The payload sent to Connect adds `type: "JOURNEY"` and `communicationLimitsOverride` — all other parameters (queue, contact flow, source phone, dialer type, AMD, schedule, segment) are identical to regular campaigns
+- The monitor (PlanDetail) shows a purple `Journey` badge on each Journey campaign card
+
+**Backend:**
+- `builders.py`: `resolve_journey_flow_arn()` resolves `Test-Journey-Flow` by name; `build_campaign_params()` accepts `delivery_type` param
+- `executor.py`: reads `campaign.deliveryType` in both `_create_and_start_campaign` and `_create_campaign_only` (pre-warm path)
+
+**Files:** `services/api-plans/src/builders.py`, `services/api-plans/src/executor.py`, `frontend/src/lib/api.ts`, `frontend/src/pages/PlanNew.tsx`, `frontend/src/pages/PlanDetail.tsx`

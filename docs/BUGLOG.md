@@ -283,6 +283,44 @@ Orden cronológico. **Append al final.**
 
 ---
 
+## 2026-05-21 — Sesión 11: bugs estructurales del executor
+
+### S11-A — `connect_deleted` falso etiquetado en campañas que completaron correctamente
+
+- **Síntoma:** Campañas que habían terminado en `completed` aparecían como `connect_deleted` tras el próximo tick, disparando la guarda S-11-A que abortaba el run.
+- **Causa:** `_advance_bucket` eliminaba las campañas de Connect (cleanup) **antes** de persistir los estados terminales en DynamoDB. Si `save_run` fallaba con `ConcurrentWriteError` en ese momento, el siguiente tick re-consultaba Connect, encontraba las campañas en estado `Deleted`, y sobreescribía los estados correctos con `connect_deleted`. La guarda S-11-A lo interpretaba como borrado externo y abortaba un run que había completado legítimamente.
+- **Fix:** Llamada a `save_run(run)` **antes** del bloque de cleanup en `_advance_bucket`. Los estados terminales quedan persitidos con `bucket.status = "running"` (retriable si falla). Solo después se eliminan los recursos de Connect.
+- **Archivo:** `executor.py:_advance_bucket`
+
+---
+
+### S11-B — Cascade-cancel de dependientes por status del padre
+
+- **Síntoma:** Campañas cuyo padre terminaba en `cancelled` o `error` eran automáticamente canceladas con `parent_cancelled`, impidiendo que corrieran. Operadores tenían que force-start manualmente cada dependiente.
+- **Causa:** `_dispatch_ready_campaigns` Phase 2 contenía un bloque de cascade-cancel que propagaba cualquier estado terminal no-`completed` del padre a los hijos. El diseño original asumía que solo `completed` era un resultado "exitoso".
+- **Fix:** Eliminado el bloque de cascade-cancel. Un dependiente se desbloquea cuando todos sus padres están en cualquier estado terminal (`completed`, `cancelled`, `error`, `expired`). El dependiente decide por sí mismo si tiene leads al intentar iniciar.
+- **Archivo:** `executor.py:_dispatch_ready_campaigns`
+
+---
+
+### S11-C — `ThrottlingException` / `ServiceQuotaExceededException` marcaba campaña como error permanente
+
+- **Síntoma:** Si Connect retornaba throttling o quota exceeded al crear una campaña, ésta quedaba en `error` permanentemente. El operador tenía que force-start manualmente.
+- **Causa:** El `except ClientError` en `_start_one_campaign` trataba todos los errores de cliente igual — marcaba la campaña como `error` con `exitReason = creation_failed`. No distinguía errores transitorios (rate limit) de errores definitivos (configuración inválida).
+- **Fix:** Nuevo `except ClientError` explícito antes del genérico: si el código es `ThrottlingException` o `ServiceQuotaExceededException`, revierte la campaña a `queued` (sin eliminar el segmento ya creado) y emite alerta SNS. El siguiente tick reintenta automáticamente.
+- **Archivo:** `executor.py:_start_one_campaign`
+
+---
+
+### S11-D — `force_start_campaign` rechazaba campañas `queued` en bucket `completed`
+
+- **Síntoma:** Al intentar force-start en una campaña `queued` dentro de un bucket ya `completed`, el API retornaba `"Bucket X is already completed — force-start only allowed for cancelled campaigns in a completed bucket"`.
+- **Causa:** Este estado inconsistente (campaña `queued` en bucket `completed`) podía ocurrir cuando el cascade-cancel fallaba parcialmente por un `ConcurrentWriteError` — la campaña no alcanzó a ser cancelada pero el bucket sí cerró. La validación de `force_start_campaign` solo permitía `cancelled` en buckets completados.
+- **Fix:** Condición ampliada a `cs["status"] not in ("cancelled", "queued")` para buckets `completed`. Si el estado es `queued`, se loguea un warning de estado inconsistente y se procede igual que con `cancelled` (reactiva el bucket, programa nuevo tick).
+- **Archivo:** `executor.py:force_start_campaign`
+
+---
+
 ## 2026-05-19 — Sesión 9
 
 ### S9-A — Botón skip silenciosamente fallaba — doble causa raíz
@@ -417,6 +455,75 @@ Orden cronológico. **Append al final.**
 - **Tests:** `test_safe_delete_campaign_skips_stop_for_completed`, `test_safe_delete_campaign_stops_before_delete_for_running`
 - **Archivos:** `executor.py:_safe_delete_campaign`
 
+### S11-G — Edit Plan: UI muestra datos viejos inmediatamente después de guardar *(Fix 2026-05-22)*
+
+- **Síntoma:** El usuario guarda un plan editado, es redirigido a PlanDetail, pero la pantalla muestra los datos anteriores (nombre, trigger, buckets sin cambios). Los datos nuevos aparecen solo después de un segundo o dos, o nunca si se alejaba rápidamente.
+- **Causa raíz:** El `onSuccess` de `saveMutation` en `PlanNew.tsx` llamaba `invalidateQueries({ queryKey: ['plans'] })` y luego `navigate`. Con `staleTime: 30_000` global y `refetchOnWindowFocus: false`, PlanDetail montaba con el dato stale del cache mientras esperaba el background refetch (~300-500ms de flash de datos viejos). La mutación retornaba el plan actualizado pero el código lo ignoraba para seedear el cache.
+- **Fix:** `qc.setQueryData(['plans', plan.planId], { plan, latestRun: prev?.latestRun })` antes del navigate. PlanDetail recibe datos frescos en el primer render, sin esperar refetch.
+- **Archivo:** `frontend/src/pages/PlanNew.tsx:saveMutation.onSuccess`
+
+---
+
+### S11-F — `duration_minutes` y campos numéricos viajan como string por bug de serialización Decimal → str *(Fix 2026-05-22)*
+
+- **Síntoma:** `PUT /plans/{id}` devuelve `INTERNAL_ERROR: Unexpected error` al guardar un plan con buckets `time_based`. La UI muestra "Unexpected error" en la pantalla de Edit Plan.
+- **Causa raíz:** boto3 DynamoDB resource deserializa todos los números como `Decimal`. `vip_shared.json_response` usa `json.dumps(..., default=str)`, lo que convierte `Decimal('30')` en `"30"` (string JSON). El frontend almacena el valor como string y lo retorna en el PUT body. `_validate_dag` hacía `duration < 10` → `TypeError: '<' not supported between instances of 'str' and 'int'`. El mismo bug afectaba `bandwidthAllocation`, `dialingCapacity`, y cualquier otro campo numérico de buckets/campaigns.
+- **Fix (dos capas):**
+  1. `store._normalize()` — helper recursivo que convierte `Decimal` → `int`/`float` en cualquier dict/list. Se aplica en `_plan_from_item` (read path) y en `put_plan` (write path).
+  2. `handlers/plans._validate_dag` — `int()` defensivo en `duration_minutes` como segunda línea de defensa.
+- **Alcance:** DynamoDB scan confirmó que los 350 planes existentes tienen `duration_minutes` como tipo `N` (número), no `S` (string). El problema era exclusivo del round-trip API → frontend → API.
+- **Archivos:** `store.py:_normalize`, `store.py:_plan_from_item`, `store.py:put_plan`, `handlers/plans.py:_validate_dag`
+
+---
+
+### S11-E — `_create_and_start_campaign` sin guard de cutoff → `ValidationException` al crear campaign cerca de las 7 PM COT *(Fix 2026-05-22)*
+
+- **Síntoma:** SNS alert: `"Campaign 'NJ-NL' failed to start (Connect error ValidationException). Error: Schedule end time needs to be greater than start time."` La campaña NJ-NL fallaba si el tick ocurría dentro de los 6 minutos previos al corte diario (7 PM COT = midnight UTC).
+- **Causa raíz:** `_create_campaign_only` (warmup) tenía guard `if start_dt >= end_dt: raise ValueError`. Pero `_create_and_start_campaign` (cold-start, path de `_start_one_campaign`) **no tenía este guard**. Cuando `now + 6min > 7 PM`, Connect devuelve `ValidationException: Schedule end time needs to be greater than start time`.
+- **Fix:** Agregar el mismo guard en `_create_and_start_campaign`. Introducir `_CutoffTooCloseError` (nueva excepción) para distinguir este caso de otros `ValueError`. `_start_one_campaign` captura `_CutoffTooCloseError` → marca campaign `expired` con `exitReason=cutoff_too_close` (no `error`). `_prestart_next_bucket` captura `_CutoffTooCloseError` → deja campaign en `queued` (sin cambio de estado).
+- **Tests:** `test_create_and_start_campaign_guard_raises_when_start_gte_end`, `test_start_one_campaign_cutoff_too_close_marks_expired`
+- **Archivos:** `executor.py:_create_and_start_campaign`, `executor.py:_start_one_campaign`, `executor.py:_prestart_next_bucket`, `executor.py:_CutoffTooCloseError`
+
+---
+
+## 2026-05-26 — sesión 13
+
+### S13-A — `removeCampaign` no limpiaba referencias `dependsOn` cross-bucket → plan irguardable *(Fix 2026-05-26)*
+
+- **Síntoma:** Al editar un plan y eliminar una campaign de un bucket, al intentar guardar el backend devolvía `"Campaign 'X' depends on unknown campaign 'Y'"`. El plan en DynamoDB quedaba intacto (el save fallido no escribió nada), pero el usuario no podía guardar ninguna modificación.
+- **Causa raíz:** `removeCampaign` dentro de `BucketEditor` (`PlanNew.tsx`) limpiaba referencias `dependsOn` solo dentro del mismo bucket (via `remaining = bucket.campaigns.filter(...).map(...)`). Llamaba `onChange({ ...bucket, campaigns: remaining })` que se resolvía en `updateBucket(i, b)` del padre, el cual simplemente reemplazaba el bucket `i` sin propagar la limpieza a otros buckets. Campaigns en buckets posteriores que tenían `dependsOn: [id_eliminado]` conservaban la referencia huérfana invisible para el usuario.
+- **Fix:** `updateBucket` en `PlanNew.tsx` ahora calcula el conjunto de IDs eliminados (`removedIds = prev[i].campaigns.ids − b.campaigns.ids`) y filtra esos IDs del `dependsOn` de todos los demás buckets antes de actualizar el estado. Zero overhead cuando no hay IDs eliminados (`removedIds.size === 0` → short-circuit).
+- **Cobertura:** Todas las rutas de eliminación de campaigns pasan por `updateBucket` (verificado: `removeBucket` y `moveBucket` ya tenían cleanup cross-bucket; `addBucket` y la carga inicial no requieren limpieza).
+- **Archivos:** `frontend/src/pages/PlanNew.tsx` (`updateBucket`, línea 1264)
+
+---
+
+## 2026-05-26 — sesión 12
+
+### S12-A — `reconcileRetryLimit: 1` hardcodeado en 5 planes → campaigns canceladas por rebuild de Redis *(Fix 2026-05-26)*
+
+- **Síntoma:** CT-NL (y otras campañas de estados específicos) aparecían con `skipped_empty` / `No Redis records match campaign filters` después de solo 2 intentos, incluso cuando había leads disponibles. Operadores debían hacer `force-start` manual.
+- **Causa raíz:** Los 5 planes activos (Plan 2.1 New Leads, All NLs, Plan 2.1 New Lead v.2, SAT Plan 2.1 New Lead, Plan 2.1 New Lead) tenían `reconcileRetryLimit: 1` explícito en todos sus buckets, anulando el default de 5 que fue subido en S11-F. Con límite=1 solo había 2 intentos totales (~2 min), insuficiente para rebuilds de Redis.
+- **Fix 1:** Eliminado `reconcileRetryLimit` de los 32 buckets afectados en DynamoDB (VipAdminPlans) vía `UpdateItem`. El default del código (5) aplica ahora.
+- **Fix 2:** Agregado fallback en `executor.py`: cuando se agotan los reintentos de `_EmptySegmentError`, se hace un check final de `is_ready()`. Si Redis tiene LLEN=0 en ese momento (rebuild activo), se resetean los retries a 0 y se re-encola la campaña en vez de cancelarla. Si LLEN>0 (genuinamente vacío), se cancela con `skipped_empty`. Aplica tanto en `_start_one_campaign` como en `_prestart_next_bucket`.
+- **Archivos:** `executor.py` (`_check_redis_ready()`, `_start_one_campaign`, `_prestart_next_bucket`), DynamoDB `VipAdminPlans` (5 planes).
+
+---
+
+## 2026-05-25 — sesión 11
+
+### S11-F — `reconcileRetryLimit` default demasiado bajo → campaigns canceladas durante rebuild de Redis *(Fix 2026-05-25)*
+
+- **Síntoma:** Campañas NCA terminaban con `skipped_empty` y `exitReason: reconcile_exhausted` a pesar de tener leads disponibles (15 leads visibles en el preview del segmento).
+- **Causa raíz:** Cuando el pipeline de ingest reconstruye la lista Redis (`wait_list:{team}:list`), hay una ventana donde `LLEN > 0` pero los leads de un estado específico (ej. NCA) aún no han sido cargados. En ese estado, `_create_segment()` lanza `_EmptySegmentError` aunque eventualmente haya leads. Con el default de 2 reintentos (3 intentos totales, 1 por minuto), el executor agotaba el límite antes de que el rebuild terminara y marcaba el campaign `cancelled/skipped_empty`.
+- **Fix:** Aumentar default de `reconcileRetryLimit` de `2` a `5` (6 intentos totales = 6 minutos de ventana). Cambiado en ambos paths: `_start_one_campaign` (line 1789) y `_prestart_next_bucket` (line 1087).
+- **Archivos:** `executor.py` (2 cambios: líneas 1087 y 1789)
+- **Nota:** El valor sigue siendo configurable por bucket vía `reconcileRetryLimit` en la definición del plan.
+
+---
+
+## 2026-05 (continuación sesión 10)
+
 ### S10-E — `force_start_campaign` save final sin retry → campaign bloqueada 5 minutos en `creating` *(Fix 2026-05-19)*
 
 - **Síntoma:** Después del fix S10-D, una campaña iniciada manualmente quedaba en `"creating"` por ~5 minutos antes de aparecer como `"running"`. El operador observó NJ-NL_4-5 stuck después de que force_start fue ejecutado concurrentemente con un tick de otro bucket.
@@ -424,3 +531,29 @@ Orden cronológico. **Append al final.**
 - **Fix:** Agregar retry loop (hasta 3 intentos) en el save final de `force_start_campaign`. En cada retry: re-leer run de DDB, detectar si un tick ya adoptó el campaign (status=running con mismo connectCampaignId → retornar éxito), re-aplicar el snapshot de `_start_one_campaign` y reintentar el save.
 - **Tests:** `test_force_start_final_save_retries_on_concurrent_write`, `test_force_start_final_save_returns_early_when_tick_already_adopted`
 - **Archivos:** `executor.py:force_start_campaign` (Phase 3)
+
+---
+
+## 2026-05-28 — Sesión 14
+
+### S14-A — executor.py sin logging visible en CloudWatch → errores de pre-warm invisibles *(Fix 2026-05-28)*
+
+- **Síntoma:** Campañas NJ/LI/MD del plan "Plan 1.1 - Cancellation / No Show" arrancaron a las 7:06 AM en vez de las 7:00 AM. Solo NY arrancó puntual. Al investigar, se confirmó que el error de pre-warm (en `_prestart_plan`) fue completamente silencioso — ningún log visible en CloudWatch.
+- **Causa raíz:** `executor.py` usa `logger = logging.getLogger(__name__)` (stdlib Python logging). El Lambda root logger opera en nivel WARNING, por lo que todos los `logger.info()`/`logger.error()` del executor son descartados silenciosamente. Solo los eventos de `StructuredLogger` (definido en `handler.py`) aparecen en CloudWatch. Esto dejó las funciones `_prestart_plan`, `_prestart_next_bucket`, `prestart_check` y `_activate_warming_bucket` completamente opacas.
+- **Fix:** Agregar `_slog` (instancia de `StructuredLogger`) a `executor.py` con patrón `try/except ImportError` para preservar compatibilidad con el entorno de tests (que no tiene `vip_shared` en el path). Logs estructurados añadidos en:
+  - `_prestart_plan`: `prestart_plan_campaign_ok`, `prestart_plan_campaign_failed` (con `error_type`), `prestart_plan_summary`
+  - `prestart_check`: `prestart_check_warming_plan`, `prestart_check_plan_failed`, `prestart_check_done`
+  - `_activate_warming_bucket`: `activate_warming_campaign_prewarmed`, `activate_warming_campaign_cold_started`, `activate_warming_campaign_failed`
+  - `_prestart_next_bucket`: `prestart_next_bucket_start`, `prestart_next_bucket_campaign_ok`, `prestart_next_bucket_campaign_failed`, `prestart_next_bucket_redis_rebuilding`, `prestart_next_bucket_empty_segment_retry`, `prestart_next_bucket_cutoff_too_close`
+- **Tests:** 150 passing (sin regresiones).
+- **Archivos:** `services/api-plans/src/executor.py`
+
+### S14-B — `_prestart_plan` no reintentaba campaigns fallidos → pre-warm parcial permanente *(Fix 2026-05-28)*
+
+- **Síntoma:** Cuando `_prestart_plan` fallaba para algunos campaigns en el primer tick (6:54 AM), los ticks siguientes (6:55, 6:56 AM) no reintentaban los fallidos. Solo el primer campaign exitoso arrancaba a las 7:00 AM; los demás arrancaban 6 min tarde.
+- **Causa raíz:** Dos problemas combinados:
+  1. `_prestart_plan` tenía el guard `if target_plan.get("pendingWarmup"): return` — cualquier `pendingWarmup`, aunque parcial, bloqueaba todos los reintentos en los ticks siguientes.
+  2. Las excepciones individuales por campaign (ej. `_EmptySegmentError` cuando Redis aún no tiene leads a las 6:54 AM) eran atrapadas y descartadas sin oportunidad de retry. `prestart_check` corre cada minuto en la ventana 4–6 min, pero el guard impedía aprovechar esa ventana.
+- **Fix:** Cambiar el guard para que solo salte si **todos** los stage-1 campaigns ya están en `pendingWarmup`. Si hay un warmup parcial, continúa iterando solo los campaigns faltantes y hace merge con los existentes. Así cada tick de `prestart_check` (6:54, 6:55, 6:56) reintenta los que fallaron el tick anterior.
+- **Tests:** 150 passing (sin regresiones). Simulación local confirma: tick 1 → NY warmed, tick 2 → NJ/LI/MD warmed, pendingWarmup final = 4 campaigns.
+- **Archivos:** `services/api-plans/src/executor.py` (`_prestart_plan`)
