@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>VIP Connect External Campaigns — Documentation Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --bg-card: #1e293b;
+      --bg-card-hover: #273449;
+      --text: #f1f5f9;
+      --text-dim: #94a3b8;
+      --accent: #3b82f6;
+      --accent-bright: #60a5fa;
+      --border: #334155;
+      --code-bg: #0b1220;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 0; min-height: 100vh;
+      background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.5;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 48px 24px; }
+    header { border-bottom: 1px solid var(--border); padding-bottom: 32px; margin-bottom: 40px; }
+    .project-tag {
+      display: inline-block;
+      padding: 4px 12px;
+      border: 1px solid var(--accent);
+      color: var(--accent-bright);
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: 40px; margin: 0 0 16px 0; letter-spacing: -0.02em; }
+    .lead { font-size: 17px; color: var(--text-dim); max-width: 820px; margin: 0; }
+    section { margin-bottom: 48px; }
+    h2 {
+      font-size: 14px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin: 0 0 20px 0;
+      font-weight: 600;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+    }
+    .stat {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .stat .num {
+      font-size: 32px; font-weight: 700;
+      color: var(--accent-bright);
+      letter-spacing: -0.02em;
+      line-height: 1;
+    }
+    .stat .label {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+    .docs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .doc {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      transition: background 0.15s, border-color 0.15s, transform 0.15s;
+      text-decoration: none;
+      color: inherit;
+      display: block;
+    }
+    .doc:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .doc .title {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--accent-bright);
+      margin-bottom: 8px;
+    }
+    .doc .desc {
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+    .doc .formats {
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .doc .formats a {
+      color: var(--accent-bright);
+      margin-left: 4px;
+      text-decoration: none;
+    }
+    .doc .formats a:hover { text-decoration: underline; }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+      overflow-x: auto;
+      font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+      font-size: 13px;
+      color: #cbd5e1;
+      margin: 0 0 14px 0;
+    }
+    pre .comment { color: #64748b; }
+    pre .cmd { color: #93c5fd; }
+    footer {
+      border-top: 1px solid var(--border);
+      margin-top: 64px;
+      padding-top: 24px;
+      color: var(--text-dim);
+      font-size: 12px;
+      text-align: center;
+    }
+    .architecture-card {
+      background: linear-gradient(135deg, #1e293b, #0f172a);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      padding: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 24px;
+    }
+    .architecture-card .label { color: var(--accent-bright); font-weight: 600; font-size: 18px; }
+    .architecture-card .sub { color: var(--text-dim); font-size: 13px; margin-top: 6px; }
+    .btn {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .btn:hover { background: var(--accent-bright); }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <span class="project-tag">VIP Medical Group · us-east-1</span>
+      <h1>VIP Connect External Campaigns</h1>
+      <p class="lead">
+        Outbound dialing orchestration platform built on Amazon Connect Campaigns V2, Customer Profiles, and DynamoDB.
+        Operators configure multi-bucket campaign plans through a React admin UI; an EventBridge-driven Lambda tick loop
+        creates segments, starts campaigns, cascades DAG dependencies, and hard-stops every workload at 19:00 Colombia Time.
+        HIPAA-compliant: PHI never enters logs or plan state.
+      </p>
+    </header>
+
+    <section>
+      <h2>Platform at a Glance</h2>
+      <div class="stats">
+        <div class="stat"><div class="num">5</div><div class="label">Lambda Functions</div></div>
+        <div class="stat"><div class="num">1</div><div class="label">DynamoDB Table</div></div>
+        <div class="stat"><div class="num">8</div><div class="label">Integrations</div></div>
+        <div class="stat"><div class="num">262</div><div class="label">Tests</div></div>
+        <div class="stat"><div class="num">8</div><div class="label">Docs Generated</div></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Documentation</h2>
+      <div class="docs-grid">
+
+        <a class="doc" href="TECHNICAL_HANDOFF.md">
+          <div class="title">Technical Handoff</div>
+          <div class="desc">Senior engineer reference — system overview, architecture, infrastructure inventory, deployment guide, env vars, technical debt, glossary.</div>
+          <div class="formats">FORMATS:
+            <a href="TECHNICAL_HANDOFF.md">md</a> ·
+            <a href="TECHNICAL_HANDOFF.docx">docx</a> ·
+            <a href="TECHNICAL_HANDOFF.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="ARCHITECTURE.md">
+          <div class="title">Architecture</div>
+          <div class="desc">C4 container + component diagrams, full state machine, pre-warm sequence, 8 ADRs, and the technical debt register (TD-001 → TD-014).</div>
+          <div class="formats">FORMATS:
+            <a href="ARCHITECTURE.md">md</a> ·
+            <a href="ARCHITECTURE.docx">docx</a> ·
+            <a href="ARCHITECTURE.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="DATA_DICTIONARY.md">
+          <div class="title">Data Dictionary</div>
+          <div class="desc">Every persisted record: VipAdminPlans Plan META + Run + nested BucketState + CampaignState, Redis lead lists, PHI map, audit schema.</div>
+          <div class="formats">FORMATS:
+            <a href="DATA_DICTIONARY.md">md</a> ·
+            <a href="DATA_DICTIONARY.docx">docx</a> ·
+            <a href="DATA_DICTIONARY.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="INTEGRATION_CONTRACTS.md">
+          <div class="title">Integration Contracts</div>
+          <div class="desc">Connect Campaigns V2, Customer Profiles, Connect Contact Flows, Redis, EventBridge, Cognito, SNS, CloudWatch — auth, calls, errors, re-wiring checklists.</div>
+          <div class="formats">FORMATS:
+            <a href="INTEGRATION_CONTRACTS.md">md</a> ·
+            <a href="INTEGRATION_CONTRACTS.docx">docx</a> ·
+            <a href="INTEGRATION_CONTRACTS.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="DEPENDENCY_MANIFEST.md">
+          <div class="title">Dependency Manifest</div>
+          <div class="desc">vip_shared layer contents, per-Lambda dependency table, frontend dependencies, build &amp; packaging, local dev setup, test inventory.</div>
+          <div class="formats">FORMATS:
+            <a href="DEPENDENCY_MANIFEST.md">md</a> ·
+            <a href="DEPENDENCY_MANIFEST.docx">docx</a> ·
+            <a href="DEPENDENCY_MANIFEST.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="RUNBOOKS.md">
+          <div class="title">Runbooks (RB-001 → RB-012)</div>
+          <div class="desc">Operational playbooks: stuck runs, skipped_empty storms, pre-warm failures, runLock leaks, 19:00 cutoff incidents, OOM events, SNS issues.</div>
+          <div class="formats">FORMATS:
+            <a href="RUNBOOKS.md">md</a>
+          </div>
+        </a>
+
+        <a class="doc" href="NON_TECHNICAL_GUIDE.md">
+          <div class="title">Non-Technical Guide</div>
+          <div class="desc">Plain-English overview for stakeholders: how it works, business rules, HIPAA privacy guarantees, FAQ, service-level expectations.</div>
+          <div class="formats">FORMATS:
+            <a href="NON_TECHNICAL_GUIDE.md">md</a> ·
+            <a href="NON_TECHNICAL_GUIDE.docx">docx</a> ·
+            <a href="NON_TECHNICAL_GUIDE.pdf">pdf</a>
+          </div>
+        </a>
+
+        <a class="doc" href="IAM_REFERENCE.md">
+          <div class="title">IAM Reference</div>
+          <div class="desc">Permission boundary, per-Lambda execution roles with exact actions and ARN scopes, least-privilege assessment, Cognito authorization.</div>
+          <div class="formats">FORMATS:
+            <a href="IAM_REFERENCE.md">md</a>
+          </div>
+        </a>
+
+      </div>
+    </section>
+
+    <section>
+      <h2>Architecture Diagram</h2>
+      <div class="architecture-card">
+        <div>
+          <div class="label">architecture.drawio</div>
+          <div class="sub">Open in <a href="https://app.diagrams.net/" style="color:var(--accent-bright);">draw.io</a> for a layered view: external systems, entry/CDN, orchestration, Lambdas, shared layer, data stores, security boundary.</div>
+        </div>
+        <a class="btn" href="architecture.drawio" download>Download .drawio</a>
+      </div>
+    </section>
+
+    <section>
+      <h2>Quick Commands</h2>
+      <pre><span class="comment"># Deploy api-plans Lambda</span>
+<span class="cmd">cd</span> services/api-plans &amp;&amp; <span class="cmd">bash</span> deploy.sh
+
+<span class="comment"># Deploy frontend SPA</span>
+<span class="cmd">cd</span> frontend &amp;&amp; <span class="cmd">npm</span> run build
+<span class="cmd">aws</span> s3 sync dist/ s3://vip-admin-ui-assets-165505826690/ --delete --profile production
+<span class="cmd">aws</span> cloudfront create-invalidation --distribution-id E3QCDJPG0LCO7E --paths "/*" --profile production
+
+<span class="comment"># CDK infrastructure</span>
+<span class="cmd">cd</span> infra &amp;&amp; AWS_PROFILE=production npx cdk diff
+AWS_PROFILE=production npx cdk deploy ApiPlansStack
+
+<span class="comment"># Tail production logs</span>
+<span class="cmd">aws</span> logs tail /aws/lambda/vip-admin-ui-api-plans --profile production --since 5m --follow
+
+<span class="comment"># Run all 262 tests locally</span>
+<span class="cmd">for</span> d <span class="cmd">in</span> services/api-plans services/api-campaigns services/api-metrics services/api-profiles services/api-segments services/shared; <span class="cmd">do</span>
+  (<span class="cmd">cd</span> "$d" &amp;&amp; <span class="cmd">python</span> -m pytest -q) || <span class="cmd">exit</span> 1
+<span class="cmd">done</span></pre>
+    </section>
+
+    <footer>
+      Generated 2026-05-28 | VIP Medical Group | vip-connect-external-campaigns
+    </footer>
+  </div>
+</body>
+</html>
