@@ -283,14 +283,25 @@ def resolve_journey_flow_arn(connect_instance_id: str) -> str | None:
 
     Journey campaigns require a versioned ARN (e.g. arn:...:contact-flow/{id}:{version}).
     The base ARN from list_contact_flows lacks the version suffix and Connect rejects it
-    with ValidationException "due to missing version". We resolve the latest published
-    version via list_contact_flow_versions and append it.
+    with ValidationException "due to missing version".
 
-    Returns None if not found or versions unavailable (caller's fail-fast guard fires).
+    Resolution order:
+    1. JOURNEY_FLOW_ARN env var (set this if the Lambda role lacks ListContactFlowVersions)
+    2. list_contact_flow_versions API (requires connect:ListContactFlowVersions IAM action)
+    3. Falls back to base ARN and logs an error visible in CloudWatch
+
+    Returns None if flow not found (caller's fail-fast guard fires).
     """
     import logging
+    import os
 
     logger = logging.getLogger(__name__)
+
+    # Fast path: operator-pinned versioned ARN via env var (avoids ListContactFlowVersions
+    # IAM requirement while the CDK stack is updated to include that permission).
+    pinned = os.environ.get("JOURNEY_FLOW_ARN", "").strip()
+    if pinned:
+        return pinned
 
     connect = boto3.client("connect")
     flows: list[dict] = []
@@ -331,11 +342,27 @@ def resolve_journey_flow_arn(connect_instance_id: str) -> str | None:
             latest = max(versions, key=lambda v: int(v.get("Version", 0)))
             return latest["Arn"]
     except Exception as exc:
-        logger.error(
-            "resolve_journey_flow_arn: failed to fetch versions for flow %s: %s",
-            flow_id,
-            exc,
-        )
+        # Use StructuredLogger so this failure is visible in CloudWatch.
+        # Common cause: Lambda role missing connect:ListContactFlowVersions —
+        # set JOURNEY_FLOW_ARN env var with the full versioned ARN as a workaround.
+        try:
+            from vip_shared.infrastructure.telemetry.structured_logger import (
+                StructuredLogger as _SL,
+            )
+
+            _SL(service="api-plans").error(
+                "resolve_journey_flow_arn_versions_failed",
+                flow_id=flow_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                hint="Set JOURNEY_FLOW_ARN env var or grant connect:ListContactFlowVersions",
+            )
+        except Exception:
+            logger.error(
+                "resolve_journey_flow_arn: failed to fetch versions for flow %s: %s",
+                flow_id,
+                exc,
+            )
 
     return base_arn
 

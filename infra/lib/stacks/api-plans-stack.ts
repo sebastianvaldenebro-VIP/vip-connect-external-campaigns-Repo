@@ -145,6 +145,7 @@ export class ApiPlansStack extends cdk.Stack {
         actions: [
           'connect:ListQueues',
           'connect:ListContactFlows',
+          'connect:ListContactFlowVersions',
           'connect:DescribeContactFlow',
           'connect:DescribeQueue',
           'connect:DescribeInstance',
