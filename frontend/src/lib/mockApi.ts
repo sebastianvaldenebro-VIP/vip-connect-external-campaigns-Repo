@@ -354,6 +354,9 @@ export const mockApi: typeof RealApi = {
     skipCampaignV2: async () => {
       throw new Error('Not implemented in mock');
     },
+    applySnapshotV2: async () => {
+      throw new Error('Not implemented in mock');
+    },
     listTemplates: async () => ({ plans: [] }),
     cloneTemplate: async () => {
       throw new Error('Not implemented in mock');

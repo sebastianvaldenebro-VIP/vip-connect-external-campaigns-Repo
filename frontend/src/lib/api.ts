@@ -396,6 +396,8 @@ export type CampaignDef = {
    * The executor uses this CP segment ARN as-is — useful for testing with a hand-crafted segment.
    */
   pinnedSegmentArn?: string;
+  /** Controls the Connect campaign type. Defaults to "campaign" (MANAGED). */
+  deliveryType?: 'campaign' | 'journey';
 };
 
 export type BucketDefV2 = {
@@ -682,6 +684,11 @@ const realApi = {
     skipCampaignV2: (id: string, runId: string, bucketIndex: number, campaignIndex: number) =>
       request<PlanRunV2>(
         `/plans/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/buckets/${bucketIndex}/campaigns/${campaignIndex}/skip`,
+        { method: 'POST', body: {} },
+      ),
+    applySnapshotV2: (id: string, runId: string) =>
+      request<PlanRunV2>(
+        `/plans/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/apply-snapshot`,
         { method: 'POST', body: {} },
       ),
     listTemplates: () => request<{ plans: PlanSummaryV2[] }>('/templates'),

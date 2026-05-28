@@ -293,9 +293,13 @@ export function PlansScheduler(): ReactNode {
   const qc = useQueryClient();
   const list = useQuery({ queryKey: ['plans'], queryFn: () => api.plans.listV2() });
 
-  const nonTemplatePlans = (list.data?.plans ?? []).filter(
-    (p) => !p.isTemplate && !p.is_template,
-  );
+  const nonTemplatePlans = (list.data?.plans ?? [])
+    .filter((p) => !p.isTemplate && !p.is_template)
+    .sort((a, b) => {
+      const aEnabled = a.trigger.type !== 'manual' ? 0 : 1;
+      const bEnabled = b.trigger.type !== 'manual' ? 0 : 1;
+      return aEnabled - bEnabled;
+    });
 
   const [rowStates, setRowStates] = useState<Record<string, RowLocal>>({});
   const [savingIds, setSavingIds] = useState<Set<string>>(new Set());

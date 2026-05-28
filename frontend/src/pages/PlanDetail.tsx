@@ -201,9 +201,16 @@ function CampaignCard({
   return (
     <div className={`border rounded-xl p-4 space-y-2 border-l-4 ${borderColor} ${isError ? '' : 'bg-white'}`}>
       <div className="flex items-start justify-between gap-2">
-        <span className="text-sm font-semibold text-gray-800 leading-tight">
-          {cs.name || cs.campaignId.slice(0, 8)}
-        </span>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="text-sm font-semibold text-gray-800 leading-tight truncate">
+            {cs.name || cs.campaignId.slice(0, 8)}
+          </span>
+          {campaignDef?.deliveryType === 'journey' && (
+            <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700 leading-none">
+              Journey
+            </span>
+          )}
+        </div>
         <div className="flex items-center gap-2 shrink-0">
           <StatusBadge status={cs.status} />
           {onForceStart && (cs.status === 'queued' || cs.status === 'cancelled' || cs.status === 'error') && (
@@ -590,6 +597,18 @@ export function PlanDetail(): ReactNode {
     },
   });
 
+  const applySnapshotMutation = useMutation({
+    mutationFn: (runId: string) => api.plans.applySnapshotV2(id!, runId),
+    onSuccess: () => {
+      setActionError(null);
+      qc.invalidateQueries({ queryKey: ['plans', id] });
+      qc.invalidateQueries({ queryKey: ['plans', id, 'runs'] });
+    },
+    onError: (err: Error) => {
+      setActionError(err.message || 'Apply failed — try again');
+    },
+  });
+
   if (planQuery.isLoading) return <Spinner />;
   if (!planQuery.data?.plan) return <div className="p-6 text-gray-500">Plan not found.</div>;
 
@@ -605,6 +624,13 @@ export function PlanDetail(): ReactNode {
   const planForDisplay = (displayRun?.planSnapshot as PlanSummaryV2 | undefined) ?? plan;
 
   const isRunning = latestRun?.status === 'running';
+
+  // True when the live plan definition has diverged from the active run's snapshot
+  const hasSnapshotDiff = Boolean(
+    isRunning &&
+    displayRun?.planSnapshot &&
+    JSON.stringify((displayRun.planSnapshot as PlanSummaryV2).buckets) !== JSON.stringify(plan.buckets),
+  );
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -632,6 +658,16 @@ export function PlanDetail(): ReactNode {
               <Button variant="outline" size="sm" onClick={() => navigate(`/plans/${id}/edit`)}>
                 Edit
               </Button>
+              {hasSnapshotDiff && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => displayRun && applySnapshotMutation.mutate(displayRun.runId)}
+                  disabled={applySnapshotMutation.isPending}
+                >
+                  {applySnapshotMutation.isPending ? <Spinner /> : 'Apply to run'}
+                </Button>
+              )}
               {isRunning && !showAbortConfirm && (
                 <Button variant="destructive" size="sm" onClick={() => setShowAbortConfirm(true)}>
                   Abort

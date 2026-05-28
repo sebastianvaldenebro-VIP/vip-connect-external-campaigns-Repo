@@ -11,6 +11,7 @@ import {
   type CampaignRunType,
   type ContactFlow,
   type PlanLoop,
+  type PlanRunV2,
   type PlanSummaryV2,
   type PlanTrigger,
   type Queue,
@@ -99,6 +100,7 @@ function newCampaign(overrides?: Partial<CampaignDef>): CampaignDef {
     groups,
     run_type: 'full',
     dependsOn: [],
+    deliveryType: 'campaign',
     campaignConfig: campaignConfig ?? { ...DEFAULT_CAMPAIGN_CONFIG },
     ...rest,
   };
@@ -726,6 +728,19 @@ function CampaignCard({
               )}
             </div>
 
+            {/* Delivery type */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Delivery type</label>
+              <select
+                value={campaign.deliveryType ?? 'campaign'}
+                onChange={(e) => onChange({ ...campaign, deliveryType: e.target.value as 'campaign' | 'journey' })}
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+              >
+                <option value="campaign">Campaign</option>
+                <option value="journey">Journey</option>
+              </select>
+            </div>
+
             {/* Run type */}
             <div>
               <label className="block text-xs font-semibold text-gray-700 mb-1">Run type</label>
@@ -1226,6 +1241,10 @@ export function PlanNew() {
         ? api.plans.updateV2(id!, body)
         : api.plans.createV2(body),
     onSuccess: (plan) => {
+      // Seed cache immediately so PlanDetail renders with fresh data on first paint,
+      // avoiding a stale-data flash caused by the background refetch delay.
+      const prev = qc.getQueryData<{ plan: PlanSummaryV2; latestRun?: PlanRunV2 }>(['plans', plan.planId]);
+      qc.setQueryData(['plans', plan.planId], { plan, latestRun: prev?.latestRun });
       qc.invalidateQueries({ queryKey: ['plans'] });
       navigate(`/plans/${plan.planId}`);
     },
@@ -1257,7 +1276,22 @@ export function PlanNew() {
   const addBucket = () => setBuckets((prev) => [...prev, newBucket()]);
 
   const updateBucket = (i: number, b: BucketDefV2) =>
-    setBuckets((prev) => prev.map((x, idx) => (idx === i ? b : x)));
+    setBuckets((prev) => {
+      const removedIds = new Set(
+        prev[i].campaigns.map((c) => c.id).filter((id) => !b.campaigns.some((c2) => c2.id === id)),
+      );
+      return prev.map((x, idx) => {
+        if (idx === i) return b;
+        if (removedIds.size === 0) return x;
+        return {
+          ...x,
+          campaigns: x.campaigns.map((c) => ({
+            ...c,
+            dependsOn: c.dependsOn.filter((depId) => !removedIds.has(depId)),
+          })),
+        };
+      });
+    });
 
   const removeBucket = (i: number) =>
     setBuckets((prev) => {
