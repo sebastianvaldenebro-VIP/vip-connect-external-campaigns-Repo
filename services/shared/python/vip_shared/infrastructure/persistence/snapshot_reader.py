@@ -4,6 +4,7 @@
 S3 prefix; each row is a profile in the segment. We only need two columns —
 ``ProfileId`` and ``customerid`` — to diff against Redis.
 """
+
 from __future__ import annotations
 
 import csv

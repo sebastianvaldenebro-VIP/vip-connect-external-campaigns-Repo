@@ -17,5 +17,5 @@ class ScheduleSpec:
     enabled: bool
     timezone: str
     schedule_start_at: str | None = None  # ISO 8601 UTC
-    schedule_end_at: str | None = None    # ISO 8601 UTC
+    schedule_end_at: str | None = None  # ISO 8601 UTC
     allowed_hours: tuple[AllowedHour, ...] = ()

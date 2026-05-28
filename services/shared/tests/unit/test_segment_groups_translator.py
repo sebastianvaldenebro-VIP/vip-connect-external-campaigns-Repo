@@ -5,6 +5,7 @@ Reconcile uses customer_ids_to_segment_groups to build the static list segment.
 Both directions share the same canonical FilterRule shape so the tests live
 together.
 """
+
 from __future__ import annotations
 
 import pytest

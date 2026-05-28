@@ -10,6 +10,7 @@ estimate) and returns the Redis-matching customerIds as "source of truth".
 Extras (profiles in CP that no longer match Redis) are not detectable in this
 mode — the UI surfaces that limitation.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -66,13 +67,10 @@ def verify_segment(event: dict, path_params: dict) -> dict:
             definition.get("SegmentGroups") or {}
         )
         version_tag = tags.get("VipVersion", "1")
-        legacy_warning = (
-            "Legacy segment without persisted filter config. "
-            + (
-                "Recreate with the original filter to enable full drift detection."
-                if version_tag != "1"
-                else "Verify works this time; will keep working until first rebuild."
-            )
+        legacy_warning = "Legacy segment without persisted filter config. " + (
+            "Recreate with the original filter to enable full drift detection."
+            if version_tag != "1"
+            else "Verify works this time; will keep working until first rebuild."
         )
 
     if not rules:
@@ -136,7 +134,9 @@ def _scan_redis(rules, combinator: str) -> tuple[set[str], dict[str, dict[str, A
 
     for record in source.iter_records():
         if matches_group(record, rules, combinator):
-            customer_id = str(record.get("customerid") or record.get("id") or "").strip()
+            customer_id = str(
+                record.get("customerid") or record.get("id") or ""
+            ).strip()
             if not customer_id:
                 continue
             matching_ids.add(customer_id)

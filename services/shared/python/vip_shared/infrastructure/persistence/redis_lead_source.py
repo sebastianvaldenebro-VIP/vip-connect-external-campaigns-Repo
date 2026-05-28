@@ -4,6 +4,7 @@ The wait_list key lives at ``wait_list:{team}:list`` as a Redis list of
 JSON-encoded lead payloads. We read in chunks via LRANGE so that a large list
 (tens of thousands of entries) doesn't blow the Lambda memory budget.
 """
+
 from __future__ import annotations
 
 import json
@@ -92,9 +93,7 @@ def _parse_record(raw: Any) -> dict[str, Any] | None:
         record["available"] = "True" if available else "False"
     elif isinstance(available, str):
         record["available"] = (
-            "True"
-            if available.strip().lower() in {"true", "1", "yes"}
-            else "False"
+            "True" if available.strip().lower() in {"true", "1", "yes"} else "False"
         )
     elif isinstance(available, (int, float)):
         record["available"] = "True" if available else "False"

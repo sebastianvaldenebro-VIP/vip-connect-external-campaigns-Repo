@@ -13,6 +13,7 @@ re-evaluation has not run yet.
 This produces self-contained, timestamped JSON evidence that can be sent
 directly to AWS support without relying on any static profile ID.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -97,9 +98,7 @@ def diagnose_staleness(event: dict, path_params: dict) -> dict:
 
     # ── 4. Fetch CP attributes for non-members ───────────────────────────
     cp_profiles = _batch_get_profiles(cp, non_members)
-    profile_map: dict[str, dict] = {
-        p.get("ProfileId", ""): p for p in cp_profiles
-    }
+    profile_map: dict[str, dict] = {p.get("ProfileId", ""): p for p in cp_profiles}
 
     # ── 5. Evaluate CP attributes against filter rules ───────────────────
     confirmed_stale = []
@@ -179,9 +178,7 @@ def _check_membership(cp, segment_name: str, profile_ids: list[str]) -> dict[str
     for i in range(0, len(profile_ids), _MEMBERSHIP_BATCH):
         batch = profile_ids[i : i + _MEMBERSHIP_BATCH]
         try:
-            response = cp.get_segment_membership(
-                name=segment_name, profile_ids=batch
-            )
+            response = cp.get_segment_membership(name=segment_name, profile_ids=batch)
             for entry in response.get("Profiles", []):
                 pid = entry.get("ProfileId", "")
                 result[pid] = bool(entry.get("IsProfileInSegment", False))

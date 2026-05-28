@@ -1,4 +1,5 @@
 """Tests for audit log read handler."""
+
 from __future__ import annotations
 
 import json
@@ -50,9 +51,7 @@ def test_list_audit_uses_gsi_when_actor_filter():
     mock_table.query.return_value = {"Items": [], "LastEvaluatedKey": None}
 
     with patch("handlers.audit._table", return_value=mock_table):
-        audit.list_audit_entries(
-            {"queryStringParameters": {"actor": "user-1"}}, {}
-        )
+        audit.list_audit_entries({"queryStringParameters": {"actor": "user-1"}}, {})
 
     mock_table.query.assert_called_once()
     call_kwargs = mock_table.query.call_args.kwargs
@@ -66,9 +65,7 @@ def test_list_audit_uses_gsi_when_action_filter():
     mock_table.query.return_value = {"Items": [], "LastEvaluatedKey": None}
 
     with patch("handlers.audit._table", return_value=mock_table):
-        audit.list_audit_entries(
-            {"queryStringParameters": {"action": "create"}}, {}
-        )
+        audit.list_audit_entries({"queryStringParameters": {"action": "create"}}, {})
 
     call_kwargs = mock_table.query.call_args.kwargs
     assert call_kwargs["IndexName"] == "GSI2_ByAction"

@@ -1,4 +1,5 @@
 """Tests for metrics handler."""
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,10 @@ def test_get_campaign_metrics_returns_totals_and_series():
     from handlers import metrics
 
     mock_cw = MagicMock()
-    mock_cw.get_campaign_totals.return_value = {"Delivery": 1247, "ContactsAnswered": 612}
+    mock_cw.get_campaign_totals.return_value = {
+        "Delivery": 1247,
+        "ContactsAnswered": 612,
+    }
     mock_cw.get_campaign_metric_series.return_value = [
         {"timestamp": "2026-04-22T14:00:00+00:00", "value": 100.0},
     ]

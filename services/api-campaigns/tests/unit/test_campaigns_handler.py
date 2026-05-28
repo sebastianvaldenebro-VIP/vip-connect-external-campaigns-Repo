@@ -1,4 +1,5 @@
 """Tests for campaigns CRUD + lifecycle handlers."""
+
 from __future__ import annotations
 
 import json
@@ -83,12 +84,20 @@ def test_create_campaign_audits():
         "contactFlowId": "f",
         "campaignFlowArn": "arn:aws:connect:us-east-1:123:instance/i/contact-flow/cf",
         "sourcePhoneNumber": "+1",
-        "dialer": {"type": "progressive", "bandwidthAllocation": 1.0, "dialingCapacity": 1.0},
-        "schedule": {"startTime": "2026-04-23T14:00:00Z", "endTime": "2026-04-23T22:00:00Z"},
+        "dialer": {
+            "type": "progressive",
+            "bandwidthAllocation": 1.0,
+            "dialingCapacity": 1.0,
+        },
+        "schedule": {
+            "startTime": "2026-04-23T14:00:00Z",
+            "endTime": "2026-04-23T22:00:00Z",
+        },
     }
 
-    with patch("handlers.campaigns.build_oc", return_value=mock_oc), patch(
-        "handlers.campaigns.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
     ):
         response = campaigns.create_campaign(_event(body), {})
 
@@ -107,8 +116,9 @@ def test_delete_campaign_stops_if_running():
     mock_oc.get_campaign_state.return_value = {"state": "Running"}
     mock_audit = MagicMock()
 
-    with patch("handlers.campaigns.build_oc", return_value=mock_oc), patch(
-        "handlers.campaigns.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
     ):
         response = campaigns.delete_campaign(_event(), {"id": "c-1"})
 
@@ -125,8 +135,9 @@ def test_delete_campaign_skips_stop_if_not_running():
     mock_oc.get_campaign_state.return_value = {"state": "Stopped"}
     mock_audit = MagicMock()
 
-    with patch("handlers.campaigns.build_oc", return_value=mock_oc), patch(
-        "handlers.campaigns.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
     ):
         campaigns.delete_campaign(_event(), {"id": "c-1"})
 
@@ -142,11 +153,15 @@ def test_update_campaign_applies_multiple_fields():
 
     body = {
         "name": "new-name",
-        "schedule": {"startTime": "2026-05-01T00:00:00Z", "endTime": "2026-05-01T12:00:00Z"},
+        "schedule": {
+            "startTime": "2026-05-01T00:00:00Z",
+            "endTime": "2026-05-01T12:00:00Z",
+        },
     }
 
-    with patch("handlers.campaigns.build_oc", return_value=mock_oc), patch(
-        "handlers.campaigns.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
     ):
         response = campaigns.update_campaign(_event(body), {"id": "c-1"})
 
@@ -169,8 +184,9 @@ def test_lifecycle_actions_call_right_method():
     mock_oc.get_campaign_state.return_value = {"state": "Running"}
     mock_audit = MagicMock()
 
-    with patch("handlers.campaigns.build_oc", return_value=mock_oc), patch(
-        "handlers.campaigns.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
     ):
         response = campaigns.start_campaign(_event(), {"id": "c-1"})
 

@@ -15,7 +15,9 @@ class OutboundCampaignsClient:
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
-    def list_campaigns(self, max_results: int = 25, next_token: str | None = None) -> dict:
+    def list_campaigns(
+        self, max_results: int = 25, next_token: str | None = None
+    ) -> dict:
         kwargs: dict = {"maxResults": max_results}
         if next_token:
             kwargs["nextToken"] = next_token

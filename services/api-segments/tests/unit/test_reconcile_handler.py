@@ -1,4 +1,5 @@
 """Tests for the reconcile handler — v{N+1} + retarget + delete."""
+
 from __future__ import annotations
 
 import json
@@ -99,7 +100,9 @@ def test_creates_vNplus1_and_retargets_campaigns():
     new_arn = "arn:aws:profile:...segment-definitions/nj-available-leads-v4"
 
     cp = MagicMock()
-    cp.get_segment_definition.return_value = _definition("nj-available-leads-v3", version=3, arn=old_arn)
+    cp.get_segment_definition.return_value = _definition(
+        "nj-available-leads-v3", version=3, arn=old_arn
+    )
     cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
 
     # Redis truth: cust-a, cust-b, cust-new (3 profiles that should be members)
@@ -116,7 +119,10 @@ def test_creates_vNplus1_and_retargets_campaigns():
     oc.list_campaigns.return_value = {
         "campaignSummaryList": [
             {"id": "cmp-uses-old", "source": {"customerProfilesSegmentArn": old_arn}},
-            {"id": "cmp-other", "source": {"customerProfilesSegmentArn": "arn:some-other"}},
+            {
+                "id": "cmp-other",
+                "source": {"customerProfilesSegmentArn": "arn:some-other"},
+            },
         ],
         "nextToken": None,
     }
@@ -135,7 +141,9 @@ def test_creates_vNplus1_and_retargets_campaigns():
             ),
         ),
     ):
-        response = reconcile.reconcile_segment(_event(), {"id": "nj-available-leads-v3"})
+        response = reconcile.reconcile_segment(
+            _event(), {"id": "nj-available-leads-v3"}
+        )
 
     body = json.loads(response["body"])
     assert body["newSegmentName"] == "nj-available-leads-v4"
@@ -173,22 +181,30 @@ def test_paginates_campaign_listing_when_retargeting():
     old_arn = "arn:old"
     new_arn = "arn:new"
     cp = MagicMock()
-    cp.get_segment_definition.return_value = _definition("nj-v3", version=3, arn=old_arn)
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn=old_arn
+    )
     cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
 
     redis_source = MagicMock()
-    redis_source.iter_records.return_value = iter([
-        {"id": "cust-a", "customerid": "cust-a", "available": "1"},
-    ])
+    redis_source.iter_records.return_value = iter(
+        [
+            {"id": "cust-a", "customerid": "cust-a", "available": "1"},
+        ]
+    )
 
     oc = MagicMock()
     oc.list_campaigns.side_effect = [
         {
-            "campaignSummaryList": [{"id": "page1", "source": {"customerProfilesSegmentArn": old_arn}}],
+            "campaignSummaryList": [
+                {"id": "page1", "source": {"customerProfilesSegmentArn": old_arn}}
+            ],
             "nextToken": "TOKEN",
         },
         {
-            "campaignSummaryList": [{"id": "page2", "source": {"customerProfilesSegmentArn": old_arn}}],
+            "campaignSummaryList": [
+                {"id": "page2", "source": {"customerProfilesSegmentArn": old_arn}}
+            ],
             "nextToken": None,
         },
     ]

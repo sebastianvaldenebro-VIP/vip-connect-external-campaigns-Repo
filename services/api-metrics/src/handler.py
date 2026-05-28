@@ -1,4 +1,5 @@
 """Lambda entrypoint for api-metrics."""
+
 from __future__ import annotations
 
 from botocore.exceptions import ClientError
@@ -12,7 +13,9 @@ _logger = StructuredLogger(service="api-metrics")
 
 
 def lambda_handler(event: dict, context) -> dict:
-    route_key = event.get("routeKey") or event.get("requestContext", {}).get("routeKey", "")
+    route_key = event.get("routeKey") or event.get("requestContext", {}).get(
+        "routeKey", ""
+    )
     path_params = event.get("pathParameters") or {}
 
     _logger.info("request_received", route_key=route_key, path_params=path_params)

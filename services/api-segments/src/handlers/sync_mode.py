@@ -4,6 +4,7 @@ Sync mode lives in the segment's tags (``VipSyncMode``). We reuse tags instead
 of adding a dedicated metadata table because they're atomic with the segment
 definition: delete the segment and the tag goes with it.
 """
+
 from __future__ import annotations
 
 from vip_shared.application.http import (

@@ -1,4 +1,5 @@
 """Tests for SegmentFilterConfigStore — DDB get/put/update semantics."""
+
 from __future__ import annotations
 
 import json

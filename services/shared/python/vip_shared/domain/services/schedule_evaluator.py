@@ -26,7 +26,9 @@ class ScheduleEvaluator:
     @staticmethod
     def _within_schedule(spec: ScheduleSpec, now_utc: datetime) -> bool:
         if spec.schedule_start_at:
-            start = datetime.fromisoformat(spec.schedule_start_at.replace("Z", "+00:00"))
+            start = datetime.fromisoformat(
+                spec.schedule_start_at.replace("Z", "+00:00")
+            )
             if now_utc < start:
                 return False
         if spec.schedule_end_at:

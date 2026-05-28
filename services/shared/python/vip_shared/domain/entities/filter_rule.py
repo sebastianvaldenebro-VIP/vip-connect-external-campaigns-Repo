@@ -28,5 +28,7 @@ class FilterRule:
         op = FilterOperator(rule["op"])
         values = tuple(rule.get("values", []))
         if not values:
-            raise ValueError(f"FilterRule for field '{field}' must have at least one value")
+            raise ValueError(
+                f"FilterRule for field '{field}' must have at least one value"
+            )
         return FilterRule(field=field, operator=op, values=values)

@@ -11,6 +11,7 @@ Note: snapshot diffing was removed in favour of a pure-rebuild approach because
 Removed-count therefore reports as 0; the rebuild still produces the correct
 final membership because we replace the segment entirely with the Redis set.
 """
+
 from __future__ import annotations
 
 import re
@@ -68,7 +69,9 @@ def reconcile_segment(event: dict, path_params: dict) -> dict:
                 "to enable reconcile."
             )
         translator = SegmentGroupsTranslator()
-        rules, combinator = translator.aws_to_rules(definition.get("SegmentGroups") or {})
+        rules, combinator = translator.aws_to_rules(
+            definition.get("SegmentGroups") or {}
+        )
 
     if not rules:
         raise ValueError(
@@ -83,9 +86,8 @@ def reconcile_segment(event: dict, path_params: dict) -> dict:
     # been a rebuilt-shaped placeholder. The config row is the canonical
     # source of "what was this segment originally for".
     description = (
-        (config.description if config is not None else None)
-        or definition.get("Description")
-    )
+        config.description if config is not None else None
+    ) or definition.get("Description")
 
     # 1. Redis is source of truth. Pure rebuild — we don't diff against a CP
     # snapshot because CreateSegmentSnapshot requires iam:PassRole which is
@@ -96,9 +98,7 @@ def reconcile_segment(event: dict, path_params: dict) -> dict:
     # would create a segment with Dimensions:[] which CP evaluates as "match
     # all profiles" — far worse than keeping the current segment untouched.
     if len(redis_ids) == 0:
-        filter_summary = " AND ".join(
-            f"{r.field} IN {list(r.values)}" for r in rules
-        )
+        filter_summary = " AND ".join(f"{r.field} IN {list(r.values)}" for r in rules)
         raise ValueError(
             f"No Redis records match the current filters ({filter_summary}). "
             "Reconcile is blocked to prevent creating an empty segment. "

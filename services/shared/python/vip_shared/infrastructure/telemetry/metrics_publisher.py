@@ -9,7 +9,9 @@ class MetricsPublisher:
         self._namespace = namespace
         self._buffer: list[dict] = []
 
-    def add(self, name: str, value: float, campaign_id: str, unit: str = "Count") -> None:
+    def add(
+        self, name: str, value: float, campaign_id: str, unit: str = "Count"
+    ) -> None:
         self._buffer.append(
             {
                 "MetricName": name,

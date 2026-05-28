@@ -1,4 +1,5 @@
 """Profile read handlers — search, batch get, objects, calculated attributes."""
+
 from __future__ import annotations
 
 import os
@@ -65,7 +66,9 @@ def get_profile(event: dict, path_params: dict) -> dict:
     response = cp.batch_get_profile(profile_ids=[profile_id])
     profiles = response.get("Profiles", [])
     if not profiles:
-        return json_response(404, {"error": {"code": "NOT_FOUND", "message": "Profile not found"}})
+        return json_response(
+            404, {"error": {"code": "NOT_FOUND", "message": "Profile not found"}}
+        )
     return json_response(200, {"profile": _serialize_profile(profiles[0])})
 
 

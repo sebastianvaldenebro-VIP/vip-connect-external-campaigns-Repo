@@ -12,6 +12,7 @@ without a snapshot (Redis is the source of truth). Extras is the
 harder-to-detect side of the diff: profiles the segment still contains that
 Redis says shouldn't be members anymore.
 """
+
 from __future__ import annotations
 
 import os
@@ -211,7 +212,9 @@ def _scan_redis_ids(rules, combinator: str) -> set[str]:
     ids: set[str] = set()
     for record in source.iter_records():
         if matches_group(record, rules, combinator):
-            customer_id = str(record.get("customerid") or record.get("id") or "").strip()
+            customer_id = str(
+                record.get("customerid") or record.get("id") or ""
+            ).strip()
             if customer_id:
                 ids.add(customer_id)
     return ids

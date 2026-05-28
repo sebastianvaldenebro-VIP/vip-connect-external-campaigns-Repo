@@ -1,4 +1,5 @@
 """Tests for AuditRecorder — verify 6-year TTL + shape."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,9 @@ def test_record_creates_correct_shape():
     mock_resource = MagicMock()
     mock_resource.Table.return_value = mock_table
 
-    recorder = AuditRecorder(table_name="AdminAuditLog", dynamodb_resource=mock_resource)
+    recorder = AuditRecorder(
+        table_name="AdminAuditLog", dynamodb_resource=mock_resource
+    )
 
     recorder.record(
         entity_type="segment",
@@ -49,7 +52,9 @@ def test_record_sets_6year_ttl():
     mock_resource = MagicMock()
     mock_resource.Table.return_value = mock_table
 
-    recorder = AuditRecorder(table_name="AdminAuditLog", dynamodb_resource=mock_resource)
+    recorder = AuditRecorder(
+        table_name="AdminAuditLog", dynamodb_resource=mock_resource
+    )
 
     recorder.record(
         entity_type="campaign",
@@ -76,7 +81,9 @@ def test_record_timestamp_is_iso_8601_z():
     mock_resource = MagicMock()
     mock_resource.Table.return_value = mock_table
 
-    recorder = AuditRecorder(table_name="AdminAuditLog", dynamodb_resource=mock_resource)
+    recorder = AuditRecorder(
+        table_name="AdminAuditLog", dynamodb_resource=mock_resource
+    )
 
     recorder.record(
         entity_type="segment",
@@ -100,7 +107,9 @@ def test_optional_fields_omitted_when_none():
     mock_resource = MagicMock()
     mock_resource.Table.return_value = mock_table
 
-    recorder = AuditRecorder(table_name="AdminAuditLog", dynamodb_resource=mock_resource)
+    recorder = AuditRecorder(
+        table_name="AdminAuditLog", dynamodb_resource=mock_resource
+    )
 
     recorder.record(
         entity_type="segment",

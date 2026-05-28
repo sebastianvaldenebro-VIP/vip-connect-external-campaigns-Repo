@@ -1,4 +1,5 @@
 """Tests for ScheduleEvaluator using the new ScheduleSpec interface."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -70,7 +71,9 @@ def test_allowed_hours_different_weekday():
     spec = ScheduleSpec(
         enabled=True,
         timezone="America/New_York",
-        allowed_hours=(AllowedHour(day_of_week=0, start_hour=9, end_hour=17),),  # Monday
+        allowed_hours=(
+            AllowedHour(day_of_week=0, start_hour=9, end_hour=17),
+        ),  # Monday
     )
     # Wednesday 14:00 UTC
     wednesday = datetime(2026, 4, 22, 14, 0, tzinfo=timezone.utc)

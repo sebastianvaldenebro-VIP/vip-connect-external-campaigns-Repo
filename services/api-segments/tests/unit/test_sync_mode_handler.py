@@ -1,4 +1,5 @@
 """Tests for PATCH /segments/{id} — sync-mode toggle handler."""
+
 from __future__ import annotations
 
 import json

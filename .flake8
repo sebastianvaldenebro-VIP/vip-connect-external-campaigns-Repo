@@ -1,0 +1,17 @@
+[flake8]
+max-line-length = 120
+extend-ignore =
+    # E203: whitespace before ':' — conflicts with ruff/black slice formatting (a[1 : 2])
+    E203,
+    # W503/W504: line break before/after binary operator — conflicts with ruff
+    W503,
+    W504
+per-file-ignores =
+    # Route dict keys cannot be shortened without changing the API surface
+    services/api-plans/src/router.py: E501
+    services/api-campaigns/src/router.py: E501
+    services/api-segments/src/router.py: E501
+    services/api-metrics/src/router.py: E501
+    services/api-profiles/src/router.py: E501
+    # Docstring example strings intentionally kept unbroken for readability
+    services/api-campaigns/src/builders.py: E501

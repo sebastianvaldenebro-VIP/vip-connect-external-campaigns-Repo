@@ -1,4 +1,5 @@
 """Tests for the refactored, record-agnostic FilterEvaluator."""
+
 from __future__ import annotations
 
 from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule

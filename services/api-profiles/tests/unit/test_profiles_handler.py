@@ -1,4 +1,5 @@
 """Tests for profiles handlers."""
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,11 @@ def _env(monkeypatch):
 
 
 def _event(body=None, qs=None):
-    e = {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": "u", "email": "u@x"}}}}}
+    e = {
+        "requestContext": {
+            "authorizer": {"jwt": {"claims": {"sub": "u", "email": "u@x"}}}
+        }
+    }
     if body is not None:
         e["body"] = json.dumps(body)
     if qs is not None:
@@ -33,7 +38,10 @@ def test_search_profiles_returns_normalized_items():
                 "FirstName": "Patrina",
                 "LastName": "Crawford",
                 "PhoneNumber": "+12017801027",
-                "Attributes": {"available": "False", "groups": "New Lead / 2nd Attempt"},
+                "Attributes": {
+                    "available": "False",
+                    "groups": "New Lead / 2nd Attempt",
+                },
             }
         ]
     }
@@ -71,9 +79,7 @@ def test_batch_get_rejects_over_100():
     from handlers import profiles
 
     with pytest.raises(ValueError, match="Max 100"):
-        profiles.batch_get_profiles(
-            _event(body={"profileIds": ["id"] * 101}), {}
-        )
+        profiles.batch_get_profiles(_event(body={"profileIds": ["id"] * 101}), {})
 
 
 def test_batch_get_returns_serialized_profiles():
@@ -93,9 +99,7 @@ def test_batch_get_returns_serialized_profiles():
     }
 
     with patch("handlers.profiles.build_cp", return_value=mock_cp):
-        response = profiles.batch_get_profiles(
-            _event(body={"profileIds": ["p-1"]}), {}
-        )
+        response = profiles.batch_get_profiles(_event(body={"profileIds": ["p-1"]}), {})
 
     body = json.loads(response["body"])
     assert len(body["profiles"]) == 1

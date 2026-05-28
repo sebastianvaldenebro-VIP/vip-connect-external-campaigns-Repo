@@ -1,4 +1,5 @@
 """Tests for estimate handler — the on-demand recompute API."""
+
 from __future__ import annotations
 
 import json
@@ -32,8 +33,9 @@ def test_create_estimate_returns_estimate_id_and_audits():
     }
     mock_audit = MagicMock()
 
-    with patch("handlers.estimate.build_cp", return_value=mock_cp), patch(
-        "handlers.estimate.build_audit", return_value=mock_audit
+    with (
+        patch("handlers.estimate.build_cp", return_value=mock_cp),
+        patch("handlers.estimate.build_audit", return_value=mock_audit),
     ):
         response = estimate.create_estimate(_caller_event(), {"id": "seg-1"})
 

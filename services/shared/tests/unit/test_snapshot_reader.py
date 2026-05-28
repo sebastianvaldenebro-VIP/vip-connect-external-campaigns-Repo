@@ -1,4 +1,5 @@
 """Tests for SnapshotReader — the CSV parser for Customer Profiles snapshot exports."""
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -28,7 +29,13 @@ class TestSnapshotReader:
         s3 = MagicMock()
         paginator = MagicMock()
         paginator.paginate.return_value = [
-            {"Contents": [{"Key": "prefix/part-1.csv"}, {"Key": "prefix/part-2.csv"}, {"Key": "prefix/_SUCCESS"}]}
+            {
+                "Contents": [
+                    {"Key": "prefix/part-1.csv"},
+                    {"Key": "prefix/part-2.csv"},
+                    {"Key": "prefix/_SUCCESS"},
+                ]
+            }
         ]
         s3.get_paginator.return_value = paginator
         s3.get_object.side_effect = [

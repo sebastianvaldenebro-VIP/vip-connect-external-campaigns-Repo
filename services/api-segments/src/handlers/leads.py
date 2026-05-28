@@ -7,6 +7,7 @@ used) and preview a segment count before committing to create it.
 Both handlers live in api-segments because that Lambda already has Redis
 connectivity set up (VPC + SG) and the right Redis env vars.
 """
+
 from __future__ import annotations
 
 import json
@@ -122,9 +123,11 @@ def _parse_estimate(raw) -> int | None:
             return int(total)
     if isinstance(raw, str):
         try:
-            return int(json.loads(raw).get("totalCount", raw)) if raw.startswith(
-                "{"
-            ) else int(raw)
+            return (
+                int(json.loads(raw).get("totalCount", raw))
+                if raw.startswith("{")
+                else int(raw)
+            )
         except (ValueError, TypeError):
             return None
     return None
@@ -138,9 +141,7 @@ def _normalise_to_pascal_case(sg: dict) -> dict:
         dims = group.get("Dimensions") or group.get("dimensions") or []
         out_dims = []
         for dim in dims:
-            profile = (
-                dim.get("ProfileAttributes") or dim.get("profileAttributes") or {}
-            )
+            profile = dim.get("ProfileAttributes") or dim.get("profileAttributes") or {}
             attrs_in = profile.get("Attributes") or profile.get("attributes") or {}
             attrs_out: dict = {}
             for field, spec in attrs_in.items():

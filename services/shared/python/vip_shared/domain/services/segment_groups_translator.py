@@ -8,6 +8,7 @@ multiple typed dimensions. Our FilterRule model is a flat list of
 2. Build a synthetic ``customerid IN [list]`` segment when rebuilding
    a reconciled snapshot (reconcile).
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -55,7 +56,9 @@ class SegmentGroupsTranslator:
             profile_attrs = (
                 dim.get("ProfileAttributes") or dim.get("profileAttributes") or {}
             )
-            attrs = profile_attrs.get("Attributes") or profile_attrs.get("attributes") or {}
+            attrs = (
+                profile_attrs.get("Attributes") or profile_attrs.get("attributes") or {}
+            )
             for field_name, attr_dim in attrs.items():
                 rule = self._dimension_to_rule(field_name, attr_dim)
                 if rule is not None:

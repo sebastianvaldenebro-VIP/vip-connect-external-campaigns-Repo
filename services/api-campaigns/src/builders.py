@@ -4,6 +4,7 @@ The UI sends a simpler, flatter shape; this module produces the nested
 `channelSubtypeConfig` / `source` / `schedule` structures that
 `connectcampaignsv2:CreateCampaign` expects.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -37,8 +38,10 @@ def build_create_campaign_params(
     # connectCampaignFlowArn is optional in V2 connectcampaignsv2 — campaigns
     # that drive plain-voice agent dialing don't need a campaign-type contact
     # flow. We only forward it to AWS when the caller actually provided one.
-    _require(body, ("name", "queueId", "contactFlowId", "sourcePhoneNumber",
-                    "dialer", "schedule"))
+    _require(
+        body,
+        ("name", "queueId", "contactFlowId", "sourcePhoneNumber", "dialer", "schedule"),
+    )
 
     dialer = body["dialer"]
     dialer_type = dialer["type"]
@@ -128,9 +131,7 @@ def _build_source(body: dict, *, profiles_domain_arn: str) -> dict:
     if body.get("segmentArn"):
         return {"customerProfilesSegmentArn": body["segmentArn"]}
     # eventTrigger default (rarely used by the UI, but supported)
-    return {
-        "eventTrigger": {"customerProfilesDomainArn": profiles_domain_arn}
-    }
+    return {"eventTrigger": {"customerProfilesDomainArn": profiles_domain_arn}}
 
 
 def _build_limit(limits: dict, key: str, unit: str, value: int) -> dict:

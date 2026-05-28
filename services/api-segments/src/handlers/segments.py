@@ -1,7 +1,7 @@
 """CRUD handlers for segments."""
+
 from __future__ import annotations
 
-from typing import Any
 
 from vip_shared.application.http import (
     extract_caller,

@@ -1,4 +1,5 @@
 """Route table for api-metrics Lambda."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -16,7 +17,6 @@ ROUTES: dict[str, Handler] = {
     "GET /metrics/queues/{queueId}": metrics_handler.get_queue_realtime,
     "GET /metrics/current": metrics_handler.get_current_realtime,
     "GET /metrics/dispositions": metrics_handler.get_dispositions,
-
     # Audit log (read-only)
     "GET /audit": audit_handler.list_audit_entries,
     "GET /audit/{entityId}": audit_handler.get_entity_history,

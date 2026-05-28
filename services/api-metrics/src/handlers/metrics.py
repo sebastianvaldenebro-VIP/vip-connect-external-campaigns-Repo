@@ -1,16 +1,19 @@
 """CloudWatch metric handlers for campaigns and queues."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
 from vip_shared.application.http import json_response
 from vip_shared.infrastructure.persistence.cloudwatch_client import (
-    DEFAULT_CAMPAIGN_METRICS,
-    CloudWatchMetricsClient,
     build as build_cw,
 )
-from vip_shared.infrastructure.persistence.connect_client import build_from_env as build_connect
-from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+from vip_shared.infrastructure.persistence.connect_client import (
+    build_from_env as build_connect,
+)
+from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+    build as build_oc,
+)
 
 
 def get_campaign_metrics(event: dict, path_params: dict) -> dict:
@@ -91,7 +94,12 @@ def get_queue_realtime(event: dict, path_params: dict) -> dict:
     client = build_connect()
     results = client.get_current_metric_data(
         queue_id=queue_id,
-        metrics=["AGENTS_AVAILABLE", "AGENTS_ONLINE", "AGENTS_STAFFED", "CONTACTS_IN_QUEUE"],
+        metrics=[
+            "AGENTS_AVAILABLE",
+            "AGENTS_ONLINE",
+            "AGENTS_STAFFED",
+            "CONTACTS_IN_QUEUE",
+        ],
     )
     collections = results[0].get("Collections", []) if results else []
     metrics_map = {c["Metric"]["Name"]: c["Value"] for c in collections}

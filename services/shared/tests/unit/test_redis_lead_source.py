@@ -1,4 +1,5 @@
 """Tests for RedisLeadSource — the iterator that feeds FilterEvaluator during verify."""
+
 from __future__ import annotations
 
 import json
@@ -28,11 +29,26 @@ class FakeRedis:
 @pytest.fixture
 def items() -> list[str]:
     payloads = [
-        {"id": "cust-abcd1234", "phone": "+1111", "available": "true", "location": "NJ - Newark"},
-        {"id": "cust-deadbeef", "phone": "+2222", "available": False, "location": "FL - Miami"},
+        {
+            "id": "cust-abcd1234",
+            "phone": "+1111",
+            "available": "true",
+            "location": "NJ - Newark",
+        },
+        {
+            "id": "cust-deadbeef",
+            "phone": "+2222",
+            "available": False,
+            "location": "FL - Miami",
+        },
         {"id": "short", "phone": "+9999"},  # too-short id, should be dropped
         "{{ bad json",  # malformed, should be dropped
-        {"id": "cust-xyzwuvs1", "phone": "+3333", "available": "1", "location": "TX - Austin"},
+        {
+            "id": "cust-xyzwuvs1",
+            "phone": "+3333",
+            "available": "1",
+            "location": "TX - Austin",
+        },
     ]
     return [p if isinstance(p, str) else json.dumps(p) for p in payloads]
 
@@ -41,7 +57,11 @@ def test_iter_records_drops_malformed_and_too_short_ids(items):
     source = RedisLeadSource(FakeRedis(items), team="BASIC_TEAM", chunk_size=100)
     records = list(source.iter_records())
     assert len(records) == 3
-    assert [r["id"] for r in records] == ["cust-abcd1234", "cust-deadbeef", "cust-xyzwuvs1"]
+    assert [r["id"] for r in records] == [
+        "cust-abcd1234",
+        "cust-deadbeef",
+        "cust-xyzwuvs1",
+    ]
 
 
 def test_iter_records_normalizes_available_to_capitalized_string(items):

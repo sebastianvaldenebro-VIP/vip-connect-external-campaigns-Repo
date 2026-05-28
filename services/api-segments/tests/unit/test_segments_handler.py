@@ -1,8 +1,8 @@
 """Tests for segments CRUD handler — with mocked dependencies."""
+
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -85,11 +85,13 @@ def test_create_segment_calls_cp_and_audit():
         }
     )
 
-    with patch("handlers.segments.build_cp", return_value=mock_cp), patch(
-        "handlers.segments.build_audit", return_value=mock_audit
-    ), patch(
-        "handlers.segments.build_filter_config_store",
-        return_value=_no_config_store(),
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=mock_audit),
+        patch(
+            "handlers.segments.build_filter_config_store",
+            return_value=_no_config_store(),
+        ),
     ):
         response = segments.create_segment(event, {})
 
@@ -125,11 +127,13 @@ def test_delete_segment_captures_before_state():
     }
     mock_audit = MagicMock()
 
-    with patch("handlers.segments.build_cp", return_value=mock_cp), patch(
-        "handlers.segments.build_audit", return_value=mock_audit
-    ), patch(
-        "handlers.segments.build_filter_config_store",
-        return_value=_no_config_store(),
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=mock_audit),
+        patch(
+            "handlers.segments.build_filter_config_store",
+            return_value=_no_config_store(),
+        ),
     ):
         response = segments.delete_segment(_caller_event(), {"id": "old-seg"})
 

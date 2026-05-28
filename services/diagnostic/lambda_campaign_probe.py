@@ -13,7 +13,7 @@ Deploy as Lambda in same account as Connect. Test event:
   }
 }
 """
-import json
+
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -48,7 +48,9 @@ def test_v1(campaign_id: str, phone: str, label: str) -> dict:
             "phone": phone,
             "successful": len(resp.get("successfulRequests", [])),
             "failed": len(resp.get("failedRequests", [])),
-            "failure_codes": [f.get("failureCode") for f in resp.get("failedRequests", [])],
+            "failure_codes": [
+                f.get("failureCode") for f in resp.get("failedRequests", [])
+            ],
         }
     except Exception as e:
         return {"test": f"v1_{label}", "phone": phone, "exception": str(e)}
@@ -77,7 +79,9 @@ def test_v2(campaign_id: str, phone: str, label: str) -> dict:
             "phone": phone,
             "successful": len(resp.get("successfulRequests", [])),
             "failed": len(resp.get("failedRequests", [])),
-            "failure_codes": [f.get("failureCode") for f in resp.get("failedRequests", [])],
+            "failure_codes": [
+                f.get("failureCode") for f in resp.get("failedRequests", [])
+            ],
         }
     except Exception as e:
         return {"test": f"v2_{label}", "phone": phone, "exception": str(e)}
@@ -111,14 +115,26 @@ def lambda_handler(event, context):
 
     # Matrix: which combinations worked?
     summary = {
-        "v1_successes": [t["phone"] for t in results["tests"]
-                         if t["test"].startswith("v1_") and t.get("successful", 0) > 0],
-        "v2_successes": [t["phone"] for t in results["tests"]
-                         if t["test"].startswith("v2_") and t.get("successful", 0) > 0],
-        "v1_failures": [t for t in results["tests"]
-                        if t["test"].startswith("v1_") and t.get("failed", 0) > 0],
-        "v2_failures": [t for t in results["tests"]
-                        if t["test"].startswith("v2_") and t.get("failed", 0) > 0],
+        "v1_successes": [
+            t["phone"]
+            for t in results["tests"]
+            if t["test"].startswith("v1_") and t.get("successful", 0) > 0
+        ],
+        "v2_successes": [
+            t["phone"]
+            for t in results["tests"]
+            if t["test"].startswith("v2_") and t.get("successful", 0) > 0
+        ],
+        "v1_failures": [
+            t
+            for t in results["tests"]
+            if t["test"].startswith("v1_") and t.get("failed", 0) > 0
+        ],
+        "v2_failures": [
+            t
+            for t in results["tests"]
+            if t["test"].startswith("v2_") and t.get("failed", 0) > 0
+        ],
     }
     results["summary"] = summary
 

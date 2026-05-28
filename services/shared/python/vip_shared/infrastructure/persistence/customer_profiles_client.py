@@ -92,9 +92,13 @@ class CustomerProfilesClient:
             if status == "SUCCEEDED":
                 return response
             if status == "FAILED":
-                raise RuntimeError(f"Estimate failed: {response.get('Message', 'no detail')}")
+                raise RuntimeError(
+                    f"Estimate failed: {response.get('Message', 'no detail')}"
+                )
             time.sleep(poll_interval)
-        raise TimeoutError(f"Estimate {estimate_id} did not complete within {timeout_seconds}s")
+        raise TimeoutError(
+            f"Estimate {estimate_id} did not complete within {timeout_seconds}s"
+        )
 
     # ── Snapshot exports ──────────────────────────────────────────────
 
@@ -151,17 +155,13 @@ class CustomerProfilesClient:
             f"Snapshot {snapshot_id} did not complete within {timeout_seconds}s"
         )
 
-    def tag_segment(
-        self, *, segment_arn: str, tags: dict[str, str]
-    ) -> None:
+    def tag_segment(self, *, segment_arn: str, tags: dict[str, str]) -> None:
         """Merge tags onto an existing segment (used for syncMode updates)."""
         self._client.tag_resource(resourceArn=segment_arn, tags=tags)
 
     # ── Segment membership check ──────────────────────────────────────
 
-    def get_segment_membership(
-        self, name: str, profile_ids: list[str]
-    ) -> dict:
+    def get_segment_membership(self, name: str, profile_ids: list[str]) -> dict:
         return self._client.get_segment_membership(
             DomainName=self._domain,
             SegmentDefinitionName=name,

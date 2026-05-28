@@ -5,6 +5,7 @@ Invoke with:
 
 Returns per-ID comparison: redis_available, cp_available, in_sync.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,6 +29,7 @@ CHUNK = 5_000
 
 
 # ── Redis lookup ──────────────────────────────────────────────────────────────
+
 
 def _load_redis_availability(ids: set[str]) -> dict[str, str | None]:
     """Scan Redis list and return {id: "True"/"False"/None} for each requested ID."""
@@ -59,7 +61,11 @@ def _load_redis_availability(ids: set[str]) -> dict[str, str | None]:
             if isinstance(avail_raw, bool):
                 avail = "True" if avail_raw else "False"
             elif isinstance(avail_raw, str):
-                avail = "True" if avail_raw.strip().lower() in {"true", "1", "yes"} else "False"
+                avail = (
+                    "True"
+                    if avail_raw.strip().lower() in {"true", "1", "yes"}
+                    else "False"
+                )
             elif isinstance(avail_raw, (int, float)):
                 avail = "True" if avail_raw else "False"
             else:
@@ -71,6 +77,7 @@ def _load_redis_availability(ids: set[str]) -> dict[str, str | None]:
 
 
 # ── CP lookup ─────────────────────────────────────────────────────────────────
+
 
 def _load_cp_availability(ids: list[str]) -> dict[str, str | None]:
     """Fetch CP profiles by ProfileId (batch_get_profile) and return {id: "True"/"False"/None}.
@@ -107,6 +114,7 @@ def _load_cp_availability(ids: list[str]) -> dict[str, str | None]:
 
 # ── Handler ───────────────────────────────────────────────────────────────────
 
+
 def lambda_handler(event: dict, _context: Any) -> dict:
     ids: list[str] = event.get("ids") or []
     if not ids:
@@ -139,12 +147,14 @@ def lambda_handler(event: dict, _context: Any) -> dict:
             available_false_redis += 1
         if c_val == "False":
             available_false_cp += 1
-        rows.append({
-            "id": cid,
-            "redis_available": r_val,
-            "cp_available": c_val,
-            "in_sync": in_sync,
-        })
+        rows.append(
+            {
+                "id": cid,
+                "redis_available": r_val,
+                "cp_available": c_val,
+                "in_sync": in_sync,
+            }
+        )
 
     return {
         "total": len(ids),

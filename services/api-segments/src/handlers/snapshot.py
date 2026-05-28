@@ -4,6 +4,7 @@ Used by the UI to preview the first N matching profiles in the segment
 builder. The S3 bucket is provisioned by the data stack and encrypted
 with the project CMK.
 """
+
 from __future__ import annotations
 
 import os
@@ -32,6 +33,7 @@ def create_snapshot(event: dict, path_params: dict) -> dict:
 
     # snapshot key includes segment name + timestamp prefix for organization
     from datetime import datetime, timezone
+
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     destination_uri = f"s3://{bucket}/{name}/{ts}/"
 

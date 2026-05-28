@@ -33,7 +33,9 @@ class ConnectClient:
                 break
         return items
 
-    def list_contact_flows(self, contact_flow_types: list[str] | None = None) -> list[dict]:
+    def list_contact_flows(
+        self, contact_flow_types: list[str] | None = None
+    ) -> list[dict]:
         """List contact flows, auto-paginated."""
         kwargs: dict[str, Any] = {"InstanceId": self._instance_id}
         if contact_flow_types:

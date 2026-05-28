@@ -19,7 +19,9 @@ class AuditRecorder:
     """
 
     def __init__(self, table_name: str, dynamodb_resource=None) -> None:
-        self._table = (dynamodb_resource or boto3.resource("dynamodb")).Table(table_name)
+        self._table = (dynamodb_resource or boto3.resource("dynamodb")).Table(
+            table_name
+        )
 
     def record(
         self,

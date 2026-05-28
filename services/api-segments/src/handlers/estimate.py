@@ -5,6 +5,7 @@ Whenever the operator hits "Refresh" in the UI, we call
 `CreateSegmentEstimate` which computes the member count against live
 Profile Attributes (not the cached snapshot).
 """
+
 from __future__ import annotations
 
 from vip_shared.application.http import extract_caller, json_response

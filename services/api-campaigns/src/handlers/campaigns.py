@@ -1,4 +1,5 @@
 """CRUD + lifecycle handlers for Outbound Campaigns V2."""
+
 from __future__ import annotations
 
 import os
@@ -9,7 +10,9 @@ from vip_shared.application.http import (
     parse_body,
 )
 from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
-from vip_shared.infrastructure.persistence.outbound_campaigns_client import build as build_oc
+from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+    build as build_oc,
+)
 
 from builders import build_create_campaign_params
 
@@ -29,7 +32,9 @@ def list_campaigns(event: dict, _path_params: dict) -> dict:
     return json_response(
         200,
         {
-            "campaigns": [_serialize_summary(c) for c in response.get("campaignSummaryList", [])],
+            "campaigns": [
+                _serialize_summary(c) for c in response.get("campaignSummaryList", [])
+            ],
             "nextToken": response.get("nextToken"),
         },
     )

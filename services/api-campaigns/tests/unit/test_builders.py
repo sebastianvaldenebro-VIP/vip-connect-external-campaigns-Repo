@@ -1,4 +1,5 @@
 """Tests for the UI-body → V2 API payload transformer."""
+
 from __future__ import annotations
 
 import pytest
@@ -45,7 +46,9 @@ def test_segment_source_produces_expected_nested_structure():
     assert telephony["outboundMode"]["progressive"]["bandwidthAllocation"] == 1.0
     assert telephony["capacity"] == 1.0
     assert telephony["defaultOutboundConfig"]["connectContactFlowId"] == "flow-1"
-    assert telephony["defaultOutboundConfig"]["connectSourcePhoneNumber"] == "+19734949660"
+    assert (
+        telephony["defaultOutboundConfig"]["connectSourcePhoneNumber"] == "+19734949660"
+    )
     assert "ringTimeout" not in telephony["defaultOutboundConfig"]
 
     amd = telephony["defaultOutboundConfig"]["answerMachineDetectionConfig"]
@@ -53,7 +56,10 @@ def test_segment_source_produces_expected_nested_structure():
     assert amd["awaitAnswerMachinePrompt"] is True
 
     assert params["schedule"]["startTime"] == "2026-04-23T14:00:00Z"
-    assert params["communicationTimeConfig"]["localTimeZoneConfig"]["defaultTimeZone"] == "America/New_York"
+    assert (
+        params["communicationTimeConfig"]["localTimeZoneConfig"]["defaultTimeZone"]
+        == "America/New_York"
+    )
 
 
 def test_owner_tag_is_added_when_instance_arn_provided():
@@ -67,7 +73,10 @@ def test_owner_tag_is_added_when_instance_arn_provided():
         profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
         instance_arn="arn:aws:connect:us-east-1:165505826690:instance/abc-123",
     )
-    assert params["tags"]["owner"] == "arn:aws:connect:us-east-1:165505826690:instance/abc-123"
+    assert (
+        params["tags"]["owner"]
+        == "arn:aws:connect:us-east-1:165505826690:instance/abc-123"
+    )
 
 
 def test_owner_tag_does_not_clobber_caller_tags():
@@ -119,7 +128,9 @@ def test_event_trigger_source_strips_communication_time_config():
     )
 
     assert "eventTrigger" in params["source"]
-    assert params["source"]["eventTrigger"]["customerProfilesDomainArn"].endswith(":domains/d")
+    assert params["source"]["eventTrigger"]["customerProfilesDomainArn"].endswith(
+        ":domains/d"
+    )
     # eventTrigger campaigns don't allow communicationTimeConfig
     assert "communicationTimeConfig" not in params
 
@@ -158,12 +169,14 @@ def test_communication_limits_translation():
         profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
     )
 
-    limits = params["communicationLimitsOverride"]["allChannelSubtypes"]["communicationLimitsList"]
+    limits = params["communicationLimitsOverride"]["allChannelSubtypes"][
+        "communicationLimitsList"
+    ]
     assert len(limits) == 3
     # Each limit is a dict with maxCountPerRecipient + frequency
-    per_day = next(l for l in limits if l["frequency"]["value"] == 1)
-    per_week = next(l for l in limits if l["frequency"]["value"] == 7)
-    per_month = next(l for l in limits if l["frequency"]["value"] == 30)
+    per_day = next(lim for lim in limits if lim["frequency"]["value"] == 1)
+    per_week = next(lim for lim in limits if lim["frequency"]["value"] == 7)
+    per_month = next(lim for lim in limits if lim["frequency"]["value"] == 30)
     assert per_day["maxCountPerRecipient"] == 3
     assert per_week["maxCountPerRecipient"] == 10
     assert per_month["maxCountPerRecipient"] == 20

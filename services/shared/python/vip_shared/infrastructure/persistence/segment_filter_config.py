@@ -12,6 +12,7 @@ current (post-rebuild) segment definition. Keyed by ``family`` (e.g.
 ``nj-available-leads``) which is stable across rebuilds even as the concrete
 segment name cycles through ``-v1``, ``-v2``, ``-v3``.
 """
+
 from __future__ import annotations
 
 import json
@@ -51,7 +52,9 @@ class SegmentFilterConfigStore:
     """Thin DDB wrapper with put/get/delete + version bump on rebuild."""
 
     def __init__(self, table_name: str, dynamodb_resource=None) -> None:
-        self._table = (dynamodb_resource or boto3.resource("dynamodb")).Table(table_name)
+        self._table = (dynamodb_resource or boto3.resource("dynamodb")).Table(
+            table_name
+        )
 
     # ── reads ────────────────────────────────────────────────────
 
@@ -96,9 +99,8 @@ class SegmentFilterConfigStore:
         new_version: int,
         rebuilt_by: str | None,
     ) -> None:
-        update_expr = (
-            "SET current_version = :v, last_rebuilt_at = :ts"
-            + (", last_rebuilt_by = :by" if rebuilt_by else "")
+        update_expr = "SET current_version = :v, last_rebuilt_at = :ts" + (
+            ", last_rebuilt_by = :by" if rebuilt_by else ""
         )
         values: dict[str, Any] = {":v": new_version, ":ts": _now_iso()}
         if rebuilt_by:

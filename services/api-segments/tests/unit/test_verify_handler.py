@@ -1,4 +1,5 @@
 """Tests for the verify handler — count-based diff (no snapshot)."""
+
 from __future__ import annotations
 
 import json
@@ -73,8 +74,11 @@ def test_rejects_segment_without_filters():
     definition["SegmentGroups"] = {"Include": "ALL", "Groups": []}
     cp.get_segment_definition.return_value = definition
 
-    with patch("handlers.verify.build_cp", return_value=cp), patch(
-        "handlers.verify.build_filter_config_store", return_value=_no_config_store()
+    with (
+        patch("handlers.verify.build_cp", return_value=cp),
+        patch(
+            "handlers.verify.build_filter_config_store", return_value=_no_config_store()
+        ),
     ):
         with pytest.raises(ValueError, match="no evaluable filters"):
             verify.verify_segment(_event(), {"id": "x"})
@@ -93,7 +97,12 @@ def test_returns_counts_from_estimate_and_redis_scan():
         [
             {"id": "cust-a", "customerid": "cust-a", "phone": "+1", "available": "1"},
             {"id": "cust-b", "customerid": "cust-b", "phone": "+2", "available": "1"},
-            {"id": "cust-new", "customerid": "cust-new", "phone": "+3", "available": "1"},
+            {
+                "id": "cust-new",
+                "customerid": "cust-new",
+                "phone": "+3",
+                "available": "1",
+            },
         ]
     )
 
