@@ -557,3 +557,19 @@ Orden cronológico. **Append al final.**
 - **Fix:** Cambiar el guard para que solo salte si **todos** los stage-1 campaigns ya están en `pendingWarmup`. Si hay un warmup parcial, continúa iterando solo los campaigns faltantes y hace merge con los existentes. Así cada tick de `prestart_check` (6:54, 6:55, 6:56) reintenta los que fallaron el tick anterior.
 - **Tests:** 150 passing (sin regresiones). Simulación local confirma: tick 1 → NY warmed, tick 2 → NJ/LI/MD warmed, pendingWarmup final = 4 campaigns.
 - **Archivos:** `services/api-plans/src/executor.py` (`_prestart_plan`)
+
+---
+
+## 2026-06-01 — Sesión 15
+
+### S15-A — `pendingWarmup` stale consumido el día siguiente → plan completa en ~33s sin marcar llamadas *(Fix 2026-06-01)*
+
+- **Síntoma:** Plan 1.1 - Cancellation / No Show (programado a las 7 AM) completó en solo 33 segundos el 1 de junio. Status=completed, exitReason=completed en los 4 campaigns, 0 llamadas realizadas.
+- **Causa raíz:** El plan tiene `workingHours.days: [MON-SAT]` — no corre el domingo. El 31 de mayo (domingo) a las 6:54 AM `prestart_check` creó `pendingWarmup` con los 4 campaigns (segmentos y schedules con fecha del 31 de mayo). El `scheduled_run` de las 7 AM detectó "domingo = fuera de horario" y saltó **sin limpiar el `pendingWarmup`**. El lunes 1 de junio, `start_run` consumió ese `pendingWarmup` stale con campaigns que tenían `startTime/endTime` del 31 de mayo (ya vencidos por 24+ horas). Connect los activó y al encontrar el schedule expirado los marcó "Completed" inmediatamente → 33s de duración total, 0 dials.
+- **Fix en 4 capas:**
+  1. **`_prestart_plan`**: agrega `createdAt` ISO al `pendingWarmup` para permitir validación de frescura.
+  2. **`start_run`**: descarta `pendingWarmup` si `createdAt` tiene más de 2 horas (WARMUP_MAX_AGE_SECONDS=7200). Emite `start_run_warmup_stale_discarded` a CloudWatch. Cubre todos los callers.
+  3. **`scheduled_run`**: limpia `pendingWarmup` al skipear por `outside_working_hours`. Emite `scheduled_run_outside_hours_warmup_cleared`. Además migra todos los logs a `_slog` para visibilidad en CloudWatch.
+  4. **`start_run_chained` + `_fire_bucket_chains` + `_fire_campaign_chains`**: limpian `pendingWarmup` inmediatamente cuando un plan encadenado es skipeado por `_within_working_hours`.
+- **Tests:** 150 passing (sin regresiones).
+- **Archivos:** `services/api-plans/src/executor.py` (5 funciones modificadas)
