@@ -134,7 +134,9 @@ export class ApiSegmentsStack extends cdk.Stack {
           'connect-campaigns:UpdateCampaignSource',
           'connect-campaigns:DescribeCampaign',
         ],
-        resources: ['*'],
+        resources: [
+          `arn:aws:connect-campaigns:${this.region}:${this.account}:campaign/*`,
+        ],
       }),
     );
 
