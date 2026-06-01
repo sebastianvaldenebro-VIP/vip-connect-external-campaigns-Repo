@@ -272,26 +272,30 @@ def _fire_bucket_chains(upstream_plan_id: str, completed_bucket_index: int) -> N
 def scheduled_run(plan_id: str) -> dict:
     latest = get_latest_run(plan_id)
     if latest and latest.get("status") == "running":
-        logger.info(
-            "scheduled_run: plan %s already running (%s), skipping",
-            plan_id,
-            latest["runId"],
+        _slog.info(
+            "scheduled_run_already_running", plan_id=plan_id, run_id=latest["runId"]
         )
         return {"ok": True, "reason": "already_running"}
     plan = get_plan(plan_id)
     if not plan:
-        logger.error("scheduled_run: plan %s not found", plan_id)
+        _slog.error("scheduled_run_plan_not_found", plan_id=plan_id)
         return {"ok": False, "reason": "plan_not_found"}
     if plan.get("isTemplate") or plan.get("is_template"):
         return {"ok": True, "reason": "is_template"}
     if not _within_working_hours(plan):
-        logger.info(
-            "scheduled_run: plan %s outside working hours, skipping",
-            plan_id,
-        )
+        # Clear any stale pendingWarmup so the next working day creates fresh segments
+        # with the correct date and schedule window instead of reusing yesterday's.
+        if plan.get("pendingWarmup"):
+            update_plan_pending_warmup(plan_id, None)
+            _slog.info(
+                "scheduled_run_outside_hours_warmup_cleared",
+                plan_id=plan_id,
+                reason="stale pendingWarmup from non-working day pre-warm discarded",
+            )
+        _slog.info("scheduled_run_outside_hours", plan_id=plan_id)
         return {"ok": True, "reason": "outside_working_hours"}
     run = start_run(plan_id, triggered_by="scheduled")
-    logger.info("scheduled_run: started run %s for plan %s", run["runId"], plan_id)
+    _slog.info("scheduled_run_started", plan_id=plan_id, run_id=run["runId"])
     return {"ok": True, "runId": run["runId"]}
 
 
