@@ -181,6 +181,28 @@ def start_run(
 
     # Consume pre-warmed campaigns stored by _prestart_plan (cross-plan warmup)
     pending = plan.get("pendingWarmup")
+    # Staleness guard: discard pendingWarmup older than 2 hours. This handles plans that
+    # were pre-warmed on a non-working day (e.g. Sunday pre-warm for a MON-SAT plan) or
+    # any other scenario where the scheduled run was skipped after pre-warming.
+    # Connect campaign schedules embed the creation date, so a day-old warmup would
+    # have an already-expired startTime/endTime and complete instantly with 0 dials.
+    _WARMUP_MAX_AGE_SECONDS = 7200  # 2 hours
+    if pending:
+        created_at = pending.get("createdAt")
+        if created_at:
+            try:
+                age = (_now_utc() - datetime.fromisoformat(created_at)).total_seconds()
+                if age > _WARMUP_MAX_AGE_SECONDS:
+                    _slog.warn(
+                        "start_run_warmup_stale_discarded",
+                        plan_id=plan_id,
+                        warmup_age_hours=round(age / 3600, 1),
+                        created_at=created_at,
+                    )
+                    update_plan_pending_warmup(plan_id, None)
+                    pending = None
+            except Exception:
+                pass  # malformed createdAt — ignore and use the warmup as-is
     if pending and first_bucket == 0:
         for cs in run["bucketStates"][0]["campaignStates"]:
             match = next(
@@ -226,6 +248,9 @@ def start_run_chained(upstream_plan_id: str) -> None:
                 "start_run_chained: plan %s outside working hours, skipping chain",
                 plan["planId"],
             )
+            if plan.get("pendingWarmup"):
+                update_plan_pending_warmup(plan["planId"], None)
+                _slog.info("start_run_chained_warmup_cleared", plan_id=plan["planId"])
             continue
         try:
             start_run(plan["planId"], triggered_by="chained")
@@ -252,6 +277,9 @@ def _fire_bucket_chains(upstream_plan_id: str, completed_bucket_index: int) -> N
                 "_fire_bucket_chains: plan %s outside working hours, skipping",
                 plan["planId"],
             )
+            if plan.get("pendingWarmup"):
+                update_plan_pending_warmup(plan["planId"], None)
+                _slog.info("fire_bucket_chains_warmup_cleared", plan_id=plan["planId"])
             continue
         trigger = plan.get("trigger", {})
         raw_ab = trigger.get("afterBucket")
@@ -1664,7 +1692,10 @@ def _prestart_plan(target_plan_id: str) -> None:
         all_covered=len(warmed) == len(stage1_campaigns),
     )
     if warmed:
-        update_plan_pending_warmup(target_plan_id, {"campaigns": warmed})
+        update_plan_pending_warmup(
+            target_plan_id,
+            {"campaigns": warmed, "createdAt": _now_iso()},
+        )
 
 
 def _prestart_chained_runs(run: dict, plan: dict, bucket_index: int) -> None:
@@ -1846,6 +1877,11 @@ def _fire_campaign_chains(
                 "_fire_campaign_chains: plan %s outside working hours, skipping",
                 plan["planId"],
             )
+            if plan.get("pendingWarmup"):
+                update_plan_pending_warmup(plan["planId"], None)
+                _slog.info(
+                    "fire_campaign_chains_warmup_cleared", plan_id=plan["planId"]
+                )
             continue
         trigger = plan.get("trigger", {})
         if trigger.get("type") != "on_plan_complete":
