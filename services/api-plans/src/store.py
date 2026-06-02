@@ -92,7 +92,42 @@ def put_plan(plan: dict) -> dict:
 
 
 def delete_plan(plan_id: str) -> None:
-    _table().delete_item(Key={"pk": f"PLAN#{plan_id}", "sk": "META"})
+    """Delete the plan META record and cascade-delete all orphaned RUN records.
+
+    Without the cascade, deleted plans leave RUN#* items in DynamoDB forever
+    because they share the same PK (PLAN#{plan_id}) and the table has no TTL
+    or stream-based cleanup.
+    """
+    table = _table()
+    pk = f"PLAN#{plan_id}"
+
+    # Collect all RUN item sort keys
+    run_keys: list[dict] = []
+    kwargs: dict = {
+        "KeyConditionExpression": Key("pk").eq(pk) & Key("sk").begins_with("RUN#"),
+        "ProjectionExpression": "pk, sk",
+    }
+    while True:
+        resp = table.query(**kwargs)
+        run_keys.extend(
+            {"pk": item["pk"], "sk": item["sk"]} for item in resp.get("Items", [])
+        )
+        if not resp.get("LastEvaluatedKey"):
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+    # Batch-delete runs in groups of 25 (DynamoDB BatchWriteItem limit)
+    for i in range(0, len(run_keys), 25):
+        table.meta.client.batch_write_item(
+            RequestItems={
+                table.name: [
+                    {"DeleteRequest": {"Key": key}} for key in run_keys[i : i + 25]
+                ]
+            }
+        )
+
+    # Finally delete the META record
+    table.delete_item(Key={"pk": pk, "sk": "META"})
 
 
 def update_plan_trigger(plan_id: str, trigger: dict) -> None:

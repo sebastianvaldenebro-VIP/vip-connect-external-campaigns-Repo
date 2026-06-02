@@ -3,6 +3,7 @@ import { Construct } from 'constructs';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 
 export interface HostingStackProps extends cdk.StackProps {
@@ -34,13 +35,47 @@ export class HostingStack extends cdk.Stack {
       iam.PermissionsBoundary.of(this).apply(boundary);
     }
 
+    // KMS CMK for S3 assets (#004 — replace SSE-S3 with customer-managed key)
+    const assetBucketKey = new kms.Key(this, 'AssetBucketKey', {
+      description: 'KMS CMK for VIP Admin UI assets bucket',
+      enableKeyRotation: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    // CloudFront OAC needs kms:Decrypt to serve KMS-encrypted objects.
+    assetBucketKey.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowCloudFrontDecrypt',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
+        actions: ['kms:Decrypt'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:SourceAccount': this.account },
+        },
+      }),
+    );
+
+    // S3 access-log bucket (#009 — enable server access logging)
+    const accessLogBucket = new s3.Bucket(this, 'AssetBucketLogs', {
+      bucketName: `vip-admin-ui-assets-logs-${this.account}`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      lifecycleRules: [{ expiration: cdk.Duration.days(90) }],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
     this.assetBucket = new s3.Bucket(this, 'AssetBucket', {
       bucketName: `vip-admin-ui-assets-${this.account}`,
-      encryption: s3.BucketEncryption.S3_MANAGED,
+      encryption: s3.BucketEncryption.KMS,
+      encryptionKey: assetBucketKey,
+      bucketKeyEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       versioned: true,
       enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      serverAccessLogsBucket: accessLogBucket,
+      serverAccessLogsPrefix: 'assets/',
     });
 
     // Origin Access Control — the modern replacement for Origin Access
@@ -75,6 +110,24 @@ export class HostingStack extends cdk.Stack {
           override: true,
         },
         xssProtection: { protection: true, modeBlock: true, override: true },
+        // #006 — Content-Security-Policy
+        contentSecurityPolicy: {
+          contentSecurityPolicy: [
+            "default-src 'self'",
+            // API Gateway and Cognito endpoints
+            "connect-src 'self' https://*.amazonaws.com https://*.amazoncognito.com",
+            // Vite bundles all JS into a single file served from self
+            "script-src 'self'",
+            // Inline styles are injected by Tailwind/Radix; unsafe-inline required
+            "style-src 'self' 'unsafe-inline'",
+            "img-src 'self' data:",
+            "font-src 'self'",
+            "frame-ancestors 'none'",
+            "base-uri 'self'",
+            "form-action 'self'",
+          ].join('; '),
+          override: true,
+        },
       },
     });
 
