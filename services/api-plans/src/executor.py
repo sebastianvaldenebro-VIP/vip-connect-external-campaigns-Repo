@@ -2690,7 +2690,7 @@ class _CutoffTooCloseError(Exception):
     pass
 
 
-_MAX_SEGMENT_MEMBERS = 5000  # AWS CP has no documented hard limit; raised from 3000 after confirming API supports larger segments via 50-ID chunks
+_MAX_SEGMENT_MEMBERS = 3000  # Derived from AWS CP limits: 60 max attributes × 50 max values/attribute = 3,000
 
 
 def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
@@ -2745,26 +2745,37 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
             f"Redis lead list '{redis_source._list_key}' is empty — likely mid-rebuild"
         )
 
-    redis_ids: set[str] = set()
+    # Preserve Redis iteration order (list + seen-set for dedup) so that when
+    # the segment is truncated the most recently-added leads take priority.
+    seen: set[str] = set()
+    redis_ids_ordered: list[str] = []
     for record in redis_source.iter_records():
         if not rules or matches_group(record, rules, "ALL"):
             cid = str(record.get("customerid") or record.get("ID") or "").strip()
-            if cid:
-                redis_ids.add(cid)
+            if cid and cid not in seen:
+                seen.add(cid)
+                redis_ids_ordered.append(cid)
 
-    if not redis_ids:
+    if not redis_ids_ordered:
         raise _EmptySegmentError("No Redis records match campaign filters")
 
-    if len(redis_ids) > _MAX_SEGMENT_MEMBERS:
-        raise ValueError(
-            f"Campaign would produce {len(redis_ids):,} leads, "
-            f"over the CP segment limit of {_MAX_SEGMENT_MEMBERS:,}."
+    total_matched = len(redis_ids_ordered)
+    if total_matched > _MAX_SEGMENT_MEMBERS:
+        # Truncate to the AWS CP hard limit (60 attributes × 50 values = 3,000).
+        # Takes the first _MAX_SEGMENT_MEMBERS records from Redis — which are the
+        # most recently added leads since the pipeline prepends via LPUSH.
+        _slog.warn(
+            "segment_truncated",
+            total_matched=total_matched,
+            limit=_MAX_SEGMENT_MEMBERS,
+            dropped=total_matched - _MAX_SEGMENT_MEMBERS,
         )
+        redis_ids_ordered = redis_ids_ordered[:_MAX_SEGMENT_MEMBERS]
 
     cp = build_cp()
     segment_name = build_segment_name(bucket, campaign)
     segment_groups = SegmentGroupsTranslator().customer_ids_to_segment_groups(
-        sorted(redis_ids), field="ID"
+        redis_ids_ordered, field="ID"
     )
 
     state_str = "/".join(state_codes) if state_codes else "all"
