@@ -1181,6 +1181,8 @@ export function PlanNew() {
   const [isTemplate, setIsTemplate] = useState(false);
   const [overlapAck, setOverlapAck] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const errorBannerRef = useRef<HTMLDivElement>(null);
+  const overlapRef = useRef<HTMLDivElement>(null);
 
   // Load plan when editing
   const { data: existingData, isLoading: loadingPlan } = useQuery({
@@ -1250,25 +1252,36 @@ export function PlanNew() {
     },
   });
 
+  const setErrorAndScroll = (msg: string, scrollToOverlap = false) => {
+    setSaveError(msg);
+    if (scrollToOverlap && overlapRef.current) {
+      overlapRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } else {
+      setTimeout(() => errorBannerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50);
+    }
+  };
+
   const handleSave = () => {
     setSaveError(null);
-    if (!name.trim()) { setSaveError('Plan name is required.'); return; }
-    if (buckets.length === 0) { setSaveError('Add at least one bucket.'); return; }
+    if (!name.trim()) { setErrorAndScroll('Plan name is required.'); return; }
+    if (buckets.length === 0) { setErrorAndScroll('Add at least one bucket.'); return; }
     for (let bi = 0; bi < buckets.length; bi++) {
       const b = buckets[bi];
-      if (b.campaigns.length === 0) { setSaveError(`Bucket ${bi + 1} has no campaigns.`); return; }
+      if (b.campaigns.length === 0) { setErrorAndScroll(`Bucket ${bi + 1} has no campaigns.`); return; }
       for (let ci = 0; ci < b.campaigns.length; ci++) {
         const c = b.campaigns[ci];
-        if (c.states.length === 0 && !c.pinnedSegmentArn) { setSaveError(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} has no states selected.`); return; }
+        if (c.states.length === 0 && !c.pinnedSegmentArn) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} has no states selected.`); return; }
         if (c.run_type === 'custom' && (!c.run_duration_minutes || c.run_duration_minutes < 1)) {
-          setSaveError(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} needs a duration > 0 minutes.`); return;
+          setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} needs a duration > 0 minutes.`); return;
         }
       }
     }
     if (trigger.type === 'on_plan_complete' && !trigger.planId) {
-      setSaveError('Select a plan for the "After plan" trigger.'); return;
+      setErrorAndScroll('Select a plan for the "After plan" trigger.'); return;
     }
-    if (overlaps.length > 0 && !overlapAck) { setSaveError('Acknowledge the campaign overlap warning below.'); return; }
+    if (overlaps.length > 0 && !overlapAck) {
+      setErrorAndScroll('There are overlapping campaign filters. Scroll down to review and acknowledge before saving.', true); return;
+    }
 
     saveMutation.mutate({ name: name.trim(), description, trigger, loop, workingHours, buckets, isTemplate });
   };
@@ -1369,10 +1382,11 @@ export function PlanNew() {
         </div>
       </div>
 
-      {/* Top-level save error */}
-      {saveMutation.isError && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">
-          {String((saveMutation.error as Error)?.message ?? 'Save failed')}
+      {/* Validation / save error — always visible near top */}
+      {(saveError || saveMutation.isError) && (
+        <div ref={errorBannerRef} className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3 flex items-start gap-2">
+          <span className="text-red-500 mt-0.5 shrink-0">⚠</span>
+          <span>{saveError ?? String((saveMutation.error as Error)?.message ?? 'Save failed')}</span>
         </div>
       )}
 
@@ -1479,7 +1493,7 @@ export function PlanNew() {
 
       {/* Overlap warning */}
       {overlaps.length > 0 && (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-2">
+        <div ref={overlapRef} className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-2">
           <div className="text-sm font-semibold text-amber-800">Overlapping campaign filters detected</div>
           <ul className="text-xs text-amber-700 space-y-1">
             {overlaps.map((o) => {
@@ -1498,13 +1512,6 @@ export function PlanNew() {
             <input type="checkbox" checked={overlapAck} onChange={(e) => setOverlapAck(e.target.checked)} />
             I acknowledge this overlap and want to proceed
           </label>
-        </div>
-      )}
-
-      {/* Inline validation error */}
-      {(saveError || saveMutation.isError) && (
-        <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3">
-          {saveError ?? String((saveMutation.error as Error)?.message ?? 'Save failed')}
         </div>
       )}
 
