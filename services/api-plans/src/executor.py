@@ -2690,7 +2690,7 @@ class _CutoffTooCloseError(Exception):
     pass
 
 
-_MAX_SEGMENT_MEMBERS = 3000
+_MAX_SEGMENT_MEMBERS = 5000  # AWS CP has no documented hard limit; raised from 3000 after confirming API supports larger segments via 50-ID chunks
 
 
 def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
