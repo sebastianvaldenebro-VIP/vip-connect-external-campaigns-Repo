@@ -320,6 +320,22 @@ export class ApiStack extends cdk.Stack {
             sampledRequestsEnabled: true,
           },
         },
+        {
+          name: 'RateLimitPerIP',
+          priority: 3,
+          statement: {
+            rateBasedStatement: {
+              limit: 300,
+              aggregateKeyType: 'IP',
+            },
+          },
+          action: { block: {} },
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: 'RateLimitPerIP',
+            sampledRequestsEnabled: true,
+          },
+        },
       ],
     });
 
