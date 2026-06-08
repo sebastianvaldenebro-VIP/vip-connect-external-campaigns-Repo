@@ -27,7 +27,17 @@ def list_audit_entries(event: dict, _path_params: dict) -> dict:
 
     scan_kwargs: dict[str, Any] = {"Limit": limit}
     if next_token:
-        scan_kwargs["ExclusiveStartKey"] = json.loads(next_token)
+        parsed = json.loads(next_token)
+        if not isinstance(parsed, dict):
+            return json_response(
+                400, {"error": {"code": "INVALID_TOKEN", "message": "Invalid nextToken"}}
+            )
+        allowed_keys = {"entity_id", "timestamp", "actor_sub", "action"}
+        if not set(parsed.keys()).issubset(allowed_keys):
+            return json_response(
+                400, {"error": {"code": "INVALID_TOKEN", "message": "Invalid nextToken"}}
+            )
+        scan_kwargs["ExclusiveStartKey"] = parsed
 
     # Prefer GSI if a unique filter is present
     if qs.get("actor"):

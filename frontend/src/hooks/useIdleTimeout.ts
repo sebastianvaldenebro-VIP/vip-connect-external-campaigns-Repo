@@ -13,7 +13,6 @@ const ACTIVITY_EVENTS: (keyof WindowEventMap)[] = [
 export function useIdleTimeout(enabled: boolean): void {
   useEffect(() => {
     if (!enabled) return;
-    return; // TEMP: logout disabled for testing
 
     let timer: ReturnType<typeof setTimeout> | undefined;
 

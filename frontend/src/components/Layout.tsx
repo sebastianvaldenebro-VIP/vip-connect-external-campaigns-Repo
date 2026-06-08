@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 
+import { signOut } from '@/lib/auth';
 import { useAuth } from '@/hooks/useAuth';
 import { useIdleTimeout } from '@/hooks/useIdleTimeout';
 import { cn } from '@/lib/utils';
@@ -45,7 +46,13 @@ export function Layout(): ReactNode {
           </div>
           <div className="flex items-center gap-3 text-sm">
             <span className="text-muted-foreground">{user?.username}</span>
-            {/* Sign out button — temporarily hidden for testing */}
+            <button
+              onClick={() => void signOut()}
+              className="rounded-md px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+              type="button"
+            >
+              Sign out
+            </button>
           </div>
         </div>
       </header>
