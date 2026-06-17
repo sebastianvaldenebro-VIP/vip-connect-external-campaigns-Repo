@@ -1,0 +1,3 @@
+# services/api-progressive-dialer/requirements.txt
+# boto3 is provided by the Lambda runtime — do not bundle it (causes drift)
+requests>=2.31.0

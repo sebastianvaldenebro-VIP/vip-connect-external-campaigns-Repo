@@ -16,6 +16,7 @@ export interface ApiStackProps extends cdk.StackProps {
   readonly metricsFunction: lambda.IFunction;
   readonly profilesFunction: lambda.IFunction;
   readonly plansFunction: lambda.IFunction;
+  readonly progressiveDialerSeedFunction: lambda.IFunction;
   readonly corsAllowOrigins: string[];
   readonly permissionsBoundaryName?: string;
 }
@@ -83,6 +84,10 @@ export class ApiStack extends cdk.Stack {
     const plansIntegration = new integrations.HttpLambdaIntegration(
       'PlansIntegration',
       props.plansFunction,
+    );
+    const progressiveDialerIntegration = new integrations.HttpLambdaIntegration(
+      'ProgressiveDialerIntegration',
+      props.progressiveDialerSeedFunction,
     );
 
     // ── Segments routes ─────────────────────────────────────────────
@@ -274,6 +279,14 @@ export class ApiStack extends cdk.Stack {
         authorizer,
       });
     }
+
+    // ── Progressive Dialer routes ────────────────────────────────────
+    this.httpApi.addRoutes({
+      path: '/dialer/{id}/seed',
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: progressiveDialerIntegration,
+      authorizer,
+    });
 
     this.apiUrl = this.httpApi.apiEndpoint;
 
