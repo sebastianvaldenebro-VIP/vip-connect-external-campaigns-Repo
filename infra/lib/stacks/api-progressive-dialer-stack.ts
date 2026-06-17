@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
@@ -90,7 +91,9 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     // delay and push the total to 44s, past First Orion's branding window.
     const dialQueue = new sqs.Queue(this, 'DialQueue', {
       queueName: 'vip-progressive-dialer-calls',
-      visibilityTimeout: cdk.Duration.seconds(60),
+      // 6× caller Lambda timeout (6×30s=180s) per SQS/Lambda convention to prevent
+      // re-delivery while an invocation is still running.
+      visibilityTimeout: cdk.Duration.seconds(180),
       encryptionMasterKey: dataKey,
       enforceSSL: true,
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
@@ -165,6 +168,14 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
       resources: [dataKey.keyArn],
     }));
+    consumerRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ConsumerPutMetrics',
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: { 'cloudwatch:namespace': 'VipConnect/ProgressiveDialer' },
+      },
+    }));
 
     // ── Lambda: Caller (SQS) ──────────────────────────────────────────
     const callerLogGroup = new logs.LogGroup(this, 'CallerLogs', {
@@ -197,11 +208,16 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
+        // Required for First Orion re-push on throttle retry (Fix #6)
+        FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
+        SOURCE_PHONE: props.sourcePhonenumber,
       },
     });
 
     callerFn.addEventSource(new SqsEventSource(dialQueue, {
       batchSize: 1, // one dial per invocation
+      // Explicit partial-batch failure contract — correct behaviour even if batchSize ever rises.
+      reportBatchItemFailures: true,
     }));
 
     campaignQueueTable.grantReadWriteData(callerRole);
@@ -224,6 +240,19 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     callerRole.addToPolicy(new iam.PolicyStatement({
       actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
       resources: [dataKey.keyArn],
+    }));
+    // First Orion secret access — needed for re-push on throttle retry (Fix #6)
+    callerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.firstOrionSecretArn],
+    }));
+    callerRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CallerPutMetrics',
+      actions: ['cloudwatch:PutMetricData'],
+      resources: ['*'],
+      conditions: {
+        StringEquals: { 'cloudwatch:namespace': 'VipConnect/ProgressiveDialer' },
+      },
     }));
 
     // ── Lambda: Seeder (HTTP via API Gateway) ─────────────────────────
@@ -274,11 +303,90 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       },
     });
 
+    // ── Alarms ────────────────────────────────────────────────────────
+    // 1. DLQ visible messages >= 1 — any message in DLQ means failures exceeded maxReceiveCount
+    const dlqAlarm = new cloudwatch.Alarm(this, 'DlqMessagesAlarm', {
+      alarmName: 'vip-progressive-dialer-dlq-messages',
+      alarmDescription: 'Messages in progressive dialer DLQ — dial failures exceeded maxReceiveCount',
+      metric: dlq.metricApproximateNumberOfMessagesVisible({
+        period: cdk.Duration.minutes(1),
+        statistic: 'Maximum',
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // 2. Consumer Lambda errors > 0 in 5min — Kinesis records failing to process
+    const consumerErrorAlarm = new cloudwatch.Alarm(this, 'ConsumerErrorAlarm', {
+      alarmName: 'vip-progressive-dialer-consumer-errors',
+      alarmDescription: 'Consumer Lambda errors — Kinesis records failing to process',
+      metric: consumerFn.metricErrors({
+        period: cdk.Duration.minutes(5),
+        statistic: 'Sum',
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // 3. Caller Lambda errors > 5 in 5min — some errors expected from throttle retries
+    new cloudwatch.Alarm(this, 'CallerErrorAlarm', {
+      alarmName: 'vip-progressive-dialer-caller-errors',
+      alarmDescription: 'Caller Lambda errors — StartOutboundVoiceContact failures beyond retries',
+      metric: callerFn.metricErrors({
+        period: cdk.Duration.minutes(5),
+        statistic: 'Sum',
+      }),
+      threshold: 5,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // 4. Connect throttle metric (custom) — emitted by handler_caller.py on TooManyRequestsException
+    new cloudwatch.Alarm(this, 'ConnectThrottleAlarm', {
+      alarmName: 'vip-progressive-dialer-connect-throttle',
+      alarmDescription: 'Connect StartOutboundVoiceContact throttled — check dial concurrency',
+      metric: new cloudwatch.Metric({
+        namespace: 'VipConnect/ProgressiveDialer',
+        metricName: 'ConnectThrottleCount',
+        dimensionsMap: {},
+        period: cdk.Duration.minutes(5),
+        statistic: 'Sum',
+      }),
+      threshold: 10,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // 5. First Orion push failures (custom) — emitted by handler_consumer.py
+    new cloudwatch.Alarm(this, 'FirstOrionFailAlarm', {
+      alarmName: 'vip-progressive-dialer-firstorion-failures',
+      alarmDescription: 'First Orion INFORM push failures — calls going out without branding',
+      metric: new cloudwatch.Metric({
+        namespace: 'VipConnect/ProgressiveDialer',
+        metricName: 'FirstOrionPushFailed',
+        dimensionsMap: {},
+        period: cdk.Duration.minutes(5),
+        statistic: 'Sum',
+      }),
+      threshold: 5,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
     // ── Outputs ───────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'CampaignQueueTableName', { value: campaignQueueTable.tableName });
     new cdk.CfnOutput(this, 'DialQueueUrl', { value: dialQueue.queueUrl });
     new cdk.CfnOutput(this, 'ConsumerFunctionArn', { value: consumerFn.functionArn });
     new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
     new cdk.CfnOutput(this, 'SeederFunctionArn', { value: this.seederFunction.functionArn });
+    new cdk.CfnOutput(this, 'DlqAlarmName', { value: dlqAlarm.alarmName });
+    new cdk.CfnOutput(this, 'ConsumerErrorAlarmName', { value: consumerErrorAlarm.alarmName });
   }
 }
