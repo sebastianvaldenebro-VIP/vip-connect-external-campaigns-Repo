@@ -3,6 +3,7 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { ApiCampaignsStack } from '../lib/stacks/api-campaigns-stack';
 import { ApiMetricsStack } from '../lib/stacks/api-metrics-stack';
+import { ApiProgressiveDialerStack } from '../lib/stacks/api-progressive-dialer-stack';
 import { ApiPlansStack } from '../lib/stacks/api-plans-stack';
 import { ApiProfilesStack } from '../lib/stacks/api-profiles-stack';
 import { ApiSegmentsStack } from '../lib/stacks/api-segments-stack';
@@ -144,7 +145,35 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
   permissionsBoundaryName,
 });
 
-// 8. API Gateway fronting all 5 Lambdas with Cognito JWT Authorizer
+// 8. Progressive Branded Dialer stack — fully autonomous, no cross-stack references
+// ARNs passed as strings per the isolation rule: never import from already-deployed stacks.
+// Before deploying, fill these context values in cdk.json or pass via --context:
+//   dataKeyArn:         aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
+//   firstOrionSecretArn: ARN from Task 6 Step 1
+//   activeCampaignId:   current Outbound Campaigns V2 campaign ID
+const progressiveDialerDataKeyArn =
+  (app.node.tryGetContext('progressiveDialerDataKeyArn') as string) ??
+  'arn:aws:kms:us-east-1:165505826690:key/00000000-0000-0000-0000-000000000000';
+const firstOrionSecretArn =
+  (app.node.tryGetContext('firstOrionSecretArn') as string) ??
+  'arn:aws:secretsmanager:us-east-1:165505826690:secret:vip/firstorion/credentials-XXXXXX';
+const activeCampaignId =
+  (app.node.tryGetContext('activeCampaignId') as string) ?? 'placeholder-campaign-id';
+
+const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
+  env,
+  description: 'Progressive Branded Dialer — Kinesis consumer + SQS caller + seeder Lambda',
+  dataKeyArn: progressiveDialerDataKeyArn,
+  connectInstanceId,
+  agentEventStreamArn: 'arn:aws:kinesis:us-east-1:165505826690:stream/vip-use1-datastream',
+  firstOrionSecretArn,
+  sourcePhonenumber: '+19174105649',
+  activeCampaignId,
+  profilesDomainName,
+  permissionsBoundaryName,
+});
+
+// 10. API Gateway fronting all 5 Lambdas with Cognito JWT Authorizer
 const corsAllowOrigins = (app.node.tryGetContext('corsAllowOrigins') as string[]) ?? [
   'http://localhost:5173',
 ];
@@ -159,11 +188,12 @@ new ApiStack(app, 'VipAdminApiStack', {
   metricsFunction: metrics.lambdaFunction,
   profilesFunction: profiles.lambdaFunction,
   plansFunction: plans.lambdaFunction,
+  progressiveDialerSeedFunction: progressiveDialer.seederFunction,
   corsAllowOrigins,
   permissionsBoundaryName,
 });
 
-// 9. S3 + CloudFront hosting for the SPA
+// 11. S3 + CloudFront hosting for the SPA
 new HostingStack(app, 'VipAdminHostingStack', {
   env,
   description: 'CloudFront + S3 bucket that host the admin UI SPA',

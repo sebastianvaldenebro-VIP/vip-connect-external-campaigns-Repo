@@ -1,0 +1,281 @@
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as kinesis from 'aws-cdk-lib/aws-kinesis';
+import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as path from 'path';
+import { buildSharedLayer } from '../utils/shared-layer';
+
+export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
+  /** KMS CMK ARN — passed as string to avoid cross-stack Fn::ImportValue dependency */
+  readonly dataKeyArn: string;
+  readonly connectInstanceId: string;
+  /** Kinesis stream ARN — vip-use1-datastream (Task 1 confirmed) */
+  readonly agentEventStreamArn: string;
+  /** Secrets Manager ARN from Task 6 Step 1 */
+  readonly firstOrionSecretArn: string;
+  /** e.g. "+19174105649" */
+  readonly sourcePhonenumber: string;
+  /** Set at deploy time, update per campaign */
+  readonly activeCampaignId: string;
+  /** CP domain — seeder reads segment + phones from here */
+  readonly profilesDomainName: string;
+  /** Comma-separated queue ARNs to filter agents. Empty = all queues. */
+  readonly allowedQueueArns?: string;
+  readonly permissionsBoundaryName?: string;
+}
+
+// Contact flow ID is fixed per environment — not a CDK-time variable.
+const CONTACT_FLOW_ID = '3d24320b-c1e3-40f3-90a2-b6867ef70c85';
+
+export class ApiProgressiveDialerStack extends cdk.Stack {
+  public readonly seederFunction: lambda.Function;
+
+  constructor(scope: Construct, id: string, props: ApiProgressiveDialerStackProps) {
+    super(scope, id, props);
+
+    if (props.permissionsBoundaryName) {
+      const boundary = iam.ManagedPolicy.fromManagedPolicyName(
+        this,
+        'PermissionsBoundary',
+        props.permissionsBoundaryName,
+      );
+      iam.PermissionsBoundary.of(this).apply(boundary);
+    }
+
+    // Resolve KMS key from ARN — avoids cross-stack Fn::ImportValue dependency
+    const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
+
+    // ── DynamoDB: Campaign Queue ──────────────────────────────────────
+    const campaignQueueTable = new dynamodb.Table(this, 'CampaignQueueTable', {
+      tableName: 'VipProgressiveCampaignQueue',
+      partitionKey: { name: 'campaignId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: dataKey,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // ── DynamoDB: Agent Locks ─────────────────────────────────────────
+    const agentLockTable = new dynamodb.Table(this, 'AgentLockTable', {
+      tableName: 'VipProgressiveAgentLocks',
+      partitionKey: { name: 'agentId', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: dataKey,
+      timeToLiveAttribute: 'ttl',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // ── SQS: Dead-letter queue ────────────────────────────────────────
+    const dlq = new sqs.Queue(this, 'DialDLQ', {
+      queueName: 'vip-progressive-dialer-calls-dlq',
+      retentionPeriod: cdk.Duration.days(14),
+      encryptionMasterKey: dataKey,
+      // HIPAA: deny non-TLS access — even internal body has correlatable data
+      enforceSSL: true,
+    });
+
+    // ── SQS: Dial delay queue (22s) ───────────────────────────────────
+    const dialQueue = new sqs.Queue(this, 'DialQueue', {
+      queueName: 'vip-progressive-dialer-calls',
+      deliveryDelay: cdk.Duration.seconds(22),
+      visibilityTimeout: cdk.Duration.seconds(60),
+      encryptionMasterKey: dataKey,
+      enforceSSL: true,
+      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+    });
+
+    // ── Shared Layer ──────────────────────────────────────────────────
+    const sharedLayer = buildSharedLayer(this);
+
+    // ── Lambda: Consumer (Kinesis) ────────────────────────────────────
+    const consumerLogGroup = new logs.LogGroup(this, 'ConsumerLogs', {
+      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-consumer',
+      retention: logs.RetentionDays.ONE_YEAR,
+      encryptionKey: dataKey,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const consumerRole = new iam.Role(this, 'ConsumerRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      description: 'Execution role for progressive-dialer consumer Lambda',
+    });
+    consumerLogGroup.grantWrite(consumerRole);
+
+    const consumerFn = new lambda.Function(this, 'ConsumerFunction', {
+      functionName: 'vip-admin-progressive-dialer-consumer',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler_consumer.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '../../../services/api-progressive-dialer/src'),
+      ),
+      layers: [sharedLayer],
+      role: consumerRole,
+      logGroup: consumerLogGroup,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 256,
+      environment: {
+        CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
+        AGENT_LOCK_TABLE: agentLockTable.tableName,
+        SQS_QUEUE_URL: dialQueue.queueUrl,
+        CONNECT_INSTANCE_ID: props.connectInstanceId,
+        CONTACT_FLOW_ID,
+        SOURCE_PHONE: props.sourcePhonenumber,
+        ACTIVE_CAMPAIGN_ID: props.activeCampaignId,
+        FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
+        ...(props.allowedQueueArns ? { ALLOWED_QUEUE_ARNS: props.allowedQueueArns } : {}),
+      },
+    });
+
+    // Kinesis ESM — filter to STATE_CHANGE only to reduce invocations
+    const agentStream = kinesis.Stream.fromStreamArn(
+      this, 'AgentEventStream', props.agentEventStreamArn,
+    );
+    consumerFn.addEventSource(new KinesisEventSource(agentStream, {
+      startingPosition: lambda.StartingPosition.LATEST,
+      batchSize: 100,
+      bisectBatchOnError: true,
+      filters: [
+        lambda.FilterCriteria.filter({
+          data: { EventType: lambda.FilterRule.isEqual('STATE_CHANGE') },
+        }),
+      ],
+    }));
+
+    agentStream.grantRead(consumerRole);
+    campaignQueueTable.grantReadWriteData(consumerRole);
+    agentLockTable.grantReadWriteData(consumerRole);
+    dialQueue.grantSendMessages(consumerRole);
+    consumerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.firstOrionSecretArn],
+    }));
+    consumerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+      resources: [dataKey.keyArn],
+    }));
+
+    // ── Lambda: Caller (SQS) ──────────────────────────────────────────
+    const callerLogGroup = new logs.LogGroup(this, 'CallerLogs', {
+      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-caller',
+      retention: logs.RetentionDays.ONE_YEAR,
+      encryptionKey: dataKey,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const callerRole = new iam.Role(this, 'CallerRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      description: 'Execution role for progressive-dialer caller Lambda',
+    });
+    callerLogGroup.grantWrite(callerRole);
+
+    const callerFn = new lambda.Function(this, 'CallerFunction', {
+      functionName: 'vip-admin-progressive-dialer-caller',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler_caller.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '../../../services/api-progressive-dialer/src'),
+      ),
+      layers: [sharedLayer],
+      role: callerRole,
+      logGroup: callerLogGroup,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      // Throttle to 2 concurrent max — matches StartOutboundVoiceContact 2 RPS limit
+      reservedConcurrentExecutions: 2,
+      environment: {
+        CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
+        AGENT_LOCK_TABLE: agentLockTable.tableName,
+      },
+    });
+
+    callerFn.addEventSource(new SqsEventSource(dialQueue, {
+      batchSize: 1, // one dial per invocation
+    }));
+
+    campaignQueueTable.grantReadWriteData(callerRole);
+    agentLockTable.grantReadWriteData(callerRole);
+    dialQueue.grantConsumeMessages(callerRole);
+    callerRole.addToPolicy(new iam.PolicyStatement({
+      // StartOutboundVoiceContact validates referenced resources under the caller's identity.
+      // DescribeContactFlow + DescribeQueue prevent AccessDeniedException on the referenced
+      // flow and queue IDs — same issue observed with CreateCampaign in api-campaigns-stack.
+      actions: [
+        'connect:StartOutboundVoiceContact',
+        'connect:DescribeContactFlow',
+        'connect:DescribeQueue',
+      ],
+      resources: [
+        `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}/*`,
+      ],
+    }));
+    callerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+      resources: [dataKey.keyArn],
+    }));
+
+    // ── Lambda: Seeder (HTTP via API Gateway) ─────────────────────────
+    // No VPC — uses Customer Profiles GetSegmentDefinition + BatchGetProfile.
+    // Phone is at profile["PhoneNumber"] (standard CP field). 3,000-member max → ≤30 API calls.
+    const seederLogGroup = new logs.LogGroup(this, 'SeederLogs', {
+      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-seeder',
+      retention: logs.RetentionDays.ONE_YEAR,
+      encryptionKey: dataKey,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const seederRole = new iam.Role(this, 'SeederRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      description: 'Execution role for progressive-dialer seeder Lambda',
+    });
+    seederLogGroup.grantWrite(seederRole);
+    campaignQueueTable.grantWriteData(seederRole);
+    dataKey.grant(seederRole, 'kms:Decrypt', 'kms:GenerateDataKey');
+    seederRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CPSeedPerms',
+      actions: ['profile:GetSegmentDefinition', 'profile:BatchGetProfile'],
+      // Two explicit ARNs required — same pattern as api-profiles-stack and api-segments-stack:
+      // • GetSegmentDefinition evaluates against domains/{name}/segment-definitions/*
+      // • BatchGetProfile evaluates against domains/{name} (bare domain)
+      // A single glob like domains/{name}* is fragile; list both explicitly.
+      resources: [
+        `arn:aws:profile:${this.region}:${this.account}:domains/${props.profilesDomainName}`,
+        `arn:aws:profile:${this.region}:${this.account}:domains/${props.profilesDomainName}/*`,
+      ],
+    }));
+
+    this.seederFunction = new lambda.Function(this, 'SeederFunction', {
+      functionName: 'vip-admin-progressive-dialer-seeder',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler_seeder.lambda_handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '../../../services/api-progressive-dialer/src'),
+      ),
+      layers: [sharedLayer],
+      role: seederRole,
+      logGroup: seederLogGroup,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 256,
+      environment: {
+        CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
+        PROFILES_DOMAIN_NAME: props.profilesDomainName,
+      },
+    });
+
+    // ── Outputs ───────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'CampaignQueueTableName', { value: campaignQueueTable.tableName });
+    new cdk.CfnOutput(this, 'DialQueueUrl', { value: dialQueue.queueUrl });
+    new cdk.CfnOutput(this, 'ConsumerFunctionArn', { value: consumerFn.functionArn });
+    new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
+    new cdk.CfnOutput(this, 'SeederFunctionArn', { value: this.seederFunction.functionArn });
+  }
+}
