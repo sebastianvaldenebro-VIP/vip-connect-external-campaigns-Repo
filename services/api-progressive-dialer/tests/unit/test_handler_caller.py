@@ -47,7 +47,7 @@ def test_calls_start_outbound_voice_contact():
         mock_queue.mark_dialed.assert_called_once_with("campaign-1", "2026-06-16T14:00:00.000Z#uuid-1", "contact-001")
 
 
-def test_does_not_raise_on_throttle():
+def test_raises_on_throttle_for_sqs_retry():
     if "handler_caller" in sys.modules:
         del sys.modules["handler_caller"]
 
@@ -57,7 +57,9 @@ def test_does_not_raise_on_throttle():
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
-        mock_caller.dial.return_value = DialResult(success=False, error_code="TooManyRequestsException")
+        mock_caller.dial.return_value = DialResult(
+            success=False, error_code="TooManyRequestsException", throttled=True
+        )
         mock_queue = MagicMock()
         mock_queue.get_phone.return_value = "+15551234567"
         mock_lock = MagicMock()
@@ -66,9 +68,11 @@ def test_does_not_raise_on_throttle():
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
              patch("handler_caller.AgentLock", return_value=mock_lock):
             from handler_caller import lambda_handler
-            result = lambda_handler(_make_sqs_event(), None)
+            # Exception must propagate so SQS redelivers the message
+            with pytest.raises(RuntimeError, match="throttled"):
+                lambda_handler(_make_sqs_event(), None)
 
-        # mark_dialed must NOT be called on failure
+        # mark_dialed must NOT be called on throttle
         mock_queue.mark_dialed.assert_not_called()
         # contact must be reset to PENDING so the next agent can retry it
         mock_queue.reset_to_pending.assert_called_once_with(

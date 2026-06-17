@@ -60,7 +60,7 @@ def _process_message(body: dict) -> None:
         logger.error(
             "Contact not found or missing phone campaign_id=%s correlation_id=%s",
             campaign_id,
-            agent_arn[-8:],
+            contact_sk,
         )
         return
 
@@ -83,30 +83,43 @@ def _process_message(body: dict) -> None:
             "Dial success campaign_id=%s contact_id=%s correlation_id=%s",
             campaign_id,
             result.contact_id,
-            agent_arn[-8:],
+            contact_sk,
         )
+    elif result.throttled or result.error_code == "TooManyRequestsException":
+        # Throttle: reset + release, then raise so SQS retries this message.
+        # Do NOT ack — the message must be redelivered after the visibility timeout.
+        logger.warning(
+            "Dial throttled campaign_id=%s correlation_id=%s — SQS will retry",
+            campaign_id,
+            contact_sk,
+        )
+        try:
+            _get_queue().reset_to_pending(campaign_id, contact_sk)
+        except Exception:
+            logger.error("Failed to reset contact to PENDING correlation_id=%s", contact_sk)
+        _get_lock().release(agent_arn)
+        raise RuntimeError("StartOutboundVoiceContact throttled — SQS will retry")
     else:
+        # Permanent failure: reset + release but ack the message (do not raise).
+        # The contact re-enters the queue for the next available agent.
         logger.warning(
             "Dial failed error_code=%s campaign_id=%s correlation_id=%s",
             result.error_code,
             campaign_id,
-            agent_arn[-8:],
+            contact_sk,
         )
-        # Reset contact to PENDING so the next available agent can retry it.
-        # Without this, the contact stays DISPATCHING forever (24h TTL wasted).
         try:
             _get_queue().reset_to_pending(campaign_id, contact_sk)
         except Exception:
-            logger.error("Failed to reset contact to PENDING correlation_id=%s", agent_arn[-8:])
+            logger.error("Failed to reset contact to PENDING correlation_id=%s", contact_sk)
         # Release agent lock so the next AVAILABLE event can dispatch
         _get_lock().release(agent_arn)
 
 
 def lambda_handler(event: dict, _context) -> dict:
     for record in event.get("Records", []):
-        try:
-            body = json.loads(record["body"])
-            _process_message(body)
-        except Exception as exc:
-            logger.error("Failed to process SQS message: %s", type(exc).__name__)
+        body = json.loads(record["body"])
+        # RuntimeError from throttle is intentionally NOT caught here — it must
+        # propagate so Lambda returns a partial-batch failure and SQS redelivers.
+        _process_message(body)
     return {"status": "ok"}
