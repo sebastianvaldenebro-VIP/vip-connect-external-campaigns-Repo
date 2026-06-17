@@ -72,6 +72,7 @@ const redisConfig = {
   team: (app.node.tryGetContext('redisTeam') as string) ?? 'BASIC_TEAM',
   profileObjectType:
     (app.node.tryGetContext('profileObjectType') as string) ?? 'leads-data-mapping',
+  passwordSecretArn: (app.node.tryGetContext('redisPasswordSecretArn') as string | undefined) || undefined,
 };
 const redisVpcConfig = {
   vpcId:
@@ -151,14 +152,15 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
 //   dataKeyArn:         aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
 //   firstOrionSecretArn: ARN from Task 6 Step 1
 //   activeCampaignId:   current Outbound Campaigns V2 campaign ID
-const progressiveDialerDataKeyArn =
-  (app.node.tryGetContext('progressiveDialerDataKeyArn') as string) ??
-  'arn:aws:kms:us-east-1:165505826690:key/00000000-0000-0000-0000-000000000000';
-const firstOrionSecretArn =
-  (app.node.tryGetContext('firstOrionSecretArn') as string) ??
-  'arn:aws:secretsmanager:us-east-1:165505826690:secret:vip/firstorion/credentials-XXXXXX';
-const activeCampaignId =
-  (app.node.tryGetContext('activeCampaignId') as string) ?? 'placeholder-campaign-id';
+function requireContext(key: string): string {
+  const val = app.node.tryGetContext(key) as string | undefined;
+  if (!val) throw new Error(`CDK context '${key}' is required — pass via --context or cdk.json`);
+  return val;
+}
+
+const progressiveDialerDataKeyArn = requireContext('progressiveDialerDataKeyArn');
+const firstOrionSecretArn         = requireContext('firstOrionSecretArn');
+const activeCampaignId            = requireContext('activeCampaignId');
 
 const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
   env,
