@@ -32,16 +32,21 @@ class FirstOrionClient:
         self._token_fetched_at: float = 0.0
 
     @classmethod
-    def build_from_secret(cls, secret_name: str, region: str = "us-east-1") -> "FirstOrionClient":
+    def build_from_secret(cls, secret_arn: str, region: str = "us-east-1") -> "FirstOrionClient":
+        """Build client from AWS Secrets Manager secret.
+
+        Args:
+            secret_arn: ARN or name of the secret containing api_key and secret_key.
+            region: AWS region where the secret is stored.
+        """
         sm = boto3.client("secretsmanager", region_name=region)
-        raw = sm.get_secret_value(SecretId=secret_name)["SecretString"]
+        raw = sm.get_secret_value(SecretId=secret_arn)["SecretString"]
         creds = json.loads(raw)
         return cls(api_key=creds["api_key"], secret_key=creds["secret_key"])
 
     def _get_token(self) -> str:
         resp = requests.post(
             _AUTH_URL,
-            json={},
             headers={
                 "X-SERVICE": "auth",
                 "X-API-KEY": self._api_key,
@@ -80,6 +85,7 @@ class FirstOrionClient:
                 return True
             logger.warning("First Orion push failed status=%d", resp.status_code)
             return False
+        # auth failures and push failures both return False — callers cannot distinguish them
         except Exception as exc:
             logger.error("First Orion push exception: %s", type(exc).__name__)
             return False
