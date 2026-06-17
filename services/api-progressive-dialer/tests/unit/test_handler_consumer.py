@@ -95,6 +95,9 @@ def test_dispatches_contact_when_agent_available():
         assert sqs_kwargs["DelaySeconds"] == 22
         body = json.loads(sqs_kwargs["MessageBody"])
         assert "destinationPhone" not in body  # PHI must never appear in SQS body
+        # correlationId must be present in the SQS body for end-to-end tracing
+        assert "correlationId" in body
+        assert len(body["correlationId"]) == 8  # short UUID prefix
 
 
 def test_lambda_handler_propagates_processing_error():

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 import boto3
 
@@ -35,6 +36,7 @@ _SOURCE_PHONE = os.environ["SOURCE_PHONE"]
 _ACTIVE_CAMPAIGN_ID = os.environ["ACTIVE_CAMPAIGN_ID"]
 _FIRSTORION_SECRET_NAME = os.environ["FIRSTORION_SECRET_NAME"]
 _SQS_DELAY_SECONDS = 22
+_CW_NAMESPACE = "VipConnect/ProgressiveDialer"
 # Optional comma-separated queue ARNs to restrict which agents trigger dispatch.
 # Empty = all queues served. Set to limit branded dialing to specific outbound queues.
 _ALLOWED_QUEUE_ARNS: set[str] = {
@@ -48,6 +50,7 @@ _lock_store: AgentLock | None = None
 _queue_store: CampaignQueue | None = None
 _fo_client: FirstOrionClient | None = None
 _sqs_client = None
+_cw_client = None
 
 
 def _get_lock() -> AgentLock:
@@ -78,6 +81,27 @@ def _get_sqs():
     return _sqs_client
 
 
+def _get_cw():
+    global _cw_client
+    if _cw_client is None:
+        _cw_client = boto3.client("cloudwatch")
+    return _cw_client
+
+
+def _emit_metric(metric_name: str, value: float = 1.0) -> None:
+    """Emit a custom metric to VipConnect/ProgressiveDialer namespace.
+
+    Failures are logged but not raised — metric emission must never abort a dispatch.
+    """
+    try:
+        _get_cw().put_metric_data(
+            Namespace=_CW_NAMESPACE,
+            MetricData=[{"MetricName": metric_name, "Value": value, "Unit": "Count"}],
+        )
+    except Exception as exc:
+        logger.warning("Failed to emit metric %s: %s", metric_name, type(exc).__name__)
+
+
 def _process_record(record: dict) -> None:
     raw = base64.b64decode(record["kinesis"]["data"]).decode("utf-8")
     agent_event = json.loads(raw)
@@ -101,19 +125,24 @@ def _process_record(record: dict) -> None:
     # invocations both delete the lock then both acquire it, causing double-dispatch.
     lock = _get_lock()
     if not lock.acquire(agent_arn, campaign_id=_ACTIVE_CAMPAIGN_ID):
-        logger.info("Lock already held for agent — skipping dispatch correlation_id=%s", f"{agent_arn[-8:]}:{int(time.time())}")
+        logger.info("Lock already held for agent — skipping dispatch")
         return
 
     contact = _get_queue().dequeue(_ACTIVE_CAMPAIGN_ID)
     if contact is None:
         lock.release(agent_arn)
-        logger.info("Campaign queue empty — releasing lock correlation_id=%s", f"{agent_arn[-8:]}:{int(time.time())}")
+        logger.info("Campaign queue empty — releasing lock")
         return
+
+    # Generate a short correlation ID once per dispatch. Used in all subsequent log lines
+    # and propagated in the SQS body so the caller Lambda shares the same trace ID in CW.
+    correlation_id = str(uuid.uuid4())[:8]
 
     # Fire First Orion push — does NOT log phone numbers
     pushed = _get_fo().push(a_number=_SOURCE_PHONE, b_number=contact.phone)
     if not pushed:
-        logger.warning("First Orion push failed — will retry via SQS caller")
+        logger.warning("First Orion push failed — will retry via SQS caller correlation_id=%s", correlation_id)
+        _emit_metric("FirstOrionPushFailed")
 
     # Enqueue SQS with 22s delay regardless of push result
     # (caller Lambda fires StartOutboundVoiceContact, not dependent on push success)
@@ -128,6 +157,7 @@ def _process_record(record: dict) -> None:
         "sourcePhone": _SOURCE_PHONE,
         "contactFlowId": _CONTACT_FLOW_ID,
         "instanceId": _CONNECT_INSTANCE_ID,
+        "correlationId": correlation_id,
     }
     _get_sqs().send_message(
         QueueUrl=_SQS_QUEUE_URL,
@@ -136,7 +166,7 @@ def _process_record(record: dict) -> None:
     )
     logger.info(
         "SQS message enqueued correlation_id=%s campaign_id=%s",
-        f"{agent_arn[-8:]}:{int(time.time())}",
+        correlation_id,
         contact.campaign_id,
     )
 
