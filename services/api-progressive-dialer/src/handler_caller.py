@@ -180,7 +180,7 @@ def _process_message(body: dict) -> None:
             logger.warning(
                 "first_orion_repush_failed_on_throttle correlation_id=%s error=%s",
                 correlation_id,
-                str(fo_err),
+                type(fo_err).__name__,  # not str() — avoid PHI in exception message
             )
         raise RuntimeError("StartOutboundVoiceContact throttled — SQS will retry")
     else:
@@ -197,7 +197,13 @@ def _process_message(body: dict) -> None:
         except Exception:
             logger.error("Failed to reset contact to PENDING correlation_id=%s", correlation_id)
         # Release agent lock so the next AVAILABLE event can dispatch
-        _get_lock().release(agent_arn)
+        try:
+            _get_lock().release(agent_arn)
+        except Exception as rel_err:
+            logger.error("lock_release_failed_permanent_failure", extra={
+                "correlationId": correlation_id,
+                "error": type(rel_err).__name__,
+            })
 
 
 def lambda_handler(event: dict, _context) -> dict:

@@ -216,8 +216,6 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
 
     callerFn.addEventSource(new SqsEventSource(dialQueue, {
       batchSize: 1, // one dial per invocation
-      // Explicit partial-batch failure contract — correct behaviour even if batchSize ever rises.
-      reportBatchItemFailures: true,
     }));
 
     campaignQueueTable.grantReadWriteData(callerRole);
