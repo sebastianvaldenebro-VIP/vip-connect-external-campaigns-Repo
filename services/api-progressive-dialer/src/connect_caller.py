@@ -23,6 +23,7 @@ class DialResult:
     success: bool
     contact_id: str | None = None
     error_code: str | None = None
+    throttled: bool = False
 
 
 class ConnectCaller:
@@ -73,4 +74,6 @@ class ConnectCaller:
         except ClientError as exc:
             code = exc.response["Error"]["Code"]
             logger.warning("StartOutboundVoiceContact failed error_code=%s", code)
+            if code == "TooManyRequestsException":
+                return DialResult(success=False, error_code=code, throttled=True)
             return DialResult(success=False, error_code=code)

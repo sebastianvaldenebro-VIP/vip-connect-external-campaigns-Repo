@@ -43,6 +43,7 @@ def test_dial_returns_failure_on_throttle():
     result = caller.dial(destination_phone="+15551234567", queue_id="queue-001")
     assert result.success is False
     assert result.error_code == "TooManyRequestsException"
+    assert result.throttled is True
 
 
 def test_dial_returns_failure_on_limit_exceeded():
