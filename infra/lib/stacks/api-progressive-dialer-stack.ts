@@ -84,10 +84,12 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       enforceSSL: true,
     });
 
-    // ── SQS: Dial delay queue (22s) ───────────────────────────────────
+    // ── SQS: Dial delay queue ─────────────────────────────────────────
+    // Delay is set per-message (DelaySeconds=22) in handler_consumer.py.
+    // Do NOT set deliveryDelay here — it would stack with the per-message
+    // delay and push the total to 44s, past First Orion's branding window.
     const dialQueue = new sqs.Queue(this, 'DialQueue', {
       queueName: 'vip-progressive-dialer-calls',
-      deliveryDelay: cdk.Duration.seconds(22),
       visibilityTimeout: cdk.Duration.seconds(60),
       encryptionMasterKey: dataKey,
       enforceSSL: true,
