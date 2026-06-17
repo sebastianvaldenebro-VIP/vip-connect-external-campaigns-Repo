@@ -27,6 +27,9 @@ def _build_kinesis_event(agent_arn: str, status_type: str, status_name: str, nex
 
 
 def test_skips_heartbeat_events():
+    if "handler_consumer" in sys.modules:
+        del sys.modules["handler_consumer"]
+
     heartbeat = {"EventType": "HEART_BEAT"}
     encoded = base64.b64encode(json.dumps(heartbeat).encode()).decode()
     event = {"Records": [{"kinesis": {"data": encoded}}]}

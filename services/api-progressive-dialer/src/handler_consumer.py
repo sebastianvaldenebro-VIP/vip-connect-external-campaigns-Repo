@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import time
 
 import boto3
 
@@ -100,13 +101,13 @@ def _process_record(record: dict) -> None:
     # invocations both delete the lock then both acquire it, causing double-dispatch.
     lock = _get_lock()
     if not lock.acquire(agent_arn, campaign_id=_ACTIVE_CAMPAIGN_ID):
-        logger.info("Lock already held for agent — skipping dispatch correlation_id=%s", agent_arn[-8:])
+        logger.info("Lock already held for agent — skipping dispatch correlation_id=%s", f"{agent_arn[-8:]}:{int(time.time())}")
         return
 
     contact = _get_queue().dequeue(_ACTIVE_CAMPAIGN_ID)
     if contact is None:
         lock.release(agent_arn)
-        logger.info("Campaign queue empty — releasing lock correlation_id=%s", agent_arn[-8:])
+        logger.info("Campaign queue empty — releasing lock correlation_id=%s", f"{agent_arn[-8:]}:{int(time.time())}")
         return
 
     # Fire First Orion push — does NOT log phone numbers
@@ -135,17 +136,17 @@ def _process_record(record: dict) -> None:
     )
     logger.info(
         "SQS message enqueued correlation_id=%s campaign_id=%s",
-        agent_arn[-8:],
+        f"{agent_arn[-8:]}:{int(time.time())}",
         contact.campaign_id,
     )
 
 
 def lambda_handler(event: dict, _context) -> dict:
-    dispatched = 0
+    dispatched_count = 0
     for record in event.get("Records", []):
         try:
             _process_record(record)
-            dispatched += 1
+            dispatched_count += 1
         except Exception as exc:
             logger.error("Failed to process record: %s", type(exc).__name__)
-    return {"dispatched": dispatched}
+    return {"dispatched_count": dispatched_count}
