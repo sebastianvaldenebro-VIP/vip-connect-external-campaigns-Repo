@@ -149,4 +149,5 @@ def lambda_handler(event: dict, _context) -> dict:
             dispatched_count += 1
         except Exception as exc:
             logger.error("Failed to process record: %s", type(exc).__name__)
+            raise
     return {"dispatched_count": dispatched_count}

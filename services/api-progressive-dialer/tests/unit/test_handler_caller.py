@@ -74,11 +74,8 @@ def test_raises_on_throttle_for_sqs_retry():
 
         # mark_dialed must NOT be called on throttle
         mock_queue.mark_dialed.assert_not_called()
-        # contact must be reset to PENDING so the next agent can retry it
-        mock_queue.reset_to_pending.assert_called_once_with(
-            "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
-        )
-        # lock must be released so the next AVAILABLE event can dispatch
-        mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
-        )
+        # reset_to_pending must NOT be called — releasing the lock before SQS retry
+        # would allow a duplicate First Orion push via the next agent-available event.
+        mock_queue.reset_to_pending.assert_not_called()
+        # lock must NOT be released — the TTL expiry handles cleanup.
+        mock_lock.release.assert_not_called()

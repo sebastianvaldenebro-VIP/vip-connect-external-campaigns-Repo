@@ -86,18 +86,16 @@ def _process_message(body: dict) -> None:
             contact_sk,
         )
     elif result.throttled or result.error_code == "TooManyRequestsException":
-        # Throttle: reset + release, then raise so SQS retries this message.
-        # Do NOT ack — the message must be redelivered after the visibility timeout.
+        # Throttle: raise immediately — do NOT reset or release the lock.
+        # Releasing the lock here would allow the next agent-available event to
+        # re-dequeue the same contact and fire a second First Orion push before
+        # this SQS message is redelivered by the visibility timeout.
+        # The lock TTL will expire naturally; SQS visibility timeout retries the call.
         logger.warning(
             "Dial throttled campaign_id=%s correlation_id=%s — SQS will retry",
             campaign_id,
             contact_sk,
         )
-        try:
-            _get_queue().reset_to_pending(campaign_id, contact_sk)
-        except Exception:
-            logger.error("Failed to reset contact to PENDING correlation_id=%s", contact_sk)
-        _get_lock().release(agent_arn)
         raise RuntimeError("StartOutboundVoiceContact throttled — SQS will retry")
     else:
         # Permanent failure: reset + release but ack the message (do not raise).

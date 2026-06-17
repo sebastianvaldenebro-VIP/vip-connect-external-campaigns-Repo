@@ -282,14 +282,8 @@ export class ApiStack extends cdk.Stack {
 
     // ── Progressive Dialer routes ────────────────────────────────────
     this.httpApi.addRoutes({
-      path: '/dialer/seed',
+      path: '/dialer/{id}/seed',
       methods: [apigatewayv2.HttpMethod.POST],
-      integration: progressiveDialerIntegration,
-      authorizer,
-    });
-    this.httpApi.addRoutes({
-      path: '/dialer/status',
-      methods: [apigatewayv2.HttpMethod.GET],
       integration: progressiveDialerIntegration,
       authorizer,
     });

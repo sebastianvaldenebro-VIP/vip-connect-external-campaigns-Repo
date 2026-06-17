@@ -66,6 +66,18 @@ def test_mark_dialed_updates_status():
     call_kwargs = table.update_item.call_args[1]
     assert "DIALED" in str(call_kwargs["ExpressionAttributeValues"])
     assert "contact-id-xyz" in str(call_kwargs["ExpressionAttributeValues"])
+    # Must include a ConditionExpression to guard against SQS redelivery overwrites
+    assert call_kwargs.get("ConditionExpression") is not None
+
+
+def test_mark_dialed_is_idempotent_on_conditional_check_failed():
+    """SQS redelivery after a successful dial must not raise — treat as idempotent success."""
+    q, table = _make_queue()
+    # Simulate ConditionalCheckFailedException (contact already advanced past DISPATCHING)
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = Exception("ConditionalCheckFailed")
+    # Must not raise
+    q.mark_dialed("campaign-1", "ts1#uuid1", "contact-id-xyz")
 
 
 def test_enqueue_writes_pending_item():

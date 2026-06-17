@@ -90,13 +90,22 @@ class CampaignQueue:
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
     def mark_dialed(self, campaign_id: str, sk: str, contact_id: str) -> None:
-        """Record the Connect contactId after StartOutboundVoiceContact succeeds."""
-        self._table.update_item(
-            Key={"campaignId": campaign_id, "sk": sk},
-            UpdateExpression="SET #s = :dialed, contactId = :cid",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":dialed": "DIALED", ":cid": contact_id},
-        )
+        """Record the Connect contactId after StartOutboundVoiceContact succeeds.
+
+        Guards on status=DISPATCHING so SQS redelivery after a successful dial
+        does not overwrite a contact another flow has already advanced to DONE.
+        ConditionalCheckFailedException is treated as idempotent success.
+        """
+        try:
+            self._table.update_item(
+                Key={"campaignId": campaign_id, "sk": sk},
+                UpdateExpression="SET #s = :dialed, contactId = :cid",
+                ConditionExpression=Attr("status").eq("DISPATCHING"),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":dialed": "DIALED", ":cid": contact_id},
+            )
+        except self._table.meta.client.exceptions.ConditionalCheckFailedException:
+            pass  # already advanced by another flow — idempotent success
 
     def reset_to_pending(self, campaign_id: str, sk: str) -> None:
         """Reset a DISPATCHING contact back to PENDING so the next available agent retries it.

@@ -215,6 +215,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
         'connect:DescribeQueue',
       ],
       resources: [
+        `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}`,
         `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}/*`,
       ],
     }));
