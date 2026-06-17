@@ -60,6 +60,27 @@ def _get_fo() -> FirstOrionClient:
     return _fo_client
 
 
+def _get_cw():
+    global _cw_client
+    if _cw_client is None:
+        _cw_client = boto3.client("cloudwatch")
+    return _cw_client
+
+
+def _emit_metric(metric_name: str, value: float = 1.0) -> None:
+    """Emit a custom metric to VipConnect/ProgressiveDialer namespace.
+
+    Failures are logged but not raised — metric emission must never abort a dispatch.
+    """
+    try:
+        _get_cw().put_metric_data(
+            Namespace=_CW_NAMESPACE,
+            MetricData=[{"MetricName": metric_name, "Value": value, "Unit": "Count"}],
+        )
+    except Exception as exc:
+        logger.warning("Failed to emit metric %s: %s", metric_name, type(exc).__name__)
+
+
 def _process_message(body: dict) -> None:
     agent_arn = body["agentArn"]
     queue_arn = body["queueArn"]
@@ -148,6 +169,7 @@ def _process_message(body: dict) -> None:
             campaign_id,
             correlation_id,
         )
+        _emit_metric("ConnectThrottleCount")
         # Re-push First Orion so the branding window is fresh for the retry.
         # The SQS visibilityTimeout (180s) far exceeds First Orion's 30s window,
         # so the original push is always stale by the time SQS redelivers.
