@@ -3784,16 +3784,132 @@ class TestStopBrandedCampaign:
 
 
 class TestPrestartSkipsBranded:
-    def test_prestart_next_bucket_skips_branded(self, mocker):
-        branded_campaign = {
-            "id": "bc-1", "deliveryType": "branded",
+    """_prestart_next_bucket must skip branded campaigns and only warmup non-branded ones."""
+
+    def _branded_campaign_def(self, cid: str = "bc-1") -> dict:
+        return {
+            "id": cid,
+            "name": cid,
+            "deliveryType": "branded",
+            "states": ["NY"],
+            "groups": [],
+            "dependsOn": [],
             "campaignConfig": {"queueArn": "arn::queue/q1"},
         }
+
+    def test_prestart_next_bucket_skips_branded(self, mocker):
+        """_create_campaign_only must NOT be called for a branded campaign during prewarm."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+                _bucket_def("b1", [self._branded_campaign_def("bc-1")]),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state("b1", [_campaign_state("bc-1", "queued")], status="queued"),
+            ],
+        )
+
         create = mocker.patch("executor._create_campaign_only")
-        # build a run where next bucket has a branded campaign
-        # ... (construct minimal run/plan with next bucket having branded campaign)
-        # Verify _create_campaign_only is never called
+        mocker.patch("executor.save_run")
+
+        executor._prestart_next_bucket(run, plan, 0)
+
+        # Branded campaign must be skipped — no warmup phase
         create.assert_not_called()
+        # Bucket status set to warming regardless (the bucket-level claim is still made)
+        assert run["bucketStates"][1]["status"] == "warming"
+        # Campaign itself stays queued — it will be started directly by _start_one_campaign
+        assert run["bucketStates"][1]["campaignStates"][0]["status"] == "queued"
+
+    def test_prestart_next_bucket_warms_nonbranded_skips_branded(self, mocker):
+        """_create_campaign_only is called for non-branded but not for branded in the same bucket."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+                _bucket_def(
+                    "b1",
+                    [
+                        _campaign_def("c-connect"),
+                        self._branded_campaign_def("bc-2"),
+                    ],
+                ),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state(
+                    "b1",
+                    [
+                        _campaign_state("c-connect", "queued"),
+                        _campaign_state("bc-2", "queued"),
+                    ],
+                    status="queued",
+                ),
+            ],
+        )
+
+        create = mocker.patch(
+            "executor._create_campaign_only",
+            return_value=("conn-w", "seg-w", "arn:seg-w", True),
+        )
+        mocker.patch("executor.save_run")
+
+        executor._prestart_next_bucket(run, plan, 0)
+
+        # Exactly one create call — only for the non-branded campaign
+        assert create.call_count == 1
+        # Non-branded campaign is now warming
+        assert run["bucketStates"][1]["campaignStates"][0]["status"] == "warming"
+        assert run["bucketStates"][1]["campaignStates"][0]["connectCampaignId"] == "conn-w"
+        # Branded campaign stays queued — never passed to _create_campaign_only
+        assert run["bucketStates"][1]["campaignStates"][1]["status"] == "queued"
+        assert run["bucketStates"][1]["campaignStates"][1].get("connectCampaignId") is None
+
+    def test_prestart_plan_skips_branded_campaign(self, mocker):
+        """_prestart_plan must skip branded campaigns and only store non-branded warmups."""
+        import executor
+
+        plan = {
+            "planId": "plan-target",
+            "buckets": [
+                _bucket_def(
+                    "b0",
+                    [
+                        _campaign_def("c-connect"),
+                        self._branded_campaign_def("bc-3"),
+                    ],
+                )
+            ],
+        }
+
+        create = mocker.patch(
+            "executor._create_campaign_only",
+            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False),
+        )
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor.get_latest_run", return_value=None)
+        update_warmup = mocker.patch("executor.update_plan_pending_warmup")
+
+        executor._prestart_plan("plan-target")
+
+        # Only one create call — for the non-branded campaign
+        assert create.call_count == 1
+        # The warmup stored must only contain the non-branded campaign
+        update_warmup.assert_called_once()
+        warmup_arg = update_warmup.call_args[0][1]
+        warmed_ids = [c["campaignId"] for c in warmup_arg["campaigns"]]
+        assert "c-connect" in warmed_ids
+        assert "bc-3" not in warmed_ids
 
 
 class TestTickBrandedPoll:
