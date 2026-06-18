@@ -179,6 +179,9 @@ def _count_branded_queue(campaign_id: str) -> int:
         },
         Select="COUNT",
     )
+    # Select=COUNT without pagination is safe: Count > 0 (partial page) still correctly
+    # blocks completion; Count == 0 (empty page) only occurs when there are genuinely no
+    # matching items (DDB returns Count=0, no LastEvaluatedKey, for empty result sets).
     return resp.get("Count", 0)
 
 
@@ -188,14 +191,15 @@ def _expire_branded_queue_items(campaign_id: str) -> None:
     DynamoDB TTL sweep will delete them within 48h. This stops the consumer from
     dequeuing contacts for a stopped/aborted campaign.
     Batch-writes up to 3000 items in pages of 25 — acceptable for segment max size.
+    UnprocessedItems are retried up to 3 times with exponential backoff (0.1s base).
     """
-    import time as _time
-    now_epoch = int(_time.time())
+    now_epoch = int(time.time())
+    table = _CAMPAIGN_QUEUE_TABLE_BRANDED
     ddb = _get_ddb_client()
     last_key = None
     while True:
         kwargs = dict(
-            TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+            TableName=table,
             KeyConditionExpression="campaignId = :c",
             FilterExpression="#s IN (:p, :d)",
             ExpressionAttributeNames={"#s": "status"},
@@ -210,26 +214,38 @@ def _expire_branded_queue_items(campaign_id: str) -> None:
             kwargs["ExclusiveStartKey"] = last_key
         resp = ddb.query(**kwargs)
         items = resp.get("Items", [])
-        # Batch write in chunks of 25
+        # Batch write in chunks of 25, retrying UnprocessedItems up to 3 times
         for i in range(0, len(items), 25):
             chunk = items[i : i + 25]
-            ddb.batch_write_item(
-                RequestItems={
-                    _CAMPAIGN_QUEUE_TABLE_BRANDED: [
-                        {
-                            "PutRequest": {
-                                "Item": {
-                                    "campaignId": item["campaignId"],
-                                    "sk":         item["sk"],
-                                    "status":     {"S": "EXPIRED"},
-                                    "ttl":        {"N": str(now_epoch)},
-                                }
-                            }
+            batch = [
+                {
+                    "PutRequest": {
+                        "Item": {
+                            "campaignId": item["campaignId"],
+                            "sk":         item["sk"],
+                            "status":     {"S": "EXPIRED"},
+                            "ttl":        {"N": str(now_epoch)},
                         }
-                        for item in chunk
-                    ]
+                    }
                 }
-            )
+                for item in chunk
+            ]
+            attempts = 0
+            while batch and attempts < 3:
+                resp_bw = ddb.batch_write_item(RequestItems={table: batch})
+                unprocessed = resp_bw.get("UnprocessedItems", {}).get(table, [])
+                if unprocessed:
+                    attempts += 1
+                    time.sleep(0.1 * (2 ** attempts))
+                    batch = unprocessed
+                else:
+                    break
+            else:
+                if batch:
+                    logger.warning(
+                        "_expire_branded_queue_items: %d items unprocessed after retries for %s",
+                        len(batch), campaign_id,
+                    )
         last_key = resp.get("LastEvaluatedKey")
         if not last_key:
             break
@@ -276,6 +292,9 @@ def _invoke_seeder(
 
     Returns number of contacts seeded. PHI rule: source_phone must never appear
     in log lines — only counts and exception type names are logged.
+    Raises RuntimeError if the Lambda invocation itself succeeded (HTTP 200) but
+    the handler threw — boto3 does NOT raise in that case; callers must check
+    FunctionError explicitly.
     """
     import json as _json
 
@@ -290,6 +309,9 @@ def _invoke_seeder(
         InvocationType="RequestResponse",
         Payload=_json.dumps(payload).encode(),
     )
+    if response.get("FunctionError"):
+        # Do NOT log the payload — stack frames may contain PHI.
+        raise RuntimeError(f"seeder invocation failed: {response['FunctionError']}")
     result = _json.loads(response["Payload"].read())
     return int(result.get("seeded", 0))
 

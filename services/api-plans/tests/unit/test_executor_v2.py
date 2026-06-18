@@ -4149,3 +4149,133 @@ class TestAbortStopCallsStopBranded:
         force_start_campaign("plan-1", "run-1", 0, 0)
 
         stop.assert_not_called()
+
+
+# ── Fix: _invoke_seeder must check FunctionError ──────────────────────────────
+
+
+class TestInvokeSeederFunctionError:
+    """_invoke_seeder must raise RuntimeError when Lambda returns FunctionError."""
+
+    def test_seeder_function_error_raises(self, mocker):
+        """When Lambda invoke returns HTTP 200 but FunctionError='Unhandled',
+        _invoke_seeder must raise RuntimeError so _start_one_campaign marks
+        the campaign as error — not silently treat it as 0 seeded contacts.
+        """
+        from unittest.mock import MagicMock
+        import executor
+
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        # boto3 returns HTTP 200 with FunctionError field — does NOT raise
+        lam.invoke.return_value = {
+            "StatusCode": 200,
+            "FunctionError": "Unhandled",
+            "Payload": MagicMock(read=lambda: b'{"errorMessage": "something crashed"}'),
+        }
+
+        with pytest.raises(RuntimeError, match="seeder invocation failed"):
+            executor._invoke_seeder("bc-1", "seg-name", "flow-abc", "+15550001234")
+
+    def test_seeder_function_error_causes_error_status_in_start_one_campaign(
+        self, mocker
+    ):
+        """When _invoke_seeder raises (due to FunctionError), _start_one_campaign
+        must set cs['status'] = 'error', not 'completed' with exitReason='empty_segment'.
+        """
+        from unittest.mock import MagicMock
+        import executor
+
+        campaign_id = "bc-fe"
+        bucket = _bucket_def("b0", campaigns=[{
+            "id": campaign_id,
+            "name": "FunctionError branded",
+            "deliveryType": "branded",
+            "campaignConfig": {
+                "dialerType": "progressive",
+                "queueArn": "arn:aws:connect:::queue/q1",
+                "contactFlowId": "flow-abc",
+                "sourcePhone": "+15550001234",
+            },
+        }])
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        cs = _campaign_state(campaign_id, status="queued")
+        run = {
+            "planId": "p-1",
+            "runId": "r-1",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "StatusCode": 200,
+            "FunctionError": "Unhandled",
+            "Payload": MagicMock(read=lambda: b'{"errorMessage": "handler crashed"}'),
+        }
+        mocker.patch("executor._get_ddb_client")
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "error", (
+            "FunctionError on seeder must set status=error, not complete with 0 seeded"
+        )
+
+
+# ── Fix: _expire_branded_queue_items must retry UnprocessedItems ──────────────
+
+
+class TestExpireHandlesUnprocessedItems:
+    """_expire_branded_queue_items must retry DynamoDB UnprocessedItems under throttling."""
+
+    def test_expire_handles_unprocessed_items(self, mocker):
+        """batch_write_item returns UnprocessedItems on first call, empty on second.
+        Verify the retry loop fires and the warning is NOT raised as an exception.
+        """
+        import executor
+
+        table = "VipProgressiveCampaignQueue"
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", table)
+
+        items = [
+            {"campaignId": {"S": "bc-1"}, "sk": {"S": f"CONTACT#{i}"}}
+            for i in range(3)
+        ]
+        write_requests = [
+            {
+                "PutRequest": {
+                    "Item": {
+                        "campaignId": item["campaignId"],
+                        "sk": item["sk"],
+                        "status": {"S": "EXPIRED"},
+                        "ttl": {"N": mocker.ANY},
+                    }
+                }
+            }
+            for item in items
+        ]
+
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        # Query returns 3 items in one page
+        ddb.query.return_value = {"Items": items, "Count": 3}
+
+        batch_write_calls = []
+
+        def fake_batch_write(RequestItems):
+            batch_write_calls.append(len(RequestItems.get(table, [])))
+            if len(batch_write_calls) == 1:
+                # First call: return 1 unprocessed item
+                return {"UnprocessedItems": {table: [write_requests[0]]}}
+            # Second call: all processed
+            return {"UnprocessedItems": {}}
+
+        ddb.batch_write_item.side_effect = fake_batch_write
+
+        mocker.patch("executor.time.sleep")  # avoid real sleep in tests
+
+        # Must not raise even with UnprocessedItems on first attempt
+        executor._expire_branded_queue_items("bc-1")
+
+        assert len(batch_write_calls) == 2, (
+            "Expected 2 batch_write_item calls: first with all items, second with unprocessed retry"
+        )
