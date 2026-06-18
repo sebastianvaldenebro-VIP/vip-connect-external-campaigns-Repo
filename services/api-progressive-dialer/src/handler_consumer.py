@@ -173,59 +173,68 @@ def _process_record(record: dict) -> None:
     contact_flow_id = None
     source_phone = None
 
-    for camp in campaigns:
-        c_id = camp["campaignId"]["S"]
-        c = _get_queue().dequeue(c_id)
-        if c is not None:
-            contact = c
-            campaign_id = c_id
-            contact_flow_id = camp["contactFlowId"]["S"]
-            source_phone = camp["sourcePhone"]["S"]
-            break
+    # NOTE: use try/except (NOT try/finally) — on success the lock must STAY held.
+    # It auto-expires via TTL, giving the caller Lambda its run window.
+    # Only release on failure so we don't accidentally double-dispatch.
+    try:
+        for camp in campaigns:
+            c_id = camp["campaignId"]["S"]
+            c = _get_queue().dequeue(c_id)
+            if c is not None:
+                contact = c
+                campaign_id = c_id
+                contact_flow_id = camp["contactFlowId"]["S"]
+                source_phone = camp["sourcePhone"]["S"]
+                break
 
-    if contact is None:
-        lock.release(agent_arn)
-        logger.info("All campaign queues empty — releasing lock")
-        return
+        if contact is None:
+            lock.release(agent_arn)
+            logger.info("All campaign queues empty — releasing lock")
+            return
 
-    # Generate a short correlation ID once per dispatch. Used in all subsequent log lines
-    # and propagated in the SQS body so the caller Lambda shares the same trace ID in CW.
-    correlation_id = str(uuid.uuid4())[:8]
+        # Generate a short correlation ID once per dispatch. Used in all subsequent log lines
+        # and propagated in the SQS body so the caller Lambda shares the same trace ID in CW.
+        correlation_id = str(uuid.uuid4())[:8]
 
-    # Fire First Orion push — does NOT log phone numbers (PHI rule)
-    pushed = _get_fo().push(a_number=source_phone, b_number=contact.phone)
-    if not pushed:
-        logger.warning(
-            "First Orion push failed — will retry via SQS caller correlation_id=%s",
-            correlation_id,
+        # Fire First Orion push — does NOT log phone numbers (PHI rule)
+        pushed = _get_fo().push(a_number=source_phone, b_number=contact.phone)
+        if not pushed:
+            logger.warning(
+                "First Orion push failed — will retry via SQS caller correlation_id=%s",
+                correlation_id,
+            )
+            _emit_metric("FirstOrionPushFailed")
+
+        # Enqueue SQS with 22s delay regardless of push result
+        # (caller Lambda fires StartOutboundVoiceContact, not dependent on push success)
+        # sourcePhone is a campaign-level branded DID (non-PHI — the same number is shared
+        # by all contacts in this campaign; it is the outbound caller-ID configured by the
+        # plan author, not derived from any patient record).
+        # destinationPhone (PHI) is intentionally excluded — the caller Lambda reads it from
+        # DynamoDB (KMS-encrypted at rest) to keep PHI out of SQS and the 14-day DLQ.
+        message = {
+            "agentArn": agent_arn,
+            "queueArn": queue_arn,
+            "campaignId": campaign_id,
+            "contactSk": contact.sk,
+            "sourcePhone": source_phone,
+            "contactFlowId": contact_flow_id,
+            "instanceId": _CONNECT_INSTANCE_ID,
+            "correlationId": correlation_id,
+        }
+        _get_sqs().send_message(
+            QueueUrl=_SQS_QUEUE_URL,
+            MessageBody=json.dumps(message),
+            DelaySeconds=_SQS_DELAY_SECONDS,
         )
-        _emit_metric("FirstOrionPushFailed")
-
-    # Enqueue SQS with 22s delay regardless of push result
-    # (caller Lambda fires StartOutboundVoiceContact, not dependent on push success)
-    # destinationPhone (PHI) is intentionally NOT included in the SQS message.
-    # The caller Lambda reads it from DynamoDB (encrypted at rest via KMS CMK).
-    # This keeps PHI out of SQS and prevents it from sitting in the DLQ for 14 days.
-    message = {
-        "agentArn": agent_arn,
-        "queueArn": queue_arn,
-        "campaignId": campaign_id,
-        "contactSk": contact.sk,
-        "sourcePhone": source_phone,
-        "contactFlowId": contact_flow_id,
-        "instanceId": _CONNECT_INSTANCE_ID,
-        "correlationId": correlation_id,
-    }
-    _get_sqs().send_message(
-        QueueUrl=_SQS_QUEUE_URL,
-        MessageBody=json.dumps(message),
-        DelaySeconds=_SQS_DELAY_SECONDS,
-    )
-    logger.info(
-        "SQS message enqueued correlation_id=%s campaign_id=%s",
-        correlation_id,
-        campaign_id,
-    )
+        logger.info(
+            "SQS message enqueued correlation_id=%s campaign_id=%s",
+            correlation_id,
+            campaign_id,
+        )
+    except Exception:
+        lock.release(agent_arn)
+        raise
 
 
 def lambda_handler(event: dict, _context) -> dict:

@@ -117,11 +117,14 @@ def lambda_handler(event: dict, _context) -> dict:
         )
     except ClientError as exc:
         code = exc.response["Error"]["Code"]
-        if code == "ResourceNotFoundException":
-            return {"statusCode": 404, "body": json.dumps({"error": "segment not found"})}
-        if code == "AccessDeniedException":
-            return {"statusCode": 403, "body": json.dumps({"error": "access denied to segment"})}
-        return {"statusCode": 500, "body": json.dumps({"error": "failed to read segment"})}
+        if _http_mode:
+            if code == "ResourceNotFoundException":
+                return {"statusCode": 404, "body": json.dumps({"error": "segment not found"})}
+            if code == "AccessDeniedException":
+                return {"statusCode": 403, "body": json.dumps({"error": "access denied to segment"})}
+            return {"statusCode": 500, "body": json.dumps({"error": "failed to read segment"})}
+        # Direct-invoke mode: raise so executor can handle as a real error
+        raise RuntimeError(f"segment lookup failed: {type(exc).__name__}")
 
     profile_ids = _extract_profile_ids(resp.get("SegmentGroups") or {})
     if not profile_ids:

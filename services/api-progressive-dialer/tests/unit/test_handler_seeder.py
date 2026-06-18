@@ -189,6 +189,61 @@ def test_lambda_handler_success_seeds_contacts():
 
 
 # ---------------------------------------------------------------------------
+# H-6: direct-invoke mode raises RuntimeError on segment ClientError
+# ---------------------------------------------------------------------------
+
+def test_direct_invoke_raises_on_segment_not_found():
+    """When get_segment_definition raises ResourceNotFoundException in direct-invoke mode
+    (no pathParameters in event), the handler must raise RuntimeError so the executor
+    treats it as a real error instead of silently producing 0 seeded contacts.
+    """
+    from botocore.exceptions import ClientError
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.side_effect = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException", "Message": "not found"}},
+        "GetSegmentDefinition",
+    )
+
+    # Direct-invoke event: flat dict (no pathParameters, campaignId at top level)
+    direct_invoke_event = {
+        "campaignId": "bc-h6",
+        "segmentName": "missing-seg",
+        "contactFlowId": "flow-abc",
+        "sourcePhone": "+15550001234",
+    }
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp):
+        with pytest.raises(RuntimeError, match="segment lookup failed"):
+            handler_seeder.lambda_handler(direct_invoke_event, None)
+
+
+def test_direct_invoke_raises_on_segment_access_denied():
+    """When get_segment_definition raises AccessDeniedException in direct-invoke mode,
+    the handler must raise RuntimeError (not return an HTTP 403 dict).
+    """
+    from botocore.exceptions import ClientError
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.side_effect = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "not authorized"}},
+        "GetSegmentDefinition",
+    )
+
+    # Direct-invoke event: flat dict (no pathParameters, campaignId at top level)
+    direct_invoke_event = {
+        "campaignId": "bc-h6b",
+        "segmentName": "restricted-seg",
+        "contactFlowId": "flow-abc",
+        "sourcePhone": "+15550001234",
+    }
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp):
+        with pytest.raises(RuntimeError, match="segment lookup failed"):
+            handler_seeder.lambda_handler(direct_invoke_event, None)
+
+
+# ---------------------------------------------------------------------------
 # lambda_handler — direct Lambda invocation (not via API Gateway)
 # ---------------------------------------------------------------------------
 

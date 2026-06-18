@@ -225,12 +225,16 @@ export class ApiPlansStack extends cdk.Stack {
     );
 
     // CloudWatch PutMetricData — used by prestart_check to emit stuck-run metrics
-    // PutMetricData does not support resource-level restrictions
+    // PutMetricData does not support resource-level restrictions (resources must be '*'),
+    // but the namespace condition constrains writes to the VipConnect/Plans namespace only.
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'CloudWatchPutMetric',
         actions: ['cloudwatch:PutMetricData'],
         resources: ['*'],
+        conditions: {
+          StringEquals: { 'cloudwatch:namespace': 'VipConnect/Plans' },
+        },
       }),
     );
 

@@ -3579,6 +3579,12 @@ class TestInitialCampaignStateFields:
 class TestStartBrandedCampaign:
     """_start_one_campaign with deliveryType='branded'."""
 
+    @pytest.fixture(autouse=True)
+    def _branded_env(self, mocker):
+        """Ensure module-level branded env vars are non-empty so the validation guard passes."""
+        mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue")
+
     def _branded_campaign(
         self, campaign_id: str = "bc-1", queue_arn: str = "arn:aws:connect:::queue/q1"
     ) -> dict:
@@ -3695,6 +3701,8 @@ class TestStartBrandedCampaign:
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.side_effect = Exception("Lambda timeout")
         ddb = mocker.patch("executor._get_ddb_client").return_value
+        # Cleanup is exercised by its own tests; isolate the status transition here.
+        mocker.patch("executor._expire_branded_queue_items")
 
         from executor import _start_one_campaign
         cs = run["bucketStates"][0]["campaignStates"][0]
@@ -3747,6 +3755,7 @@ class TestStopBrandedCampaign:
                 "pk": {"S": "QUEUE#arn::queue/q1"},
                 "sk": {"S": "CAMPAIGN#bc-1"},
             },
+            ConditionExpression="attribute_exists(pk)",
         )
 
     def test_expires_queue_items(self, mocker):
@@ -4279,3 +4288,325 @@ class TestExpireHandlesUnprocessedItems:
         assert len(batch_write_calls) == 2, (
             "Expected 2 batch_write_item calls: first with all items, second with unprocessed retry"
         )
+
+
+# ── Round-2 audit fixes: BL-1, H-1, H-2, H-3, H-4, H-5 ─────────────────────
+
+
+def _branded_campaign_def_for_start(cid: str) -> dict:
+    """Minimal branded campaign definition suitable for _start_one_campaign tests."""
+    return {
+        "id": cid,
+        "name": cid,
+        "deliveryType": "branded",
+        "campaignConfig": {
+            "queueArn": "arn:aws:connect:us-east-1:123:instance/abc/queue/q1",
+            "contactFlowId": "flow-abc",
+            "sourcePhone": "+15550001234",
+        },
+    }
+
+
+def _branded_run_and_plan(cid="bc-1"):
+    """Return a (run, plan) pair for a single branded campaign in status=queued."""
+    bucket = {
+        "id": "b0",
+        "name": "b0",
+        "run_mode": "status_based",
+        "duration_minutes": 30,
+        "cleanup": False,
+        "prestart_next": True,
+        "parallel": False,
+        "campaigns": [_branded_campaign_def_for_start(cid)],
+        "campaignConfig": {},
+    }
+    plan = {"planId": "plan-1", "buckets": [bucket]}
+    cs = _campaign_state(cid, "queued")
+    run = {
+        "planId": "plan-1",
+        "runId": "run-1",
+        "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+    }
+    return run, plan, cs
+
+
+class TestBL1ExpireOnSeederException:
+    """BL-1: _expire_branded_queue_items called on seeder exception."""
+
+    @pytest.fixture(autouse=True)
+    def _branded_env(self, mocker):
+        mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue")
+
+    def test_expire_called_on_seeder_exception(self, mocker):
+        """When _invoke_seeder raises, _expire_branded_queue_items must be called
+        with campaign_id so partially-seeded contacts don't sit in the queue for 24h.
+        """
+        import executor
+
+        run, plan, cs = _branded_run_and_plan("bc-bl1")
+
+        mocker.patch(
+            "executor._create_segment",
+            return_value=("seg-bl1", "arn:seg-bl1"),
+        )
+        mocker.patch(
+            "executor._invoke_seeder",
+            side_effect=RuntimeError("seeder boom"),
+        )
+        expire = mocker.patch("executor._expire_branded_queue_items")
+        mocker.patch("executor._get_ddb_client")
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        expire.assert_called_once_with("bc-bl1")
+        assert cs["status"] == "error"
+
+
+class TestH1ExpireOnDdbWriteFailure:
+    """H-1: _expire_branded_queue_items called when active-campaigns DDB put_item fails."""
+
+    @pytest.fixture(autouse=True)
+    def _branded_env(self, mocker):
+        mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue")
+
+    def test_expire_called_on_ddb_write_failure(self, mocker):
+        """When put_item to VipActiveBrandedCampaigns raises (non-conditional),
+        _expire_branded_queue_items must be called so stranded contacts are cleaned up.
+        """
+        import executor
+        from botocore.exceptions import ClientError
+
+        run, plan, cs = _branded_run_and_plan("bc-h1")
+
+        mocker.patch(
+            "executor._create_segment",
+            return_value=("seg-h1", "arn:seg-h1"),
+        )
+        mocker.patch("executor._invoke_seeder", return_value=5)
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        ddb.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
+            "PutItem",
+        )
+        expire = mocker.patch("executor._expire_branded_queue_items")
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        expire.assert_called_once_with("bc-h1")
+        assert cs["status"] == "error"
+
+
+class TestH2AbortCreatingBrandedCampaign:
+    """H-2: abort_run and _force_finish_internal must clean up creating-status branded campaigns."""
+
+    def test_abort_run_cleans_creating_branded_campaign(self, mocker):
+        """Campaign in status='creating' with brandedCampaignId set (seeder already ran,
+        put_item not yet succeeded) must trigger _stop_branded_campaign on abort.
+        """
+        import executor
+
+        cs = {
+            "campaignId": "bc-h2",
+            "brandedCampaignId": "bc-h2",
+            "queueArn": "arn::queue/q1",
+            "status": "creating",
+            "connectCampaignId": None,
+            "segmentName": None,
+            "segmentArn": None,
+            "leadCount": None,
+            "startedAt": None,
+            "completedAt": None,
+            "exitReason": None,
+            "errorDetail": None,
+        }
+        run = {
+            "planId": "p-h2",
+            "runId": "r-h2",
+            "status": "running",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor.lock_plan_run", return_value=run)
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        executor.abort_run("p-h2", "r-h2")
+
+        stop.assert_called_once_with(cs)
+        assert cs["status"] == "cancelled"
+
+
+class TestH3DeleteConditionExpression:
+    """H-3: delete_item in _stop_branded_campaign must use ConditionExpression."""
+
+    def test_stop_branded_delete_condition_expression(self, mocker):
+        """delete_item must be called with ConditionExpression='attribute_exists(pk)'."""
+        import executor
+
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        mocker.patch("executor._expire_branded_queue_items")
+
+        cs = {
+            "brandedCampaignId": "bc-h3",
+            "queueArn": "arn:aws:connect:us-east-1:123:instance/abc/queue/q3",
+        }
+        executor._stop_branded_campaign(cs)
+
+        delete_kwargs = ddb.delete_item.call_args[1]
+        assert delete_kwargs.get("ConditionExpression") == "attribute_exists(pk)", (
+            "delete_item must include ConditionExpression='attribute_exists(pk)'"
+        )
+
+    def test_stop_branded_already_deleted_is_noop(self, mocker):
+        """ConditionalCheckFailedException on delete must be a no-op — another invocation
+        already cleaned up the record; the calling path must not see an exception.
+        """
+        import executor
+        from botocore.exceptions import ClientError
+
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        ddb.delete_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "already deleted"}},
+            "DeleteItem",
+        )
+        mocker.patch("executor._expire_branded_queue_items")
+
+        cs = {
+            "brandedCampaignId": "bc-h3-idem",
+            "queueArn": "arn:aws:connect:us-east-1:123:instance/abc/queue/q3",
+        }
+        # Must not raise
+        executor._stop_branded_campaign(cs)
+
+
+class TestH4PutItemConditionalCheck:
+    """H-4: ConditionalCheckFailedException on active-campaigns put_item is a no-op."""
+
+    @pytest.fixture(autouse=True)
+    def _branded_env(self, mocker):
+        mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue")
+
+    def test_start_branded_put_item_conditional_check_is_noop(self, mocker):
+        """When put_item raises ConditionalCheckFailedException (concurrent start already
+        registered the campaign), status must transition to 'running', not 'error'.
+        """
+        import executor
+        from botocore.exceptions import ClientError
+
+        run, plan, cs = _branded_run_and_plan("bc-h4")
+
+        mocker.patch(
+            "executor._create_segment",
+            return_value=("seg-h4", "arn:seg-h4"),
+        )
+        mocker.patch("executor._invoke_seeder", return_value=3)
+
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        ddb.put_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "already exists"}},
+            "PutItem",
+        )
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "running", (
+            "ConditionalCheckFailed on put_item must be a no-op — campaign proceeds to running"
+        )
+
+
+class TestH5EnvVarValidation:
+    """H-5 Part A: Missing branded env vars must set status='error'."""
+
+    def test_branded_env_var_missing_sets_error(self, mocker):
+        """When ACTIVE_BRANDED_CAMPAIGNS_TABLE or CAMPAIGN_QUEUE_TABLE_BRANDED is empty,
+        _start_one_campaign must set status='error' (ValueError caught by outer try/except).
+        """
+        import executor
+
+        run, plan, cs = _branded_run_and_plan("bc-h5")
+
+        mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "")
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "error", (
+            "Missing branded env vars must cause status='error'"
+        )
+
+
+class TestH5ConsecutivePollFailures:
+    """H-5 Part B: Consecutive branded poll failures must transition campaign to error."""
+
+    def _run_plan_cs(self, cid="bc-poll"):
+        cs = _campaign_state(cid, status="running")
+        cs["brandedCampaignId"] = cid
+        cs["queueArn"] = "arn::queue/q1"
+        cs["connectCampaignId"] = None
+        bucket = {
+            "id": "b0",
+            "name": "b0",
+            "run_mode": "status_based",
+            "duration_minutes": 30,
+            "cleanup": False,
+            "prestart_next": True,
+            "parallel": False,
+            "campaigns": [{
+                "id": cid, "name": "B", "deliveryType": "branded",
+                "campaignConfig": {"queueArn": "arn::queue/q1"},
+            }],
+            "campaignConfig": {},
+        }
+        run = {
+            "planId": "p-1", "runId": "r-1", "status": "running",
+            "bucketStates": [{"status": "running", "campaignStates": [cs],
+                              "startedAt": datetime.utcnow().isoformat()}],
+        }
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        return run, plan, cs
+
+    def test_consecutive_poll_failures_transition_to_error(self, mocker):
+        """After 5 consecutive poll failures, campaign must transition to status='error'
+        with exitReason='poll_failure' and _stop_branded_campaign called.
+        """
+        import executor
+
+        # Reset module-level counter between test runs
+        executor._branded_poll_failures.clear()
+
+        run, plan, cs = self._run_plan_cs("bc-poll-h5")
+
+        mocker.patch("executor._count_branded_queue", side_effect=Exception("DDB down"))
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_plan", return_value=plan)
+        # After the 5th failure the campaign is terminal → tick advances the
+        # bucket → run completion fans out to unlock/loop/SNS. That orchestration
+        # has its own tests; isolate this test to the poll-failure transition.
+        mocker.patch("executor._advance_bucket")
+
+        from executor import tick
+
+        for i in range(4):
+            mocker.patch("executor.get_run", return_value=run)
+            tick("p-1", "r-1", 0)
+            assert cs["status"] == "running", f"Should still be running after {i+1} failures"
+
+        # 5th failure must trigger error transition
+        mocker.patch("executor.get_run", return_value=run)
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "error", (
+            "5 consecutive poll failures must transition campaign to error"
+        )
+        assert cs["exitReason"] == "poll_failure"
+        stop.assert_called_once_with(cs)
+
+        # Counter must be cleared after transition
+        assert "bc-poll-h5" not in executor._branded_poll_failures

@@ -104,6 +104,11 @@ _PROGRESSIVE_DIALER_SEEDER_ARN: Final = os.environ.get("PROGRESSIVE_DIALER_SEEDE
 _ACTIVE_BRANDED_CAMPAIGNS_TABLE: Final = os.environ.get("ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
 _CAMPAIGN_QUEUE_TABLE_BRANDED: Final = os.environ.get("CAMPAIGN_QUEUE_TABLE_BRANDED", "")
 
+# Consecutive branded-poll failure tracking — keyed by brandedCampaignId.
+# Resets on a successful poll; campaign transitions to error after this many consecutive failures.
+_branded_poll_failures: dict[str, int] = {}
+_BRANDED_POLL_FAILURE_LIMIT: Final = 5
+
 # Pre-start window: create next-bucket campaigns this many minutes before expiry
 _PRESTART_MINUTES: Final = 5
 
@@ -280,6 +285,24 @@ def _expire_branded_queue_items(campaign_id: str) -> None:
             break
 
 
+def _safe_expire_branded_queue(campaign_id: str, context: str) -> None:
+    """Best-effort queue cleanup for branded error paths.
+
+    Skips when the queue table is not configured (e.g. the env-var guard itself
+    raised, so nothing was ever seeded) and NEVER raises — cleanup failure must
+    not mask the caller's error-status transition or escape the function.
+    """
+    if not _CAMPAIGN_QUEUE_TABLE_BRANDED:
+        return
+    try:
+        _expire_branded_queue_items(campaign_id)
+    except Exception as exc:
+        logger.error(
+            "_safe_expire_branded_queue: cleanup failed [%s] for %s: %s",
+            context, campaign_id, type(exc).__name__,
+        )
+
+
 def _stop_branded_campaign(cs: dict) -> None:
     """Remove branded campaign from VipActiveBrandedCampaigns and expire its queue.
 
@@ -299,7 +322,20 @@ def _stop_branded_campaign(cs: dict) -> None:
                 "pk": {"S": f"QUEUE#{queue_arn}"},
                 "sk": {"S": f"CAMPAIGN#{campaign_id}"},
             },
+            ConditionExpression="attribute_exists(pk)",
         )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            # Another invocation already deleted the record — idempotent no-op
+            logger.debug(
+                "_stop_branded_campaign: record already deleted for %s (ConditionalCheckFailed)",
+                campaign_id,
+            )
+        else:
+            logger.error(
+                "_stop_branded_campaign: delete failed for %s: %s",
+                campaign_id, type(exc).__name__,
+            )
     except Exception as exc:
         logger.error(
             "_stop_branded_campaign: delete failed for %s: %s",
@@ -680,7 +716,25 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                     cs["brandedCampaignId"], type(_poll_exc).__name__,
                 )
                 _emit_branded_metric("BrandedTickError")
+                _branded_poll_failures[cs["brandedCampaignId"]] = (
+                    _branded_poll_failures.get(cs["brandedCampaignId"], 0) + 1
+                )
+                if _branded_poll_failures[cs["brandedCampaignId"]] >= _BRANDED_POLL_FAILURE_LIMIT:
+                    logger.error(
+                        "tick: branded poll failed %d consecutive times for campaign %s "
+                        "— transitioning to error",
+                        _BRANDED_POLL_FAILURE_LIMIT,
+                        cs["brandedCampaignId"],
+                    )
+                    cs["status"] = "error"
+                    cs["exitReason"] = "poll_failure"
+                    cs["completedAt"] = _now_iso()
+                    _stop_branded_campaign(cs)
+                    _branded_poll_failures.pop(cs["brandedCampaignId"], None)
                 continue  # don't transition on poll error
+
+            # Successful poll — reset failure counter
+            _branded_poll_failures.pop(cs.get("brandedCampaignId"), None)
 
             if count == 0:
                 logger.info(
@@ -864,7 +918,7 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                     if cs.get("segmentName"):
                         _safe_delete_segment(cs["segmentName"])
                 # ── Branded cleanup ──
-                if cs["status"] in ("running",) and cs.get("brandedCampaignId"):
+                if cs["status"] in ("running", "creating") and cs.get("brandedCampaignId"):
                     _stop_branded_campaign(cs)
                 # ─────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
@@ -914,7 +968,7 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
                 if cs.get("segmentName"):
                     _safe_delete_segment(cs["segmentName"])
             # ── Branded cleanup ──
-            if cs["status"] == "running" and cs.get("brandedCampaignId"):
+            if cs["status"] in ("running", "creating") and cs.get("brandedCampaignId"):
                 _stop_branded_campaign(cs)
             # ─────────────────────
             if cs["status"] in ("running", "warming", "queued", "creating"):
@@ -2468,7 +2522,15 @@ def _start_one_campaign(
         cfg = campaign.get("campaignConfig", {})
         queue_arn = cfg.get("queueArn", "")
         campaign_id = cs["campaignId"]
+        # Set these early so abort/stop paths can find them even if seeder fails mid-flight
+        cs["brandedCampaignId"] = campaign_id
+        cs["queueArn"] = queue_arn
         try:
+            if not _ACTIVE_BRANDED_CAMPAIGNS_TABLE or not _CAMPAIGN_QUEUE_TABLE_BRANDED:
+                raise ValueError(
+                    "Branded env vars not configured: ACTIVE_BRANDED_CAMPAIGNS_TABLE and "
+                    "CAMPAIGN_QUEUE_TABLE_BRANDED must be set"
+                )
             seg_name, _ = _create_segment(bucket, campaign)
             seeded = _invoke_seeder(
                 campaign_id=campaign_id,
@@ -2484,6 +2546,13 @@ def _start_one_campaign(
                 type(exc).__name__,
             )
             _emit_branded_metric("BrandedSeederError")
+            # No VipActiveBrandedCampaigns record exists yet (put_item runs
+            # later), so only the queue needs clearing — calling
+            # _stop_branded_campaign here would be a redundant second expire
+            # plus a no-op conditional delete.
+            _safe_expire_branded_queue(
+                campaign_id, f"seeder[{bucket_index}/{campaign_index}]"
+            )
             cs["status"] = "error"
             cs["exitReason"] = REASON_ERROR
             cs["errorDetail"] = type(exc).__name__
@@ -2514,7 +2583,34 @@ def _start_one_campaign(
                     "createdAt":     {"S": now_iso},
                     "ttl":           {"N": str(bucket_end_epoch + 1800)},
                 },
+                ConditionExpression="attribute_not_exists(pk)",
             )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # Another invocation already registered this campaign — idempotent, treat as success
+                logger.warning(
+                    "_start_one_campaign[%d/%d]: branded active-campaigns record already exists "
+                    "for %s — concurrent start detected, proceeding",
+                    bucket_index,
+                    campaign_index,
+                    campaign_id,
+                )
+            else:
+                logger.error(
+                    "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
+                    bucket_index,
+                    campaign_index,
+                    type(exc).__name__,
+                )
+                _emit_branded_metric("BrandedStartError")
+                _safe_expire_branded_queue(
+                    campaign_id, f"ddb-write[{bucket_index}/{campaign_index}]"
+                )
+                cs["status"] = "error"
+                cs["exitReason"] = REASON_ERROR
+                cs["errorDetail"] = type(exc).__name__
+                cs["completedAt"] = now_iso
+                return
         except Exception as exc:
             logger.error(
                 "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
@@ -2523,6 +2619,9 @@ def _start_one_campaign(
                 type(exc).__name__,
             )
             _emit_branded_metric("BrandedStartError")
+            _safe_expire_branded_queue(
+                campaign_id, f"ddb-write[{bucket_index}/{campaign_index}]"
+            )
             cs["status"] = "error"
             cs["exitReason"] = REASON_ERROR
             cs["errorDetail"] = type(exc).__name__
@@ -2530,8 +2629,7 @@ def _start_one_campaign(
             return
 
         _emit_branded_metric("BrandedCampaignStarted")
-        cs["brandedCampaignId"] = campaign_id
-        cs["queueArn"] = queue_arn
+        # brandedCampaignId and queueArn already set early (before try/except)
         cs["connectCampaignId"] = None
         cs["status"] = "running"
         return

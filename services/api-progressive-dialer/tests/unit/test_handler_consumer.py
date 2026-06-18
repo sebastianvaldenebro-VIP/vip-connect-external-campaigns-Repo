@@ -232,3 +232,60 @@ class TestGsiCampaignLookup:
         handler_consumer._process_record(record)
 
         lock.acquire.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# H-8: lock released on exception between acquire and SQS send
+# ---------------------------------------------------------------------------
+
+class TestH8LockReleaseOnException:
+    """H-8: if an exception occurs after lock.acquire() succeeds, lock.release() is called."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("CAMPAIGN_QUEUE_TABLE", "VipProgressiveCampaignQueue")
+        monkeypatch.setenv("AGENT_LOCK_TABLE", "VipProgressiveAgentLocks")
+        monkeypatch.setenv("SQS_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/queue")
+        monkeypatch.setenv("CONNECT_INSTANCE_ID", "instance-1")
+        monkeypatch.setenv("ACTIVE_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        monkeypatch.setenv("FIRSTORION_SECRET_NAME", "vip/firstorion/credentials")
+        sys.modules.pop("handler_consumer", None)
+        import handler_consumer  # noqa: F401
+        yield
+        sys.modules.pop("handler_consumer", None)
+
+    def test_lock_released_on_dequeue_exception(self, mocker):
+        """If _get_queue().dequeue raises after lock is acquired, lock.release must be called
+        and the exception must propagate so Kinesis ESM retries the batch.
+        """
+        agent_arn = "arn:aws:connect:us-east-1:123:instance/abc/agent/agent-h8"
+
+        mock_ddb = mocker.patch("handler_consumer._get_ddb")
+        mock_ddb.return_value.query.return_value = {"Items": [{
+            "campaignId": {"S": "campaign-h8"},
+            "contactFlowId": {"S": "flow-abc"},
+            "sourcePhone": {"S": "+12125550199"},
+            "priority": {"N": "0"},
+            "createdAt": {"S": "2026-06-18T10:00:00"},
+        }]}
+
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.side_effect = RuntimeError("DynamoDB throttled")
+
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch("handler_consumer.extract_agent_info", return_value={
+            "agent_arn": agent_arn,
+            "queue_arn": "arn:aws:connect:us-east-1:123:instance/abc/queue/q1",
+        })
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+
+        import handler_consumer, base64, json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+
+        with pytest.raises(RuntimeError, match="DynamoDB throttled"):
+            handler_consumer._process_record(record)
+
+        lock.release.assert_called_once_with(agent_arn)

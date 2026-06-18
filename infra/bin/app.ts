@@ -148,6 +148,7 @@ const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDial
   firstOrionSecretArn,
   profilesDomainName,
   permissionsBoundaryName,
+  alertsTopicArn: `arn:aws:sns:${env.region}:${env.account}:vip-progressive-dialer-alerts`,
 });
 
 // 6. api-plans Lambda + DynamoDB plans table
