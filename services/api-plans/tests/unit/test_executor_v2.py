@@ -3574,3 +3574,149 @@ class TestInitialCampaignStateFields:
         cs = _initial_campaign_state({"id": "c-1"})
         assert "queueArn" in cs
         assert cs["queueArn"] is None
+
+
+class TestStartBrandedCampaign:
+    """_start_one_campaign with deliveryType='branded'."""
+
+    def _branded_campaign(
+        self, campaign_id: str = "bc-1", queue_arn: str = "arn:aws:connect:::queue/q1"
+    ) -> dict:
+        return {
+            "id": campaign_id,
+            "name": "Branded Test",
+            "deliveryType": "branded",
+            "campaignConfig": {
+                "dialerType": "progressive",
+                "queueArn": queue_arn,
+                "contactFlowId": "flow-abc",
+                "sourcePhone": "+19174105649",
+            },
+        }
+
+    def _make_run_with_branded(self, campaign_id: str = "bc-1"):
+        import json  # noqa: F401 — used for payload assertions in tests below
+        bucket = _bucket_def("b-branded", campaigns=[self._branded_campaign(campaign_id)])
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        cs = _campaign_state(campaign_id, status="queued")
+        run = {
+            "planId": "p-1",
+            "runId": "r-1",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+        return run, plan
+
+    def test_invokes_seeder_lambda(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 5}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        lam.invoke.assert_called_once()
+        call_kwargs = lam.invoke.call_args.kwargs or lam.invoke.call_args[1]
+        raw_payload = call_kwargs.get("Payload") or lam.invoke.call_args[0][0].get("Payload")
+        payload = json.loads(raw_payload)
+        assert payload["campaignId"] == "bc-1"
+        assert payload["segmentName"] == "seg-name"
+
+    def test_writes_vip_active_branded_campaigns(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 3}).encode())
+        }
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        ddb.put_item.assert_called_once()
+        item = ddb.put_item.call_args.kwargs["Item"]
+        assert item["pk"]["S"] == "QUEUE#arn:aws:connect:::queue/q1"
+        assert item["sk"]["S"] == "CAMPAIGN#bc-1"
+        assert item["campaignId"]["S"] == "bc-1"
+
+    def test_sets_status_running_and_branded_campaign_id(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 2}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["brandedCampaignId"] == "bc-1"
+        assert cs["queueArn"] == "arn:aws:connect:::queue/q1"
+        assert cs["connectCampaignId"] is None
+
+    def test_empty_segment_sets_completed_immediately(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 0}).encode())
+        }
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "completed"
+        ddb.put_item.assert_not_called()  # no entry written when empty
+
+    def test_seeder_error_sets_error_status(self, mocker):
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.side_effect = Exception("Lambda timeout")
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "error"
+        ddb.put_item.assert_not_called()
+
+    def test_does_not_call_create_and_start_campaign(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 1}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+        create_fn = mocker.patch("executor._create_and_start_campaign")
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        create_fn.assert_not_called()

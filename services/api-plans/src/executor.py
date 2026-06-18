@@ -99,6 +99,11 @@ PROFILES_DOMAIN_NAME: Final = os.environ.get("PROFILES_DOMAIN_NAME", "")
 LAMBDA_FUNCTION_ARN: Final = os.environ.get("LAMBDA_FUNCTION_ARN", "")
 SNS_ALERTS_TOPIC_ARN: Final = os.environ.get("SNS_ALERTS_TOPIC_ARN", "")
 
+# ── Progressive branded dialer env vars (wired in CDK at Task 9) ──────────────
+_PROGRESSIVE_DIALER_SEEDER_ARN: Final = os.environ.get("PROGRESSIVE_DIALER_SEEDER_ARN", "")
+_ACTIVE_BRANDED_CAMPAIGNS_TABLE: Final = os.environ.get("ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
+_CAMPAIGN_QUEUE_TABLE_BRANDED: Final = os.environ.get("CAMPAIGN_QUEUE_TABLE_BRANDED", "")
+
 # Pre-start window: create next-bucket campaigns this many minutes before expiry
 _PRESTART_MINUTES: Final = 5
 
@@ -131,6 +136,53 @@ def _is_branded(campaign: dict) -> bool:
     'branded'.
     """
     return campaign.get("deliveryType") == "branded"
+
+
+# ── Branded dialer boto3 singletons ──────────────────────────────────────────
+
+_lambda_client = None
+_ddb_client_branded = None
+
+
+def _get_lambda_client():
+    global _lambda_client
+    if _lambda_client is None:
+        import boto3 as _boto3
+        _lambda_client = _boto3.client("lambda")
+    return _lambda_client
+
+
+def _get_ddb_client():
+    global _ddb_client_branded
+    if _ddb_client_branded is None:
+        import boto3 as _boto3
+        _ddb_client_branded = _boto3.client("dynamodb")
+    return _ddb_client_branded
+
+
+def _invoke_seeder(
+    campaign_id: str, segment_name: str, contact_flow_id: str, source_phone: str
+) -> int:
+    """Invoke the progressive dialer seeder Lambda directly.
+
+    Returns number of contacts seeded. PHI rule: source_phone must never appear
+    in log lines — only counts and exception type names are logged.
+    """
+    import json as _json
+
+    payload = {
+        "campaignId": campaign_id,
+        "segmentName": segment_name,
+        "contactFlowId": contact_flow_id,
+        "sourcePhone": source_phone,
+    }
+    response = _get_lambda_client().invoke(
+        FunctionName=_PROGRESSIVE_DIALER_SEEDER_ARN,
+        InvocationType="RequestResponse",
+        Payload=_json.dumps(payload).encode(),
+    )
+    result = _json.loads(response["Payload"].read())
+    return int(result.get("seeded", 0))
 
 
 _CONNECT_TERMINAL: Final[dict[str, str]] = {
@@ -2200,6 +2252,73 @@ def _start_one_campaign(
     now_iso = now.isoformat()
 
     cs["startedAt"] = now_iso
+
+    # ── Branded path — bypass Connect V2 entirely ─────────────────────────────
+    if _is_branded(campaign):
+        cfg = campaign.get("campaignConfig", {})
+        queue_arn = cfg.get("queueArn", "")
+        campaign_id = cs["campaignId"]
+        try:
+            seg_name, _ = _create_segment(bucket, campaign)
+            seeded = _invoke_seeder(
+                campaign_id=campaign_id,
+                segment_name=seg_name,
+                contact_flow_id=cfg["contactFlowId"],
+                source_phone=cfg["sourcePhone"],
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded seeder failed: %s",
+                bucket_index,
+                campaign_index,
+                type(exc).__name__,
+            )
+            cs["status"] = "error"
+            cs["errorDetail"] = type(exc).__name__
+            return
+
+        if seeded == 0:
+            cs["status"] = "completed"
+            cs["exitReason"] = "empty_segment"
+            cs["completedAt"] = now_iso
+            return
+
+        # Write entry to VipActiveBrandedCampaigns
+        bucket_end_epoch = int((now + timedelta(hours=4)).timestamp())
+        try:
+            _get_ddb_client().put_item(
+                TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
+                Item={
+                    "pk":            {"S": f"QUEUE#{queue_arn}"},
+                    "sk":            {"S": f"CAMPAIGN#{campaign_id}"},
+                    "queueArn":      {"S": queue_arn},
+                    "campaignId":    {"S": campaign_id},
+                    "planId":        {"S": run["planId"]},
+                    "runId":         {"S": run["runId"]},
+                    "contactFlowId": {"S": cfg["contactFlowId"]},
+                    "sourcePhone":   {"S": cfg["sourcePhone"]},
+                    "priority":      {"N": str(campaign_index)},
+                    "createdAt":     {"S": now_iso},
+                    "ttl":           {"N": str(bucket_end_epoch + 1800)},
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
+                bucket_index,
+                campaign_index,
+                type(exc).__name__,
+            )
+            cs["status"] = "error"
+            cs["errorDetail"] = type(exc).__name__
+            return
+
+        cs["brandedCampaignId"] = campaign_id
+        cs["queueArn"] = queue_arn
+        cs["connectCampaignId"] = None
+        cs["status"] = "running"
+        return
+    # ── End branded path ──────────────────────────────────────────────────────
 
     if cs.get("connectCampaignId"):
         if cs.get("warmupStarted"):
