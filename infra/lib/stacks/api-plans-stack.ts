@@ -224,16 +224,18 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
-    // CloudWatch PutMetricData — used by prestart_check to emit stuck-run metrics
+    // CloudWatch PutMetricData — two callers, two namespaces:
+    //   'VIPPlans'                   — prestart_check stuck-run metrics (existing, do not rename)
+    //   'VipConnect/ProgressiveDialer' — branded campaign lifecycle metrics from _emit_branded_metric
     // PutMetricData does not support resource-level restrictions (resources must be '*'),
-    // but the namespace condition constrains writes to the VipConnect/Plans namespace only.
+    // so we scope with a StringEquals multi-value condition covering both namespaces.
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'CloudWatchPutMetric',
         actions: ['cloudwatch:PutMetricData'],
         resources: ['*'],
         conditions: {
-          StringEquals: { 'cloudwatch:namespace': 'VipConnect/Plans' },
+          StringEquals: { 'cloudwatch:namespace': ['VIPPlans', 'VipConnect/ProgressiveDialer'] },
         },
       }),
     );

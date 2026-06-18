@@ -147,3 +147,21 @@ alarm \
 
 echo ""
 echo "=== 14 alarmas creadas ==="
+
+# ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
+# The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the
+# CFN exec role boundary). Create once before deploying ApiProgressiveDialerStack.
+# Uncomment and run when deploying the stack for the first time:
+#
+# aws sns create-topic \
+#   --name vip-progressive-dialer-alerts \
+#   --region us-east-1 \
+#   --profile production
+#
+# Then subscribe team email:
+# aws sns subscribe \
+#   --topic-arn arn:aws:sns:us-east-1:165505826690:vip-progressive-dialer-alerts \
+#   --protocol email \
+#   --notification-endpoint ops@medwork.io \
+#   --region us-east-1 \
+#   --profile production
