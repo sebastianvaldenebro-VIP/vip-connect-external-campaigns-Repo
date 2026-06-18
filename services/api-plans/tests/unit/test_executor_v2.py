@@ -3540,3 +3540,107 @@ def test_apply_plan_to_run_live_plan_shorter():
 
     # b1 (index 1) is queued but beyond live_plan length — keep original
     assert result["planSnapshot"]["buckets"][1]["duration_minutes"] == 45
+
+
+# ── Non-working-day pre-warm cleanup ─────────────────────────────────────────
+
+
+def test_scheduled_run_outside_hours_cleans_up_orphaned_campaigns():
+    """scheduled_run on a non-working day stops and deletes pre-warmed Connect campaigns."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["workingHours"] = {"days": ["MON", "TUE", "WED", "THU", "FRI", "SAT"], "startTime": "07:00", "endTime": "19:00"}
+    plan["pendingWarmup"] = {
+        "createdAt": "2026-06-07T11:54:00+00:00",
+        "campaigns": [
+            {"campaignId": "c0", "connectCampaignId": "conn-1", "segmentName": "7-6-26-NY-foo"},
+            {"campaignId": "c1", "connectCampaignId": "conn-2", "segmentName": "7-6-26-NJ-foo"},
+        ],
+    }
+
+    stopped, deleted, segs_deleted = [], [], []
+    # Sunday COT — not in ['MON'..'SAT']
+    sunday = datetime(2026, 6, 7, 8, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+
+    with (
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.get_plan", return_value=plan),
+        patch("executor.datetime") as mock_dt,
+        patch("executor._safe_stop_campaign", side_effect=stopped.append),
+        patch("executor._safe_delete_campaign", side_effect=deleted.append),
+        patch("executor._safe_delete_segment", side_effect=segs_deleted.append),
+        patch("executor.update_plan_pending_warmup") as mock_clear,
+    ):
+        mock_dt.now.return_value = sunday
+        mock_dt.fromisoformat = datetime.fromisoformat
+        result = executor.scheduled_run("plan-1")
+
+    assert result["reason"] == "outside_working_hours"
+    assert sorted(stopped) == ["conn-1", "conn-2"]
+    assert sorted(deleted) == ["conn-1", "conn-2"]
+    assert sorted(segs_deleted) == ["7-6-26-NJ-foo", "7-6-26-NY-foo"]
+    mock_clear.assert_called_once_with("plan-1", None)
+
+
+def test_prestart_check_skips_non_working_day():
+    """prestart_check does not pre-warm plans on days outside their workingHours.days."""
+    import executor
+    from unittest.mock import MagicMock
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["planId"] = "plan-sunday"
+    plan["trigger"] = {"type": "time", "time": "07:00"}
+    plan["workingHours"] = {"days": ["MON", "TUE", "WED", "THU", "FRI", "SAT"], "startTime": "07:00", "endTime": "19:00"}
+
+    # Sunday at 06:54 COT — trigger is 6 minutes away but today is not a working day
+    sunday_cot = datetime(2026, 6, 7, 6, 54, 0, tzinfo=timezone(timedelta(hours=-5)))
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.datetime") as mock_dt,
+        patch("executor._prestart_plan") as mock_warm,
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.get_plan", return_value=None),
+        patch("executor.boto3") as mock_boto3,
+    ):
+        mock_boto3.client.return_value = MagicMock()
+        mock_dt.now.return_value = sunday_cot
+        mock_dt.fromisoformat = datetime.fromisoformat
+        executor.prestart_check()
+
+    mock_warm.assert_not_called()
+
+
+# ── _is_branded ──────────────────────────────────────────────────────────────
+
+class TestIsBranded:
+    def test_returns_true_for_branded_delivery_type(self):
+        from executor import _is_branded
+        assert _is_branded({"deliveryType": "branded"}) is True
+
+    def test_returns_false_for_connect_campaign(self):
+        from executor import _is_branded
+        assert _is_branded({"campaignConfig": {"dialerType": "progressive"}}) is False
+
+    def test_returns_false_when_delivery_type_absent(self):
+        from executor import _is_branded
+        assert _is_branded({}) is False
+
+    def test_returns_false_for_other_delivery_type(self):
+        from executor import _is_branded
+        assert _is_branded({"deliveryType": "journey"}) is False
+
+
+class TestInitialCampaignStateFields:
+    def test_branded_campaign_id_initialized_to_none(self):
+        from store import _initial_campaign_state
+        cs = _initial_campaign_state({"id": "c-1"})
+        assert "brandedCampaignId" in cs
+        assert cs["brandedCampaignId"] is None
+
+    def test_queue_arn_initialized_to_none(self):
+        from store import _initial_campaign_state
+        cs = _initial_campaign_state({"id": "c-1"})
+        assert "queueArn" in cs
+        assert cs["queueArn"] is None
