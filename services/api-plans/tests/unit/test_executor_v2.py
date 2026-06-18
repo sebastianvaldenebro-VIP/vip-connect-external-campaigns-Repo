@@ -3542,9 +3542,6 @@ def test_apply_plan_to_run_live_plan_shorter():
     assert result["planSnapshot"]["buckets"][1]["duration_minutes"] == 45
 
 
-# ── Non-working-day pre-warm cleanup ─────────────────────────────────────────
-
-
 # ── _is_branded ──────────────────────────────────────────────────────────────
 
 class TestIsBranded:

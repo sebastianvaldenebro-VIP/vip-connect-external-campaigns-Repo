@@ -132,6 +132,7 @@ def _is_branded(campaign: dict) -> bool:
     """
     return campaign.get("deliveryType") == "branded"
 
+
 _CONNECT_TERMINAL: Final[dict[str, str]] = {
     "Completed": REASON_COMPLETED,
     "Stopped": REASON_STOPPED,
