@@ -321,24 +321,6 @@ def scheduled_run(plan_id: str) -> dict:
     if plan.get("isTemplate") or plan.get("is_template"):
         return {"ok": True, "reason": "is_template"}
     if not _within_working_hours(plan):
-        # Clean up any campaigns that were pre-warmed on a non-working day.
-        # prestart_check fires daily without a working-day guard, so it may have
-        # created and started Connect campaigns that no run will ever consume.
-        # Stop + delete them now so they don't accumulate as orphans in Connect.
-        pending = plan.get("pendingWarmup")
-        if pending:
-            for c in pending.get("campaigns", []):
-                if c.get("connectCampaignId"):
-                    _safe_stop_campaign(c["connectCampaignId"])
-                    _safe_delete_campaign(c["connectCampaignId"])
-                if c.get("segmentName"):
-                    _safe_delete_segment(c["segmentName"])
-            update_plan_pending_warmup(plan_id, None)
-            _slog.info(
-                "scheduled_run_outside_hours_warmup_cleaned",
-                plan_id=plan_id,
-                campaigns_deleted=len(pending.get("campaigns", [])),
-            )
         _slog.info("scheduled_run_outside_hours", plan_id=plan_id)
         return {"ok": True, "reason": "outside_working_hours"}
     run = start_run(plan_id, triggered_by="scheduled")
@@ -1804,13 +1786,6 @@ def prestart_check() -> dict:
             # Pre-warm if trigger is 4–6 minutes away (5 ± 1 tolerance)
             delta = trigger_hhmm - now_hhmm
             if 4 <= delta <= 6:
-                if not _is_working_day(plan):
-                    _slog.info(
-                        "prestart_check_skipped_non_working_day",
-                        plan_id=plan["planId"],
-                        plan_name=plan.get("name"),
-                    )
-                    continue
                 _slog.info(
                     "prestart_check_warming_plan",
                     plan_id=plan["planId"],
@@ -3169,23 +3144,6 @@ def _within_working_hours(plan: dict) -> bool:
 
     now_min = now_cot.hour * 60 + now_cot.minute
     return hhmm(start) <= now_min < hhmm(end)
-
-
-def _is_working_day(plan: dict) -> bool:
-    """Return True if today (COT) is in the plan's allowed days.
-
-    Unlike _within_working_hours, this only checks the day-of-week and ignores
-    the start/end time. Used by prestart_check so it doesn't pre-warm plans on
-    days when the scheduled run will be rejected as outside_working_hours.
-    """
-    wh = plan.get("workingHours")
-    if not wh:
-        return True
-    allowed_days = wh.get("days") or []
-    if not allowed_days:
-        return True
-    now_cot = datetime.now(_COT_TZ)
-    return _DAY_ABBR[now_cot.weekday()] in allowed_days
 
 
 _cached_account_id: str | None = None
