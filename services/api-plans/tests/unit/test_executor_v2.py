@@ -3720,3 +3720,65 @@ class TestStartBrandedCampaign:
         _start_one_campaign(run, plan, 0, 0)
 
         create_fn.assert_not_called()
+
+
+# ── TestTickBrandedPoll ───────────────────────────────────────────────────────
+
+
+class TestTickBrandedPoll:
+    def _run_with_running_branded(self, campaign_id="bc-1"):
+        cs = _campaign_state(campaign_id, status="running")
+        cs["brandedCampaignId"] = campaign_id
+        cs["queueArn"] = "arn::queue/q1"
+        cs["connectCampaignId"] = None
+        bucket = _bucket_def("b-1", campaigns=[{
+            "id": campaign_id, "name": "B", "deliveryType": "branded",
+            "campaignConfig": {"queueArn": "arn::queue/q1"},
+        }])
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs],
+                                  "startedAt": datetime.utcnow().isoformat()}]}
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        return run, plan, cs
+
+    def test_completes_branded_when_queue_empty(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", return_value=0)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor._advance_bucket")
+        mocker.patch("executor._fire_campaign_chains")
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "completed"
+        stop.assert_called_once_with(cs)
+
+    def test_does_not_poll_connect_v2_for_branded(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", return_value=5)
+        poll = mocker.patch("executor._poll_campaign_state")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        poll.assert_not_called()
+        assert cs["status"] == "running"  # still running, queue has 5 items
+
+    def test_count_error_does_not_transition_status(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", side_effect=Exception("DDB error"))
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+
+        from executor import tick
+        tick("p-1", "r-1", 0)  # must not raise
+
+        assert cs["status"] == "running"  # unchanged on poll error

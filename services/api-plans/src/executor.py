@@ -160,6 +160,33 @@ def _get_ddb_client():
     return _ddb_client_branded
 
 
+def _count_branded_queue(campaign_id: str) -> int:
+    """Count PENDING+DISPATCHING items in VipProgressiveCampaignQueue for this campaign.
+
+    Uses eventual consistency — a count of 0 means the queue is drained.
+    Callers must handle exceptions (transient DDB errors) without transitioning state.
+    """
+    ddb = _get_ddb_client()
+    resp = ddb.query(
+        TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+        KeyConditionExpression="campaignId = :c",
+        FilterExpression="#s IN (:p, :d)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":c": {"S": campaign_id},
+            ":p": {"S": "PENDING"},
+            ":d": {"S": "DISPATCHING"},
+        },
+        Select="COUNT",
+    )
+    return resp.get("Count", 0)
+
+
+def _stop_branded_campaign(cs: dict) -> None:
+    """Stub — full implementation in Task 7."""
+    pass
+
+
 def _invoke_seeder(
     campaign_id: str, segment_name: str, contact_flow_id: str, source_phone: str
 ) -> int:
@@ -508,6 +535,27 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                             _dur,
                         )
                         _safe_stop_campaign(cs["connectCampaignId"])
+
+        elif cs.get("brandedCampaignId") and cs["status"] == "running":
+            # Branded campaign: poll VipProgressiveCampaignQueue instead of Connect
+            try:
+                count = _count_branded_queue(cs["brandedCampaignId"])
+            except Exception as _poll_exc:
+                logger.warning(
+                    "tick: branded queue poll failed for %s: %s",
+                    cs["brandedCampaignId"], type(_poll_exc).__name__,
+                )
+                continue  # don't transition on poll error
+
+            if count == 0:
+                logger.info(
+                    "tick: branded campaign %s queue drained — completing",
+                    cs["brandedCampaignId"],
+                )
+                cs["status"] = "completed"
+                cs["exitReason"] = "queue_drained"
+                cs["completedAt"] = _now_iso()
+                _stop_branded_campaign(cs)
 
     # Fire plans triggered by a specific campaign completing
     newly_completed = {
