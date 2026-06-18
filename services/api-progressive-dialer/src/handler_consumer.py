@@ -113,15 +113,23 @@ def _emit_metric(metric_name: str, value: float = 1.0) -> None:
 def _get_active_campaigns(queue_arn: str) -> list[dict]:
     """Query VipActiveBrandedCampaigns GSI for all active campaigns on this queue.
 
+    Paginates through all pages so queues with many campaigns are fully retrieved.
     Returns items sorted by priority ASC then createdAt ASC (oldest high-priority first).
     """
-    resp = _get_ddb().query(
+    items: list[dict] = []
+    kwargs = dict(
         TableName=_ACTIVE_CAMPAIGNS_TABLE,
         IndexName=_ACTIVE_CAMPAIGNS_GSI,
         KeyConditionExpression="queueArn = :q",
         ExpressionAttributeValues={":q": {"S": queue_arn}},
     )
-    items = resp.get("Items", [])
+    while True:
+        resp = _get_ddb().query(**kwargs)
+        items.extend(resp.get("Items", []))
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
     return sorted(
         items,
         key=lambda x: (int(x["priority"]["N"]), x["createdAt"]["S"]),
