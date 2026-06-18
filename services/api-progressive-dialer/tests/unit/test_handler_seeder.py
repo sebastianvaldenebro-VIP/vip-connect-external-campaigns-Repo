@@ -186,3 +186,52 @@ def test_lambda_handler_success_seeds_contacts():
     assert body["profilesFound"] == 2
     assert body["contactsWithPhone"] == 2
     assert mock_batch_writer.put_item.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — direct Lambda invocation (not via API Gateway)
+# ---------------------------------------------------------------------------
+
+class TestDirectInvocation:
+    """Seeder invoked directly from executor Lambda (not via API Gateway)."""
+
+    def test_direct_payload_extracts_campaign_id(self, mocker):
+        mock_cp = MagicMock()
+        mock_cp.get_segment_definition.return_value = {
+            "SegmentGroups": {
+                "Groups": [{
+                    "Dimensions": [{
+                        "ProfileAttributes": {
+                            "Attributes": {
+                                "ID": {"DimensionType": "INCLUSIVE", "Values": ["p1"]}
+                            }
+                        }
+                    }]
+                }]
+            }
+        }
+        mock_cp.batch_get_profile.return_value = {
+            "Profiles": [{"ProfileId": "p1", "PhoneNumber": "+15551234567"}],
+            "Errors": [],
+        }
+        mocker.patch("handler_seeder._get_cp", return_value=mock_cp)
+        mock_table = MagicMock()
+        mock_batch_writer = MagicMock()
+        mock_table.batch_writer.return_value.__enter__ = MagicMock(return_value=mock_batch_writer)
+        mock_table.batch_writer.return_value.__exit__ = MagicMock(return_value=False)
+        mocker.patch("handler_seeder._get_table", return_value=mock_table)
+
+        event = {
+            "campaignId": "camp-direct-001",
+            "segmentName": "test-segment",
+            "contactFlowId": "flow-abc",
+            "sourcePhone": "+19174105649",
+        }
+        result = handler_seeder.lambda_handler(event, None)
+        assert result == {"seeded": 1}
+
+    def test_direct_payload_missing_campaign_id_returns_400_compatible(self, mocker):
+        event = {"segmentName": "test-segment"}
+        result = handler_seeder.lambda_handler(event, None)
+        # Direct invocations return dict, not HTTP response — raise on missing id
+        assert "error" in result or result.get("statusCode") == 400
