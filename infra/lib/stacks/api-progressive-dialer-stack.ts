@@ -3,11 +3,13 @@ import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
@@ -25,6 +27,8 @@ export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
   /** Comma-separated queue ARNs to filter agents. Empty = all queues. */
   readonly allowedQueueArns?: string;
   readonly permissionsBoundaryName?: string;
+  /** Optional SNS topic ARN to receive alarm notifications. */
+  readonly alertsTopicArn?: string;
 }
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
@@ -351,7 +355,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     });
 
     // 3. Caller Lambda errors > 5 in 5min — some errors expected from throttle retries
-    new cloudwatch.Alarm(this, 'CallerErrorAlarm', {
+    const callerErrorAlarm = new cloudwatch.Alarm(this, 'CallerErrorAlarm', {
       alarmName: 'vip-progressive-dialer-caller-errors',
       alarmDescription: 'Caller Lambda errors — StartOutboundVoiceContact failures beyond retries',
       metric: callerFn.metricErrors({
@@ -365,7 +369,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     });
 
     // 4. Connect throttle metric (custom) — emitted by handler_caller.py on TooManyRequestsException
-    new cloudwatch.Alarm(this, 'ConnectThrottleAlarm', {
+    const throttleAlarm = new cloudwatch.Alarm(this, 'ConnectThrottleAlarm', {
       alarmName: 'vip-progressive-dialer-connect-throttle',
       alarmDescription: 'Connect StartOutboundVoiceContact throttled — check dial concurrency',
       metric: new cloudwatch.Metric({
@@ -382,7 +386,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     });
 
     // 5. First Orion push failures (custom) — emitted by handler_consumer.py
-    new cloudwatch.Alarm(this, 'FirstOrionFailAlarm', {
+    const firstOrionAlarm = new cloudwatch.Alarm(this, 'FirstOrionFailAlarm', {
       alarmName: 'vip-progressive-dialer-firstorion-failures',
       alarmDescription: 'First Orion INFORM push failures — calls going out without branding',
       metric: new cloudwatch.Metric({
@@ -397,6 +401,14 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
+
+    // Wire SNS alarm actions when an alertsTopicArn is provided
+    if (props.alertsTopicArn) {
+      const alertsTopic = sns.Topic.fromTopicArn(this, 'AlertsTopic', props.alertsTopicArn);
+      [dlqAlarm, consumerErrorAlarm, callerErrorAlarm, throttleAlarm, firstOrionAlarm].forEach(alarm => {
+        alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alertsTopic));
+      });
+    }
 
     // ── Outputs ───────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'CampaignQueueTableName', { value: campaignQueueTable.tableName });
