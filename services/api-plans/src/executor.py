@@ -2457,7 +2457,7 @@ def _start_one_campaign(
             return
 
         # Write entry to VipActiveBrandedCampaigns
-        bucket_end_epoch = int((now + timedelta(hours=4)).timestamp())
+        bucket_end_epoch = int((now + timedelta(hours=24)).timestamp())
         try:
             _get_ddb_client().put_item(
                 TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
