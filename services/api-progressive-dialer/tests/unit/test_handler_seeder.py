@@ -230,8 +230,8 @@ class TestDirectInvocation:
         result = handler_seeder.lambda_handler(event, None)
         assert result == {"seeded": 1}
 
-    def test_direct_payload_missing_campaign_id_returns_400_compatible(self, mocker):
+    def test_direct_payload_missing_campaign_id_raises_value_error(self):
+        """Direct-invoke with no campaignId must raise ValueError (not return a 400 dict)."""
         event = {"segmentName": "test-segment"}
-        result = handler_seeder.lambda_handler(event, None)
-        # Direct invocations return dict, not HTTP response — raise on missing id
-        assert "error" in result or result.get("statusCode") == 400
+        with pytest.raises(ValueError, match="missing campaignId"):
+            handler_seeder.lambda_handler(event, None)

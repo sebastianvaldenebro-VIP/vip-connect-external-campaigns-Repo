@@ -86,8 +86,6 @@ def lambda_handler(event: dict, _context) -> dict:
     if "pathParameters" in event:                    # HTTP shape (API Gateway)
         path_params = event.get("pathParameters") or {}
         campaign_id = path_params.get("id")
-        if not campaign_id:
-            return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
         body: dict = {}
         raw = event.get("body")
         if raw:
@@ -98,10 +96,13 @@ def lambda_handler(event: dict, _context) -> dict:
         _http_mode = True
     else:                                            # Direct Lambda invocation shape
         campaign_id = event.get("campaignId")
-        if not campaign_id:
-            return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
         body = event
         _http_mode = False
+
+    if not campaign_id:
+        if _http_mode:
+            return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
+        raise ValueError("missing campaignId in direct-invoke payload")
 
     segment_name = body.get("segmentName")
     if not segment_name:
