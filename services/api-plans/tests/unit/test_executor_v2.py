@@ -3755,6 +3755,8 @@ class TestTickBrandedPoll:
         tick("p-1", "r-1", 0)
 
         assert cs["status"] == "completed"
+        assert cs["exitReason"] == "queue_drained"
+        assert cs.get("completedAt") is not None
         stop.assert_called_once_with(cs)
 
     def test_does_not_poll_connect_v2_for_branded(self, mocker):
