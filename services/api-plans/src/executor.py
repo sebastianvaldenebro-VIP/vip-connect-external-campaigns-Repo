@@ -809,6 +809,10 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                     _safe_delete_campaign(cs["connectCampaignId"])
                     if cs.get("segmentName"):
                         _safe_delete_segment(cs["segmentName"])
+                # ── Branded cleanup ──
+                if cs["status"] in ("running",) and cs.get("brandedCampaignId"):
+                    _stop_branded_campaign(cs)
+                # ─────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
                     cs["status"] = "cancelled"
                     cs["exitReason"] = REASON_ABORTED
@@ -855,6 +859,10 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
                 _safe_delete_campaign(cs["connectCampaignId"])
                 if cs.get("segmentName"):
                     _safe_delete_segment(cs["segmentName"])
+            # ── Branded cleanup ──
+            if cs["status"] == "running" and cs.get("brandedCampaignId"):
+                _stop_branded_campaign(cs)
+            # ─────────────────────
             if cs["status"] in ("running", "warming", "queued", "creating"):
                 cs["status"] = "completed"
                 cs["exitReason"] = "force_finished"
@@ -1075,6 +1083,7 @@ def force_start_campaign(
     # campaign but the final save_run crashes, tick recovery sees null and safely resets to queued
     # (no stale ID pointing at a deleted campaign, which would cause a spurious error state).
     old_connect_id = cs.get("connectCampaignId")
+    old_branded_id = cs.get("brandedCampaignId")
     cs["status"] = "creating"
     cs["creatingAt"] = _now_iso()
     cs["exitReason"] = None
@@ -1090,6 +1099,8 @@ def force_start_campaign(
     if old_connect_id:
         _safe_stop_campaign(old_connect_id)
         _safe_delete_campaign(old_connect_id)
+    if old_branded_id:
+        _stop_branded_campaign({"brandedCampaignId": old_branded_id, "queueArn": cs.get("queueArn")})
 
     # Phase 3: create new Connect campaign
     cs["status"] = "queued"  # _start_one_campaign expects "queued"
@@ -1207,6 +1218,8 @@ def skip_campaign(
 
         if cs.get("connectCampaignId") and cs["status"] == "running":
             _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("brandedCampaignId") and cs["status"] == "running":
+            _stop_branded_campaign(cs)
 
         cs["status"] = "cancelled"
         cs["exitReason"] = "skipped"
@@ -1266,6 +1279,8 @@ def force_stop_campaign(
 
         if cs.get("connectCampaignId"):
             _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("brandedCampaignId"):
+            _stop_branded_campaign(cs)
         cs["status"] = "expired"
         cs["exitReason"] = "manually_stopped"
         cs["completedAt"] = _now_iso()
@@ -1639,6 +1654,8 @@ def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
         if cs["status"] == "running":
             if cs.get("connectCampaignId"):
                 _safe_stop_campaign(cs["connectCampaignId"])
+            if cs.get("brandedCampaignId"):
+                _stop_branded_campaign(cs)
             cs["status"] = "expired"
             cs["exitReason"] = REASON_EXPIRED
             cs["completedAt"] = now

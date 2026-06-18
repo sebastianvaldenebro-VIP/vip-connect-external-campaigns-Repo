@@ -3971,3 +3971,117 @@ class TestTickBrandedPoll:
         tick("p-1", "r-1", 0)  # must not raise
 
         assert cs["status"] == "running"  # unchanged on poll error
+
+
+class TestAbortStopCallsStopBranded:
+    def _cs_branded(self, cid="bc-1"):
+        return {
+            "campaignId": cid, "brandedCampaignId": cid,
+            "queueArn": "arn::queue/q1", "status": "running",
+        }
+
+    def test_abort_run_stops_branded_campaign(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import abort_run
+        abort_run("p-1", "r-1")
+
+        stop.assert_called_once_with(cs)
+
+    def test_abort_run_no_branded_campaign_id_does_not_call_stop(self, mocker):
+        cs = {"campaignId": "c-1", "status": "running"}
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import abort_run
+        abort_run("p-1", "r-1")
+
+        stop.assert_not_called()
+
+    def test_expire_bucket_stops_branded_campaign(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor._advance_bucket")
+
+        from executor import _expire_bucket
+        _expire_bucket(run, plan, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_expire_bucket_queued_does_not_stop_branded(self, mocker):
+        cs = {**self._cs_branded(), "status": "queued"}
+        run = {"planId": "p-1", "runId": "r-1",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor._advance_bucket")
+
+        from executor import _expire_bucket
+        _expire_bucket(run, plan, 0)
+
+        stop.assert_not_called()
+
+    def test_force_stop_campaign_stops_branded(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor.get_plan", return_value={"planId": "p-1", "buckets": [_bucket_def("b-1", [])]})
+        mocker.patch("executor._all_campaigns_terminal", return_value=False)
+
+        from executor import force_stop_campaign
+        force_stop_campaign("p-1", "r-1", 0, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_skip_campaign_stops_branded_when_running(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_plan", return_value={"planId": "p-1", "buckets": [_bucket_def("b-1", [])]})
+        mocker.patch("executor._all_campaigns_terminal", return_value=False)
+        mocker.patch("executor._dispatch_ready_campaigns", return_value=False)
+
+        from executor import skip_campaign
+        skip_campaign("p-1", "r-1", 0, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_force_finish_internal_stops_branded(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import _force_finish_internal
+        _force_finish_internal(run, plan)
+
+        stop.assert_called_once_with(cs)
