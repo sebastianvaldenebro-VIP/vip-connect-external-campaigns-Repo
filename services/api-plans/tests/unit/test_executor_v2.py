@@ -3590,7 +3590,7 @@ class TestStartBrandedCampaign:
                 "dialerType": "progressive",
                 "queueArn": queue_arn,
                 "contactFlowId": "flow-abc",
-                "sourcePhone": "+19174105649",
+                "sourcePhone": "+12125550199",
             },
         }
 

@@ -75,7 +75,7 @@ def test_dispatches_contact_when_agent_available():
         mock_ddb.query.return_value = {"Items": [{
             "campaignId": {"S": "campaign-1"},
             "contactFlowId": {"S": "flow-1"},
-            "sourcePhone": {"S": "+19174105649"},
+            "sourcePhone": {"S": "+12125550199"},
             "priority": {"N": "0"},
             "createdAt": {"S": "2026-06-18T10:00:00"},
         }]}
@@ -126,7 +126,7 @@ def test_lambda_handler_propagates_processing_error():
         mock_ddb.query.return_value = {"Items": [{
             "campaignId": {"S": "campaign-1"},
             "contactFlowId": {"S": "flow-1"},
-            "sourcePhone": {"S": "+19174105649"},
+            "sourcePhone": {"S": "+12125550199"},
             "priority": {"N": "0"},
             "createdAt": {"S": "2026-06-18T10:00:00"},
         }]}
@@ -169,7 +169,7 @@ class TestGsiCampaignLookup:
         return {
             "campaignId": {"S": campaign_id},
             "contactFlowId": {"S": "flow-abc"},
-            "sourcePhone": {"S": "+19174105649"},
+            "sourcePhone": {"S": "+12125550199"},
             "priority": {"N": str(priority)},
             "createdAt": {"S": created_at},
         }

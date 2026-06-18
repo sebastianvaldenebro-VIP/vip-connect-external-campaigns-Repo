@@ -22,7 +22,7 @@ def test_dial_returns_contact_id_on_success():
 def test_dial_passes_correct_params():
     caller, mock_boto = _make_caller()
     mock_boto.start_outbound_voice_contact.return_value = {"ContactId": "contact-001"}
-    caller.dial(destination_phone="+15551234567", queue_id="queue-001", source_phone="+19174105649")
+    caller.dial(destination_phone="+15551234567", queue_id="queue-001", source_phone="+12125550199")
 
     call_kwargs = mock_boto.start_outbound_voice_contact.call_args[1]
     assert call_kwargs["InstanceId"] == INSTANCE_ID

@@ -225,7 +225,7 @@ class TestDirectInvocation:
             "campaignId": "camp-direct-001",
             "segmentName": "test-segment",
             "contactFlowId": "flow-abc",
-            "sourcePhone": "+19174105649",
+            "sourcePhone": "+12125550199",
         }
         result = handler_seeder.lambda_handler(event, None)
         assert result == {"seeded": 1}
