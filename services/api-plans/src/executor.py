@@ -160,14 +160,36 @@ def _get_ddb_client():
     return _ddb_client_branded
 
 
+def _emit_branded_metric(metric_name: str, value: float = 1.0) -> None:
+    """Emit a count metric to VipConnect/ProgressiveDialer for branded dialer events.
+
+    Fire-and-forget — failures are logged but never raised so metric emission
+    never interrupts plan execution.
+    """
+    try:
+        import boto3 as _boto3
+        _boto3.client("cloudwatch").put_metric_data(
+            Namespace="VipConnect/ProgressiveDialer",
+            MetricData=[{
+                "MetricName": metric_name,
+                "Value": value,
+                "Unit": "Count",
+                "Dimensions": [{"Name": "DeliveryType", "Value": "branded"}],
+            }],
+        )
+    except Exception as exc:
+        logger.warning("_emit_branded_metric %s failed: %s", metric_name, type(exc).__name__)
+
+
 def _count_branded_queue(campaign_id: str) -> int:
     """Count PENDING+DISPATCHING items in VipProgressiveCampaignQueue for this campaign.
 
+    Paginates through all pages so large queues are correctly counted.
     Uses eventual consistency — a count of 0 means the queue is drained.
     Callers must handle exceptions (transient DDB errors) without transitioning state.
     """
     ddb = _get_ddb_client()
-    resp = ddb.query(
+    kwargs = dict(
         TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
         KeyConditionExpression="campaignId = :c",
         FilterExpression="#s IN (:p, :d)",
@@ -179,10 +201,17 @@ def _count_branded_queue(campaign_id: str) -> int:
         },
         Select="COUNT",
     )
-    # Select=COUNT without pagination is safe: Count > 0 (partial page) still correctly
-    # blocks completion; Count == 0 (empty page) only occurs when there are genuinely no
-    # matching items (DDB returns Count=0, no LastEvaluatedKey, for empty result sets).
-    return resp.get("Count", 0)
+    total = 0
+    while True:
+        resp = ddb.query(**kwargs)
+        total += resp.get("Count", 0)
+        if total > 0:
+            return total  # early exit — non-zero means not drained
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return total
 
 
 def _expire_branded_queue_items(campaign_id: str) -> None:
@@ -259,7 +288,8 @@ def _stop_branded_campaign(cs: dict) -> None:
     """
     campaign_id = cs.get("brandedCampaignId")
     queue_arn = cs.get("queueArn")
-    if not campaign_id:
+    if not campaign_id or not queue_arn:
+        logger.warning("_stop_branded_campaign: missing campaign_id or queue_arn, skipping")
         return
 
     try:
@@ -649,6 +679,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                     "tick: branded queue poll failed for %s: %s",
                     cs["brandedCampaignId"], type(_poll_exc).__name__,
                 )
+                _emit_branded_metric("BrandedTickError")
                 continue  # don't transition on poll error
 
             if count == 0:
@@ -660,6 +691,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 cs["exitReason"] = "queue_drained"
                 cs["completedAt"] = _now_iso()
                 _stop_branded_campaign(cs)
+                _emit_branded_metric("BrandedCampaignCompleted")
 
     # Fire plans triggered by a specific campaign completing
     newly_completed = {
@@ -1106,6 +1138,7 @@ def force_start_campaign(
     # (no stale ID pointing at a deleted campaign, which would cause a spurious error state).
     old_connect_id = cs.get("connectCampaignId")
     old_branded_id = cs.get("brandedCampaignId")
+    old_queue_arn = cs.get("queueArn")
     cs["status"] = "creating"
     cs["creatingAt"] = _now_iso()
     cs["exitReason"] = None
@@ -1115,6 +1148,8 @@ def force_start_campaign(
     cs["connectCampaignId"] = None
     cs["segmentArn"] = None
     cs["segmentName"] = None
+    cs["brandedCampaignId"] = None
+    cs["queueArn"] = None
     save_run(run)  # raises ConcurrentWriteError if another tick already updated
 
     # Phase 2: clean up stale Connect campaign AFTER claim is persisted.
@@ -1122,7 +1157,7 @@ def force_start_campaign(
         _safe_stop_campaign(old_connect_id)
         _safe_delete_campaign(old_connect_id)
     if old_branded_id:
-        _stop_branded_campaign({"brandedCampaignId": old_branded_id, "queueArn": cs.get("queueArn")})
+        _stop_branded_campaign({"brandedCampaignId": old_branded_id, "queueArn": old_queue_arn})
 
     # Phase 3: create new Connect campaign
     cs["status"] = "queued"  # _start_one_campaign expects "queued"
@@ -1142,6 +1177,8 @@ def force_start_campaign(
             "errorDetail",
             "completedAt",
             "reconcileRetries",
+            "brandedCampaignId",
+            "queueArn",
         )
     }
 
@@ -2446,8 +2483,11 @@ def _start_one_campaign(
                 campaign_index,
                 type(exc).__name__,
             )
+            _emit_branded_metric("BrandedSeederError")
             cs["status"] = "error"
+            cs["exitReason"] = REASON_ERROR
             cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
             return
 
         if seeded == 0:
@@ -2482,10 +2522,14 @@ def _start_one_campaign(
                 campaign_index,
                 type(exc).__name__,
             )
+            _emit_branded_metric("BrandedStartError")
             cs["status"] = "error"
+            cs["exitReason"] = REASON_ERROR
             cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
             return
 
+        _emit_branded_metric("BrandedCampaignStarted")
         cs["brandedCampaignId"] = campaign_id
         cs["queueArn"] = queue_arn
         cs["connectCampaignId"] = None
