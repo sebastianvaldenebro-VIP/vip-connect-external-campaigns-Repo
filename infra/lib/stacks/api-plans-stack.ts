@@ -26,7 +26,11 @@ export interface ApiPlansStackProps extends cdk.StackProps {
     host: string;
     port: number;
     team: string;
+    passwordSecretArn?: string;
   };
+  readonly progressiveCampaignQueueTable?: dynamodb.ITable;
+  readonly activeBrandedCampaignsTable?: dynamodb.ITable;
+  readonly progressiveDialerSeederArn?: string;
 }
 
 export class ApiPlansStack extends cdk.Stack {
@@ -234,6 +238,36 @@ export class ApiPlansStack extends cdk.Stack {
 
     props.dataKey.grantEncryptDecrypt(role);
 
+    // #003 — Redis AUTH: grant Secrets Manager read when a password secret is configured
+    if (props.redis.passwordSecretArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'RedisPasswordSecret',
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [props.redis.passwordSecretArn],
+        }),
+      );
+    }
+
+    // ── Progressive Branded Dialer — executor access ─────────────────
+    if (props.progressiveCampaignQueueTable) {
+      props.progressiveCampaignQueueTable.grantReadWriteData(role);
+    }
+
+    if (props.activeBrandedCampaignsTable) {
+      props.activeBrandedCampaignsTable.grantReadWriteData(role);
+    }
+
+    if (props.progressiveDialerSeederArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeProgressiveDialerSeeder',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.progressiveDialerSeederArn],
+        }),
+      );
+    }
+
     // ── Lambda function ──────────────────────────────────────────────
     const sharedLayer = buildSharedLayer(this);
     this.lambdaFunction = new lambda.Function(this, 'FunctionPlans', {
@@ -282,6 +316,33 @@ export class ApiPlansStack extends cdk.Stack {
       'LAMBDA_FUNCTION_ARN',
       `arn:aws:lambda:${this.region}:${this.account}:function:vip-admin-ui-api-plans`,
     );
+
+    // #003 — inject Redis AUTH secret ARN when configured
+    if (props.redis.passwordSecretArn) {
+      this.lambdaFunction.addEnvironment('REDIS_PASSWORD_SECRET_ARN', props.redis.passwordSecretArn);
+    }
+
+    // Progressive Branded Dialer — inject table names and seeder ARN
+    if (props.progressiveCampaignQueueTable) {
+      this.lambdaFunction.addEnvironment(
+        'CAMPAIGN_QUEUE_TABLE_BRANDED',
+        props.progressiveCampaignQueueTable.tableName,
+      );
+    }
+
+    if (props.activeBrandedCampaignsTable) {
+      this.lambdaFunction.addEnvironment(
+        'ACTIVE_BRANDED_CAMPAIGNS_TABLE',
+        props.activeBrandedCampaignsTable.tableName,
+      );
+    }
+
+    if (props.progressiveDialerSeederArn) {
+      this.lambdaFunction.addEnvironment(
+        'PROGRESSIVE_DIALER_SEEDER_ARN',
+        props.progressiveDialerSeederArn,
+      );
+    }
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
     new cdk.CfnOutput(this, 'PlansTableArn', { value: this.plansTable.tableArn });

@@ -327,6 +327,8 @@ def _initial_campaign_state(campaign: dict) -> dict:
         "name": campaign.get("name", ""),
         "status": "queued",  # queued | warming | running | completed | cancelled | error | expired
         "connectCampaignId": None,
+        "brandedCampaignId": None,   # set when branded campaign starts
+        "queueArn": None,            # copied from campaignConfig on branded start
         "segmentName": None,
         "segmentArn": None,
         "leadCount": None,

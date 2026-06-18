@@ -82,22 +82,31 @@ def _fetch_phones(profile_ids: list) -> list:
 
 
 def lambda_handler(event: dict, _context) -> dict:
-    path_params = event.get("pathParameters") or {}
-    campaign_id = path_params.get("id")
-    if not campaign_id:
-        return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
-
-    body: dict = {}
-    raw = event.get("body")
-    if raw:
-        try:
-            body = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON body"})}
+    # Support both HTTP API Gateway shape and direct Lambda invocation from executor.
+    if "pathParameters" in event:                    # HTTP shape (API Gateway)
+        path_params = event.get("pathParameters") or {}
+        campaign_id = path_params.get("id")
+        if not campaign_id:
+            return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
+        body: dict = {}
+        raw = event.get("body")
+        if raw:
+            try:
+                body = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return {"statusCode": 400, "body": json.dumps({"error": "invalid JSON body"})}
+        _http_mode = True
+    else:                                            # Direct Lambda invocation shape
+        campaign_id = event.get("campaignId")
+        if not campaign_id:
+            return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
+        body = event
+        _http_mode = False
 
     segment_name = body.get("segmentName")
     if not segment_name:
-        return {"statusCode": 400, "body": json.dumps({"error": "missing segmentName"})}
+        err = {"error": "missing segmentName"}
+        return {"statusCode": 400, "body": json.dumps(err)} if _http_mode else err
 
     # 1. Get segment definition and extract profile IDs
     try:
@@ -139,13 +148,16 @@ def lambda_handler(event: dict, _context) -> dict:
             })
             written += 1
 
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({
-            "seeded": written,
-            "campaignId": campaign_id,
-            "profilesFound": len(profile_ids),
-            "contactsWithPhone": written,
-        }),
-    }
+    result = {"seeded": written}
+    if _http_mode:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "seeded": written,
+                "campaignId": campaign_id,
+                "profilesFound": len(profile_ids),
+                "contactsWithPhone": written,
+            }),
+        }
+    return result

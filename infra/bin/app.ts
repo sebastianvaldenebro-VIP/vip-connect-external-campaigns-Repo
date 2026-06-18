@@ -72,6 +72,7 @@ const redisConfig = {
   team: (app.node.tryGetContext('redisTeam') as string) ?? 'BASIC_TEAM',
   profileObjectType:
     (app.node.tryGetContext('profileObjectType') as string) ?? 'leads-data-mapping',
+  passwordSecretArn: (app.node.tryGetContext('redisPasswordSecretArn') as string | undefined) || undefined,
 };
 const redisVpcConfig = {
   vpcId:
@@ -122,6 +123,33 @@ const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
   permissionsBoundaryName,
 });
 
+// 6a. Progressive Branded Dialer stack — moved before ApiPlansStack so its
+// public properties (seederFunction, campaignQueueTable, activeBrandedCampaignsTable)
+// can be passed as props to ApiPlansStack.
+// ARNs passed as strings per the isolation rule: never import from already-deployed stacks.
+// Before deploying, fill these context values in cdk.json or pass via --context:
+//   dataKeyArn:          aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
+//   firstOrionSecretArn: ARN from Task 6 Step 1
+function requireContext(key: string): string {
+  const val = app.node.tryGetContext(key) as string | undefined;
+  if (!val) throw new Error(`CDK context '${key}' is required — pass via --context or cdk.json`);
+  return val;
+}
+
+const progressiveDialerDataKeyArn = requireContext('progressiveDialerDataKeyArn');
+const firstOrionSecretArn         = requireContext('firstOrionSecretArn');
+
+const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
+  env,
+  description: 'Progressive Branded Dialer — Kinesis consumer + SQS caller + seeder Lambda',
+  dataKeyArn: progressiveDialerDataKeyArn,
+  connectInstanceId,
+  agentEventStreamArn: 'arn:aws:kinesis:us-east-1:165505826690:stream/vip-use1-datastream',
+  firstOrionSecretArn,
+  profilesDomainName,
+  permissionsBoundaryName,
+});
+
 // 6. api-plans Lambda + DynamoDB plans table
 const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   env,
@@ -133,6 +161,9 @@ const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   permissionsBoundaryName,
   redis: redisConfig,
   redisVpc: redisVpcConfig,
+  progressiveCampaignQueueTable: progressiveDialer.campaignQueueTable,
+  activeBrandedCampaignsTable:   progressiveDialer.activeBrandedCampaignsTable,
+  progressiveDialerSeederArn:    progressiveDialer.seederFunction.functionArn,
 });
 
 // 7. api-profiles Lambda
@@ -142,34 +173,6 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
   dataKey: data.dataKey,
   profilesDomainName,
   profileObjectType: app.node.tryGetContext('profileObjectType') ?? 'leads-data-mapping',
-  permissionsBoundaryName,
-});
-
-// 8. Progressive Branded Dialer stack — fully autonomous, no cross-stack references
-// ARNs passed as strings per the isolation rule: never import from already-deployed stacks.
-// Before deploying, fill these context values in cdk.json or pass via --context:
-//   dataKeyArn:         aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
-//   firstOrionSecretArn: ARN from Task 6 Step 1
-//   activeCampaignId:   current Outbound Campaigns V2 campaign ID
-const progressiveDialerDataKeyArn =
-  (app.node.tryGetContext('progressiveDialerDataKeyArn') as string) ??
-  'arn:aws:kms:us-east-1:165505826690:key/00000000-0000-0000-0000-000000000000';
-const firstOrionSecretArn =
-  (app.node.tryGetContext('firstOrionSecretArn') as string) ??
-  'arn:aws:secretsmanager:us-east-1:165505826690:secret:vip/firstorion/credentials-XXXXXX';
-const activeCampaignId =
-  (app.node.tryGetContext('activeCampaignId') as string) ?? 'placeholder-campaign-id';
-
-const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
-  env,
-  description: 'Progressive Branded Dialer — Kinesis consumer + SQS caller + seeder Lambda',
-  dataKeyArn: progressiveDialerDataKeyArn,
-  connectInstanceId,
-  agentEventStreamArn: 'arn:aws:kinesis:us-east-1:165505826690:stream/vip-use1-datastream',
-  firstOrionSecretArn,
-  sourcePhonenumber: '+19174105649',
-  activeCampaignId,
-  profilesDomainName,
   permissionsBoundaryName,
 });
 

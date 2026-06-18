@@ -3540,3 +3540,742 @@ def test_apply_plan_to_run_live_plan_shorter():
 
     # b1 (index 1) is queued but beyond live_plan length — keep original
     assert result["planSnapshot"]["buckets"][1]["duration_minutes"] == 45
+
+
+# ── _is_branded ──────────────────────────────────────────────────────────────
+
+class TestIsBranded:
+    def test_returns_true_for_branded_delivery_type(self):
+        from executor import _is_branded
+        assert _is_branded({"deliveryType": "branded"}) is True
+
+    def test_returns_false_for_connect_campaign(self):
+        from executor import _is_branded
+        assert _is_branded({"campaignConfig": {"dialerType": "progressive"}}) is False
+
+    def test_returns_false_when_delivery_type_absent(self):
+        from executor import _is_branded
+        assert _is_branded({}) is False
+
+    def test_returns_false_for_other_delivery_type(self):
+        from executor import _is_branded
+        assert _is_branded({"deliveryType": "journey"}) is False
+
+
+class TestInitialCampaignStateFields:
+    def test_branded_campaign_id_initialized_to_none(self):
+        from store import _initial_campaign_state
+        cs = _initial_campaign_state({"id": "c-1"})
+        assert "brandedCampaignId" in cs
+        assert cs["brandedCampaignId"] is None
+
+    def test_queue_arn_initialized_to_none(self):
+        from store import _initial_campaign_state
+        cs = _initial_campaign_state({"id": "c-1"})
+        assert "queueArn" in cs
+        assert cs["queueArn"] is None
+
+
+class TestStartBrandedCampaign:
+    """_start_one_campaign with deliveryType='branded'."""
+
+    def _branded_campaign(
+        self, campaign_id: str = "bc-1", queue_arn: str = "arn:aws:connect:::queue/q1"
+    ) -> dict:
+        return {
+            "id": campaign_id,
+            "name": "Branded Test",
+            "deliveryType": "branded",
+            "campaignConfig": {
+                "dialerType": "progressive",
+                "queueArn": queue_arn,
+                "contactFlowId": "flow-abc",
+                "sourcePhone": "+19174105649",
+            },
+        }
+
+    def _make_run_with_branded(self, campaign_id: str = "bc-1"):
+        import json  # noqa: F401 — used for payload assertions in tests below
+        bucket = _bucket_def("b-branded", campaigns=[self._branded_campaign(campaign_id)])
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        cs = _campaign_state(campaign_id, status="queued")
+        run = {
+            "planId": "p-1",
+            "runId": "r-1",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+        return run, plan
+
+    def test_invokes_seeder_lambda(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 5}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        lam.invoke.assert_called_once()
+        call_kwargs = lam.invoke.call_args.kwargs or lam.invoke.call_args[1]
+        raw_payload = call_kwargs.get("Payload") or lam.invoke.call_args[0][0].get("Payload")
+        payload = json.loads(raw_payload)
+        assert payload["campaignId"] == "bc-1"
+        assert payload["segmentName"] == "seg-name"
+
+    def test_writes_vip_active_branded_campaigns(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 3}).encode())
+        }
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        ddb.put_item.assert_called_once()
+        item = ddb.put_item.call_args.kwargs["Item"]
+        assert item["pk"]["S"] == "QUEUE#arn:aws:connect:::queue/q1"
+        assert item["sk"]["S"] == "CAMPAIGN#bc-1"
+        assert item["campaignId"]["S"] == "bc-1"
+
+    def test_sets_status_running_and_branded_campaign_id(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 2}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["brandedCampaignId"] == "bc-1"
+        assert cs["queueArn"] == "arn:aws:connect:::queue/q1"
+        assert cs["connectCampaignId"] is None
+
+    def test_empty_segment_sets_completed_immediately(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 0}).encode())
+        }
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "completed"
+        ddb.put_item.assert_not_called()  # no entry written when empty
+
+    def test_seeder_error_sets_error_status(self, mocker):
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.side_effect = Exception("Lambda timeout")
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _start_one_campaign
+        cs = run["bucketStates"][0]["campaignStates"][0]
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "error"
+        ddb.put_item.assert_not_called()
+
+    def test_does_not_call_create_and_start_campaign(self, mocker):
+        import json
+        from unittest.mock import MagicMock
+
+        run, plan = self._make_run_with_branded()
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 1}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+        create_fn = mocker.patch("executor._create_and_start_campaign")
+
+        from executor import _start_one_campaign
+        _start_one_campaign(run, plan, 0, 0)
+
+        create_fn.assert_not_called()
+
+
+# ── TestTickBrandedPoll ───────────────────────────────────────────────────────
+
+
+class TestStopBrandedCampaign:
+    def _cs(self, campaign_id="bc-1", queue_arn="arn::queue/q1"):
+        return {
+            "campaignId": campaign_id,
+            "brandedCampaignId": campaign_id,
+            "queueArn": queue_arn,
+            "status": "running",
+        }
+
+    def test_deletes_from_vip_active_branded_campaigns(self, mocker):
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())
+
+        ddb.delete_item.assert_called_once_with(
+            TableName=mocker.ANY,
+            Key={
+                "pk": {"S": "QUEUE#arn::queue/q1"},
+                "sk": {"S": "CAMPAIGN#bc-1"},
+            },
+        )
+
+    def test_expires_queue_items(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.return_value = {}
+        expire = mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())
+
+        expire.assert_called_once_with("bc-1")
+
+    def test_noop_when_no_branded_campaign_id(self, mocker):
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign({"campaignId": "c-1", "status": "running"})
+
+        ddb.delete_item.assert_not_called()
+
+    def test_delete_failure_does_not_raise(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.side_effect = (
+            Exception("DDB error")
+        )
+        mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())  # must not raise
+
+    def test_expire_failure_does_not_raise(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.return_value = {}
+        mocker.patch("executor._expire_branded_queue_items", side_effect=Exception("batch fail"))
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())  # must not raise
+
+
+class TestPrestartSkipsBranded:
+    """_prestart_next_bucket must skip branded campaigns and only warmup non-branded ones."""
+
+    def _branded_campaign_def(self, cid: str = "bc-1") -> dict:
+        return {
+            "id": cid,
+            "name": cid,
+            "deliveryType": "branded",
+            "states": ["NY"],
+            "groups": [],
+            "dependsOn": [],
+            "campaignConfig": {"queueArn": "arn::queue/q1"},
+        }
+
+    def test_prestart_next_bucket_skips_branded(self, mocker):
+        """_create_campaign_only must NOT be called for a branded campaign during prewarm."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+                _bucket_def("b1", [self._branded_campaign_def("bc-1")]),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state("b1", [_campaign_state("bc-1", "queued")], status="queued"),
+            ],
+        )
+
+        create = mocker.patch("executor._create_campaign_only")
+        mocker.patch("executor.save_run")
+
+        executor._prestart_next_bucket(run, plan, 0)
+
+        # Branded campaign must be skipped — no warmup phase
+        create.assert_not_called()
+        # Bucket status set to warming regardless (the bucket-level claim is still made)
+        assert run["bucketStates"][1]["status"] == "warming"
+        # Campaign itself stays queued — it will be started directly by _start_one_campaign
+        assert run["bucketStates"][1]["campaignStates"][0]["status"] == "queued"
+
+    def test_prestart_next_bucket_warms_nonbranded_skips_branded(self, mocker):
+        """_create_campaign_only is called for non-branded but not for branded in the same bucket."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def("b0", [_campaign_def("c0")], run_mode="time_based", duration=20),
+                _bucket_def(
+                    "b1",
+                    [
+                        _campaign_def("c-connect"),
+                        self._branded_campaign_def("bc-2"),
+                    ],
+                ),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state(
+                    "b1",
+                    [
+                        _campaign_state("c-connect", "queued"),
+                        _campaign_state("bc-2", "queued"),
+                    ],
+                    status="queued",
+                ),
+            ],
+        )
+
+        create = mocker.patch(
+            "executor._create_campaign_only",
+            return_value=("conn-w", "seg-w", "arn:seg-w", True),
+        )
+        mocker.patch("executor.save_run")
+
+        executor._prestart_next_bucket(run, plan, 0)
+
+        # Exactly one create call — only for the non-branded campaign
+        assert create.call_count == 1
+        # Non-branded campaign is now warming
+        assert run["bucketStates"][1]["campaignStates"][0]["status"] == "warming"
+        assert run["bucketStates"][1]["campaignStates"][0]["connectCampaignId"] == "conn-w"
+        # Branded campaign stays queued — never passed to _create_campaign_only
+        assert run["bucketStates"][1]["campaignStates"][1]["status"] == "queued"
+        assert run["bucketStates"][1]["campaignStates"][1].get("connectCampaignId") is None
+
+    def test_prestart_plan_skips_branded_campaign(self, mocker):
+        """_prestart_plan must skip branded campaigns and only store non-branded warmups."""
+        import executor
+
+        plan = {
+            "planId": "plan-target",
+            "buckets": [
+                _bucket_def(
+                    "b0",
+                    [
+                        _campaign_def("c-connect"),
+                        self._branded_campaign_def("bc-3"),
+                    ],
+                )
+            ],
+        }
+
+        create = mocker.patch(
+            "executor._create_campaign_only",
+            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False),
+        )
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor.get_latest_run", return_value=None)
+        update_warmup = mocker.patch("executor.update_plan_pending_warmup")
+
+        executor._prestart_plan("plan-target")
+
+        # Only one create call — for the non-branded campaign
+        assert create.call_count == 1
+        # The warmup stored must only contain the non-branded campaign
+        update_warmup.assert_called_once()
+        warmup_arg = update_warmup.call_args[0][1]
+        warmed_ids = [c["campaignId"] for c in warmup_arg["campaigns"]]
+        assert "c-connect" in warmed_ids
+        assert "bc-3" not in warmed_ids
+
+
+class TestTickBrandedPoll:
+    def _run_with_running_branded(self, campaign_id="bc-1"):
+        cs = _campaign_state(campaign_id, status="running")
+        cs["brandedCampaignId"] = campaign_id
+        cs["queueArn"] = "arn::queue/q1"
+        cs["connectCampaignId"] = None
+        bucket = _bucket_def("b-1", campaigns=[{
+            "id": campaign_id, "name": "B", "deliveryType": "branded",
+            "campaignConfig": {"queueArn": "arn::queue/q1"},
+        }])
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs],
+                                  "startedAt": datetime.utcnow().isoformat()}]}
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        return run, plan, cs
+
+    def test_completes_branded_when_queue_empty(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", return_value=0)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor._advance_bucket")
+        mocker.patch("executor._fire_campaign_chains")
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "completed"
+        assert cs["exitReason"] == "queue_drained"
+        assert cs.get("completedAt") is not None
+        stop.assert_called_once_with(cs)
+
+    def test_does_not_poll_connect_v2_for_branded(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", return_value=5)
+        poll = mocker.patch("executor._poll_campaign_state")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        poll.assert_not_called()
+        assert cs["status"] == "running"  # still running, queue has 5 items
+
+    def test_count_error_does_not_transition_status(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor._count_branded_queue", side_effect=Exception("DDB error"))
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+
+        from executor import tick
+        tick("p-1", "r-1", 0)  # must not raise
+
+        assert cs["status"] == "running"  # unchanged on poll error
+
+
+class TestAbortStopCallsStopBranded:
+    def _cs_branded(self, cid="bc-1"):
+        return {
+            "campaignId": cid, "brandedCampaignId": cid,
+            "queueArn": "arn::queue/q1", "status": "running",
+        }
+
+    def test_abort_run_stops_branded_campaign(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import abort_run
+        abort_run("p-1", "r-1")
+
+        stop.assert_called_once_with(cs)
+
+    def test_abort_run_no_branded_campaign_id_does_not_call_stop(self, mocker):
+        cs = {"campaignId": "c-1", "status": "running"}
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import abort_run
+        abort_run("p-1", "r-1")
+
+        stop.assert_not_called()
+
+    def test_expire_bucket_stops_branded_campaign(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor._advance_bucket")
+
+        from executor import _expire_bucket
+        _expire_bucket(run, plan, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_expire_bucket_queued_does_not_stop_branded(self, mocker):
+        cs = {**self._cs_branded(), "status": "queued"}
+        run = {"planId": "p-1", "runId": "r-1",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor._advance_bucket")
+
+        from executor import _expire_bucket
+        _expire_bucket(run, plan, 0)
+
+        stop.assert_not_called()
+
+    def test_force_stop_campaign_stops_branded(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor.get_plan", return_value={"planId": "p-1", "buckets": [_bucket_def("b-1", [])]})
+        mocker.patch("executor._all_campaigns_terminal", return_value=False)
+
+        from executor import force_stop_campaign
+        force_stop_campaign("p-1", "r-1", 0, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_skip_campaign_stops_branded_when_running(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        mocker.patch("executor.get_run", return_value=run)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_plan", return_value={"planId": "p-1", "buckets": [_bucket_def("b-1", [])]})
+        mocker.patch("executor._all_campaigns_terminal", return_value=False)
+        mocker.patch("executor._dispatch_ready_campaigns", return_value=False)
+
+        from executor import skip_campaign
+        skip_campaign("p-1", "r-1", 0, 0)
+
+        stop.assert_called_once_with(cs)
+
+    def test_force_finish_internal_stops_branded(self, mocker):
+        cs = self._cs_branded()
+        run = {"planId": "p-1", "runId": "r-1", "status": "running",
+               "bucketStates": [{"status": "running", "campaignStates": [cs]}]}
+        plan = {"planId": "p-1", "buckets": [_bucket_def("b-1", [])]}
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.unlock_plan_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch("executor._delete_bucket_schedule_safe")
+
+        from executor import _force_finish_internal
+        _force_finish_internal(run, plan)
+
+        stop.assert_called_once_with(cs)
+
+    def test_force_start_campaign_stops_branded_of_previous_campaign(self, mocker):
+        """force_start_campaign Phase 2: _stop_branded_campaign is called with a synthetic
+        dict built from the OLD brandedCampaignId captured before the state reset."""
+        cs = {
+            "campaignId": "c-1",
+            "brandedCampaignId": "bc-old",
+            "queueArn": "arn::queue/q1",
+            "status": "cancelled",
+            "connectCampaignId": None,
+            "segmentName": None,
+            "segmentArn": None,
+            "leadCount": None,
+            "startedAt": None,
+            "completedAt": None,
+            "exitReason": "parent_cancelled",
+            "errorDetail": None,
+        }
+        plan = _make_plan([_bucket_def("b-1", [_campaign_def("c-1")])])
+        run = _make_run(plan, [_bucket_state("b-1", [cs], status="running")])
+
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.save_run")
+        mocker.patch("executor._start_one_campaign")
+        mocker.patch("executor._reset_cascade_cancelled_children")
+
+        from executor import force_start_campaign
+        force_start_campaign("plan-1", "run-1", 0, 0)
+
+        stop.assert_called_once_with(
+            {"brandedCampaignId": "bc-old", "queueArn": "arn::queue/q1"}
+        )
+
+    def test_force_start_campaign_no_branded_does_not_call_stop(self, mocker):
+        """force_start_campaign Phase 2: _stop_branded_campaign is NOT called when
+        brandedCampaignId is absent from the campaign state."""
+        cs = {
+            "campaignId": "c-1",
+            "brandedCampaignId": None,
+            "queueArn": "arn::queue/q1",
+            "status": "cancelled",
+            "connectCampaignId": None,
+            "segmentName": None,
+            "segmentArn": None,
+            "leadCount": None,
+            "startedAt": None,
+            "completedAt": None,
+            "exitReason": "parent_cancelled",
+            "errorDetail": None,
+        }
+        plan = _make_plan([_bucket_def("b-1", [_campaign_def("c-1")])])
+        run = _make_run(plan, [_bucket_state("b-1", [cs], status="running")])
+
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.save_run")
+        mocker.patch("executor._start_one_campaign")
+        mocker.patch("executor._reset_cascade_cancelled_children")
+
+        from executor import force_start_campaign
+        force_start_campaign("plan-1", "run-1", 0, 0)
+
+        stop.assert_not_called()
+
+
+# ── Fix: _invoke_seeder must check FunctionError ──────────────────────────────
+
+
+class TestInvokeSeederFunctionError:
+    """_invoke_seeder must raise RuntimeError when Lambda returns FunctionError."""
+
+    def test_seeder_function_error_raises(self, mocker):
+        """When Lambda invoke returns HTTP 200 but FunctionError='Unhandled',
+        _invoke_seeder must raise RuntimeError so _start_one_campaign marks
+        the campaign as error — not silently treat it as 0 seeded contacts.
+        """
+        from unittest.mock import MagicMock
+        import executor
+
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        # boto3 returns HTTP 200 with FunctionError field — does NOT raise
+        lam.invoke.return_value = {
+            "StatusCode": 200,
+            "FunctionError": "Unhandled",
+            "Payload": MagicMock(read=lambda: b'{"errorMessage": "something crashed"}'),
+        }
+
+        with pytest.raises(RuntimeError, match="seeder invocation failed"):
+            executor._invoke_seeder("bc-1", "seg-name", "flow-abc", "+15550001234")
+
+    def test_seeder_function_error_causes_error_status_in_start_one_campaign(
+        self, mocker
+    ):
+        """When _invoke_seeder raises (due to FunctionError), _start_one_campaign
+        must set cs['status'] = 'error', not 'completed' with exitReason='empty_segment'.
+        """
+        from unittest.mock import MagicMock
+        import executor
+
+        campaign_id = "bc-fe"
+        bucket = _bucket_def("b0", campaigns=[{
+            "id": campaign_id,
+            "name": "FunctionError branded",
+            "deliveryType": "branded",
+            "campaignConfig": {
+                "dialerType": "progressive",
+                "queueArn": "arn:aws:connect:::queue/q1",
+                "contactFlowId": "flow-abc",
+                "sourcePhone": "+15550001234",
+            },
+        }])
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        cs = _campaign_state(campaign_id, status="queued")
+        run = {
+            "planId": "p-1",
+            "runId": "r-1",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+
+        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "StatusCode": 200,
+            "FunctionError": "Unhandled",
+            "Payload": MagicMock(read=lambda: b'{"errorMessage": "handler crashed"}'),
+        }
+        mocker.patch("executor._get_ddb_client")
+
+        executor._start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "error", (
+            "FunctionError on seeder must set status=error, not complete with 0 seeded"
+        )
+
+
+# ── Fix: _expire_branded_queue_items must retry UnprocessedItems ──────────────
+
+
+class TestExpireHandlesUnprocessedItems:
+    """_expire_branded_queue_items must retry DynamoDB UnprocessedItems under throttling."""
+
+    def test_expire_handles_unprocessed_items(self, mocker):
+        """batch_write_item returns UnprocessedItems on first call, empty on second.
+        Verify the retry loop fires and the warning is NOT raised as an exception.
+        """
+        import executor
+
+        table = "VipProgressiveCampaignQueue"
+        mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", table)
+
+        items = [
+            {"campaignId": {"S": "bc-1"}, "sk": {"S": f"CONTACT#{i}"}}
+            for i in range(3)
+        ]
+        write_requests = [
+            {
+                "PutRequest": {
+                    "Item": {
+                        "campaignId": item["campaignId"],
+                        "sk": item["sk"],
+                        "status": {"S": "EXPIRED"},
+                        "ttl": {"N": mocker.ANY},
+                    }
+                }
+            }
+            for item in items
+        ]
+
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        # Query returns 3 items in one page
+        ddb.query.return_value = {"Items": items, "Count": 3}
+
+        batch_write_calls = []
+
+        def fake_batch_write(RequestItems):
+            batch_write_calls.append(len(RequestItems.get(table, [])))
+            if len(batch_write_calls) == 1:
+                # First call: return 1 unprocessed item
+                return {"UnprocessedItems": {table: [write_requests[0]]}}
+            # Second call: all processed
+            return {"UnprocessedItems": {}}
+
+        ddb.batch_write_item.side_effect = fake_batch_write
+
+        mocker.patch("executor.time.sleep")  # avoid real sleep in tests
+
+        # Must not raise even with UnprocessedItems on first attempt
+        executor._expire_branded_queue_items("bc-1")
+
+        assert len(batch_write_calls) == 2, (
+            "Expected 2 batch_write_item calls: first with all items, second with unprocessed retry"
+        )

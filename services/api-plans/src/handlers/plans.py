@@ -117,6 +117,13 @@ def create_plan(event: dict, _path_params: dict) -> dict:
     if trigger.get("type") == "on_plan_complete":
         _validate_trigger_no_cycle(None, trigger, store.list_plans())
 
+    branded_errors = _validate_plan_body(body)
+    if branded_errors:
+        return json_response(
+            400,
+            {"error": {"code": "VALIDATION_ERROR", "messages": branded_errors}},
+        )
+
     _validate_dag(body.get("buckets", []))
 
     plan = store.put_plan(body)
@@ -157,6 +164,12 @@ def update_plan(event: dict, path_params: dict) -> dict:
         _validate_trigger_no_cycle(plan_id, trigger, all_plans)
 
     if "buckets" in body:
+        branded_errors = _validate_plan_body(body)
+        if branded_errors:
+            return json_response(
+                400,
+                {"error": {"code": "VALIDATION_ERROR", "messages": branded_errors}},
+            )
         _validate_dag(body["buckets"])
 
     allowed = (
@@ -359,6 +372,32 @@ def _validate_dag(buckets: list[dict]) -> None:
         raise ValueError(
             "Plan contains a dependency cycle in campaign dependsOn references"
         )
+
+
+def _validate_branded_campaign(campaign: dict, bucket_name: str, ci: int) -> list[str]:
+    """Return validation errors for a branded campaign's required config fields."""
+    errors = []
+    cfg = campaign.get("campaignConfig") or {}
+    prefix = f"bucket '{bucket_name}' campaign[{ci}]"
+    for required_key in ("queueArn", "contactFlowId", "sourcePhone"):
+        if not cfg.get(required_key):
+            errors.append(
+                f"{prefix}: deliveryType='branded' requires campaignConfig.{required_key}"
+            )
+    return errors
+
+
+def _validate_plan_body(plan_body: dict) -> list[str]:
+    """Validate plan body; return a list of error strings (empty means valid)."""
+    errors: list[str] = []
+    for bi, bucket in enumerate(plan_body.get("buckets", [])):
+        bucket_name = bucket.get("name", str(bi))
+        for ci, campaign in enumerate(bucket.get("campaigns", [])):
+            if campaign.get("deliveryType") == "branded":
+                errors.extend(
+                    _validate_branded_campaign(campaign, bucket_name, ci)
+                )
+    return errors
 
 
 def _validate_trigger_no_cycle(

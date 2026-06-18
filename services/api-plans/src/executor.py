@@ -99,6 +99,11 @@ PROFILES_DOMAIN_NAME: Final = os.environ.get("PROFILES_DOMAIN_NAME", "")
 LAMBDA_FUNCTION_ARN: Final = os.environ.get("LAMBDA_FUNCTION_ARN", "")
 SNS_ALERTS_TOPIC_ARN: Final = os.environ.get("SNS_ALERTS_TOPIC_ARN", "")
 
+# ── Progressive branded dialer env vars (wired in CDK at Task 9) ──────────────
+_PROGRESSIVE_DIALER_SEEDER_ARN: Final = os.environ.get("PROGRESSIVE_DIALER_SEEDER_ARN", "")
+_ACTIVE_BRANDED_CAMPAIGNS_TABLE: Final = os.environ.get("ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
+_CAMPAIGN_QUEUE_TABLE_BRANDED: Final = os.environ.get("CAMPAIGN_QUEUE_TABLE_BRANDED", "")
+
 # Pre-start window: create next-bucket campaigns this many minutes before expiry
 _PRESTART_MINUTES: Final = 5
 
@@ -121,6 +126,195 @@ REASON_CREATION_FAILED: Final = "creation_failed"
 REASON_CANCELLED: Final = "cancelled"
 REASON_PARENT_CANCELLED: Final = "parent_cancelled"
 REASON_ABORTED: Final = "aborted"
+
+
+def _is_branded(campaign: dict) -> bool:
+    """Return True if this campaign uses the Progressive Branded Dialer channel.
+
+    Discriminator is deliveryType='branded', NOT dialerType — dialerType is injected
+    verbatim as a Connect V2 JSON key and would cause ValidationException if set to
+    'branded'.
+    """
+    return campaign.get("deliveryType") == "branded"
+
+
+# ── Branded dialer boto3 singletons ──────────────────────────────────────────
+
+_lambda_client = None
+_ddb_client_branded = None
+
+
+def _get_lambda_client():
+    global _lambda_client
+    if _lambda_client is None:
+        import boto3 as _boto3
+        _lambda_client = _boto3.client("lambda")
+    return _lambda_client
+
+
+def _get_ddb_client():
+    global _ddb_client_branded
+    if _ddb_client_branded is None:
+        import boto3 as _boto3
+        _ddb_client_branded = _boto3.client("dynamodb")
+    return _ddb_client_branded
+
+
+def _count_branded_queue(campaign_id: str) -> int:
+    """Count PENDING+DISPATCHING items in VipProgressiveCampaignQueue for this campaign.
+
+    Uses eventual consistency — a count of 0 means the queue is drained.
+    Callers must handle exceptions (transient DDB errors) without transitioning state.
+    """
+    ddb = _get_ddb_client()
+    resp = ddb.query(
+        TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+        KeyConditionExpression="campaignId = :c",
+        FilterExpression="#s IN (:p, :d)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":c": {"S": campaign_id},
+            ":p": {"S": "PENDING"},
+            ":d": {"S": "DISPATCHING"},
+        },
+        Select="COUNT",
+    )
+    # Select=COUNT without pagination is safe: Count > 0 (partial page) still correctly
+    # blocks completion; Count == 0 (empty page) only occurs when there are genuinely no
+    # matching items (DDB returns Count=0, no LastEvaluatedKey, for empty result sets).
+    return resp.get("Count", 0)
+
+
+def _expire_branded_queue_items(campaign_id: str) -> None:
+    """Set TTL=now on all PENDING/DISPATCHING items in VipProgressiveCampaignQueue.
+
+    DynamoDB TTL sweep will delete them within 48h. This stops the consumer from
+    dequeuing contacts for a stopped/aborted campaign.
+    Batch-writes up to 3000 items in pages of 25 — acceptable for segment max size.
+    UnprocessedItems are retried up to 3 times with exponential backoff (0.1s base).
+    """
+    now_epoch = int(time.time())
+    table = _CAMPAIGN_QUEUE_TABLE_BRANDED
+    ddb = _get_ddb_client()
+    last_key = None
+    while True:
+        kwargs = dict(
+            TableName=table,
+            KeyConditionExpression="campaignId = :c",
+            FilterExpression="#s IN (:p, :d)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":c": {"S": campaign_id},
+                ":p": {"S": "PENDING"},
+                ":d": {"S": "DISPATCHING"},
+            },
+            ProjectionExpression="campaignId, sk",
+        )
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+        resp = ddb.query(**kwargs)
+        items = resp.get("Items", [])
+        # Batch write in chunks of 25, retrying UnprocessedItems up to 3 times
+        for i in range(0, len(items), 25):
+            chunk = items[i : i + 25]
+            batch = [
+                {
+                    "PutRequest": {
+                        "Item": {
+                            "campaignId": item["campaignId"],
+                            "sk":         item["sk"],
+                            "status":     {"S": "EXPIRED"},
+                            "ttl":        {"N": str(now_epoch)},
+                        }
+                    }
+                }
+                for item in chunk
+            ]
+            attempts = 0
+            while batch and attempts < 3:
+                resp_bw = ddb.batch_write_item(RequestItems={table: batch})
+                unprocessed = resp_bw.get("UnprocessedItems", {}).get(table, [])
+                if unprocessed:
+                    attempts += 1
+                    time.sleep(0.1 * (2 ** attempts))
+                    batch = unprocessed
+                else:
+                    break
+            else:
+                if batch:
+                    logger.warning(
+                        "_expire_branded_queue_items: %d items unprocessed after retries for %s",
+                        len(batch), campaign_id,
+                    )
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+
+def _stop_branded_campaign(cs: dict) -> None:
+    """Remove branded campaign from VipActiveBrandedCampaigns and expire its queue.
+
+    Must NEVER raise — log errors and continue so the calling abort/stop path
+    completes even if cleanup partially fails.
+    """
+    campaign_id = cs.get("brandedCampaignId")
+    queue_arn = cs.get("queueArn")
+    if not campaign_id:
+        return
+
+    try:
+        _get_ddb_client().delete_item(
+            TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
+            Key={
+                "pk": {"S": f"QUEUE#{queue_arn}"},
+                "sk": {"S": f"CAMPAIGN#{campaign_id}"},
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "_stop_branded_campaign: delete failed for %s: %s",
+            campaign_id, type(exc).__name__,
+        )
+
+    try:
+        _expire_branded_queue_items(campaign_id)
+    except Exception as exc:
+        logger.error(
+            "_stop_branded_campaign: expire queue failed for %s: %s",
+            campaign_id, type(exc).__name__,
+        )
+
+
+def _invoke_seeder(
+    campaign_id: str, segment_name: str, contact_flow_id: str, source_phone: str
+) -> int:
+    """Invoke the progressive dialer seeder Lambda directly.
+
+    Returns number of contacts seeded. PHI rule: source_phone must never appear
+    in log lines — only counts and exception type names are logged.
+    Raises RuntimeError if the Lambda invocation itself succeeded (HTTP 200) but
+    the handler threw — boto3 does NOT raise in that case; callers must check
+    FunctionError explicitly.
+    """
+    import json as _json
+
+    payload = {
+        "campaignId": campaign_id,
+        "segmentName": segment_name,
+        "contactFlowId": contact_flow_id,
+        "sourcePhone": source_phone,
+    }
+    response = _get_lambda_client().invoke(
+        FunctionName=_PROGRESSIVE_DIALER_SEEDER_ARN,
+        InvocationType="RequestResponse",
+        Payload=_json.dumps(payload).encode(),
+    )
+    if response.get("FunctionError"):
+        # Do NOT log the payload — stack frames may contain PHI.
+        raise RuntimeError(f"seeder invocation failed: {response['FunctionError']}")
+    result = _json.loads(response["Payload"].read())
+    return int(result.get("seeded", 0))
+
 
 _CONNECT_TERMINAL: Final[dict[str, str]] = {
     "Completed": REASON_COMPLETED,
@@ -311,15 +505,6 @@ def scheduled_run(plan_id: str) -> dict:
     if plan.get("isTemplate") or plan.get("is_template"):
         return {"ok": True, "reason": "is_template"}
     if not _within_working_hours(plan):
-        # Clear any stale pendingWarmup so the next working day creates fresh segments
-        # with the correct date and schedule window instead of reusing yesterday's.
-        if plan.get("pendingWarmup"):
-            update_plan_pending_warmup(plan_id, None)
-            _slog.info(
-                "scheduled_run_outside_hours_warmup_cleared",
-                plan_id=plan_id,
-                reason="stale pendingWarmup from non-working day pre-warm discarded",
-            )
         _slog.info("scheduled_run_outside_hours", plan_id=plan_id)
         return {"ok": True, "reason": "outside_working_hours"}
     run = start_run(plan_id, triggered_by="scheduled")
@@ -454,6 +639,27 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                             _dur,
                         )
                         _safe_stop_campaign(cs["connectCampaignId"])
+
+        elif cs.get("brandedCampaignId") and cs["status"] == "running":
+            # Branded campaign: poll VipProgressiveCampaignQueue instead of Connect
+            try:
+                count = _count_branded_queue(cs["brandedCampaignId"])
+            except Exception as _poll_exc:
+                logger.warning(
+                    "tick: branded queue poll failed for %s: %s",
+                    cs["brandedCampaignId"], type(_poll_exc).__name__,
+                )
+                continue  # don't transition on poll error
+
+            if count == 0:
+                logger.info(
+                    "tick: branded campaign %s queue drained — completing",
+                    cs["brandedCampaignId"],
+                )
+                cs["status"] = "completed"
+                cs["exitReason"] = "queue_drained"
+                cs["completedAt"] = _now_iso()
+                _stop_branded_campaign(cs)
 
     # Fire plans triggered by a specific campaign completing
     newly_completed = {
@@ -625,6 +831,10 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                     _safe_delete_campaign(cs["connectCampaignId"])
                     if cs.get("segmentName"):
                         _safe_delete_segment(cs["segmentName"])
+                # ── Branded cleanup ──
+                if cs["status"] in ("running",) and cs.get("brandedCampaignId"):
+                    _stop_branded_campaign(cs)
+                # ─────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
                     cs["status"] = "cancelled"
                     cs["exitReason"] = REASON_ABORTED
@@ -671,6 +881,10 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
                 _safe_delete_campaign(cs["connectCampaignId"])
                 if cs.get("segmentName"):
                     _safe_delete_segment(cs["segmentName"])
+            # ── Branded cleanup ──
+            if cs["status"] == "running" and cs.get("brandedCampaignId"):
+                _stop_branded_campaign(cs)
+            # ─────────────────────
             if cs["status"] in ("running", "warming", "queued", "creating"):
                 cs["status"] = "completed"
                 cs["exitReason"] = "force_finished"
@@ -891,6 +1105,7 @@ def force_start_campaign(
     # campaign but the final save_run crashes, tick recovery sees null and safely resets to queued
     # (no stale ID pointing at a deleted campaign, which would cause a spurious error state).
     old_connect_id = cs.get("connectCampaignId")
+    old_branded_id = cs.get("brandedCampaignId")
     cs["status"] = "creating"
     cs["creatingAt"] = _now_iso()
     cs["exitReason"] = None
@@ -906,6 +1121,8 @@ def force_start_campaign(
     if old_connect_id:
         _safe_stop_campaign(old_connect_id)
         _safe_delete_campaign(old_connect_id)
+    if old_branded_id:
+        _stop_branded_campaign({"brandedCampaignId": old_branded_id, "queueArn": cs.get("queueArn")})
 
     # Phase 3: create new Connect campaign
     cs["status"] = "queued"  # _start_one_campaign expects "queued"
@@ -1023,6 +1240,8 @@ def skip_campaign(
 
         if cs.get("connectCampaignId") and cs["status"] == "running":
             _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("brandedCampaignId") and cs["status"] == "running":
+            _stop_branded_campaign(cs)
 
         cs["status"] = "cancelled"
         cs["exitReason"] = "skipped"
@@ -1082,6 +1301,8 @@ def force_stop_campaign(
 
         if cs.get("connectCampaignId"):
             _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("brandedCampaignId"):
+            _stop_branded_campaign(cs)
         cs["status"] = "expired"
         cs["exitReason"] = "manually_stopped"
         cs["completedAt"] = _now_iso()
@@ -1328,6 +1549,8 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
 
     next_bucket = plan["buckets"][next_index]
     for ci, campaign in enumerate(next_bucket.get("campaigns", [])):
+        if _is_branded(campaign):
+            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
         if not campaign.get("dependsOn"):
             cs = next_bucket_state["campaignStates"][ci]
             camp_name = campaign.get("name") or campaign.get("id", "?")
@@ -1453,6 +1676,8 @@ def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
         if cs["status"] == "running":
             if cs.get("connectCampaignId"):
                 _safe_stop_campaign(cs["connectCampaignId"])
+            if cs.get("brandedCampaignId"):
+                _stop_branded_campaign(cs)
             cs["status"] = "expired"
             cs["exitReason"] = REASON_EXPIRED
             cs["completedAt"] = now
@@ -1644,6 +1869,8 @@ def _prestart_plan(target_plan_id: str) -> None:
     )  # carry over successes from prior calls
     attempted = 0
     for campaign in stage1_campaigns:
+        if _is_branded(campaign):
+            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
         camp_id = campaign.get("id") or campaign.get("campaignId")
         if camp_id in already_warmed:
             continue  # already warmed in a previous prestart_check tick — skip
@@ -2198,6 +2425,73 @@ def _start_one_campaign(
     now_iso = now.isoformat()
 
     cs["startedAt"] = now_iso
+
+    # ── Branded path — bypass Connect V2 entirely ─────────────────────────────
+    if _is_branded(campaign):
+        cfg = campaign.get("campaignConfig", {})
+        queue_arn = cfg.get("queueArn", "")
+        campaign_id = cs["campaignId"]
+        try:
+            seg_name, _ = _create_segment(bucket, campaign)
+            seeded = _invoke_seeder(
+                campaign_id=campaign_id,
+                segment_name=seg_name,
+                contact_flow_id=cfg["contactFlowId"],
+                source_phone=cfg["sourcePhone"],
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded seeder failed: %s",
+                bucket_index,
+                campaign_index,
+                type(exc).__name__,
+            )
+            cs["status"] = "error"
+            cs["errorDetail"] = type(exc).__name__
+            return
+
+        if seeded == 0:
+            cs["status"] = "completed"
+            cs["exitReason"] = "empty_segment"
+            cs["completedAt"] = now_iso
+            return
+
+        # Write entry to VipActiveBrandedCampaigns
+        bucket_end_epoch = int((now + timedelta(hours=4)).timestamp())
+        try:
+            _get_ddb_client().put_item(
+                TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
+                Item={
+                    "pk":            {"S": f"QUEUE#{queue_arn}"},
+                    "sk":            {"S": f"CAMPAIGN#{campaign_id}"},
+                    "queueArn":      {"S": queue_arn},
+                    "campaignId":    {"S": campaign_id},
+                    "planId":        {"S": run["planId"]},
+                    "runId":         {"S": run["runId"]},
+                    "contactFlowId": {"S": cfg["contactFlowId"]},
+                    "sourcePhone":   {"S": cfg["sourcePhone"]},
+                    "priority":      {"N": str(campaign_index)},
+                    "createdAt":     {"S": now_iso},
+                    "ttl":           {"N": str(bucket_end_epoch + 1800)},
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
+                bucket_index,
+                campaign_index,
+                type(exc).__name__,
+            )
+            cs["status"] = "error"
+            cs["errorDetail"] = type(exc).__name__
+            return
+
+        cs["brandedCampaignId"] = campaign_id
+        cs["queueArn"] = queue_arn
+        cs["connectCampaignId"] = None
+        cs["status"] = "running"
+        return
+    # ── End branded path ──────────────────────────────────────────────────────
 
     if cs.get("connectCampaignId"):
         if cs.get("warmupStarted"):
