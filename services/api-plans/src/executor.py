@@ -182,9 +182,91 @@ def _count_branded_queue(campaign_id: str) -> int:
     return resp.get("Count", 0)
 
 
+def _expire_branded_queue_items(campaign_id: str) -> None:
+    """Set TTL=now on all PENDING/DISPATCHING items in VipProgressiveCampaignQueue.
+
+    DynamoDB TTL sweep will delete them within 48h. This stops the consumer from
+    dequeuing contacts for a stopped/aborted campaign.
+    Batch-writes up to 3000 items in pages of 25 — acceptable for segment max size.
+    """
+    import time as _time
+    now_epoch = int(_time.time())
+    ddb = _get_ddb_client()
+    last_key = None
+    while True:
+        kwargs = dict(
+            TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+            KeyConditionExpression="campaignId = :c",
+            FilterExpression="#s IN (:p, :d)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":c": {"S": campaign_id},
+                ":p": {"S": "PENDING"},
+                ":d": {"S": "DISPATCHING"},
+            },
+            ProjectionExpression="campaignId, sk",
+        )
+        if last_key:
+            kwargs["ExclusiveStartKey"] = last_key
+        resp = ddb.query(**kwargs)
+        items = resp.get("Items", [])
+        # Batch write in chunks of 25
+        for i in range(0, len(items), 25):
+            chunk = items[i : i + 25]
+            ddb.batch_write_item(
+                RequestItems={
+                    _CAMPAIGN_QUEUE_TABLE_BRANDED: [
+                        {
+                            "PutRequest": {
+                                "Item": {
+                                    "campaignId": item["campaignId"],
+                                    "sk":         item["sk"],
+                                    "status":     {"S": "EXPIRED"},
+                                    "ttl":        {"N": str(now_epoch)},
+                                }
+                            }
+                        }
+                        for item in chunk
+                    ]
+                }
+            )
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+
+
 def _stop_branded_campaign(cs: dict) -> None:
-    """Stub — full implementation in Task 7."""
-    pass
+    """Remove branded campaign from VipActiveBrandedCampaigns and expire its queue.
+
+    Must NEVER raise — log errors and continue so the calling abort/stop path
+    completes even if cleanup partially fails.
+    """
+    campaign_id = cs.get("brandedCampaignId")
+    queue_arn = cs.get("queueArn")
+    if not campaign_id:
+        return
+
+    try:
+        _get_ddb_client().delete_item(
+            TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
+            Key={
+                "pk": {"S": f"QUEUE#{queue_arn}"},
+                "sk": {"S": f"CAMPAIGN#{campaign_id}"},
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "_stop_branded_campaign: delete failed for %s: %s",
+            campaign_id, type(exc).__name__,
+        )
+
+    try:
+        _expire_branded_queue_items(campaign_id)
+    except Exception as exc:
+        logger.error(
+            "_stop_branded_campaign: expire queue failed for %s: %s",
+            campaign_id, type(exc).__name__,
+        )
 
 
 def _invoke_seeder(
@@ -1430,6 +1512,8 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
 
     next_bucket = plan["buckets"][next_index]
     for ci, campaign in enumerate(next_bucket.get("campaigns", [])):
+        if _is_branded(campaign):
+            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
         if not campaign.get("dependsOn"):
             cs = next_bucket_state["campaignStates"][ci]
             camp_name = campaign.get("name") or campaign.get("id", "?")
@@ -1746,6 +1830,8 @@ def _prestart_plan(target_plan_id: str) -> None:
     )  # carry over successes from prior calls
     attempted = 0
     for campaign in stage1_campaigns:
+        if _is_branded(campaign):
+            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
         camp_id = campaign.get("id") or campaign.get("campaignId")
         if camp_id in already_warmed:
             continue  # already warmed in a previous prestart_check tick — skip

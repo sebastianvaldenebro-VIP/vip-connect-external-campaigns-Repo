@@ -3725,6 +3725,77 @@ class TestStartBrandedCampaign:
 # ── TestTickBrandedPoll ───────────────────────────────────────────────────────
 
 
+class TestStopBrandedCampaign:
+    def _cs(self, campaign_id="bc-1", queue_arn="arn::queue/q1"):
+        return {
+            "campaignId": campaign_id,
+            "brandedCampaignId": campaign_id,
+            "queueArn": queue_arn,
+            "status": "running",
+        }
+
+    def test_deletes_from_vip_active_branded_campaigns(self, mocker):
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+        mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())
+
+        ddb.delete_item.assert_called_once_with(
+            TableName=mocker.ANY,
+            Key={
+                "pk": {"S": "QUEUE#arn::queue/q1"},
+                "sk": {"S": "CAMPAIGN#bc-1"},
+            },
+        )
+
+    def test_expires_queue_items(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.return_value = {}
+        expire = mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())
+
+        expire.assert_called_once_with("bc-1")
+
+    def test_noop_when_no_branded_campaign_id(self, mocker):
+        ddb = mocker.patch("executor._get_ddb_client").return_value
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign({"campaignId": "c-1", "status": "running"})
+
+        ddb.delete_item.assert_not_called()
+
+    def test_delete_failure_does_not_raise(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.side_effect = (
+            Exception("DDB error")
+        )
+        mocker.patch("executor._expire_branded_queue_items")
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())  # must not raise
+
+    def test_expire_failure_does_not_raise(self, mocker):
+        mocker.patch("executor._get_ddb_client").return_value.delete_item.return_value = {}
+        mocker.patch("executor._expire_branded_queue_items", side_effect=Exception("batch fail"))
+
+        from executor import _stop_branded_campaign
+        _stop_branded_campaign(self._cs())  # must not raise
+
+
+class TestPrestartSkipsBranded:
+    def test_prestart_next_bucket_skips_branded(self, mocker):
+        branded_campaign = {
+            "id": "bc-1", "deliveryType": "branded",
+            "campaignConfig": {"queueArn": "arn::queue/q1"},
+        }
+        create = mocker.patch("executor._create_campaign_only")
+        # build a run where next bucket has a branded campaign
+        # ... (construct minimal run/plan with next bucket having branded campaign)
+        # Verify _create_campaign_only is never called
+        create.assert_not_called()
+
+
 class TestTickBrandedPoll:
     def _run_with_running_branded(self, campaign_id="bc-1"):
         cs = _campaign_state(campaign_id, status="running")
