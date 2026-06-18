@@ -20,19 +20,12 @@ export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
   readonly agentEventStreamArn: string;
   /** Secrets Manager ARN from Task 6 Step 1 */
   readonly firstOrionSecretArn: string;
-  /** e.g. "+19174105649" */
-  readonly sourcePhonenumber: string;
-  /** Set at deploy time, update per campaign */
-  readonly activeCampaignId: string;
   /** CP domain — seeder reads segment + phones from here */
   readonly profilesDomainName: string;
   /** Comma-separated queue ARNs to filter agents. Empty = all queues. */
   readonly allowedQueueArns?: string;
   readonly permissionsBoundaryName?: string;
 }
-
-// Contact flow ID is fixed per environment — not a CDK-time variable.
-const CONTACT_FLOW_ID = '3d24320b-c1e3-40f3-90a2-b6867ef70c85';
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
   public readonly seederFunction: lambda.Function;
@@ -162,9 +155,8 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
         AGENT_LOCK_TABLE: agentLockTable.tableName,
         SQS_QUEUE_URL: dialQueue.queueUrl,
         CONNECT_INSTANCE_ID: props.connectInstanceId,
-        CONTACT_FLOW_ID,
-        SOURCE_PHONE: props.sourcePhonenumber,
-        ACTIVE_CAMPAIGN_ID: props.activeCampaignId,
+        ACTIVE_CAMPAIGNS_TABLE: activeBrandedCampaignsTable.tableName,
+        ACTIVE_CAMPAIGNS_GSI: 'queueArn-index',
         FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
         ...(props.allowedQueueArns ? { ALLOWED_QUEUE_ARNS: props.allowedQueueArns } : {}),
       },
@@ -188,6 +180,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     agentStream.grantRead(consumerRole);
     campaignQueueTable.grantReadWriteData(consumerRole);
     agentLockTable.grantReadWriteData(consumerRole);
+    activeBrandedCampaignsTable.grantReadData(consumerRole);
     dialQueue.grantSendMessages(consumerRole);
     consumerRole.addToPolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
@@ -237,9 +230,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
-        // Required for First Orion re-push on throttle retry (Fix #6)
         FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
-        SOURCE_PHONE: props.sourcePhonenumber,
       },
     });
 

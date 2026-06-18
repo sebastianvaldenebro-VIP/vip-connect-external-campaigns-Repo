@@ -149,9 +149,8 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
 // 8. Progressive Branded Dialer stack — fully autonomous, no cross-stack references
 // ARNs passed as strings per the isolation rule: never import from already-deployed stacks.
 // Before deploying, fill these context values in cdk.json or pass via --context:
-//   dataKeyArn:         aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
+//   dataKeyArn:          aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
 //   firstOrionSecretArn: ARN from Task 6 Step 1
-//   activeCampaignId:   current Outbound Campaigns V2 campaign ID
 function requireContext(key: string): string {
   const val = app.node.tryGetContext(key) as string | undefined;
   if (!val) throw new Error(`CDK context '${key}' is required — pass via --context or cdk.json`);
@@ -160,7 +159,6 @@ function requireContext(key: string): string {
 
 const progressiveDialerDataKeyArn = requireContext('progressiveDialerDataKeyArn');
 const firstOrionSecretArn         = requireContext('firstOrionSecretArn');
-const activeCampaignId            = requireContext('activeCampaignId');
 
 const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
   env,
@@ -169,8 +167,6 @@ const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDial
   connectInstanceId,
   agentEventStreamArn: 'arn:aws:kinesis:us-east-1:165505826690:stream/vip-use1-datastream',
   firstOrionSecretArn,
-  sourcePhonenumber: '+19174105649',
-  activeCampaignId,
   profilesDomainName,
   permissionsBoundaryName,
 });
