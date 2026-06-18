@@ -123,30 +123,9 @@ const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
   permissionsBoundaryName,
 });
 
-// 6. api-plans Lambda + DynamoDB plans table
-const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
-  env,
-  description: 'api-plans Lambda — Daily Plans sequential campaign orchestration',
-  adminAuditTable: data.adminAuditTable,
-  dataKey: data.dataKey,
-  connectInstanceId,
-  profilesDomainName,
-  permissionsBoundaryName,
-  redis: redisConfig,
-  redisVpc: redisVpcConfig,
-});
-
-// 7. api-profiles Lambda
-const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
-  env,
-  description: 'api-profiles Lambda — Customer Profiles read-only operations',
-  dataKey: data.dataKey,
-  profilesDomainName,
-  profileObjectType: app.node.tryGetContext('profileObjectType') ?? 'leads-data-mapping',
-  permissionsBoundaryName,
-});
-
-// 8. Progressive Branded Dialer stack — fully autonomous, no cross-stack references
+// 6a. Progressive Branded Dialer stack — moved before ApiPlansStack so its
+// public properties (seederFunction, campaignQueueTable, activeBrandedCampaignsTable)
+// can be passed as props to ApiPlansStack.
 // ARNs passed as strings per the isolation rule: never import from already-deployed stacks.
 // Before deploying, fill these context values in cdk.json or pass via --context:
 //   dataKeyArn:          aws kms describe-key --key-id alias/vip-data-key --query KeyMetadata.Arn --output text --region us-east-1 --profile production
@@ -168,6 +147,32 @@ const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDial
   agentEventStreamArn: 'arn:aws:kinesis:us-east-1:165505826690:stream/vip-use1-datastream',
   firstOrionSecretArn,
   profilesDomainName,
+  permissionsBoundaryName,
+});
+
+// 6. api-plans Lambda + DynamoDB plans table
+const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
+  env,
+  description: 'api-plans Lambda — Daily Plans sequential campaign orchestration',
+  adminAuditTable: data.adminAuditTable,
+  dataKey: data.dataKey,
+  connectInstanceId,
+  profilesDomainName,
+  permissionsBoundaryName,
+  redis: redisConfig,
+  redisVpc: redisVpcConfig,
+  progressiveCampaignQueueTable: progressiveDialer.campaignQueueTable,
+  activeBrandedCampaignsTable:   progressiveDialer.activeBrandedCampaignsTable,
+  progressiveDialerSeederArn:    progressiveDialer.seederFunction.functionArn,
+});
+
+// 7. api-profiles Lambda
+const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
+  env,
+  description: 'api-profiles Lambda — Customer Profiles read-only operations',
+  dataKey: data.dataKey,
+  profilesDomainName,
+  profileObjectType: app.node.tryGetContext('profileObjectType') ?? 'leads-data-mapping',
   permissionsBoundaryName,
 });
 
