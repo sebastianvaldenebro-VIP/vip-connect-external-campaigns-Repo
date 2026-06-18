@@ -36,6 +36,8 @@ const CONTACT_FLOW_ID = '3d24320b-c1e3-40f3-90a2-b6867ef70c85';
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
   public readonly seederFunction: lambda.Function;
+  public readonly campaignQueueTable: dynamodb.Table;
+  public readonly activeBrandedCampaignsTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: ApiProgressiveDialerStackProps) {
     super(scope, id, props);
@@ -64,6 +66,32 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       timeToLiveAttribute: 'ttl',
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
+    this.campaignQueueTable = campaignQueueTable;
+
+    // ── DynamoDB: Active Branded Campaigns ───────────────────────────
+    // One-to-many: PK=QUEUE#{queueArn}, SK=CAMPAIGN#{campaignId}
+    // GSI queueArn-index used by consumer to find campaigns by queue ARN.
+    const activeBrandedCampaignsTable = new dynamodb.Table(
+      this,
+      'ActiveBrandedCampaignsTable',
+      {
+        tableName: 'VipActiveBrandedCampaigns',
+        partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+        sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+        billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+        encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+        encryptionKey: dataKey,
+        timeToLiveAttribute: 'ttl',
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+      },
+    );
+    activeBrandedCampaignsTable.addGlobalSecondaryIndex({
+      indexName: 'queueArn-index',
+      partitionKey: { name: 'queueArn', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    this.activeBrandedCampaignsTable = activeBrandedCampaignsTable;
 
     // ── DynamoDB: Agent Locks ─────────────────────────────────────────
     const agentLockTable = new dynamodb.Table(this, 'AgentLockTable', {
@@ -380,6 +408,12 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
 
     // ── Outputs ───────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'CampaignQueueTableName', { value: campaignQueueTable.tableName });
+    new cdk.CfnOutput(this, 'ActiveBrandedCampaignsTableName', {
+      value: activeBrandedCampaignsTable.tableName,
+    });
+    new cdk.CfnOutput(this, 'ActiveBrandedCampaignsTableArn', {
+      value: activeBrandedCampaignsTable.tableArn,
+    });
     new cdk.CfnOutput(this, 'DialQueueUrl', { value: dialQueue.queueUrl });
     new cdk.CfnOutput(this, 'ConsumerFunctionArn', { value: consumerFn.functionArn });
     new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
