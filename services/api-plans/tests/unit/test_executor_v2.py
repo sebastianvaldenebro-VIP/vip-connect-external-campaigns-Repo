@@ -4085,3 +4085,67 @@ class TestAbortStopCallsStopBranded:
         _force_finish_internal(run, plan)
 
         stop.assert_called_once_with(cs)
+
+    def test_force_start_campaign_stops_branded_of_previous_campaign(self, mocker):
+        """force_start_campaign Phase 2: _stop_branded_campaign is called with a synthetic
+        dict built from the OLD brandedCampaignId captured before the state reset."""
+        cs = {
+            "campaignId": "c-1",
+            "brandedCampaignId": "bc-old",
+            "queueArn": "arn::queue/q1",
+            "status": "cancelled",
+            "connectCampaignId": None,
+            "segmentName": None,
+            "segmentArn": None,
+            "leadCount": None,
+            "startedAt": None,
+            "completedAt": None,
+            "exitReason": "parent_cancelled",
+            "errorDetail": None,
+        }
+        plan = _make_plan([_bucket_def("b-1", [_campaign_def("c-1")])])
+        run = _make_run(plan, [_bucket_state("b-1", [cs], status="running")])
+
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.save_run")
+        mocker.patch("executor._start_one_campaign")
+        mocker.patch("executor._reset_cascade_cancelled_children")
+
+        from executor import force_start_campaign
+        force_start_campaign("plan-1", "run-1", 0, 0)
+
+        stop.assert_called_once_with(
+            {"brandedCampaignId": "bc-old", "queueArn": "arn::queue/q1"}
+        )
+
+    def test_force_start_campaign_no_branded_does_not_call_stop(self, mocker):
+        """force_start_campaign Phase 2: _stop_branded_campaign is NOT called when
+        brandedCampaignId is absent from the campaign state."""
+        cs = {
+            "campaignId": "c-1",
+            "brandedCampaignId": None,
+            "queueArn": "arn::queue/q1",
+            "status": "cancelled",
+            "connectCampaignId": None,
+            "segmentName": None,
+            "segmentArn": None,
+            "leadCount": None,
+            "startedAt": None,
+            "completedAt": None,
+            "exitReason": "parent_cancelled",
+            "errorDetail": None,
+        }
+        plan = _make_plan([_bucket_def("b-1", [_campaign_def("c-1")])])
+        run = _make_run(plan, [_bucket_state("b-1", [cs], status="running")])
+
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.save_run")
+        mocker.patch("executor._start_one_campaign")
+        mocker.patch("executor._reset_cascade_cancelled_children")
+
+        from executor import force_start_campaign
+        force_start_campaign("plan-1", "run-1", 0, 0)
+
+        stop.assert_not_called()
