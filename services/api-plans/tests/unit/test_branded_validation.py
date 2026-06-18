@@ -38,7 +38,7 @@ class TestBrandedCampaignValidation:
                 "dialerType": "progressive",
                 "queueArn": "arn:aws:connect:us-east-1:123:instance/i/queue/q",
                 "contactFlowId": "flow-abc",
-                "sourcePhone": "+19174105649",
+                "sourcePhone": "+12125550199",
             },
         }
 
@@ -128,7 +128,7 @@ class TestBrandedCampaignValidation:
         errors = _validate_plan(plan)
         # The error must name the field but not echo any PHI value
         assert any("sourcePhone" in str(e) for e in (errors or []))
-        phone_value = "+19174105649"
+        phone_value = "+12125550199"
         for err in errors or []:
             assert phone_value not in str(err), (
                 "PHI value leaked into validation error message"

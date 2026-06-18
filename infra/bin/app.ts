@@ -164,6 +164,7 @@ const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   progressiveCampaignQueueTable: progressiveDialer.campaignQueueTable,
   activeBrandedCampaignsTable:   progressiveDialer.activeBrandedCampaignsTable,
   progressiveDialerSeederArn:    progressiveDialer.seederFunction.functionArn,
+  progressiveDialerDataKeyArn:   progressiveDialerDataKeyArn,
 });
 
 // 7. api-profiles Lambda

@@ -12,7 +12,7 @@ def _make_sqs_event(correlation_id: str | None = "abc12345") -> dict:
         "queueArn": "arn:aws:connect:us-east-1:165505826690:instance/abc/queue/queue-001",
         "campaignId": "campaign-1",
         "contactSk": "2026-06-16T14:00:00.000Z#uuid-1",
-        "sourcePhone": "+19174105649",
+        "sourcePhone": "+12125550199",
         "contactFlowId": "3d24320b-c1e3-40f3-90a2-b6867ef70c85",
         "instanceId": "6b3f17ba-68a4-472a-9b20-db1991507009",
     }
@@ -132,7 +132,7 @@ def test_first_orion_repushed_before_raise_on_throttle():
 
         # First Orion push must have been called with a_number=sourcePhone, b_number=destinationPhone
         mock_fo_instance.push.assert_called_once_with(
-            a_number="+19174105649",
+            a_number="+12125550199",
             b_number="+15551234567",
         )
 

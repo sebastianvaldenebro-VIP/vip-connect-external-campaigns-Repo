@@ -31,6 +31,7 @@ export interface ApiPlansStackProps extends cdk.StackProps {
   readonly progressiveCampaignQueueTable?: dynamodb.ITable;
   readonly activeBrandedCampaignsTable?: dynamodb.ITable;
   readonly progressiveDialerSeederArn?: string;
+  readonly progressiveDialerDataKeyArn?: string;
 }
 
 export class ApiPlansStack extends cdk.Stack {
@@ -264,6 +265,16 @@ export class ApiPlansStack extends cdk.Stack {
           sid: 'InvokeProgressiveDialerSeeder',
           actions: ['lambda:InvokeFunction'],
           resources: [props.progressiveDialerSeederArn],
+        }),
+      );
+    }
+
+    if (props.progressiveDialerDataKeyArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'ProgressiveDialerKmsAccess',
+          actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+          resources: [props.progressiveDialerDataKeyArn],
         }),
       );
     }

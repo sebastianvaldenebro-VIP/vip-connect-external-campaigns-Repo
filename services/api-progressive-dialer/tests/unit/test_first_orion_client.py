@@ -35,7 +35,7 @@ def test_push_returns_true_on_200():
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     with patch("first_orion_client.requests.post", return_value=mock_resp):
-        result = client.push(a_number="+19174105649", b_number="+15551234567")
+        result = client.push(a_number="+12125550199", b_number="+15551234567")
     assert result is True
 
 
@@ -46,7 +46,7 @@ def test_push_returns_false_on_4xx():
     mock_resp = MagicMock()
     mock_resp.status_code = 400
     with patch("first_orion_client.requests.post", return_value=mock_resp):
-        result = client.push(a_number="+19174105649", b_number="+15551234567")
+        result = client.push(a_number="+12125550199", b_number="+15551234567")
     assert result is False
 
 
@@ -63,7 +63,7 @@ def test_push_refreshes_token_when_expired():
     push_resp.status_code = 200
 
     with patch("first_orion_client.requests.post", side_effect=[auth_resp, push_resp]):
-        result = client.push(a_number="+19174105649", b_number="+15551234567")
+        result = client.push(a_number="+12125550199", b_number="+15551234567")
     assert result is True
     assert client._token == "new-token"
 
