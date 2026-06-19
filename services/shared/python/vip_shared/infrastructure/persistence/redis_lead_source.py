@@ -100,11 +100,26 @@ def _parse_record(raw: Any) -> dict[str, Any] | None:
     return record
 
 
+def _resolve_redis_password() -> str | None:
+    password = os.environ.get("REDIS_PASS")
+    if password:
+        return password
+    arn = os.environ.get("REDIS_PASSWORD_SECRET_ARN")
+    if not arn:
+        return None
+    import boto3  # noqa: PLC0415 — lazy import; avoids boto3 dep in unit tests
+
+    secret = boto3.client("secretsmanager").get_secret_value(SecretId=arn)
+    payload = json.loads(secret["SecretString"])
+    return (
+        payload.get("password") or payload.get("REDIS_PASS") or secret["SecretString"]
+    )
+
+
 def build_from_env(redis_client: Any | None = None) -> RedisLeadSource:
     host = os.environ["REDIS_HOST"]
     port = int(os.environ.get("REDIS_PORT", 6379))
     team = os.environ.get("TEAM", "BASIC_TEAM")
-    password = os.environ.get("REDIS_PASS") or None
 
     if redis_client is None:
         if _redis is None:
@@ -112,7 +127,7 @@ def build_from_env(redis_client: Any | None = None) -> RedisLeadSource:
         redis_client = _redis.Redis(
             host=host,
             port=port,
-            password=password,
+            password=_resolve_redis_password(),
             decode_responses=True,
             socket_timeout=10,
             socket_connect_timeout=10,

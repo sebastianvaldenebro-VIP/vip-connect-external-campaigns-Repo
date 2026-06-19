@@ -6,7 +6,6 @@ import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 
 export interface ApiStackProps extends cdk.StackProps {
   readonly userPool: cognito.IUserPool;
@@ -290,73 +289,9 @@ export class ApiStack extends cdk.Stack {
 
     this.apiUrl = this.httpApi.apiEndpoint;
 
-    // #005 — WAFv2 REGIONAL WebACL with AWS managed rules for the HTTP API
-    const webAcl = new wafv2.CfnWebACL(this, 'ApiWebAcl', {
-      name: 'vip-admin-ui-api-waf',
-      scope: 'REGIONAL',
-      defaultAction: { allow: {} },
-      visibilityConfig: {
-        cloudWatchMetricsEnabled: true,
-        metricName: 'vip-admin-ui-api-waf',
-        sampledRequestsEnabled: true,
-      },
-      rules: [
-        {
-          name: 'AWSManagedRulesCommonRuleSet',
-          priority: 1,
-          statement: {
-            managedRuleGroupStatement: {
-              vendorName: 'AWS',
-              name: 'AWSManagedRulesCommonRuleSet',
-            },
-          },
-          overrideAction: { none: {} },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: 'AWSManagedRulesCommonRuleSet',
-            sampledRequestsEnabled: true,
-          },
-        },
-        {
-          name: 'AWSManagedRulesKnownBadInputsRuleSet',
-          priority: 2,
-          statement: {
-            managedRuleGroupStatement: {
-              vendorName: 'AWS',
-              name: 'AWSManagedRulesKnownBadInputsRuleSet',
-            },
-          },
-          overrideAction: { none: {} },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: 'AWSManagedRulesKnownBadInputsRuleSet',
-            sampledRequestsEnabled: true,
-          },
-        },
-        {
-          name: 'RateLimitPerIP',
-          priority: 3,
-          statement: {
-            rateBasedStatement: {
-              limit: 300,
-              aggregateKeyType: 'IP',
-            },
-          },
-          action: { block: {} },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: 'RateLimitPerIP',
-            sampledRequestsEnabled: true,
-          },
-        },
-      ],
-    });
-
-    // Associate WAF WebACL with the HTTP API $default stage
-    new wafv2.CfnWebACLAssociation(this, 'ApiWebAclAssociation', {
-      resourceArn: `arn:aws:apigateway:${this.region}::/apis/${this.httpApi.apiId}/stages/$default`,
-      webAclArn: webAcl.attrArn,
-    });
+    // #002 — WAFv2 cannot associate with HTTP API v2 $default stages (WAFv2 ARN validator
+    // rejects '$' in stage names — both CLI and CloudFormation fail with WAFInvalidParameterException).
+    // WAF is applied at the CloudFront layer instead. See docs/waf-and-logging-deploy.sh.
 
     new cdk.CfnOutput(this, 'HttpApiId', { value: this.httpApi.apiId });
     new cdk.CfnOutput(this, 'HttpApiEndpoint', { value: this.apiUrl });

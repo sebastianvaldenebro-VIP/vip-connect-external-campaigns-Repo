@@ -32,6 +32,7 @@ export interface ApiSegmentsStackProps extends cdk.StackProps {
     port: number;
     team: string;
     profileObjectType: string;
+    passwordSecretArn?: string;
   };
 }
 
@@ -187,6 +188,17 @@ export class ApiSegmentsStack extends cdk.Stack {
 
     props.dataKey.grantEncryptDecrypt(role);
 
+    // #003 — Redis AUTH: grant Secrets Manager read when a password secret is configured
+    if (props.redis.passwordSecretArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'RedisPasswordSecret',
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [props.redis.passwordSecretArn],
+        }),
+      );
+    }
+
     // VPC wiring — reuse the existing feeder SG so Redis already allows us in.
     const vpc = ec2.Vpc.fromVpcAttributes(this, 'RedisVpc', {
       vpcId: props.redisVpc.vpcId,
@@ -240,6 +252,11 @@ export class ApiSegmentsStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-segments',
       },
     });
+
+    // #003 — inject Redis AUTH secret ARN when configured
+    if (props.redis.passwordSecretArn) {
+      this.lambdaFunction.addEnvironment('REDIS_PASSWORD_SECRET_ARN', props.redis.passwordSecretArn);
+    }
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
     new cdk.CfnOutput(this, 'SnapshotBucketName', { value: this.snapshotBucket.bucketName });
