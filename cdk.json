@@ -21,7 +21,7 @@
     "privateSubnetIds": ["subnet-06c7669b5e3e0e814", "subnet-088367ac9fc0a2fec"],
     "lambdaSecurityGroupId": "sg-01d54d29c2a4785f1",
 
-    "_comment_redis": "ElastiCache Redis. No auth (VPC isolation), leave redisPasswordSecretArn empty.",
+    "_comment_redis": "ElastiCache Redis. Set redisPasswordSecretArn to the Secrets Manager ARN after enabling AUTH on the cluster (finding #003). Leave empty for VPC-isolation-only environments.",
     "redisHost": "production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com",
     "redisPort": "6379",
     "redisPasswordSecretArn": "",
@@ -33,6 +33,10 @@
 
     "_comment_iam": "Org-mandated permission boundary — required to CreateRole",
     "permissionsBoundaryName": "EngineeringPermissionBoundary",
+
+    "_comment_progressive_dialer": "Progressive Branded Dialer — reuses alias/prod/external-campaigns/data CMK (same account/system scope). firstOrionSecretArn = vip/firstorion/credentials in Secrets Manager.",
+    "progressiveDialerDataKeyArn": "arn:aws:kms:us-east-1:165505826690:key/df585888-2f49-4de0-9cba-14803fda63f0",
+    "firstOrionSecretArn": "arn:aws:secretsmanager:us-east-1:165505826690:secret:vip/firstorion/credentials-FvWzcj",
 
     "_comment_admin_ui": "VIP Admin UI config — Customer Profiles + Cognito",
     "profilesDomainName": "amazon-connect-vipmedicalgroup",
