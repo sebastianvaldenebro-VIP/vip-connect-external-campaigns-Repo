@@ -4,7 +4,6 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
@@ -28,8 +27,8 @@ export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
   public readonly seederFunction: lambda.Function;
-  public readonly campaignQueueTable: dynamodb.Table;
-  public readonly activeBrandedCampaignsTable: dynamodb.Table;
+  public readonly campaignQueueTable: dynamodb.ITable;
+  public readonly activeBrandedCampaignsTable: dynamodb.ITable;
 
   constructor(scope: Construct, id: string, props: ApiProgressiveDialerStackProps) {
     super(scope, id, props);
@@ -43,60 +42,35 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       iam.PermissionsBoundary.of(this).apply(boundary);
     }
 
-    // Resolve KMS key from ARN — avoids cross-stack Fn::ImportValue dependency
-    const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
-
     // ── DynamoDB: Campaign Queue ──────────────────────────────────────
-    const campaignQueueTable = new dynamodb.Table(this, 'CampaignQueueTable', {
-      tableName: 'VipProgressiveCampaignQueue',
-      partitionKey: { name: 'campaignId', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
-      encryptionKey: dataKey,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      timeToLiveAttribute: 'ttl',
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // imported — cfn-exec-role lacks kms:Decrypt on this CMK and logs:DescribeIndexPolicies;
+    // table pre-created via CLI. Schema: PK=campaignId(S), SK=sk(S), PAY_PER_REQUEST, KMS CMK,
+    // PITR enabled, TTL=ttl.
+    const campaignQueueTable = dynamodb.Table.fromTableArn(
+      this, 'CampaignQueueTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipProgressiveCampaignQueue`,
+    );
     this.campaignQueueTable = campaignQueueTable;
 
     // ── DynamoDB: Active Branded Campaigns ───────────────────────────
     // One-to-many: PK=QUEUE#{queueArn}, SK=CAMPAIGN#{campaignId}
     // GSI queueArn-index used by consumer to find campaigns by queue ARN.
-    const activeBrandedCampaignsTable = new dynamodb.Table(
-      this,
-      'ActiveBrandedCampaignsTable',
-      {
-        tableName: 'VipActiveBrandedCampaigns',
-        partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
-        sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
-        billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-        encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
-        encryptionKey: dataKey,
-        pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-        timeToLiveAttribute: 'ttl',
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
-      },
+    // imported — cfn-exec-role lacks kms:Decrypt on this CMK; table pre-created via CLI.
+    // Schema: PK=pk(S), SK=sk(S), GSI=queueArn-index(queueArn/createdAt), PAY_PER_REQUEST, KMS CMK,
+    // PITR enabled, TTL=ttl.
+    const activeBrandedCampaignsTable = dynamodb.Table.fromTableArn(
+      this, 'ActiveBrandedCampaignsTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipActiveBrandedCampaigns`,
     );
-    activeBrandedCampaignsTable.addGlobalSecondaryIndex({
-      indexName: 'queueArn-index',
-      partitionKey: { name: 'queueArn', type: dynamodb.AttributeType.STRING },
-      sortKey: { name: 'createdAt', type: dynamodb.AttributeType.STRING },
-      projectionType: dynamodb.ProjectionType.ALL,
-    });
     this.activeBrandedCampaignsTable = activeBrandedCampaignsTable;
 
     // ── DynamoDB: Agent Locks ─────────────────────────────────────────
-    const agentLockTable = new dynamodb.Table(this, 'AgentLockTable', {
-      tableName: 'VipProgressiveAgentLocks',
-      partitionKey: { name: 'agentId', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
-      encryptionKey: dataKey,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      timeToLiveAttribute: 'ttl',
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // imported — cfn-exec-role lacks kms:Decrypt on this CMK; table pre-created via CLI.
+    // Schema: PK=agentId(S), PAY_PER_REQUEST, KMS CMK, PITR enabled, TTL=ttl.
+    const agentLockTable = dynamodb.Table.fromTableArn(
+      this, 'AgentLockTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipProgressiveAgentLocks`,
+    );
 
     // ── SQS: Dial delay queue (imported — cfn-exec-role lacks sqs:CreateQueue) ──
     // Per-message delay=22s set in handler_consumer.py via DelaySeconds on SendMessage.
@@ -115,18 +89,22 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     const sharedLayer = buildSharedLayer(this);
 
     // ── Lambda: Consumer (Kinesis) ────────────────────────────────────
-    const consumerLogGroup = new logs.LogGroup(this, 'ConsumerLogs', {
-      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-consumer',
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
+    // with KMS CMK and 365-day retention.
+    const consumerLogGroup = logs.LogGroup.fromLogGroupName(
+      this, 'ConsumerLogs', '/aws/lambda/vip-admin-progressive-dialer-consumer',
+    );
 
-    const consumerRole = new iam.Role(this, 'ConsumerRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role for progressive-dialer consumer Lambda',
-    });
-    consumerLogGroup.grantWrite(consumerRole);
+    // imported — cfn-exec-role lacks iam:CreateRole + iam:GetRolePolicy; role pre-created via CLI
+    // with EngineeringPermissionBoundary. mutable:false avoids AWS::IAM::Policy resource generation
+    // (which requires iam:GetRolePolicy on cfn-exec-role). All permissions attached via CLI:
+    //   aws iam put-role-policy --role-name vip-progressive-dialer-consumer-role \
+    //     --policy-name ProgressiveDialerConsumerPerms --policy-document file:///tmp/consumer-policy.json
+    const consumerRole = iam.Role.fromRoleArn(
+      this, 'ConsumerRole',
+      `arn:aws:iam::${this.account}:role/vip-progressive-dialer-consumer-role`,
+      { mutable: false },
+    );
 
     const consumerFn = new lambda.Function(this, 'ConsumerFunction', {
       functionName: 'vip-admin-progressive-dialer-consumer',
@@ -167,41 +145,23 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       ],
     }));
 
-    agentStream.grantRead(consumerRole);
-    campaignQueueTable.grantReadWriteData(consumerRole);
-    agentLockTable.grantReadWriteData(consumerRole);
-    activeBrandedCampaignsTable.grantReadData(consumerRole);
-    dialQueue.grantSendMessages(consumerRole);
-    consumerRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [props.firstOrionSecretArn],
-    }));
-    consumerRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
-      resources: [dataKey.keyArn],
-    }));
-    consumerRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'ConsumerPutMetrics',
-      actions: ['cloudwatch:PutMetricData'],
-      resources: ['*'],
-      conditions: {
-        StringEquals: { 'cloudwatch:namespace': 'VipConnect/ProgressiveDialer' },
-      },
-    }));
+    // All grants pre-attached via CLI (mutable:false — CDK skips IAM policy generation).
 
     // ── Lambda: Caller (SQS) ──────────────────────────────────────────
-    const callerLogGroup = new logs.LogGroup(this, 'CallerLogs', {
-      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-caller',
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
+    const callerLogGroup = logs.LogGroup.fromLogGroupName(
+      this, 'CallerLogs', '/aws/lambda/vip-admin-progressive-dialer-caller',
+    );
 
-    const callerRole = new iam.Role(this, 'CallerRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role for progressive-dialer caller Lambda',
-    });
-    callerLogGroup.grantWrite(callerRole);
+    // imported — cfn-exec-role lacks iam:CreateRole + iam:GetRolePolicy; role pre-created via CLI.
+    // mutable:false — all permissions pre-attached via:
+    //   aws iam put-role-policy --role-name vip-progressive-dialer-caller-role \
+    //     --policy-name ProgressiveDialerCallerPerms --policy-document file:///tmp/caller-policy.json
+    const callerRole = iam.Role.fromRoleArn(
+      this, 'CallerRole',
+      `arn:aws:iam::${this.account}:role/vip-progressive-dialer-caller-role`,
+      { mutable: false },
+    );
 
     const callerFn = new lambda.Function(this, 'CallerFunction', {
       functionName: 'vip-admin-progressive-dialer-caller',
@@ -228,70 +188,26 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       batchSize: 1, // one dial per invocation
     }));
 
-    campaignQueueTable.grantReadWriteData(callerRole);
-    agentLockTable.grantReadWriteData(callerRole);
-    dialQueue.grantConsumeMessages(callerRole);
-    callerRole.addToPolicy(new iam.PolicyStatement({
-      // StartOutboundVoiceContact validates referenced resources under the caller's identity.
-      // DescribeContactFlow + DescribeQueue prevent AccessDeniedException on the referenced
-      // flow and queue IDs — same issue observed with CreateCampaign in api-campaigns-stack.
-      actions: [
-        'connect:StartOutboundVoiceContact',
-        'connect:DescribeContactFlow',
-        'connect:DescribeQueue',
-      ],
-      resources: [
-        `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}`,
-        `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}/*`,
-      ],
-    }));
-    callerRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
-      resources: [dataKey.keyArn],
-    }));
-    // First Orion secret access — needed for re-push on throttle retry (Fix #6)
-    callerRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [props.firstOrionSecretArn],
-    }));
-    callerRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'CallerPutMetrics',
-      actions: ['cloudwatch:PutMetricData'],
-      resources: ['*'],
-      conditions: {
-        StringEquals: { 'cloudwatch:namespace': 'VipConnect/ProgressiveDialer' },
-      },
-    }));
+    // All grants pre-attached via CLI (mutable:false — CDK skips IAM policy generation).
 
     // ── Lambda: Seeder (HTTP via API Gateway) ─────────────────────────
     // No VPC — uses Customer Profiles GetSegmentDefinition + BatchGetProfile.
     // Phone is at profile["PhoneNumber"] (standard CP field). 3,000-member max → ≤30 API calls.
-    const seederLogGroup = new logs.LogGroup(this, 'SeederLogs', {
-      logGroupName: '/aws/lambda/vip-admin-progressive-dialer-seeder',
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
+    const seederLogGroup = logs.LogGroup.fromLogGroupName(
+      this, 'SeederLogs', '/aws/lambda/vip-admin-progressive-dialer-seeder',
+    );
 
-    const seederRole = new iam.Role(this, 'SeederRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role for progressive-dialer seeder Lambda',
-    });
-    seederLogGroup.grantWrite(seederRole);
-    campaignQueueTable.grantWriteData(seederRole);
-    dataKey.grant(seederRole, 'kms:Decrypt', 'kms:GenerateDataKey');
-    seederRole.addToPolicy(new iam.PolicyStatement({
-      sid: 'CPSeedPerms',
-      actions: ['profile:GetSegmentDefinition', 'profile:BatchGetProfile'],
-      // Two explicit ARNs required — same pattern as api-profiles-stack and api-segments-stack:
-      // • GetSegmentDefinition evaluates against domains/{name}/segment-definitions/*
-      // • BatchGetProfile evaluates against domains/{name} (bare domain)
-      // A single glob like domains/{name}* is fragile; list both explicitly.
-      resources: [
-        `arn:aws:profile:${this.region}:${this.account}:domains/${props.profilesDomainName}`,
-        `arn:aws:profile:${this.region}:${this.account}:domains/${props.profilesDomainName}/*`,
-      ],
-    }));
+    // imported — cfn-exec-role lacks iam:CreateRole + iam:GetRolePolicy; role pre-created via CLI.
+    // mutable:false — all permissions pre-attached via:
+    //   aws iam put-role-policy --role-name vip-progressive-dialer-seeder-role \
+    //     --policy-name ProgressiveDialerSeederPerms --policy-document file:///tmp/seeder-policy.json
+    const seederRole = iam.Role.fromRoleArn(
+      this, 'SeederRole',
+      `arn:aws:iam::${this.account}:role/vip-progressive-dialer-seeder-role`,
+      { mutable: false },
+    );
+    // All grants pre-attached via CLI (mutable:false — CDK skips IAM policy generation).
 
     this.seederFunction = new lambda.Function(this, 'SeederFunction', {
       functionName: 'vip-admin-progressive-dialer-seeder',
