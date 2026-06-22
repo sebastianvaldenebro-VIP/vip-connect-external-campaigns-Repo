@@ -210,6 +210,11 @@ function CampaignCard({
               Journey
             </span>
           )}
+          {campaignDef?.deliveryType === 'branded' && (
+            <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 leading-none">
+              Branded
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <StatusBadge status={cs.status} />

@@ -733,11 +733,12 @@ function CampaignCard({
               <label className="block text-xs font-semibold text-gray-700 mb-1">Delivery type</label>
               <select
                 value={campaign.deliveryType ?? 'campaign'}
-                onChange={(e) => onChange({ ...campaign, deliveryType: e.target.value as 'campaign' | 'journey' })}
+                onChange={(e) => onChange({ ...campaign, deliveryType: e.target.value as 'campaign' | 'journey' | 'branded' })}
                 className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
               >
                 <option value="campaign">Campaign</option>
                 <option value="journey">Journey</option>
+                <option value="branded">Branded (Progressive)</option>
               </select>
             </div>
 
@@ -810,21 +811,39 @@ function CampaignCard({
               </button>
               {configOpen && (
                 <div className="mt-2 grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-700 mb-1">Queue</label>
-                    <select
-                      value={cfg.queueId}
-                      onChange={(e) => updateCfg({ queueId: e.target.value })}
-                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
-                    >
-                      <option value="">— select queue —</option>
-                      {queues.map((q) => (
-                        <option key={q.id} value={q.id}>
-                          {q.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  {campaign.deliveryType === 'branded' ? (
+                    <div className="col-span-2">
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">
+                        Queue ARN <span className="text-red-500">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={cfg.queueArn ?? ''}
+                        onChange={(e) => updateCfg({ queueArn: e.target.value })}
+                        placeholder="arn:aws:connect:us-east-1:165505826690:instance/.../queue/..."
+                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-300"
+                      />
+                      <p className="text-[10px] text-gray-500 mt-0.5">
+                        Full ARN of the agent routing queue (not the campaign queue)
+                      </p>
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">Queue</label>
+                      <select
+                        value={cfg.queueId}
+                        onChange={(e) => updateCfg({ queueId: e.target.value })}
+                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                      >
+                        <option value="">— select queue —</option>
+                        {queues.map((q) => (
+                          <option key={q.id} value={q.id}>
+                            {q.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
                   <div>
                     <label className="block text-xs font-semibold text-gray-700 mb-1">Contact flow</label>
                     <select
@@ -849,29 +868,33 @@ function CampaignCard({
                       className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-300"
                     />
                   </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-700 mb-1">Dialer type</label>
-                    <select
-                      value={cfg.dialerType}
-                      onChange={(e) => updateCfg({ dialerType: e.target.value })}
-                      className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
-                    >
-                      <option value="progressive">Progressive</option>
-                      <option value="predictive">Predictive</option>
-                      <option value="agentless">Agentless</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-700 mb-1">AMD</label>
-                    <label className="flex items-center gap-2 text-sm cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={cfg.amdEnabled}
-                        onChange={(e) => updateCfg({ amdEnabled: e.target.checked })}
-                      />
-                      <span className="text-gray-700">Enable answer machine detection</span>
-                    </label>
-                  </div>
+                  {campaign.deliveryType !== 'branded' && (
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">Dialer type</label>
+                      <select
+                        value={cfg.dialerType}
+                        onChange={(e) => updateCfg({ dialerType: e.target.value })}
+                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                      >
+                        <option value="progressive">Progressive</option>
+                        <option value="predictive">Predictive</option>
+                        <option value="agentless">Agentless</option>
+                      </select>
+                    </div>
+                  )}
+                  {campaign.deliveryType !== 'branded' && (
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">AMD</label>
+                      <label className="flex items-center gap-2 text-sm cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cfg.amdEnabled}
+                          onChange={(e) => updateCfg({ amdEnabled: e.target.checked })}
+                        />
+                        <span className="text-gray-700">Enable answer machine detection</span>
+                      </label>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

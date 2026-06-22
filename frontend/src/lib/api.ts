@@ -301,6 +301,8 @@ export type BucketCampaignConfig = {
   amdEnabled: boolean;
   amdAwaitPrompt: boolean;
   campaignFlowArn?: string;
+  /** Full routing queue ARN — required for deliveryType='branded' */
+  queueArn?: string;
 };
 
 export type BucketDef = {
@@ -397,7 +399,7 @@ export type CampaignDef = {
    */
   pinnedSegmentArn?: string;
   /** Controls the Connect campaign type. Defaults to "campaign" (MANAGED). */
-  deliveryType?: 'campaign' | 'journey';
+  deliveryType?: 'campaign' | 'journey' | 'branded';
 };
 
 export type BucketDefV2 = {
