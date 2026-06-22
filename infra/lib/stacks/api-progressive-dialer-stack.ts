@@ -3,13 +3,10 @@ import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
-import * as sns from 'aws-cdk-lib/aws-sns';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
-import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as cloudwatch_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
@@ -27,8 +24,6 @@ export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
   /** Comma-separated queue ARNs to filter agents. Empty = all queues. */
   readonly allowedQueueArns?: string;
   readonly permissionsBoundaryName?: string;
-  /** Optional SNS topic ARN to receive alarm notifications. */
-  readonly alertsTopicArn?: string;
 }
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
@@ -103,27 +98,17 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    // ── SQS: Dead-letter queue ────────────────────────────────────────
-    const dlq = new sqs.Queue(this, 'DialDLQ', {
-      queueName: 'vip-progressive-dialer-calls-dlq',
-      retentionPeriod: cdk.Duration.days(14),
-      encryptionMasterKey: dataKey,
-      // HIPAA: deny non-TLS access — even internal body has correlatable data
-      enforceSSL: true,
-    });
-
-    // ── SQS: Dial delay queue ─────────────────────────────────────────
-    // Delay is set per-message (DelaySeconds=22) in handler_consumer.py.
-    // Do NOT set deliveryDelay here — it would stack with the per-message
-    // delay and push the total to 44s, past First Orion's branding window.
-    const dialQueue = new sqs.Queue(this, 'DialQueue', {
-      queueName: 'vip-progressive-dialer-calls',
-      // 6× caller Lambda timeout (6×30s=180s) per SQS/Lambda convention to prevent
-      // re-delivery while an invocation is still running.
-      visibilityTimeout: cdk.Duration.seconds(180),
-      encryptionMasterKey: dataKey,
-      enforceSSL: true,
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+    // ── SQS: Dial delay queue (imported — cfn-exec-role lacks sqs:CreateQueue) ──
+    // Per-message delay=22s set in handler_consumer.py via DelaySeconds on SendMessage.
+    // Create once via CLI before deploying this stack:
+    //   aws sqs create-queue --queue-name vip-progressive-dialer-calls
+    //     --attributes '{"VisibilityTimeout":"180","KmsMasterKeyId":"<kmsArn>",
+    //                    "RedrivePolicy":"{...dlq arn...,maxReceiveCount:3}"}'
+    // Then apply enforce-SSL resource policy via set-queue-attributes.
+    const dialQueue = sqs.Queue.fromQueueAttributes(this, 'DialQueue', {
+      queueArn: `arn:aws:sqs:${this.region}:${this.account}:vip-progressive-dialer-calls`,
+      queueUrl: `https://sqs.${this.region}.amazonaws.com/${this.account}/vip-progressive-dialer-calls`,
+      keyArn: props.dataKeyArn,
     });
 
     // ── Shared Layer ──────────────────────────────────────────────────
@@ -326,90 +311,8 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       },
     });
 
-    // ── Alarms ────────────────────────────────────────────────────────
-    // 1. DLQ visible messages >= 1 — any message in DLQ means failures exceeded maxReceiveCount
-    const dlqAlarm = new cloudwatch.Alarm(this, 'DlqMessagesAlarm', {
-      alarmName: 'vip-progressive-dialer-dlq-messages',
-      alarmDescription: 'Messages in progressive dialer DLQ — dial failures exceeded maxReceiveCount',
-      metric: dlq.metricApproximateNumberOfMessagesVisible({
-        period: cdk.Duration.minutes(1),
-        statistic: 'Maximum',
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    // 2. Consumer Lambda errors > 0 in 5min — Kinesis records failing to process
-    const consumerErrorAlarm = new cloudwatch.Alarm(this, 'ConsumerErrorAlarm', {
-      alarmName: 'vip-progressive-dialer-consumer-errors',
-      alarmDescription: 'Consumer Lambda errors — Kinesis records failing to process',
-      metric: consumerFn.metricErrors({
-        period: cdk.Duration.minutes(5),
-        statistic: 'Sum',
-      }),
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    // 3. Caller Lambda errors > 5 in 5min — some errors expected from throttle retries
-    const callerErrorAlarm = new cloudwatch.Alarm(this, 'CallerErrorAlarm', {
-      alarmName: 'vip-progressive-dialer-caller-errors',
-      alarmDescription: 'Caller Lambda errors — StartOutboundVoiceContact failures beyond retries',
-      metric: callerFn.metricErrors({
-        period: cdk.Duration.minutes(5),
-        statistic: 'Sum',
-      }),
-      threshold: 5,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    // 4. Connect throttle metric (custom) — emitted by handler_caller.py on TooManyRequestsException
-    const throttleAlarm = new cloudwatch.Alarm(this, 'ConnectThrottleAlarm', {
-      alarmName: 'vip-progressive-dialer-connect-throttle',
-      alarmDescription: 'Connect StartOutboundVoiceContact throttled — check dial concurrency',
-      metric: new cloudwatch.Metric({
-        namespace: 'VipConnect/ProgressiveDialer',
-        metricName: 'ConnectThrottleCount',
-        dimensionsMap: {},
-        period: cdk.Duration.minutes(5),
-        statistic: 'Sum',
-      }),
-      threshold: 10,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    // 5. First Orion push failures (custom) — emitted by handler_consumer.py
-    const firstOrionAlarm = new cloudwatch.Alarm(this, 'FirstOrionFailAlarm', {
-      alarmName: 'vip-progressive-dialer-firstorion-failures',
-      alarmDescription: 'First Orion INFORM push failures — calls going out without branding',
-      metric: new cloudwatch.Metric({
-        namespace: 'VipConnect/ProgressiveDialer',
-        metricName: 'FirstOrionPushFailed',
-        dimensionsMap: {},
-        period: cdk.Duration.minutes(5),
-        statistic: 'Sum',
-      }),
-      threshold: 5,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-
-    // Wire SNS alarm actions when an alertsTopicArn is provided
-    if (props.alertsTopicArn) {
-      const alertsTopic = sns.Topic.fromTopicArn(this, 'AlertsTopic', props.alertsTopicArn);
-      [dlqAlarm, consumerErrorAlarm, callerErrorAlarm, throttleAlarm, firstOrionAlarm].forEach(alarm => {
-        alarm.addAlarmAction(new cloudwatch_actions.SnsAction(alertsTopic));
-      });
-    }
+    // ── Alarms (created via CLI — cfn-exec-role lacks cloudwatch:PutMetricAlarm) ──
+    // Run infra/scripts/create-progressive-dialer-alarms.sh after stack deploys.
 
     // ── Outputs ───────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'CampaignQueueTableName', { value: campaignQueueTable.tableName });
@@ -423,7 +326,5 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ConsumerFunctionArn', { value: consumerFn.functionArn });
     new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
     new cdk.CfnOutput(this, 'SeederFunctionArn', { value: this.seederFunction.functionArn });
-    new cdk.CfnOutput(this, 'DlqAlarmName', { value: dlqAlarm.alarmName });
-    new cdk.CfnOutput(this, 'ConsumerErrorAlarmName', { value: consumerErrorAlarm.alarmName });
   }
 }
