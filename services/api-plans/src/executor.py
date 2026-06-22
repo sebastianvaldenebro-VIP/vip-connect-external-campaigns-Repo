@@ -2536,7 +2536,7 @@ def _start_one_campaign(
                 campaign_id=campaign_id,
                 segment_name=seg_name,
                 contact_flow_id=cfg["contactFlowId"],
-                source_phone=cfg["sourcePhone"],
+                source_phone=cfg.get("sourcePhone") or cfg.get("sourcePhoneNumber", ""),
             )
         except Exception as exc:
             logger.error(
@@ -2578,7 +2578,7 @@ def _start_one_campaign(
                     "planId":        {"S": run["planId"]},
                     "runId":         {"S": run["runId"]},
                     "contactFlowId": {"S": cfg["contactFlowId"]},
-                    "sourcePhone":   {"S": cfg["sourcePhone"]},
+                    "sourcePhone":   {"S": cfg.get("sourcePhone") or cfg.get("sourcePhoneNumber", "")},
                     "priority":      {"N": str(campaign_index)},
                     "createdAt":     {"S": now_iso},
                     "ttl":           {"N": str(bucket_end_epoch + 1800)},

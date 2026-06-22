@@ -379,11 +379,16 @@ def _validate_branded_campaign(campaign: dict, bucket_name: str, ci: int) -> lis
     errors = []
     cfg = campaign.get("campaignConfig") or {}
     prefix = f"bucket '{bucket_name}' campaign[{ci}]"
-    for required_key in ("queueArn", "contactFlowId", "sourcePhone"):
+    for required_key in ("queueArn", "contactFlowId"):
         if not cfg.get(required_key):
             errors.append(
                 f"{prefix}: deliveryType='branded' requires campaignConfig.{required_key}"
             )
+    # Accept either sourcePhone or sourcePhoneNumber (frontend sends sourcePhoneNumber)
+    if not cfg.get("sourcePhone") and not cfg.get("sourcePhoneNumber"):
+        errors.append(
+            f"{prefix}: deliveryType='branded' requires campaignConfig.sourcePhone"
+        )
     return errors
 
 
