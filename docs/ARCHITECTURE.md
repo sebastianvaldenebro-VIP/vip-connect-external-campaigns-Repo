@@ -83,6 +83,31 @@ flowchart TB
 
     DDB -.encrypt.-> KMS
     REDIS -.encrypt.-> KMS
+
+    subgraph ProgressiveDialer["Progressive Branded Dialer (ApiProgressiveDialerStack)"]
+        KIN[Kinesis Agent Event Stream]
+        CONS[consumer Lambda]
+        SQS_PD[SQS vip-progressive-dialer-calls\n22s delay]
+        CALL[caller Lambda]
+        SEED[seeder Lambda]
+        ACB[(DynamoDB\nVipActiveBrandedCampaigns)]
+        CPQ[(DynamoDB\nVipProgressiveCampaignQueue)]
+        ALK[(DynamoDB\nVipAgentLock)]
+        FO[First Orion API\nINFORM push]
+    end
+
+    KIN --> CONS
+    CONS --> ACB
+    CONS --> ALK
+    CONS --> CPQ
+    CONS --> FO
+    CONS --> SQS_PD
+    SQS_PD --> CALL
+    CALL --> CPQ
+    APL -->|invoke seeder| SEED
+    SEED --> CPQ
+    SEED --> SH
+    CALL -->|StartOutboundVoiceContact| CC
 ```
 
 ---
@@ -307,7 +332,112 @@ Why it matters: Connect V2 enforces `startTime >= now + 6m`. Without pre-warm, a
 
 ---
 
-## 6. Technical Debt Register
+## 6. Progressive Branded Dialer — Architecture
+
+### Overview
+
+El Progressive Branded Dialer es una capa de infraestructura separada (`ApiProgressiveDialerStack`) que dispara llamadas salientes branded en respuesta a disponibilidad del agente, no a un scheduler. A diferencia de las campañas Connect V2 (segment-driven, el dialer maneja el timing), aquí la aplicación controla exactamente cuándo se llama a cada lead.
+
+### Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AG as Amazon Connect Agent
+    participant KIN as Kinesis Agent Event Stream
+    participant CONS as consumer Lambda
+    participant DDB_ACB as VipActiveBrandedCampaigns
+    participant DDB_ALK as VipAgentLock
+    participant DDB_CPQ as VipProgressiveCampaignQueue
+    participant FO as First Orion API
+    participant SQS as SQS (22s delay)
+    participant CALL as caller Lambda
+    participant CC as Amazon Connect
+
+    AG->>KIN: STATE_CHANGE (ROUTABLE/Available)
+    KIN->>CONS: Kinesis record batch
+    CONS->>CONS: filter: EventType=STATE_CHANGE, Status=Available, no pending break
+    CONS->>DDB_ACB: query GSI queueArn-index for each InboundQueue ARN
+    Note over CONS: First queue with active campaigns wins
+    CONS->>DDB_ALK: PutItem conditional (acquire agent lock, TTL=120s)
+    CONS->>DDB_CPQ: DeleteItem conditional (dequeue lead — atomic)
+    CONS->>FO: push INFORM (a_number=sourcePhone, b_number=lead.phone)
+    CONS->>SQS: SendMessage (DelaySeconds=22, no PHI — phone stays in DDB)
+    Note over SQS: 22s window: First Orion processes INFORM,\nConnect answer detection ready
+    SQS->>CALL: trigger after 22s delay
+    CALL->>DDB_CPQ: GetItem (read lead phone — PHI read from encrypted DDB)
+    CALL->>CC: StartOutboundVoiceContact
+    CALL->>DDB_CPQ: UpdateItem status=DIALED
+```
+
+### Multi-agent concurrency
+
+Tres capas de aislamiento previenen double-dispatch cuando múltiples agentes van Available simultáneamente:
+
+1. **Kinesis → una invocación Lambda por registro.** Cada `STATE_CHANGE` genera un registro independiente procesado en paralelo.
+2. **Agent lock por agente ARN.** `VipAgentLock` PutItem condicional (`attribute_not_exists OR TTL expirado`). Un agente solo puede tener un dispatch activo. No bloquea otros agentes — los locks son por ARN.
+3. **Dequeue atómico por lead.** `VipProgressiveCampaignQueue` DeleteItem condicional garantiza que solo un caller elimina cada lead. Si dos invocaciones concurrentes llegan al mismo lead, una gana y la otra recibe `None` y libera su lock.
+
+### PHI handling
+
+- El `phone` del lead **nunca entra al mensaje SQS** ni a los logs del consumer. Solo se loguea el `contactSk` (SK del item en DDB).
+- El caller Lambda lee el teléfono directamente de DDB (KMS-encrypted) en el momento de llamar.
+- First Orion recibe el teléfono solo en el API call HTTP (TLS en tránsito); no se loguea.
+
+### DynamoDB tables
+
+| Tabla | PK | SK | Propósito |
+|---|---|---|---|
+| `VipActiveBrandedCampaigns` | `CAMPAIGN#{campaignId}` | — | Campañas activas con config (queueArn, flowId, sourcePhone, priority). GSI: `queueArn-index`. |
+| `VipProgressiveCampaignQueue` | `campaignId` | `{timestamp}#{contactUUID}` | Lead queue. TTL=24h. status: PENDING→DIALED. |
+| `VipAgentLock` | `agentArn` | — | Lock activo por agente. TTL=120s (auto-expira si caller Lambda falla). |
+
+### Seeder flow (api-plans → seeder Lambda)
+
+Cuando el executor detecta `deliveryType: "branded"`:
+
+1. `_start_one_campaign` obtiene el `segmentName` (via `pinnedSegmentArn` o `_create_segment`).
+2. Invoca `vip-admin-progressive-dialer-seeder` con `campaignId` + `segmentName` + `campaignConfig`.
+3. El seeder lee el segmento CP, extrae teléfonos del `segmentGroups.PhoneNumber.INCLUSIVE` filter, y escribe cada teléfono como item PENDING en `VipProgressiveCampaignQueue`.
+4. El executor registra la campaña en `VipActiveBrandedCampaigns` con el `queueArn` de la config (que debe coincidir con una InboundQueue de los agentes asignados).
+
+### Segment strategy para branded campaigns
+
+Las campañas branded no usan Connect V2 segment-driven dialing — usan `StartOutboundVoiceContact` directo. El segmento CP sirve solo como fuente de la lista de teléfonos. Se construye con `PhoneNumber.INCLUSIVE` (no `ID.INCLUSIVE`) porque CP no indexa los Lead IDs del CRM; solo el teléfono es buscable directamente sin `BatchGetProfile`.
+
+---
+
+### ADR-009 — InboundQueues como lookup key para campañas branded
+
+**Status:** Accepted.
+**Context:** Las campañas branded se registran en `VipActiveBrandedCampaigns` contra la queue que los agentes atienden (InboundQueue). El Agent Event Stream reporta tanto `DefaultOutboundQueue` (queue para llamadas agente-iniciadas) como `InboundQueues` (queues del routing profile). El consumer inicialmente solo buscaba por `DefaultOutboundQueue` y nunca encontraba campañas.
+**Decision:** `extract_agent_info` retorna ambas: `queue_arn` (DefaultOutboundQueue) e `inbound_queue_arns` (lista). El consumer itera todas y usa la primera con campañas activas como `matched_queue_arn`. El SQS message incluye `matched_queue_arn` (no el DefaultOutboundQueue del agente) porque el caller Lambda extrae el queue ID de Connect de ahí.
+**Consequences:** Si un agente tiene muchas InboundQueues, el lookup hace N queries al GSI. Con el scale actual (<5 queues por agente) es negligible.
+
+### ADR-010 — PhoneNumber.INCLUSIVE en lugar de ID.INCLUSIVE para branded segments
+
+**Status:** Accepted.
+**Context:** CP no indexa los Lead IDs del CRM (UUIDs externos). `customer_ids_to_segment_groups` con `ID.INCLUSIVE` creaba segmentos válidos en CP pero con 0 profiles porque los UUIDs no mapeaban a ningún ProfileId interno. La única forma de filtrar profiles por leads del CRM sin `BatchGetProfile` por cada lead es usar el teléfono, que CP sí almacena como `PhoneNumber`.
+**Decision:** `_create_segment` usa `phones_to_segment_groups` (PhoneNumber.INCLUSIVE, chunks de 50). El seeder lee los teléfonos directamente del `segmentGroups` definition sin necesidad de resolve adicional.
+**Consequences:** Si dos leads tienen el mismo teléfono (landline compartido), CP retorna un profile que puede ser dialed dos veces en runs distintos. Aceptable en el contexto actual.
+
+### ADR-011 — SQS delay de 22s para ventana First Orion + answer detection
+
+**Status:** Accepted.
+**Context:** First Orion INFORM debe procesarse antes de que el teléfono suene para que el branded caller ID aparezca en el device del contacto. `StartOutboundVoiceContact` inicia el dial inmediatamente. Se necesita una ventana entre el push INFORM y el dial.
+**Decision:** El consumer envía First Orion push y luego encola en SQS con `DelaySeconds=22`. El caller Lambda se ejecuta 22s después cuando First Orion ya propagó la información. Este delay también da tiempo para que Connect procese la respuesta del agente.
+**Consequences:** El lead no es llamado en los primeros 22s desde que el agente va Available. Si el agente va Unavailable en esos 22s, la llamada se inicia de todos modos (el caller no verifica disponibilidad del agente antes de `StartOutboundVoiceContact`).
+
+### ADR-012 — TTL de 24h en VipProgressiveCampaignQueue
+
+**Status:** Accepted.
+**Context:** Si el plan termina o es cancelado mientras quedan leads PENDING, esos items deben limpiarse solos. Un janitor activo que borre items al terminar la campaña es más complejo que un TTL.
+**Decision:** Todos los items de `VipProgressiveCampaignQueue` tienen TTL=now+86400s (24h) al crearse. DynamoDB los elimina automáticamente. Campañas branded no duran más de 1 día de trabajo.
+**Consequences:** Items DIALED también se limpian a las 24h. No hay historial persistente de dials en esta tabla — el audit trail vive en CloudWatch logs del caller Lambda.
+
+---
+
+## 8. Technical Debt Register
 
 | ID | Title | Impact | Effort | Notes |
 |---|---|---|---|---|
@@ -325,3 +455,7 @@ Why it matters: Connect V2 enforces `startTime >= now + 6m`. Without pre-warm, a
 | TD-012 | No canary / blue-green Lambda deploy | MEDIUM | HIGH | Hard-cutover `update-function-code`. CodeDeploy alias-shifting would close this. |
 | TD-013 | Customer Profiles segment definitions never garbage-collected | LOW | LOW | Each run creates 1 segment per campaign. Slow leak; add a daily janitor. |
 | TD-014 | System `zip` broken on dev host | LOW | LOW | `deploy.sh` uses Python `zipfile` workaround; document in onboarding. |
+| TD-015 | No branded campaign progress UI | MEDIUM | MEDIUM | `VipProgressiveCampaignQueue` solo visible via DDB console. Falta contador PENDING/DIALED en PlanDetail. |
+| TD-016 | Caller Lambda no verifica disponibilidad del agente antes de dial | MEDIUM | LOW | Si el agente va Unavailable en la ventana de 22s, la llamada se inicia sin agente disponible. Agregar check de agent state antes de `StartOutboundVoiceContact`. |
+| TD-017 | Branded campaign no tiene mecanismo de stop/cancel desde UI | MEDIUM | MEDIUM | Para detener un branded campaign hay que borrar el item de `VipActiveBrandedCampaigns` manualmente. Falta botón de stop en PlanDetail. |
+| TD-018 | Agent lock TTL hardcoded a 120s | LOW | LOW | Si el caller Lambda falla después de los 120s, el agente no puede recibir otro dispatch hasta que el TTL expire. Configurable via env var sería mejor. |

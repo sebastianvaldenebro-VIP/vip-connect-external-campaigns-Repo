@@ -177,6 +177,70 @@ Agregados al role del Lambda en la política `FunctionRoleDefaultPolicy41A10F9C`
 
 ---
 
+## 2026-06-16 a 2026-07-01 — Progressive Branded Dialer
+
+### Sistema completo Progressive Branded Dialer (`ApiProgressiveDialerStack`)
+
+Nueva capa de infraestructura para llamadas salientes branded disparadas por disponibilidad del agente, no por scheduler. Amazon Connect Agent Event Stream (Kinesis) → consumer Lambda → SQS (22s delay) → caller Lambda → `StartOutboundVoiceContact` + First Orion INFORM.
+
+**Tablas DynamoDB nuevas:**
+
+- `VipActiveBrandedCampaigns` — PK=`CAMPAIGN#{campaignId}`, GSI=`queueArn-index`. Contiene campañas activas con `queueArn`, `contactFlowId`, `sourcePhone`, `priority`, `segmentName`, `segmentArn`.
+- `VipProgressiveCampaignQueue` — PK=`campaignId`, SK=timestamp. Queue de leads pre-poblada por el seeder con TTL=24h. Cada item tiene `phone`, `contactId`, `contactUUID`, `status` (PENDING→DIALED).
+- `VipAgentLock` — PK=`agentArn`. Lock por agente con TTL para prevenir double-dispatch.
+
+**Tres Lambdas nuevas:**
+
+- `vip-admin-progressive-dialer-consumer`: consume Kinesis Agent Event Stream, filtra `STATE_CHANGE` ROUTABLE Available, busca campañas por InboundQueues del agente, adquiere agent lock, desencola lead, dispara First Orion push, encola SQS.
+- `vip-admin-progressive-dialer-seeder`: invocado por el executor de api-plans al iniciar una branded campaign. Lee el segmento CP, extrae teléfonos, popula `VipProgressiveCampaignQueue`.
+- `vip-admin-progressive-dialer-caller`: consume SQS (22s delay), lee el lead de DDB, llama `StartOutboundVoiceContact`, actualiza status a DIALED.
+
+**Flujo completo:**
+
+1. Plan executor detecta `deliveryType: "branded"` → invoca seeder
+2. Seeder lee CP segment, escribe leads en `VipProgressiveCampaignQueue`
+3. Agente va Available en Connect → Kinesis emite `STATE_CHANGE`
+4. Consumer Lambda: busca campaña por InboundQueues → adquiere lock → desencola lead → First Orion INFORM → SQS enqueue (22s)
+5. Caller Lambda: `StartOutboundVoiceContact` → actualiza DDB item a DIALED
+
+### `pinnedSegmentArn` en branded campaigns
+
+Si una campaña tiene `pinnedSegmentArn` en su config, el executor usa ese segmento existente directamente en lugar de crear uno dinámico con `_create_segment`. Permite reutilizar segmentos CP ya construidos externamente sin consumir el timeout de creación de segmento en cada run.
+
+### `sourcePhoneNumber` fallback en executor.py
+
+`_start_one_campaign` acepta tanto `cfg["sourcePhone"]` como `cfg["sourcePhoneNumber"]` (fallback). El frontend del Plan editor escribe `sourcePhoneNumber`; planes legacy en DynamoDB pueden tener `sourcePhone`. Ambos formatos funcionan sin migración.
+
+### `_normalize_phone_e164` — normalización de teléfonos del CRM
+
+Nueva función en `executor.py` que convierte teléfonos del CRM a E.164 (`+1XXXXXXXXXX`) antes de construir el segmento CP. Maneja: 10 dígitos → `+1` prefix, 11 dígitos con `1` → `+` prefix, ya E.164 → sin cambio. Formatos como `(555) 123-4567` o `555-123-4567` también normalizados.
+
+### `phones_to_segment_groups` — segmentos CP por teléfono (fix `_EmptySegmentError`)
+
+`SegmentGroupsTranslator.phones_to_segment_groups` construye filtros `PhoneNumber.INCLUSIVE` en grupos de 50. Reemplaza `customer_ids_to_segment_groups` en el path branded porque CP no expone los Lead IDs del CRM — solo los teléfonos son buscables directamente. El seeder (`_extract_phones_from_filter`) lee los teléfonos del `segmentGroups` definition sin `BatchGetProfile`.
+
+### Redis/Valkey `ssl=True`
+
+`redis_lead_source.build_from_env` ahora pasa `ssl=True` al cliente Redis para soportar el endpoint TLS de Valkey. Sin esta flag, la conexión era rechazada silenciosamente.
+
+### Consumer: `InboundQueues` fix — matching correcto de campañas branded
+
+`extract_agent_info` retorna tanto `DefaultOutboundQueue` como todas las `InboundQueues` del routing profile. El consumer itera ambas en orden y usa la primera con campañas activas. Antes solo buscaba por `DefaultOutboundQueue` (queue para llamadas agente-iniciadas), pero las campañas branded se registran contra las queues de `InboundQueues`.
+
+### Frontend — Plan editor: tipo de entrega Branded (Progressive)
+
+`PlanNew.tsx` ahora incluye la opción `Branded (Progressive)` en el selector de delivery type. Al seleccionarlo:
+
+- Aparece campo **Queue ARN** (ARN completo de la queue de agentes)
+- Se ocultan los campos `dialerType`, bandwidth, dialing capacity, AMD enabled, AMD await prompt (irrelevantes para branded)
+- `contactFlowId` y `sourcePhoneNumber` permanecen visibles
+
+`PlanDetail.tsx` muestra un badge amber "Branded" en cada campaña con `deliveryType: "branded"`.
+
+`api.ts`: `deliveryType` extendido con `'branded'`, `BucketCampaignConfig` incluye `queueArn?: string`.
+
+---
+
 ## 2026-05-21 — Sesión 11: alertas operacionales SNS y UX del Scheduler
 
 ### Alertas SNS operacionales (`_notify_sns`)
@@ -239,12 +303,14 @@ El default de reintentos para reconciliación de segmentos durante rebuilds de R
 Operators can now configure each campaign in a plan bucket as **Campaign** (default, MANAGED type) or **Journey** (JOURNEY type) directly from the Plan editor.
 
 **How it works:**
+
 - Each campaign in the BucketEditor has a new **Delivery type** dropdown: `Campaign` | `Journey`
 - Journey campaigns use the canonical `Test-Journey-Flow` contact flow (CAMPAIGN type) instead of the per-state `campaign-<STATE>` flow
 - The payload sent to Connect adds `type: "JOURNEY"` and `communicationLimitsOverride` — all other parameters (queue, contact flow, source phone, dialer type, AMD, schedule, segment) are identical to regular campaigns
 - The monitor (PlanDetail) shows a purple `Journey` badge on each Journey campaign card
 
 **Backend:**
+
 - `builders.py`: `resolve_journey_flow_arn()` resolves `Test-Journey-Flow` by name; `build_campaign_params()` accepts `delivery_type` param
 - `executor.py`: reads `campaign.deliveryType` in both `_create_and_start_campaign` and `_create_campaign_only` (pre-warm path)
 

@@ -573,3 +573,22 @@ Orden cronológico. **Append al final.**
   4. **`start_run_chained` + `_fire_bucket_chains` + `_fire_campaign_chains`**: limpian `pendingWarmup` inmediatamente cuando un plan encadenado es skipeado por `_within_working_hours`.
 - **Tests:** 150 passing (sin regresiones).
 - **Archivos:** `services/api-plans/src/executor.py` (5 funciones modificadas)
+
+---
+
+## 2026-07-01 — Sesión Progressive Branded Dialer E2E
+
+### BD-001 — Consumer Lambda matcheaba `DefaultOutboundQueue` en vez de `InboundQueues` → ninguna campaña branded encontrada *(Fix 2026-07-01)*
+
+- **Síntoma:** El consumer Lambda procesaba los eventos `STATE_CHANGE` correctamente pero nunca encontraba campañas branded para ningún agente disponible. Los logs mostraban que el lookup de `VipActiveBrandedCampaigns` siempre retornaba vacío.
+- **Causa raíz:** `extract_agent_info` extraía solo `routing_profile.DefaultOutboundQueue` (la queue usada cuando un agente inicia una llamada saliente). Las campañas branded están registradas contra las queues de `InboundQueues` (las queues que el agente atiende). En el caso real: la campaña estaba en la VIP test queue (`eb308429`, en `InboundQueues`), pero el consumer buscaba por la `DefaultOutboundQueue` del agente (`ee129237`). El GSI nunca retornaba match.
+- **Fix:** `extract_agent_info` ahora retorna tanto `queue_arn` (DefaultOutboundQueue) como `inbound_queue_arns` (lista de todas las InboundQueues). El consumer itera todas las ARNs candidatas en orden y usa la primera que tiene campañas activas como `matched_queue_arn`. El SQS message lleva el `matched_queue_arn` (queue de la campaña), no el DefaultOutboundQueue del agente.
+- **Archivos:** `services/api-progressive-dialer/src/agent_event_filter.py`, `services/api-progressive-dialer/src/handler_consumer.py`
+
+### BD-002 — `_EmptySegmentError` al seeder: Lead UUIDs de Redis ≠ CP internal ProfileIds *(Fix 2026-07-01)*
+
+- **Síntoma:** El plan "Test Branded" / campaña "NY-NL_13" fallaba con `_EmptySegmentError` en el live monitor. El seeder invocado por el executor retornaba 0 leads.
+- **Causa raíz:** `_create_segment` construía el segmento de Customer Profiles usando los `customerid` de Redis (UUIDs del CRM, ej. `abc123-uuid`) como filtro `ID.INCLUSIVE`. Amazon Customer Profiles usa sus propios ProfileIds internos (completamente distintos de los IDs del CRM). El segmento se creaba en CP correctamente pero no matcheaba ningún perfil → 0 results → seeder sin leads → `_EmptySegmentError`. El bug existía desde el inicio del feature y nunca había sido activado en producción sin `pinnedSegmentArn`.
+- **Fix:** `_create_segment` ahora extrae teléfonos de los registros Redis, los normaliza a E.164 via `_normalize_phone_e164`, y construye el segmento con `PhoneNumber.INCLUSIVE` via `SegmentGroupsTranslator.phones_to_segment_groups`. CP puede filtrar por `PhoneNumber` directamente ya que ese campo viene del CRM sync. El seeder (`_extract_phones_from_filter`) lee los teléfonos del `segmentGroups` definition sin necesidad de `BatchGetProfile`.
+- **Archivos:** `services/api-plans/src/executor.py` (`_normalize_phone_e164`, `_create_segment`), `services/shared/python/vip_shared/domain/services/segment_groups_translator.py` (`phones_to_segment_groups`)
+- **Nota:** `redis_lead_source.py` también actualizado con `ssl=True` en el mismo batch (migración Valkey).
