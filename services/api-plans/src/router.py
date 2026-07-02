@@ -31,6 +31,7 @@ ROUTES: dict[str, Handler] = {
     "POST /plans/{id}/runs/{runId}/buckets/{bucketIndex}/campaigns/{campaignIndex}/force-stop": runs_handler.force_stop_campaign,
     "POST /plans/{id}/runs/{runId}/buckets/{bucketIndex}/campaigns/{campaignIndex}/skip": runs_handler.skip_campaign,
     "POST /plans/{id}/runs/{runId}/apply-snapshot": runs_handler.apply_plan_snapshot,
+    "GET /plans/{id}/runs/{runId}/branded-progress": runs_handler.branded_progress,
 }
 
 

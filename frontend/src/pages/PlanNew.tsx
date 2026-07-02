@@ -812,20 +812,20 @@ function CampaignCard({
               {configOpen && (
                 <div className="mt-2 grid grid-cols-2 gap-3">
                   {campaign.deliveryType === 'branded' ? (
-                    <div className="col-span-2">
-                      <label className="block text-xs font-semibold text-gray-700 mb-1">
-                        Queue ARN <span className="text-red-500">*</span>
-                      </label>
-                      <input
-                        type="text"
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">Queue</label>
+                      <select
                         value={cfg.queueArn ?? ''}
                         onChange={(e) => updateCfg({ queueArn: e.target.value })}
-                        placeholder="arn:aws:connect:us-east-1:165505826690:instance/.../queue/..."
-                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-300"
-                      />
-                      <p className="text-[10px] text-gray-500 mt-0.5">
-                        Full ARN of the agent routing queue (not the campaign queue)
-                      </p>
+                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                      >
+                        <option value="">— select queue —</option>
+                        {queues.map((q) => (
+                          <option key={q.id} value={q.arn}>
+                            {q.name}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   ) : (
                     <div>

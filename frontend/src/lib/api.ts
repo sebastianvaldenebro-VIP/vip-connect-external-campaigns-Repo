@@ -424,6 +424,16 @@ export type PlanTrigger =
 
 export type CampaignStatus = 'queued' | 'warming' | 'running' | 'completed' | 'cancelled' | 'error' | 'expired';
 
+export type BrandedCampaignCounts = {
+  pending: number;
+  dialed: number;
+  total: number;
+};
+
+export type BrandedProgressResponse = {
+  progress: Record<string, BrandedCampaignCounts>;
+};
+
 export type CampaignState = {
   campaignId: string;
   name: string;
@@ -692,6 +702,10 @@ const realApi = {
       request<PlanRunV2>(
         `/plans/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/apply-snapshot`,
         { method: 'POST', body: {} },
+      ),
+    getBrandedProgressV2: (planId: string, runId: string) =>
+      request<BrandedProgressResponse>(
+        `/plans/${encodeURIComponent(planId)}/runs/${encodeURIComponent(runId)}/branded-progress`,
       ),
     listTemplates: () => request<{ plans: PlanSummaryV2[] }>('/templates'),
     cloneTemplate: (tid: string, body?: { name?: string }) =>

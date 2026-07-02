@@ -273,3 +273,46 @@ def apply_plan_snapshot(event: dict, path_params: dict) -> dict:
         user_agent=caller.user_agent,
     )
     return json_response(200, run)
+
+
+def branded_progress(event: dict, path_params: dict) -> dict:
+    """Return PENDING/DIALED contact counts per branded campaign for a run.
+
+    Response shape:
+      { "progress": { "<campaignId>": { "pending": N, "dialed": N, "total": N } } }
+
+    Keyed by plan-level campaignId (e.g. "NY-NL_13"). Campaigns without a
+    brandedCampaignId are omitted.
+    Count errors per-campaign are swallowed — that campaign is omitted rather
+    than failing the whole response.
+    """
+    plan_id = path_params["id"]
+    run_id = path_params["runId"]
+
+    run = store.get_run(plan_id, run_id)
+    if not run:
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Run {run_id} not found"}},
+        )
+
+    progress: dict[str, dict] = {}
+    for bs in run.get("bucketStates", []):
+        for cs in bs.get("campaignStates", []):
+            branded_id = cs.get("brandedCampaignId")
+            if not branded_id:
+                continue
+            campaign_id = cs.get("campaignId", "")
+            if not campaign_id:
+                continue
+            try:
+                pending, dialed = executor.get_branded_queue_counts(branded_id)
+                progress[campaign_id] = {
+                    "pending": pending,
+                    "dialed": dialed,
+                    "total": pending + dialed,
+                }
+            except Exception:
+                pass  # DDB transient error — omit this campaign, don't 500
+
+    return json_response(200, {"progress": progress})

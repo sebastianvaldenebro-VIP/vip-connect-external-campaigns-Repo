@@ -5,6 +5,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { Button, Spinner } from '@/components/ui';
 import {
   api,
+  type BrandedCampaignCounts,
   type BucketDefV2,
   type BucketStateV2,
   type CampaignDef,
@@ -155,6 +156,7 @@ function CampaignCard({
   onForceStart,
   onForceStop,
   onSkip,
+  brandedCounts,
 }: {
   cs: CampaignState;
   campaignDef?: CampaignDef | null;
@@ -165,6 +167,7 @@ function CampaignCard({
   onForceStart?: () => void;
   onForceStop?: () => void;
   onSkip?: () => void;
+  brandedCounts?: BrandedCampaignCounts;
 }) {
   const durMin = campaignDurMin(campaignDef, bucketDef);
   const isTimeBased = bucketDef?.run_mode === 'time_based';
@@ -266,6 +269,40 @@ function CampaignCard({
       {cs.leadCount != null && (
         <div className="text-xs text-gray-400">{cs.leadCount.toLocaleString()} leads</div>
       )}
+      {campaignDef?.deliveryType === 'branded' && brandedCounts != null && (
+        <div className="space-y-1">
+          {/* Bug 5 fix: clamp pct to [0, 100] so a backend counting race (dialed > total)
+              never renders ">100%" text or a bar wider than its container. */}
+          {(() => {
+            const pct = brandedCounts.total > 0
+              ? Math.min(100, Math.round((brandedCounts.dialed / brandedCounts.total) * 100))
+              : 0;
+            return (
+              <>
+                <div className="flex items-center justify-between text-[10px] text-gray-500">
+                  <span>
+                    <span className="font-medium text-green-600">{brandedCounts.dialed}</span>
+                    {' dialed · '}
+                    <span className="font-medium text-amber-600">{brandedCounts.pending}</span>
+                    {' pending'}
+                  </span>
+                  {brandedCounts.total > 0 && (
+                    <span className="text-gray-400">{pct}%</span>
+                  )}
+                </div>
+                {brandedCounts.total > 0 && (
+                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-green-400 rounded-full transition-all duration-500"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
       {cs.exitReason && cs.exitReason !== 'completed' && (
         <div className="text-xs text-orange-500">{cs.exitReason}</div>
       )}
@@ -298,6 +335,7 @@ function BucketSection({
   onForceStartCampaign,
   onForceStopCampaign,
   onSkipCampaign,
+  brandedProgress,
 }: {
   bs: BucketStateV2;
   bucketDef?: BucketDefV2 | null;
@@ -309,6 +347,7 @@ function BucketSection({
   onForceStartCampaign?: (campaignIndex: number) => void;
   onForceStopCampaign?: (campaignIndex: number) => void;
   onSkipCampaign?: (campaignIndex: number) => void;
+  brandedProgress?: Record<string, BrandedCampaignCounts>;
 }) {
   const plannedStart = computePlannedStart(plan, run, index);
   const durMin = bucketDef?.duration_minutes ?? 0;
@@ -410,6 +449,7 @@ function BucketSection({
                   onForceStart={onForceStartCampaign ? () => onForceStartCampaign(ci) : undefined}
                   onForceStop={onForceStopCampaign ? () => onForceStopCampaign(ci) : undefined}
                   onSkip={onSkipCampaign ? () => onSkipCampaign(ci) : undefined}
+                  brandedCounts={brandedProgress?.[cs.campaignId]}
                 />
               </div>
             );
@@ -532,6 +572,31 @@ export function PlanDetail(): ReactNode {
     queryKey: ['plans', id, 'runs'],
     queryFn: () => api.plans.listRunsV2(id!),
     refetchInterval: planQuery.data?.latestRun?.status === 'running' ? 5_000 : false,
+  });
+
+  const isRunActive = planQuery.data?.latestRun?.status === 'running';
+
+  // Bug 2 fix: derive hasBrandedCampaigns from the run's frozen planSnapshot (not the live
+  // plan), so mid-run plan edits don't silence polling while campaigns are still dialing.
+  // Fall back to live plan only when no snapshot is available (e.g., pre-run).
+  const snapshotBuckets = (planQuery.data?.latestRun?.planSnapshot as PlanSummaryV2 | undefined)?.buckets
+    ?? planQuery.data?.plan?.buckets
+    ?? [];
+  const hasBrandedCampaigns = isRunActive && snapshotBuckets.some(
+    (b) => b.campaigns?.some((c) => c.deliveryType === 'branded'),
+  );
+
+  const brandedProgressQuery = useQuery({
+    queryKey: ['branded-progress', id, planQuery.data?.latestRun?.runId],
+    // Bug 4 fix: replace non-null assertions with optional chaining + early return to
+    // prevent TypeError if planQuery is mid-refetch when this queryFn fires.
+    queryFn: () => {
+      const runId = planQuery.data?.latestRun?.runId;
+      if (!id || !runId) return Promise.resolve({ progress: {} });
+      return api.plans.getBrandedProgressV2(id, runId);
+    },
+    enabled: !!id && hasBrandedCampaigns && !!planQuery.data?.latestRun?.runId,
+    refetchInterval: isRunActive ? 30_000 : false,
   });
 
   const triggerMutation = useMutation({
@@ -827,6 +892,11 @@ export function PlanDetail(): ReactNode {
               {displayRun.bucketStates.map((bs, bi) => {
                 const bucketDef = planForDisplay.buckets[bi] ?? null;
                 const canControl = isRunning && displayRun.runId === latestRun?.runId;
+                // Bug 1 + 3 fix: only pass brandedProgress when the user is viewing the
+                // active latestRun AND it is currently running. This prevents:
+                //   - Bug 1: latestRun counts bleeding into historical run cards
+                //   - Bug 3: stale counts persisting in React Query cache after run completes
+                const isCurrentRunDisplayed = isRunActive && displayRun.runId === latestRun?.runId;
                 return (
                   <BucketSection
                     key={bs.bucketId}
@@ -850,6 +920,7 @@ export function PlanDetail(): ReactNode {
                     onSkipCampaign={canControl
                       ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'skip' })
                       : undefined}
+                    brandedProgress={isCurrentRunDisplayed ? brandedProgressQuery.data?.progress : undefined}
                   />
                 );
               })}
