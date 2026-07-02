@@ -15,7 +15,7 @@ SUBNET_A=subnet-06c7669b5e3e0e814
 SUBNET_B=subnet-088367ac9fc0a2fec
 SG_ID=sg-01d54d29c2a4785f1
 
-REDIS_HOST="production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com"
+REDIS_HOST="master.prod-medwork-api.jrdc0s.use1.cache.amazonaws.com"
 REDIS_PORT=6379
 TEAM="BASIC_TEAM"
 CONNECT_INSTANCE_ID="6b3f17ba-68a4-472a-9b20-db1991507009"

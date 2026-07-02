@@ -22,7 +22,7 @@
     "lambdaSecurityGroupId": "sg-01d54d29c2a4785f1",
 
     "_comment_redis": "ElastiCache Redis. Set redisPasswordSecretArn to the Secrets Manager ARN after enabling AUTH on the cluster (finding #003). Leave empty for VPC-isolation-only environments.",
-    "redisHost": "production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com",
+    "redisHost": "master.prod-medwork-api.jrdc0s.use1.cache.amazonaws.com",
     "redisPort": "6379",
     "redisPasswordSecretArn": "",
 

@@ -81,7 +81,7 @@ This project delivers a React admin UI backed by AWS-native APIs that removes al
 | Component | Location | Purpose |
 |---|---|---|
 | `connectcampaignRedisSub.py` | `projects/Connect-batch-redis-refactor/` | Consumes Redis list, writes to Customer Profiles via PutProfileObject |
-| ElastiCache Redis | `production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com:6379` | Source of truth for lead lists, populated by CRM rebuild |
+| AWS Valkey | `master.prod-medwork-api.jrdc0s.use1.cache.amazonaws.com:6379` | Source of truth for lead lists, populated by CRM rebuild |
 | Customer Profiles domain | `amazon-connect-vipmedicalgroup` | Profile storage with custom object type `leads-data-mapping` |
 | Connect instance | `6b3f17ba-68a4-472a-9b20-db1991507009` | Voice routing, agent queues, outbound campaigns engine |
 

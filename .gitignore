@@ -41,3 +41,11 @@ npm-debug.log*
 
 # Worktrees
 .worktrees/
+
+# CDK TypeScript compilation artifacts (infra/)
+infra/**/*.js
+infra/**/*.d.ts
+
+# data-table-tools CSV exports (data lives in DynamoDB, not in the repo)
+services/data-table-tools/*.csv
+

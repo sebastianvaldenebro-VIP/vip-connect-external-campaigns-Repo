@@ -67,7 +67,7 @@ const auth = new AuthStack(app, 'VipAdminAuthStack', {
 const redisConfig = {
   host:
     (app.node.tryGetContext('redisHost') as string) ??
-    'production-leads.jrdc0s.ng.0001.use1.cache.amazonaws.com',
+    'master.prod-medwork-api.jrdc0s.use1.cache.amazonaws.com',
   port: Number(app.node.tryGetContext('redisPort') ?? 6379),
   team: (app.node.tryGetContext('redisTeam') as string) ?? 'BASIC_TEAM',
   profileObjectType:
