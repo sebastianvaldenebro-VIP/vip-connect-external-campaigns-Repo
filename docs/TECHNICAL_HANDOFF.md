@@ -1,7 +1,7 @@
 # VIP Connect External Campaigns — Technical Handoff
 
 **Audience:** Senior engineer taking ownership of the platform.
-**Last verified:** 2026-05-28
+**Last verified:** 2026-07-02
 **Production AWS Account:** 165505826690 (us-east-1)
 **Live hours:** Daily 08:00 – 19:00 COT (UTC-5, no DST)
 
@@ -23,7 +23,7 @@ The system runs autonomously between **08:00 and 19:00 COT**:
 - **Pre-warms** stage-1 campaigns of the *next* bucket 5 minutes before the current bucket expires to absorb the Connect 6-minute scheduling offset
 - Hard-stops every campaign at the 19:00 COT cutoff
 
-Five Lambda functions implement the backend; a React SPA served from CloudFront drives the UI.
+Eight Lambda functions implement the backend (five for Plans + Campaigns, three for the Progressive Branded Dialer); a React SPA served from CloudFront drives the UI.
 
 ---
 
@@ -80,6 +80,12 @@ C4Context
 | Lambda | `vip-admin-ui-api-profiles` | Customer Profiles ops | Python 3.12 |
 | Lambda | `vip-admin-ui-api-segments` | Segment management, estimates, reconcile | Python 3.12 |
 | Lambda | `vip-admin-ui-campaign-exporter` | CSV/PDF export of completed campaigns | Imported (out-of-band deploy) |
+| Lambda | `vip-admin-progressive-dialer-consumer` | Kinesis agent events → agent lock → SQS dispatch | Python 3.12, VPC, Kinesis trigger (STATE_CHANGE) |
+| Lambda | `vip-admin-progressive-dialer-caller` | SQS → `StartOutboundVoiceContact` + First Orion push | Python 3.12, VPC, SQS trigger (22s delay queue) |
+| Lambda | `vip-admin-progressive-dialer-seeder` | Populate `VipProgressiveCampaignQueue` from Redis + CP | Python 3.12, VPC |
+| DynamoDB table | `VipActiveBrandedCampaigns` | Active branded campaign registry; consumed by consumer | PK=`pk` (QUEUE#{queueArn}), SK=`sk` (CAMPAIGN#{id}), PAY_PER_REQUEST, CMK, PITR, TTL=ttl, GSI=`queueArn-index` |
+| DynamoDB table | `VipProgressiveCampaignQueue` | Per-campaign contact dial queue; one item per contact | PK=`campaignId`, SK=`{ts}#{uuid}`, PAY_PER_REQUEST, CMK, PITR, TTL=24h |
+| DynamoDB table | `VipProgressiveAgentLocks` | Single-item per agent; prevents double-dispatch | PK=`agentId`, PAY_PER_REQUEST, CMK, PITR, TTL=600s, stale-threshold=60s |
 | Lambda Layer | `vip-shared` | StructuredLogger, OutboundCampaignsClient, RedisLeadSource, Customer Profiles client, audit, filter evaluator | Built by `infra/lib/utils/shared-layer.ts`; bundled into each api-* function |
 | CloudFront | `E3QCDJPG0LCO7E` | Admin UI distribution | Origin: S3 `vip-admin-ui-assets-165505826690`; HTTPS only |
 | S3 | `vip-admin-ui-assets-165505826690` | Static React SPA bundle | Block public access, OAC, KMS at rest |
@@ -226,6 +232,12 @@ Look for `{"service":"api-plans","event":"tick_complete", ...}` events with no `
 10. **Compiled `*.js`/`*.d.ts` files inside `infra/` are sometimes committed.** `.gitignore` is incomplete.
 11. **`startTime = now + 6 min` is permanent on cold start.** If pre-warm fails, the cold-started campaign starts 6 minutes late and that delay cannot be recovered until the next bucket.
 12. **No canary / blue-green Lambda deploys.** `update-function-code` is a hard cutover. Roll-forward only.
+13. **`deploy.sh` zip broken on dev host.** `~/.local/bin/zip` is a Python script that treats `-r` (the first arg) as the archive name. Build zip with Python's `zipfile` module directly — see TD-014 in `docs/BUGLOG.md`.
+14. **Progressive Dialer not included in CDK stack diff tests.** `ApiProgressiveDialerStack` exists but its 3 Lambdas are deployed via standalone `deploy.sh`, not CDK. Any infra change (tables, IAM) requires `cdk deploy ApiProgressiveDialerStack`.
+15. **`+19174105649` ("NYC - Vein Leads") not enrolled in First Orion.** All pushes from this DID return 400. Calls still go out (StartOutboundVoiceContact does not depend on First Orion), but without branded caller ID. Enroll in the First Orion INFORM campaign portal before using this number in a branded campaign.
+16. **Agent lock stale-threshold (60s) is a calculated constant.** SQS delay=22s + Connect bridge=~14s = 36s total call-setup window. 60s provides 24s buffer. If SQS delay is ever changed, re-evaluate `_LOCK_STALE_SECONDS` in `agent_lock.py`.
+17. **Valkey migration requires `ssl=True`.** Post-migration ElastiCache endpoint requires TLS. Any Redis client instantiated without `ssl=True` will get `SSL: WRONG_VERSION_NUMBER`. All current Lambdas have been updated.
+18. **`_BATCH_SIZE = 20` in seeder.** Comment claims "CP BatchGetProfile hard limit" but actual CP limit is 100. Likely intentional throttle — verify before increasing.
 
 ---
 

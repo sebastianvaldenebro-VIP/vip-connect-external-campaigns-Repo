@@ -187,7 +187,7 @@ aws kms get-key-rotation-status --key-id alias/prod/external-campaigns/data \
   --query 'KeyRotationEnabled'  # expected: true
 
 # 2. DynamoDB tables have PITR + encryption
-for TABLE in AdminAuditLog ExternalCampaignFilters ExternalCampaignDialTracking ExternalCampaignAudit; do
+for TABLE in VipAdminPlans VipAdminAudit VipActiveBrandedCampaigns VipProgressiveCampaignQueue VipProgressiveAgentLocks; do
   aws dynamodb describe-continuous-backups --table-name $TABLE \
     --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus'
   aws dynamodb describe-table --table-name $TABLE \

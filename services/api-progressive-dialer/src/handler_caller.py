@@ -146,18 +146,11 @@ def _process_message(body: dict) -> None:
             result.contact_id,
             correlation_id,
         )
-        # Lock purpose: prevent double-dispatch on the same Available event.
-        # Once the agent is in a call (mark_dialed succeeded), release the lock
-        # so it is eligible for the next dispatch after the call ends.
-        # Non-critical: TTL (600s) will auto-release if this call fails.
-        try:
-            _get_lock().release(agent_arn)
-        except Exception as e:
-            logger.warning(
-                "lock_release_failed_post_dial correlation_id=%s error=%s",
-                correlation_id,
-                type(e).__name__,
-            )
+        # Lock is intentionally NOT released here. StartOutboundVoiceContact is async —
+        # the call takes ~14s to bridge to the agent after this API returns. Releasing at
+        # mark_dialed allowed a new AVAILABLE event to dispatch a second call before the
+        # first contact flow ran, causing CONTACT_FLOW_DISCONNECT.
+        # Re-dispatch is gated by AgentLock.acquire()'s stale-threshold condition (60s).
     elif result.throttled or result.error_code == "TooManyRequestsException":
         # Throttle: raise immediately — do NOT reset or release the lock.
         # Releasing the lock here would allow the next agent-available event to

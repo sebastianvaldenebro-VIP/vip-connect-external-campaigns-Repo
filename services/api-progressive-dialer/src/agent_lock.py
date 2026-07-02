@@ -7,17 +7,27 @@ Table: VipProgressiveAgentLocks
     lockedAt (N)    — epoch seconds
     ttl (N)         — epoch seconds, 600s from lock acquisition (auto-release)
 
-Acquire uses an atomic conditional PutItem:
-  attribute_not_exists(agentId) OR #ttl < :now
+Acquire uses an atomic conditional PutItem with three conditions (OR):
+  1. attribute_not_exists(agentId)    — no lock; safe to dispatch
+  2. #ttl < :now                      — TTL expired but DynamoDB sweep not yet run
+  3. lockedAt < :stale_threshold      — lock older than _LOCK_STALE_SECONDS, meaning the
+                                        agent returned AVAILABLE after their previous call
 
-This prevents the release-before-acquire race: two concurrent consumer invocations
-for the same agent both try to PutItem atomically. Exactly one wins (the other sees
-ConditionalCheckFailed because the winner's item now exists and its TTL is in the future).
-Stale locks whose TTL has expired but whose item was not yet swept by DynamoDB TTL are
-also replaced atomically — no blind delete+insert required.
+Condition 3 is what allows re-dispatch after a call ends without releasing the lock
+inside the caller Lambda. The caller does NOT release on success — StartOutboundVoiceContact
+is async and the call takes ~14s to bridge after the API returns. Releasing at mark_dialed
+(before the flow runs) caused CONTACT_FLOW_DISCONNECT on the first contact when a second
+AVAILABLE event arrived in that 14s window. The stale threshold (60s) safely covers the
+entire call-setup window (22s SQS delay + ~14s connect) with a comfortable buffer.
 
-release() is still called by: (a) the consumer when the campaign queue is empty and
-(b) the caller on dial failure, to unblock the agent for the next AVAILABLE event.
+Concurrency safety: all three conditions are evaluated atomically by DynamoDB. Two concurrent
+AVAILABLE events for the same agent: the first PutItem writes a fresh lock (lockedAt = now).
+The second evaluates the condition on the new lock — lockedAt < :stale_threshold is FALSE,
+TTL is in the future, item exists — so it gets ConditionalCheckFailed. One dispatch only.
+
+release() is still called by: (a) the consumer when the campaign queue is empty,
+(b) the caller on dial failure (permanent errors), and (c) the caller when get_phone
+returns None (contact missing from queue).
 """
 from __future__ import annotations
 
@@ -27,7 +37,8 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-_LOCK_TTL_SECONDS = 600  # 10 min — covers longest expected call
+_LOCK_TTL_SECONDS = 600       # 10 min safety net; stale threshold is the primary re-dispatch gate
+_LOCK_STALE_SECONDS = 60      # locks older than this are overrideable on AVAILABLE events
 
 
 class AgentLock:
@@ -37,9 +48,9 @@ class AgentLock:
     def acquire(self, agent_id: str, *, campaign_id: str) -> bool:
         """Attempt to acquire the lock. Returns True on success, False if already locked.
 
-        Succeeds when: no lock exists OR existing lock's TTL is in the past (stale).
-        This single atomic write prevents the double-dispatch race that would occur if
-        release() were called first and two concurrent invocations both saw the lock absent.
+        Succeeds when: no lock exists, OR existing lock's TTL is past, OR the lock is
+        older than _LOCK_STALE_SECONDS (agent came back Available after a completed call).
+        The atomic write prevents double-dispatch even from concurrent invocations.
         """
         now = int(time.time())
         try:
@@ -50,9 +61,16 @@ class AgentLock:
                     "lockedAt": now,
                     "ttl": now + _LOCK_TTL_SECONDS,
                 },
-                ConditionExpression="attribute_not_exists(agentId) OR #ttl < :now",
+                ConditionExpression=(
+                    "attribute_not_exists(agentId) OR "
+                    "#ttl < :now OR "
+                    "lockedAt < :stale_threshold"
+                ),
                 ExpressionAttributeNames={"#ttl": "ttl"},
-                ExpressionAttributeValues={":now": now},
+                ExpressionAttributeValues={
+                    ":now": now,
+                    ":stale_threshold": now - _LOCK_STALE_SECONDS,
+                },
             )
             return True
         except ClientError as e:

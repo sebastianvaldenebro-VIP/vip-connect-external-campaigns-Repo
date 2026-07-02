@@ -1,0 +1,1555 @@
+
+<title>VIP Connect — Debugging Reference</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:         #E8ECF2;
+    --surface:    #FFFFFF;
+    --ink:        #0B1422;
+    --ink-2:      #4A5568;
+    --ink-3:      #8897A6;
+    --accent:     #1840A2;
+    --accent-lt:  #EBF0FC;
+    --border:     #CBD3DE;
+    --p1:         #B91C1C;
+    --p1-bg:      #FEF2F2;
+    --p2:         #A84300;
+    --p2-bg:      #FFF4EC;
+    --p3:         #1840A2;
+    --p3-bg:      #EBF0FC;
+    --fixed:      #0B6E47;
+    --fixed-bg:   #ECFBF4;
+    --warn:       #A84300;
+    --code-bg:    #0D1520;
+    --code-text:  #C8D5E8;
+    --code-kw:    #5B9CF6;
+    --code-str:   #63C9A0;
+    --code-cmnt:  #5E7491;
+  }
+
+  html { font-size: 15px; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ── Layout ─────────────────────────────────────── */
+  .page-shell {
+    display: flex;
+    gap: 0;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 20px;
+  }
+
+  .sidebar {
+    width: 210px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 32px 0 32px 0;
+    border-right: 1px solid var(--border);
+  }
+
+  .main {
+    flex: 1;
+    padding: 40px 0 80px 44px;
+    min-width: 0;
+  }
+
+  /* ── Cover / Header ────────────────────────────── */
+  .doc-cover {
+    margin-bottom: 48px;
+    padding-bottom: 36px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .doc-cover .eyebrow {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 10px;
+  }
+
+  .doc-cover h1 {
+    font-size: 1.9rem;
+    font-weight: 800;
+    letter-spacing: -0.035em;
+    line-height: 1.15;
+    color: var(--ink);
+    text-wrap: balance;
+    margin-bottom: 12px;
+  }
+
+  .doc-cover .meta {
+    font-size: 0.82rem;
+    color: var(--ink-3);
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .doc-cover .meta span { display: flex; align-items: center; gap: 5px; }
+
+  /* ── Sidebar nav ────────────────────────────────── */
+  .nav-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding: 0 0 6px 0;
+    margin: 20px 0 4px;
+  }
+
+  .nav-label:first-child { margin-top: 0; }
+
+  .nav-link {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--ink-2);
+    text-decoration: none;
+    padding: 3px 0 3px 10px;
+    border-left: 2px solid transparent;
+    transition: border-color 0.15s, color 0.15s;
+    line-height: 1.4;
+  }
+
+  .nav-link:hover { color: var(--accent); border-left-color: var(--accent); }
+  .nav-link.p1 { border-left-color: var(--p1); }
+  .nav-link.p2 { border-left-color: var(--p2); }
+  .nav-link.fixed { border-left-color: var(--fixed); color: var(--fixed); }
+
+  /* ── Section headings ───────────────────────────── */
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 52px 0 20px;
+  }
+
+  .section-head:first-of-type { margin-top: 0; }
+
+  .section-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+  }
+
+  .section-icon.dialer { background: #1840A2; color: #fff; }
+  .section-icon.plans  { background: #374151; color: #fff; }
+  .section-icon.infra  { background: #6D28D9; color: #fff; }
+  .section-icon.cw     { background: #0B6E47; color: #fff; }
+  .section-icon.qr     { background: #A84300; color: #fff; }
+
+  .section-head h2 {
+    font-size: 1.15rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--ink);
+  }
+
+  .section-head .section-sub {
+    font-size: 0.78rem;
+    color: var(--ink-3);
+    margin-top: 1px;
+  }
+
+  /* ── Error cards ────────────────────────────────── */
+  .error-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+
+  .card-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 18px 20px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .severity-bar {
+    width: 4px;
+    min-height: 48px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    align-self: stretch;
+  }
+
+  .error-card.p1 .severity-bar { background: var(--p1); }
+  .error-card.p2 .severity-bar { background: var(--p2); }
+  .error-card.p3 .severity-bar { background: var(--p3); }
+  .error-card.fixed .severity-bar { background: var(--fixed); }
+
+  .card-id {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+    margin-bottom: 3px;
+  }
+
+  .card-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--ink);
+    line-height: 1.3;
+  }
+
+  .badge-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+  }
+
+  .badge {
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+
+  .badge.p1  { background: var(--p1-bg);   color: var(--p1); }
+  .badge.p2  { background: var(--p2-bg);   color: var(--p2); }
+  .badge.p3  { background: var(--p3-bg);   color: var(--p3); }
+  .badge.fixed { background: var(--fixed-bg); color: var(--fixed); }
+  .badge.service { background: #F3F4F6; color: #374151; }
+  .badge.warn  { background: #FFFBEB; color: #92400E; }
+
+  .card-body { padding: 18px 20px 20px; }
+  .card-body > * + * { margin-top: 16px; }
+
+  /* ── Card sub-sections ──────────────────────────── */
+  .card-section-label {
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 5px;
+  }
+
+  .card-section p {
+    font-size: 0.85rem;
+    color: var(--ink-2);
+    line-height: 1.55;
+  }
+
+  .card-section p strong { color: var(--ink); }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  @media (max-width: 640px) {
+    .card-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ── Code blocks ────────────────────────────────── */
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    font-family: 'Cascadia Code', 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    border-top: 2px solid var(--accent);
+  }
+
+  .code-label {
+    font-size: 0.63rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin-bottom: 5px;
+  }
+
+  code {
+    font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+    font-size: 0.8rem;
+    background: #F1F4F9;
+    color: #1840A2;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; border-radius: 0; }
+
+  .kw   { color: var(--code-kw); }
+  .str  { color: var(--code-str); }
+  .cmnt { color: var(--code-cmnt); }
+  .hi   { color: #F9A825; }
+  .err  { color: #FF6B6B; }
+
+  /* ── Quick reference table ──────────────────────── */
+  .ref-table-wrap { overflow-x: auto; margin-top: 0; }
+
+  .ref-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  .ref-table th {
+    text-align: left;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    padding: 8px 12px;
+    border-bottom: 2px solid var(--border);
+    background: var(--surface);
+    white-space: nowrap;
+  }
+
+  .ref-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    color: var(--ink-2);
+    line-height: 1.4;
+  }
+
+  .ref-table tr:last-child td { border-bottom: none; }
+
+  .ref-table td:first-child {
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.73rem;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+
+  .ref-table tr:hover td { background: #F8FAFF; }
+
+  /* ── Flow diagram ───────────────────────────────── */
+  .flow-diagram {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow-x: auto;
+    margin-bottom: 24px;
+  }
+
+  .flow-node {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .flow-box {
+    background: var(--accent-lt);
+    border: 1px solid #BDD0FF;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--accent);
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  .flow-time {
+    font-size: 0.62rem;
+    color: var(--ink-3);
+    font-family: monospace;
+    white-space: nowrap;
+  }
+
+  .flow-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 6px;
+    flex-shrink: 0;
+  }
+
+  .flow-line {
+    width: 30px;
+    height: 1px;
+    background: var(--border);
+    margin-bottom: 2px;
+  }
+
+  .flow-delay {
+    font-size: 0.6rem;
+    color: var(--p2);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  /* ── Insights section ───────────────────────────── */
+  .query-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+
+  .query-label {
+    padding: 12px 16px 10px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ink);
+    border-bottom: 1px solid var(--border);
+    background: #FAFBFD;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .query-card pre {
+    border-radius: 0;
+    border-top-color: transparent;
+    border-top: none;
+    border-radius: 0 0 9px 9px;
+  }
+
+  /* ── Divider ────────────────────────────────────── */
+  .section-rule {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 0 0 24px;
+  }
+
+  /* ── Note / callout ─────────────────────────────── */
+  .callout {
+    padding: 12px 14px;
+    border-radius: 7px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    display: flex;
+    gap: 8px;
+  }
+
+  .callout.warn  { background: #FFF9EC; border: 1px solid #FFDF9E; color: var(--ink-2); }
+  .callout.info  { background: var(--accent-lt); border: 1px solid #BDD0FF; color: var(--ink-2); }
+  .callout.fixed { background: var(--fixed-bg); border: 1px solid #93DDB8; color: var(--ink-2); }
+  .callout .icon { flex-shrink: 0; }
+
+  /* ── Print ──────────────────────────────────────── */
+  @media print {
+    body { background: #fff; font-size: 11pt; }
+    .sidebar { display: none; }
+    .page-shell { display: block; max-width: 100%; padding: 0; }
+    .main { padding: 0; }
+    .error-card { break-inside: avoid; page-break-inside: avoid; }
+    .section-head { page-break-before: always; }
+    .section-head:first-of-type { page-break-before: auto; }
+    pre { font-size: 8pt; border-top: none; border: 1px solid #ccc; }
+    .doc-cover { page-break-after: always; }
+    .flow-diagram { overflow: visible; }
+    a { color: inherit; text-decoration: none; }
+  }
+</style>
+
+<!-- Sidebar nav -->
+<div class="page-shell">
+  <nav class="sidebar" aria-label="Document sections">
+    <div class="nav-label">Quick Reference</div>
+    <a class="nav-link" href="#qr-lambdas">Lambda Functions</a>
+    <a class="nav-link" href="#qr-tables">DynamoDB Tables</a>
+    <a class="nav-link" href="#qr-logs">Log Groups</a>
+
+    <div class="nav-label">Progressive Dialer</div>
+    <a class="nav-link fixed" href="#bd-003">BD-003 CONTACT_FLOW_DISCONNECT</a>
+    <a class="nav-link" href="#bd-001">BD-001 Consumer no matchea</a>
+    <a class="nav-link" href="#bd-002">BD-002 _EmptySegmentError</a>
+    <a class="nav-link" href="#bd-004">BD-004 First Orion 400</a>
+    <a class="nav-link" href="#bd-005">BD-005 DestinationNotAllowed</a>
+    <a class="nav-link" href="#bd-006">BD-006 Log group erróneo</a>
+    <a class="nav-link p2" href="#bd-007">BD-007 deploy.sh zip bug</a>
+
+    <div class="nav-label">Orchestrador</div>
+    <a class="nav-link" href="#run-001">RUN-001 Run stuck &gt; 30 min</a>
+    <a class="nav-link" href="#run-002">RUN-002 skipped_empty</a>
+    <a class="nav-link" href="#run-003">RUN-003 pendingWarmup stale</a>
+    <a class="nav-link" href="#run-004">RUN-004 ValidationException</a>
+    <a class="nav-link" href="#run-005">RUN-005 runLock leaked</a>
+    <a class="nav-link p1" href="#run-006">RUN-006 Operation not valid</a>
+    <a class="nav-link" href="#run-007">RUN-007 Campaign creating</a>
+    <a class="nav-link" href="#run-008">RUN-008 ConcurrentWrite 409</a>
+
+    <div class="nav-label">Infraestructura</div>
+    <a class="nav-link p1" href="#inf-001">INF-001 Layer rebuild</a>
+    <a class="nav-link" href="#inf-002">INF-002 Valkey ssl=True</a>
+    <a class="nav-link" href="#inf-003">INF-003 Decimal→str</a>
+
+    <div class="nav-label">CloudWatch</div>
+    <a class="nav-link" href="#cw-queries">Insights Queries</a>
+  </nav>
+
+  <main class="main">
+
+    <!-- Cover -->
+    <div class="doc-cover">
+      <div class="eyebrow">VIP Connect External Campaigns · Debugging Reference</div>
+      <h1>Guía de Debugging<br>y Diagnóstico Operacional</h1>
+      <div class="meta">
+        <span>Versión: 2026-07-02</span>
+        <span>Cuenta AWS: 165505826690</span>
+        <span>Región: us-east-1</span>
+        <span>Plataforma: vip-connect-external-campaigns</span>
+      </div>
+    </div>
+
+    <!-- Quick Reference -->
+    <div id="qr" class="section-head">
+      <div class="section-icon qr">⚡</div>
+      <div>
+        <h2>Quick Reference</h2>
+        <div class="section-sub">Nombres canónicos de recursos. Usar siempre estos — no inventar.</div>
+      </div>
+    </div>
+    <hr class="section-rule">
+
+    <div id="qr-lambdas">
+      <div class="card-section-label">Lambda Functions</div>
+      <div class="ref-table-wrap">
+        <table class="ref-table">
+          <thead>
+            <tr><th>Función</th><th>Handler</th><th>Trigger</th><th>Uso</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>vip-admin-ui-api-plans</td>
+              <td>handler.lambda_handler</td>
+              <td>API GW + EventBridge</td>
+              <td>Plans executor, HTTP API, ticks</td>
+            </tr>
+            <tr>
+              <td>vip-admin-progressive-dialer-consumer</td>
+              <td>handler_consumer.lambda_handler</td>
+              <td>Kinesis (STATE_CHANGE)</td>
+              <td>Detecta agentes AVAILABLE, dispatch</td>
+            </tr>
+            <tr>
+              <td>vip-admin-progressive-dialer-caller</td>
+              <td>handler_caller.lambda_handler</td>
+              <td>SQS (delay 22s)</td>
+              <td>Llama StartOutboundVoiceContact</td>
+            </tr>
+            <tr>
+              <td>vip-admin-progressive-dialer-seeder</td>
+              <td>handler_seeder.lambda_handler</td>
+              <td>Direct invoke / HTTP</td>
+              <td>Pobla VipProgressiveCampaignQueue</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="qr-tables" style="margin-top:24px">
+      <div class="card-section-label">DynamoDB Tables</div>
+      <div class="ref-table-wrap">
+        <table class="ref-table">
+          <thead>
+            <tr><th>Tabla</th><th>PK / SK</th><th>GSI</th><th>TTL</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>VipAdminPlans</td>
+              <td>pk=PLAN#{id} / sk=META|RUN#|etc.</td>
+              <td>—</td>
+              <td>No</td>
+            </tr>
+            <tr>
+              <td>VipAdminAudit</td>
+              <td>pk=AUDIT#{id}</td>
+              <td>—</td>
+              <td>Sí</td>
+            </tr>
+            <tr>
+              <td>VipActiveBrandedCampaigns</td>
+              <td>pk=QUEUE#{queueArn} / sk=CAMPAIGN#{campaignId}</td>
+              <td>queueArn-index</td>
+              <td>Sí</td>
+            </tr>
+            <tr>
+              <td>VipProgressiveCampaignQueue</td>
+              <td>pk=campaignId / sk={ts}#{uuid}</td>
+              <td>—</td>
+              <td>24h</td>
+            </tr>
+            <tr>
+              <td>VipProgressiveAgentLocks</td>
+              <td>pk=agentId</td>
+              <td>—</td>
+              <td>600s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="qr-logs" style="margin-top:24px">
+      <div class="card-section-label">CloudWatch Log Groups — Nombres exactos</div>
+      <div class="callout warn" style="margin-top:8px">
+        <span class="icon">⚠</span>
+        <span>Los grupos del dialer NO tienen <code>-ui-</code> en el nombre. El grupo del plans sí: <code>vip-admin-<strong>ui</strong>-api-plans</code>. Confusión frecuente.</span>
+      </div>
+      <div class="ref-table-wrap" style="margin-top:12px">
+        <table class="ref-table">
+          <thead><tr><th>Log Group</th><th>Lambda</th></tr></thead>
+          <tbody>
+            <tr><td>/aws/lambda/vip-admin-ui-api-plans</td><td>api-plans (executor)</td></tr>
+            <tr><td>/aws/lambda/vip-admin-progressive-dialer-consumer</td><td>consumer</td></tr>
+            <tr><td>/aws/lambda/vip-admin-progressive-dialer-caller</td><td>caller</td></tr>
+            <tr><td>/aws/lambda/vip-admin-progressive-dialer-seeder</td><td>seeder</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Call Flow Diagram -->
+    <div style="margin-top:36px">
+      <div class="card-section-label">Progressive Branded Dialer — Secuencia de dispatch</div>
+      <div class="flow-diagram" style="margin-top:8px">
+        <div class="flow-node">
+          <div class="flow-box">Agent<br>AVAILABLE</div>
+          <div class="flow-time">t = 0s</div>
+        </div>
+        <div class="flow-arrow"><div class="flow-line"></div><div class="flow-delay">Kinesis</div></div>
+        <div class="flow-node">
+          <div class="flow-box">Consumer<br>Lambda</div>
+          <div class="flow-time">lock acquired</div>
+        </div>
+        <div class="flow-arrow"><div class="flow-line"></div><div class="flow-delay">SQS 22s</div></div>
+        <div class="flow-node">
+          <div class="flow-box">Caller<br>Lambda</div>
+          <div class="flow-time">t ≈ 22s</div>
+        </div>
+        <div class="flow-arrow"><div class="flow-line"></div><div class="flow-delay">Connect</div></div>
+        <div class="flow-node">
+          <div class="flow-box">StartOutbound<br>VoiceContact</div>
+          <div class="flow-time">async, ~1s</div>
+        </div>
+        <div class="flow-arrow"><div class="flow-line"></div><div class="flow-delay">~14s bridge</div></div>
+        <div class="flow-node">
+          <div class="flow-box">Contact<br>Flow runs</div>
+          <div class="flow-time">t ≈ 36s</div>
+        </div>
+        <div class="flow-arrow"><div class="flow-line"></div><div class="flow-delay">call</div></div>
+        <div class="flow-node">
+          <div class="flow-box">Agent<br>ON_CALL</div>
+          <div class="flow-time">lock stale @ 60s</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PROGRESSIVE BRANDED DIALER -->
+    <div id="bd" class="section-head" style="margin-top:48px">
+      <div class="section-icon dialer">📞</div>
+      <div>
+        <h2>Progressive Branded Dialer</h2>
+        <div class="section-sub">consumer · caller · seeder — Lambdas vip-admin-progressive-dialer-*</div>
+      </div>
+    </div>
+    <hr class="section-rule">
+
+    <!-- BD-003 -->
+    <div id="bd-003" class="error-card fixed">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-003</div>
+          <div class="card-title">CONTACT_FLOW_DISCONNECT al segundo 1 — Agent Lock Race Condition</div>
+          <div class="badge-row">
+            <span class="badge fixed">✓ Fixed 2026-07-02</span>
+            <span class="badge p1">P1 Crítico</span>
+            <span class="badge service">caller</span>
+            <span class="badge service">consumer</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>La llamada conecta (aparece en el log de Connect) pero el agente nunca la recibe. CloudWatch muestra <strong>CONTACT_FLOW_DISCONNECT</strong> ~1s después de la conexión. El agente reporta que no le llegó ninguna llamada aunque la marcación fue exitosa.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p><code>StartOutboundVoiceContact</code> es async. La llamada tarda ~14s en bridgearse al agente. El caller Lambda <strong>liberaba el lock</strong> en <code>mark_dialed</code> (~t=22s). En esos 14s, un nuevo evento AVAILABLE del mismo agente adquiría el lock, lanzaba un segundo dispatch, y el contact flow del primer contacto encontraba al agente ocupado → disconnect.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Fix aplicado</div>
+          <p>1. <strong>handler_caller.py</strong>: eliminado <code>lock.release(agent_arn)</code> del path de éxito. El lock no se libera al completar el dial.<br>
+          2. <strong>agent_lock.py</strong>: condición de acquire ampliada con <code>lockedAt &lt; :stale_threshold</code> (60s). Cuando el agente termina la llamada y vuelve a AVAILABLE (>60s después del dispatch), el consumer puede adquirir el lock normalmente. La atomicidad de DynamoDB PutItem previene el double-dispatch concurrente.</p>
+        </div>
+        <div class="card-section">
+          <div class="code-label">Cómo detectar en CloudWatch</div>
+          <pre><span class="cmnt"># Correlacionar Dial success → CONTACT_FLOW_DISCONNECT en el mismo agent_arn</span>
+<span class="kw">fields</span> @timestamp, @message
+| <span class="kw">filter</span> @logStream <span class="kw">like</span> <span class="str">/progressive-dialer/</span>
+| <span class="kw">filter</span> @message <span class="kw">like</span> <span class="str">"Dial success"</span> <span class="kw">or</span> @message <span class="kw">like</span> <span class="str">"CONTACT_FLOW_DISCONNECT"</span>
+| <span class="kw">sort</span> @timestamp <span class="kw">asc</span>
+| <span class="kw">limit</span> 50</pre>
+        </div>
+        <div class="callout fixed">
+          <span class="icon">✓</span>
+          <span>Deploiado 2026-07-02. El lock ahora expira por stale-threshold (60s) en el próximo evento AVAILABLE del agente, en lugar de liberarse prematuramente en el caller.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-001 -->
+    <div id="bd-001" class="error-card fixed">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-001</div>
+          <div class="card-title">Consumer no encuentra campañas branded — DefaultOutboundQueue vs InboundQueues</div>
+          <div class="badge-row">
+            <span class="badge fixed">✓ Fixed 2026-07-01</span>
+            <span class="badge p2">P2 Alto</span>
+            <span class="badge service">consumer</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>El consumer procesa eventos STATE_CHANGE correctamente pero el lookup en <code>VipActiveBrandedCampaigns</code> siempre retorna vacío. Los logs muestran múltiples "All campaign queues empty" incluso cuando hay campañas activas.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p><code>extract_agent_info</code> extraía solo <code>routing_profile.DefaultOutboundQueue</code> (para llamadas salientes del agente). Las campañas branded se registran contra <code>InboundQueues</code> (queues que el agente atiende). GSI query usaba el ARN incorrecto → cero resultados.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Diagnóstico — verificar qué queues reporta el agente</div>
+          <pre><span class="kw">aws</span> logs filter-log-events \
+  --log-group-name /aws/lambda/vip-admin-progressive-dialer-consumer \
+  --filter-pattern <span class="str">'"inbound_queue_arns"'</span> \
+  --start-time $(($(date +%s) - 3600))000 \
+  --profile production | <span class="kw">jq</span> <span class="str">'.events[].message'</span> | head -10</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-002 -->
+    <div id="bd-002" class="error-card fixed">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-002</div>
+          <div class="card-title">_EmptySegmentError en seeder — Lead UUIDs de Redis ≠ CP ProfileIds</div>
+          <div class="badge-row">
+            <span class="badge fixed">✓ Fixed 2026-07-01</span>
+            <span class="badge p2">P2 Alto</span>
+            <span class="badge service">executor</span>
+            <span class="badge service">seeder</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>El plan falla con <code>_EmptySegmentError</code>. El seeder retorna <code>{"seeded": 0}</code>. El live monitor muestra la campaña en <code>cancelled / skipped_empty</code> segundos después de iniciada.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p><code>_create_segment</code> construía el segmento de CP usando los <code>customerid</code> de Redis (UUIDs del CRM) como filtro <code>ID.INCLUSIVE</code>. CP usa internamente ProfileIds completamente distintos. El segmento existía pero matcheaba 0 perfiles → seeder sin leads.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Fix aplicado</div>
+          <p><code>_create_segment</code> ahora extrae teléfonos de Redis, los normaliza a E.164, y construye el segmento con <code>PhoneNumber.INCLUSIVE</code>. El seeder lee los teléfonos directamente del <code>segmentGroups</code> definition, sin necesidad de <code>BatchGetProfile</code>.</p>
+        </div>
+        <div class="card-section">
+          <div class="code-label">Diagnóstico si vuelve a ocurrir</div>
+          <pre><span class="cmnt"># Verificar que el segmento en CP tiene PhoneNumber (no ID) como filtro</span>
+<span class="kw">aws</span> customer-profiles get-segment-definition \
+  --domain-name vip_connect_cp_domain \
+  --segment-definition-name &lt;segmentName&gt; \
+  --profile production | <span class="kw">jq</span> <span class="str">'.SegmentGroups.Groups[0].Dimensions[0].ProfileAttributes'</span>
+
+<span class="cmnt"># Debe mostrar PhoneNumber, no ID</span>
+<span class="cmnt"># Si muestra ID → el segment fue creado con lógica vieja (reconectar y re-seed)</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-004 -->
+    <div id="bd-004" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-004</div>
+          <div class="card-title">First Orion push falla con 400 — Número de origen no registrado</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto — branding pierde efecto</span>
+            <span class="badge service">consumer</span>
+            <span class="badge warn">Requiere acción operacional</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Logs del consumer muestran <code>First Orion push failed — will retry via SQS caller</code>. Métrica <code>FirstOrionPushFailed</code> en CloudWatch sube. Las llamadas SÍ se realizan (StartOutboundVoiceContact no depende de First Orion) pero sin nombre de empresa en el caller ID.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>El <code>sourcePhone</code> (aNumber) configurado en la campaña no está registrado en la campaña de First Orion INFORM. First Orion retorna <code>HTTP 400</code>. Ejemplo conocido: <code>+19174105649</code> ("NYC - Vein Leads") → 148/148 pushes fallidos.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Diagnóstico — identificar qué sourcePhone está fallando</div>
+          <pre><span class="cmnt"># Encontrar campaña activa y su sourcePhone</span>
+<span class="kw">aws</span> dynamodb scan \
+  --table-name VipActiveBrandedCampaigns \
+  --profile production | <span class="kw">jq</span> <span class="str">'.Items[] | {campaignId: .campaignId.S, sourcePhone: .sourcePhone.S, queueArn: .queueArn.S}'</span>
+
+<span class="cmnt"># Confirmar errores de First Orion en logs</span>
+<span class="kw">aws</span> logs filter-log-events \
+  --log-group-name /aws/lambda/vip-admin-progressive-dialer-consumer \
+  --filter-pattern <span class="str">'"First Orion push failed"'</span> \
+  --start-time $(($(date +%s) - 3600))000 \
+  --profile production | <span class="kw">jq</span> <span class="str">'.events | length'</span></pre>
+        </div>
+        <div class="callout warn">
+          <span class="icon">⚠</span>
+          <span><strong>Fix operacional:</strong> Registrar el DID en el portal de First Orion (campaign INFORM) antes de activar cualquier campaña branded con ese número. Los dials continúan sin branding si no se hace esto.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-005 -->
+    <div id="bd-005" class="error-card p3">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-005</div>
+          <div class="card-title">DestinationNotAllowedException — Número de destino bloqueado por Connect</div>
+          <div class="badge-row">
+            <span class="badge p3">P3 Bajo — por contacto</span>
+            <span class="badge service">caller</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Log del caller: <code>Dial failed error_code=DestinationNotAllowedException</code>. El contacto se resetea a PENDING y queda disponible para el próximo agente. Solo afecta ese número específico.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>Connect bloquea llamadas a ciertos códigos de área (VOIP, números no geográficos, o números explícitamente bloqueados en la allowlist del instance). Esto es <strong>por número de destino, no por número de origen</strong>. No relacionado con First Orion ni con el sourcePhone.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Acción requerida</div>
+          <p>Ninguna — el contacto se auto-resetea y queda en la cola para retry. Si el volumen de estos errores es alto (&gt;10% del total de dials), revisar la allowlist de llamadas salientes en Connect Console → Telephony → Outbound calls → Allowed calling destinations.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-006 -->
+    <div id="bd-006" class="error-card p3">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-006</div>
+          <div class="card-title">aws logs no retorna nada — Nombre incorrecto del log group</div>
+          <div class="badge-row">
+            <span class="badge p3">P3 Confusión de operaciones</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p><code>aws logs filter-log-events</code> retorna vacío o error <code>ResourceNotFoundException</code> al buscar logs del dialer. El comando pareciera estar bien escrito.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa</div>
+            <p>Los log groups del dialer son <code>/aws/lambda/vip-admin-<strong>progressive</strong>-dialer-*</code>. El plans executor tiene <code>-ui-</code> en el nombre (<code>vip-admin-<strong>ui</strong>-api-plans</code>). Agregar <code>-ui-</code> al dialer es un error frecuente.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Listar todos los log groups del platform</div>
+          <pre><span class="kw">aws</span> logs describe-log-groups \
+  --log-group-name-prefix <span class="str">"/aws/lambda/vip-admin"</span> \
+  --profile production | <span class="kw">jq</span> <span class="str">'.logGroups[].logGroupName'</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-007 -->
+    <div id="bd-007" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">BD-007</div>
+          <div class="card-title">deploy.sh falla silenciosamente — Script zip personalizado en ~/.local/bin/zip</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Deploy se rompe</span>
+            <span class="badge service">infra</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p><code>deploy.sh</code> reporta <code>adding: /tmp/progressive_dialer.zip, ., -q (deflated)</code> pero el zip file no existe → <code>aws lambda update-function-code</code> falla con <code>Unable to load paramfile</code>.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>Existe un script Python en <code>~/.local/bin/zip</code> que tiene precedencia sobre el zip del sistema. El script toma el primer argumento como <em>archivo a agregar</em> en lugar del archivo de salida, creando un zip con nombre <code>-r</code> en el directorio actual.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Workaround — build directo con Python (usar siempre este approach)</div>
+          <pre><span class="kw">python3</span> - &lt;&lt;<span class="str">'EOF'</span>
+<span class="kw">import</span> zipfile, os, shutil, subprocess, sys, tempfile
+SERVICE = <span class="str">"/path/to/services/api-progressive-dialer"</span>
+TMP = tempfile.mkdtemp()
+subprocess.run([sys.executable, <span class="str">"-m"</span>, <span class="str">"pip"</span>, <span class="str">"install"</span>, <span class="str">"-r"</span>,
+    f<span class="str">"{SERVICE}/requirements.txt"</span>, <span class="str">"-t"</span>, TMP, <span class="str">"-q"</span>,
+    <span class="str">"--platform"</span>, <span class="str">"manylinux2014_x86_64"</span>, <span class="str">"--only-binary=:all:"</span>,
+    <span class="str">"--python-version"</span>, <span class="str">"3.12"</span>])
+<span class="kw">for</span> e <span class="kw">in</span> os.listdir(f<span class="str">"{SERVICE}/src"</span>):
+    shutil.copy2(f<span class="str">"{SERVICE}/src/{e}"</span>, TMP)
+<span class="kw">with</span> zipfile.ZipFile(<span class="str">"/tmp/out.zip"</span>, <span class="str">"w"</span>, zipfile.ZIP_DEFLATED) <span class="kw">as</span> zf:
+    <span class="kw">for</span> root, dirs, files <span class="kw">in</span> os.walk(TMP):
+        dirs[:] = [d <span class="kw">for</span> d <span class="kw">in</span> dirs <span class="kw">if</span> d != <span class="str">"__pycache__"</span>]
+        <span class="kw">for</span> fn <span class="kw">in</span> files:
+            <span class="kw">if not</span> fn.endswith(<span class="str">".pyc"</span>):
+                fp = os.path.join(root, fn)
+                zf.write(fp, os.path.relpath(fp, TMP))
+shutil.rmtree(TMP)
+print(<span class="str">f"Done: {os.path.getsize('/tmp/out.zip'):,} bytes"</span>)
+EOF</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- PLANS ORCHESTRATOR -->
+    <div id="run" class="section-head">
+      <div class="section-icon plans">🔁</div>
+      <div>
+        <h2>Plans Orchestrator</h2>
+        <div class="section-sub">api-plans executor — Lambda vip-admin-ui-api-plans</div>
+      </div>
+    </div>
+    <hr class="section-rule">
+
+    <!-- RUN-001 -->
+    <div id="run-001" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-001</div>
+          <div class="card-title">Run stuck en "running" por más de 30 minutos</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto</span>
+            <span class="badge service">executor</span>
+            <span class="badge service">EventBridge</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>El plan muestra <code>status: running</code> pero no se están realizando dials. La alarma <code>StuckRunDetected</code> dispara a las 4 horas. DynamoDB muestra el run con timestamp de hace horas.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causas comunes</div>
+            <p>1. La regla EventBridge del tick fue eliminada manualmente.<br>2. El tick está fallando con excepción no capturada (ver logs).<br>3. El run <code>_version</code> se incrementó y hay un deadlock de escritura optimista.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Diagnóstico paso a paso</div>
+          <pre><span class="cmnt"># 1. ¿Existe la regla EventBridge?</span>
+<span class="kw">aws</span> events list-rules --name-prefix vip-plan-<span class="hi">{runId}</span> --profile production
+
+<span class="cmnt"># 2. Ver logs del último tick</span>
+<span class="kw">aws</span> logs filter-log-events \
+  --log-group-name /aws/lambda/vip-admin-ui-api-plans \
+  --filter-pattern <span class="str">'"event":"tick"'</span> \
+  --start-time $(($(date +%s) - 3600))000 \
+  --profile production | <span class="kw">jq</span> <span class="str">'.events[-5:][].message'</span>
+
+<span class="cmnt"># 3. Estado del run en DynamoDB</span>
+<span class="kw">aws</span> dynamodb get-item \
+  --table-name VipAdminPlans \
+  --key <span class="str">'{"pk":{"S":"PLAN#<span class="hi">{planId}</span>"},"sk":{"S":"RUN#<span class="hi">{runId}</span>"}}'</span> \
+  --profile production | <span class="kw">jq</span> <span class="str">'.Item | {status:.status.S, _version:._version.N}'</span></pre>
+        </div>
+        <div class="card-section">
+          <div class="card-section-label">Resolución</div>
+          <p>Si la regla EventBridge no existe: usar <strong>RB-004</strong> para recrearla. Si ticks están disparando pero campañas stuck: revisar estado en Connect (<code>connectcampaignsv2 get-campaign-state</code>). Como último recurso: llamar endpoint <code>POST /plans/{planId}/runs/{runId}/abort</code>.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-002 -->
+    <div id="run-002" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-002</div>
+          <div class="card-title">Todas las campañas terminan con exitReason=skipped_empty</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto — bucket completo sin dials</span>
+            <span class="badge service">executor</span>
+            <span class="badge service">Redis/Valkey</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Todos los campaigns del bucket terminan con <code>exitReason: skipped_empty</code> o <code>reconcile_exhausted</code>. Cero llamadas realizadas. Puede ocurrir simultáneamente en múltiples estados/plans.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causas comunes</div>
+            <p>1. Redis/Valkey está en rebuild parcial — los leads de ciertos estados no han cargado aún.<br>2. <code>reconcileRetryLimit</code> muy bajo (legacy: 1 en lugar del default 5).<br>3. Redis genuinamente vacío — pipeline de feeder no corrió.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Diagnóstico</div>
+          <pre><span class="cmnt"># Verificar leads en Redis para el estado fallido</span>
+redis-cli -h $REDIS_HOST -p 6379 --tls \
+  LLEN wait_list:vip:list
+
+<span class="cmnt"># Verificar reconcileRetryLimit en el plan</span>
+<span class="kw">aws</span> dynamodb get-item \
+  --table-name VipAdminPlans \
+  --key <span class="str">'{"pk":{"S":"PLAN#<span class="hi">{planId}</span>"},"sk":{"S":"META"}}'</span> \
+  --profile production | <span class="kw">jq</span> <span class="str">'.Item.buckets.L[0].M.reconcileRetryLimit'</span>
+
+<span class="cmnt"># Si retorna 1 → problema TD-005. Editar el plan y resavear.</span></pre>
+        </div>
+        <div class="card-section">
+          <div class="card-section-label">Resolución</div>
+          <p>Si <code>reconcileRetryLimit=1</code>: editar el plan (PUT /plans/{id}) y guardar sin cambios — el backend normaliza el valor a 5. Si Redis vacío: esperar rebuild o escalar el pipeline de feeder. Si rebuild parcial: esperar 5-10 min y re-triggear el run.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-003 -->
+    <div id="run-003" class="error-card p1">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-003</div>
+          <div class="card-title">Plan completa en 33 segundos con 0 llamadas — pendingWarmup stale</div>
+          <div class="badge-row">
+            <span class="badge p1">P1 Crítico — 0 dials</span>
+            <span class="badge fixed">✓ Fixed S15-A</span>
+            <span class="badge service">executor</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>El plan se activa puntual pero en la UI muestra <code>status: completed</code> y <code>duration: ~33s</code> con <code>dialCount: 0</code>. Connect reporta los campaigns como "Completed" inmediatamente.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>El <code>pendingWarmup</code> del pre-calentamiento del día anterior quedó en DynamoDB (no se limpió al detectar fuera de horario). Los segmentos tenían <code>startTime/endTime</code> del día anterior. Connect los activó y al encontrar el schedule vencido los marcó "Completed" al instante.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Verificar / limpiar pendingWarmup manualmente</div>
+          <pre><span class="cmnt"># Verificar si hay warmup stale (createdAt de hace &gt;2h)</span>
+<span class="kw">aws</span> dynamodb get-item \
+  --table-name VipAdminPlans \
+  --key <span class="str">'{"pk":{"S":"PLAN#<span class="hi">{planId}</span>"},"sk":{"S":"META"}}'</span> \
+  --profile production | <span class="kw">jq</span> <span class="str">'.Item.pendingWarmup'</span>
+
+<span class="cmnt"># Si createdAt tiene más de 2 horas → limpiar</span>
+<span class="kw">aws</span> dynamodb update-item \
+  --table-name VipAdminPlans \
+  --key <span class="str">'{"pk":{"S":"PLAN#<span class="hi">{planId}</span>"},"sk":{"S":"META"}}'</span> \
+  --update-expression <span class="str">"REMOVE pendingWarmup"</span> \
+  --profile production
+
+<span class="cmnt"># Luego abortar el run corrupto y re-triggearlo manualmente</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-004 -->
+    <div id="run-004" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-004</div>
+          <div class="card-title">ValidationException: "Schedule end time needs to be greater than start time"</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto — última hora del plan</span>
+            <span class="badge fixed">✓ Fixed S7 + S11-E</span>
+            <span class="badge service">executor</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>SNS alert con <code>ValidationException: Schedule end time needs to be greater than start time</code> típicamente a las 22:54–23:00 UTC (17:54–18:00 COT). Todos los campaigns del bucket entran simultáneamente en <code>error</code>.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>El tick ocurre dentro de los 6 minutos antes del corte (7 PM COT). <code>_create_campaign_only</code> calcula <code>startTime = now + 6min</code> pero ese tiempo supera el cutoff → Connect rechaza con startTime &gt; endTime. Fix: <code>_CutoffTooCloseError</code> marca la campaña como <code>expired</code> (no <code>error</code>) sin SNS alert.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Acción si todavía ocurre</div>
+          <p>Verificar que el código desplegado tiene el guard <code>if start_dt >= end_dt: raise _CutoffTooCloseError</code> en <code>_create_and_start_campaign</code>. Si el bug persiste, hacer force-finish del run — las campañas <code>expired</code> no bloquean el avance del bucket.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-005 -->
+    <div id="run-005" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-005</div>
+          <div class="card-title">runLock leaked — "Plan already has an active run" después de que completó</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto — plan no puede iniciar</span>
+            <span class="badge service">executor</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>El operador intenta triggerear el plan pero recibe <code>400 Plan already has an active run</code>. DynamoDB muestra el run anterior como <code>completed</code> pero el campo <code>runLock</code> en el META item sigue presente.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa</div>
+            <p><code>unlock_plan_run</code> no fue llamado en algún path de terminación del run. Puede ocurrir si una excepción inesperada dejó el proceso a mitad de <code>_force_finish_internal</code> y el <code>finally</code> no corrió (crash de Lambda).</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Fix inmediato — remover runLock manualmente</div>
+          <pre><span class="kw">aws</span> dynamodb update-item \
+  --table-name VipAdminPlans \
+  --key <span class="str">'{"pk":{"S":"PLAN#<span class="hi">{planId}</span>"},"sk":{"S":"META"}}'</span> \
+  --update-expression <span class="str">"REMOVE runLock"</span> \
+  --profile production
+
+<span class="cmnt"># Verificar que no haya run activo real antes de hacer esto:</span>
+<span class="kw">aws</span> dynamodb query \
+  --table-name VipAdminPlans \
+  --key-condition-expression <span class="str">"pk = :pk AND begins_with(sk, :run)"</span> \
+  --expression-attribute-values <span class="str">'{"<span class="hi">:pk</span>":{"S":"PLAN#<span class="hi">{planId}</span>"},"<span class="hi">:run</span>":{"S":"RUN#"}}'</span> \
+  --filter-expression <span class="str">"#s = :running"</span> \
+  --expression-attribute-names <span class="str">'{"#s":"status"}'</span> \
+  --expression-attribute-values <span class="str">'{"<span class="hi">:running</span>":{"S":"running"}}'</span> \
+  --profile production | <span class="kw">jq</span> <span class="str">'.Count'</span>
+<span class="cmnt"># Debe ser 0 para proceder con el REMOVE</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-006 -->
+    <div id="run-006" class="error-card p1">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-006</div>
+          <div class="card-title">Connect rechaza con "Operation is not valid for this campaign" — Outage total</div>
+          <div class="badge-row">
+            <span class="badge p1">P1 Crítico — todos los dials fallan</span>
+            <span class="badge service">Connect</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Todos los campaigns del platform fallan con <code>exitReason: creation_failed</code>. Los logs muestran <code>Operation is not valid for this campaign</code> en todos los llamados a <code>StartCampaign</code>.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>La instancia de Amazon Connect fue reconfigurada y perdió la integración con Customer Profiles o el modo de dialing segment-driven. Típicamente ocurre después de cambios manuales en la consola de Connect.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Resolución</div>
+          <p>1. En Connect Console → Instance → Campaigns: verificar que el modo "segment-based" con Customer Profiles esté habilitado.<br>2. Re-habilitar si fue desactivado.<br>3. Abortar todos los runs activos y re-triggerear.<br>4. Si persiste: ticket a AWS Support (Enterprise) — puede requerir re-provisioning de la instancia.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-007 -->
+    <div id="run-007" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-007</div>
+          <div class="card-title">Campaign stuck en estado "creating" por más de 5 minutos</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto</span>
+            <span class="badge fixed">✓ Fixed S10-D, S9-F</span>
+            <span class="badge service">executor</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>DynamoDB muestra <code>status: "creating"</code> en una campaña por más de 5 minutos sin avanzar. El run no completa. El campo <code>creatingAt</code> muestra un timestamp de hace varios minutos.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa</div>
+            <p>El Lambda crasheó entre crear el campaign en Connect y persistir el <code>connectCampaignId</code> en DynamoDB. El recovery del próximo tick es intencional: espera 5 minutos (<code>creatingAt</code> guard) antes de resetear, para no interrumpir un <code>force_start</code> activo.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Diagnóstico — smart recovery verifica Connect antes de resetear</div>
+          <pre><span class="cmnt"># Ver estado del campaign en Connect (si connectCampaignId existe)</span>
+<span class="kw">aws</span> connectcampaignsv2 get-campaign-state \
+  --id <span class="hi">{connectCampaignId}</span> \
+  --profile production
+
+<span class="cmnt"># Si está Running → el próximo tick lo va a adoptar automáticamente</span>
+<span class="cmnt"># Si no existe (deleted) → el tick va a resetear a queued después de 5 min</span>
+<span class="cmnt"># Si creatingAt hace &gt;5 min y connectCampaignId=null → el tick lo resetea a queued</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- RUN-008 -->
+    <div id="run-008" class="error-card p3">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">RUN-008</div>
+          <div class="card-title">Operación de UI retorna 409 — ConcurrentWriteError con tick de EventBridge</div>
+          <div class="badge-row">
+            <span class="badge p3">P3 Medio</span>
+            <span class="badge fixed">✓ Fixed S9/S10 — retry interno</span>
+            <span class="badge service">executor</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Operaciones de UI (skip, stop, abort, force-finish) muestran banner de error rojo en la interfaz. En DevTools el HTTP response es 409. La operación no tuvo efecto.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa</div>
+            <p>El tick de EventBridge (cada ~60s) corrió concurrentemente con la operación HTTP y ganó el lock de escritura DynamoDB optimista (<code>_version</code>). El executor tiene retry interno de 3 intentos — si los 3 fallan retorna 409.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Resolución</div>
+          <p>Reintentar la operación desde la UI 1-2 segundos después. Si el 409 persiste en 3+ intentos manuales: verificar en DynamoDB si la operación tuvo efecto parcial. En algunos casos el tick habrá avanzado el estado al mismo resultado que se buscaba — la operación fue implícitamente exitosa.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- INFRASTRUCTURE -->
+    <div id="inf" class="section-head">
+      <div class="section-icon infra">🔧</div>
+      <div>
+        <h2>Infraestructura y Deploy</h2>
+        <div class="section-sub">SharedLayer · Redis/Valkey · Packaging</div>
+      </div>
+    </div>
+    <hr class="section-rule">
+
+    <!-- INF-001 -->
+    <div id="inf-001" class="error-card p1">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">INF-001</div>
+          <div class="card-title">Packages desaparecen del SharedLayer — NUNCA reconstruir desde source</div>
+          <div class="badge-row">
+            <span class="badge p1">P1 Crítico — platform-wide outage</span>
+            <span class="badge service">SharedLayer</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p>Todas las funciones fallan con <code>ModuleNotFoundError: No module named 'redis'</code> (o cualquier otro package). El error aparece simultáneamente en múltiples Lambdas después de un deploy del layer.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>El layer se reconstruyó desde source code en lugar de parchear el zip existente. Los packages instalados en el layer anterior no están en el repo → se eliminaron silenciosamente. <strong>Regla: siempre parchear el zip existente.</strong></p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Rollback de emergencia — restaurar layer anterior</div>
+          <pre><span class="cmnt"># 1. Obtener ARN del layer anterior</span>
+<span class="kw">aws</span> lambda list-layer-versions \
+  --layer-name vip-connect-shared-layer \
+  --profile production | <span class="kw">jq</span> <span class="str">'.LayerVersions[:3]'</span>
+
+<span class="cmnt"># 2. Actualizar todas las funciones para usar la versión anterior</span>
+<span class="kw">for</span> fn in vip-admin-ui-api-plans \
+           vip-admin-progressive-dialer-consumer \
+           vip-admin-progressive-dialer-caller \
+           vip-admin-progressive-dialer-seeder; <span class="kw">do</span>
+  <span class="kw">aws</span> lambda update-function-configuration \
+    --function-name $fn \
+    --layers <span class="hi">arn:aws:lambda:us-east-1:165505826690:layer:vip-connect-shared-layer:&lt;PREV_VERSION&gt;</span> \
+    --profile production
+<span class="kw">done</span>
+
+<span class="cmnt"># 3. Para publicar un layer nuevo SIEMPRE usar patch del zip existente:</span>
+<span class="cmnt">#    get-layer-version → download Content.Location → unzip → modify → zip → publish</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- INF-002 -->
+    <div id="inf-002" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">INF-002</div>
+          <div class="card-title">Redis/Valkey falla con "Connection refused" o TLS error</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto</span>
+            <span class="badge fixed">✓ ssl=True requerido post-migración</span>
+            <span class="badge service">Redis/Valkey</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p><code>redis.exceptions.ConnectionError</code> o <code>SSL: WRONG_VERSION_NUMBER</code> en los logs del executor o del consumer. Las campañas no pueden verificar leads en Redis.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>Post-migración a Valkey, el endpoint requiere TLS. El cliente Redis debe inicializarse con <code>ssl=True</code>. Cualquier código que cree el cliente sin este parámetro fallará. Verificar <code>redis_lead_source.py</code> y cualquier otro módulo que conecte a Redis.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="code-label">Pattern correcto de conexión</div>
+          <pre><span class="kw">import</span> redis, os
+
+_redis_client = <span class="kw">None</span>
+
+<span class="kw">def</span> <span class="hi">get_redis</span>():
+    <span class="kw">global</span> _redis_client
+    <span class="kw">if</span> _redis_client <span class="kw">is None</span>:
+        _redis_client = redis.Redis(
+            host=os.environ[<span class="str">"REDIS_HOST"</span>],
+            port=<span class="hi">6379</span>,
+            <span class="hi">ssl=True</span>,        <span class="cmnt"># OBLIGATORIO post-migración Valkey</span>
+            ssl_cert_reqs=<span class="kw">None</span>,  <span class="cmnt"># sin certificado de cliente</span>
+            decode_responses=<span class="kw">True</span>,
+        )
+    <span class="kw">return</span> _redis_client</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- INF-003 -->
+    <div id="inf-003" class="error-card p2">
+      <div class="card-header">
+        <div class="severity-bar"></div>
+        <div>
+          <div class="card-id">INF-003</div>
+          <div class="card-title">Campos numéricos de DynamoDB viajan como string — TypeError en validación</div>
+          <div class="badge-row">
+            <span class="badge p2">P2 Alto — PUT /plans falla</span>
+            <span class="badge fixed">✓ Fixed S11-F — store._normalize()</span>
+            <span class="badge service">api-plans</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-grid">
+          <div class="card-section">
+            <div class="card-section-label">Síntoma</div>
+            <p><code>PUT /plans/{id}</code> retorna <code>INTERNAL_ERROR: Unexpected error</code> al editar un plan con buckets <code>time_based</code>. En CloudWatch: <code>TypeError: '&lt;' not supported between instances of 'str' and 'int'</code> en <code>_validate_dag</code>.</p>
+          </div>
+          <div class="card-section">
+            <div class="card-section-label">Causa raíz</div>
+            <p>boto3 DynamoDB resource deserializa números como <code>Decimal</code>. <code>json.dumps(default=str)</code> convierte <code>Decimal('30')</code> → <code>"30"</code> (string). El frontend devuelve el string y el backend falla en comparaciones numéricas. Fix: <code>store._normalize()</code> convierte Decimal → int/float en el read path.</p>
+          </div>
+        </div>
+        <div class="card-section" style="margin-top:16px">
+          <div class="card-section-label">Diagnóstico si vuelve a ocurrir</div>
+          <p>Verificar en el response de <code>GET /plans/{id}</code> si algún campo numérico viene como string JSON (con comillas). Si es así, <code>_normalize</code> no está siendo aplicado en el read path del campo afectado.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- CLOUDWATCH INSIGHTS -->
+    <div id="cw-queries" class="section-head">
+      <div class="section-icon cw">📊</div>
+      <div>
+        <h2>CloudWatch Insights — Queries</h2>
+        <div class="section-sub">Copiar directamente en la consola de CloudWatch Logs Insights</div>
+      </div>
+    </div>
+    <hr class="section-rule">
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Ver todos los dispatches del dialer en los últimos 60 min</span>
+        <span class="badge service">consumer · caller</span>
+      </div>
+      <pre>fields @timestamp, @message
+| filter @logGroup like /progressive-dialer/
+| filter @message like "SQS message enqueued" or @message like "Dial success" or @message like "Dial failed"
+| sort @timestamp asc
+| limit 100</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Errores de First Orion — contar por hora</span>
+        <span class="badge service">consumer</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-progressive-dialer-consumer"
+| filter @message like "First Orion push failed"
+| stats count() as fails by bin(1h)
+| sort bin desc</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Agent lock — ver adquisiciones y bloqueos</span>
+        <span class="badge service">consumer</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-progressive-dialer-consumer"
+| filter @message like "Lock already held" or @message like "SQS message enqueued"
+| parse @message "correlation_id=* campaign_id=*" as correlation_id, campaign_id
+| sort @timestamp asc
+| limit 50</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Seeder — trazabilidad completa (HIPAA-safe)</span>
+        <span class="badge service">seeder</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-progressive-dialer-seeder"
+| filter @message like "seeder_invoked" or @message like "segment_resolved" or @message like "seeder_complete"
+| sort @timestamp asc
+| limit 50</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Plans executor — errores del último tick por plan</span>
+        <span class="badge service">api-plans</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-ui-api-plans"
+| filter @message like "error" or @message like "ERROR" or @message like "Exception"
+| filter @message not like "DEBUG"
+| sort @timestamp desc
+| limit 50</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Pre-warm — seguimiento completo del prestart</span>
+        <span class="badge service">api-plans</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-ui-api-plans"
+| filter @message like "prestart_check" or @message like "prestart_plan"
+      or @message like "activate_warming"
+| sort @timestamp asc
+| limit 100</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>DestinationNotAllowedException — volumetría diaria</span>
+        <span class="badge service">caller</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-progressive-dialer-caller"
+| filter @message like "DestinationNotAllowedException"
+| stats count() as blocked by bin(24h)
+| sort bin desc</pre>
+    </div>
+
+    <div class="query-card">
+      <div class="query-label">
+        <span>Connect throttle — ver retries del caller</span>
+        <span class="badge service">caller</span>
+      </div>
+      <pre>filter @logGroup = "/aws/lambda/vip-admin-progressive-dialer-caller"
+| filter @message like "throttled" or @message like "TooManyRequestsException"
+| stats count() as throttles by bin(1h)
+| sort bin desc</pre>
+    </div>
+
+    <div style="margin-top:32px; padding:20px; background:var(--surface); border:1px solid var(--border); border-radius:10px;">
+      <div class="card-section-label">AWS CLI — Configuración rápida</div>
+      <pre style="margin-top:8px"><span class="cmnt"># Profile: production · Región: us-east-1</span>
+<span class="kw">export</span> AWS_PROFILE=production
+<span class="kw">export</span> AWS_REGION=us-east-1
+
+<span class="cmnt"># Shortcut para logs del dialer en tiempo real</span>
+<span class="kw">alias</span> dialer-logs=<span class="str">"aws logs tail /aws/lambda/vip-admin-progressive-dialer-consumer --follow --profile production"</span>
+<span class="kw">alias</span> caller-logs=<span class="str">"aws logs tail /aws/lambda/vip-admin-progressive-dialer-caller --follow --profile production"</span>
+<span class="kw">alias</span> plans-logs=<span class="str">"aws logs tail /aws/lambda/vip-admin-ui-api-plans --follow --profile production"</span></pre>
+    </div>
+
+  </main>
+</div>

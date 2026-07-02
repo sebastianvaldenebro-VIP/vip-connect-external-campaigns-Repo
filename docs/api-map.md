@@ -57,7 +57,6 @@ IAM role needs: `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, `
         "sourcePhoneNumber": "+19734949660",
         "dialerType": "progressive",
         "contactFlowId": "3d24320b-c1e3-40f3-90a2-b6867ef70c85",
-        "campaignFlowArn": "arn:aws:connect:us-east-1:165505826690:instance/.../contact-flow/..."
       },
       "campaigns": [
         { "id": "c1", "name": "NY New Lead", "states": ["NY"], "group": "New lead",

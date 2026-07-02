@@ -231,3 +231,69 @@ Owned by other services but produced by api-plans through `vip_shared.infrastruc
 | `timestamp` | String | ISO 8601 |
 
 PHI is never written to audit records.
+
+---
+
+## 7. DynamoDB Table: `VipActiveBrandedCampaigns`
+
+Registry of active outbound branded campaigns consumed by the Progressive Branded Dialer consumer Lambda. One record per campaign.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `pk` | String | `QUEUE#{queueArn}` — partition by the Connect queue ARN serving this campaign |
+| `sk` | String | `CAMPAIGN#{campaignId}` — sort by internal campaign UUID |
+| `queueArn` | String | Full ARN of the Connect queue (also the GSI partition key) |
+| `campaignId` | String | Internal branded campaign UUID |
+| `connectCampaignId` | String | Amazon Connect V2 campaign UUID (if campaign-mode dialing) |
+| `sourcePhone` | String | E.164 DID used as caller ID; must be enrolled in First Orion INFORM |
+| `contactFlowId` | String | Connect contact flow UUID for post-answer handling |
+| `instanceId` | String | Connect instance UUID |
+| `createdAt` | String | ISO 8601 UTC |
+| `ttl` | Number | Unix epoch; DynamoDB TTL cleanup |
+
+**GSI:** `queueArn-index` — PK=`queueArn`, SK=`createdAt`. Allows the consumer to look up campaigns by the agent's inbound queue ARN.
+
+PHI: **None.** `sourcePhone` is the business DID (outbound caller ID), not a patient phone number.
+
+---
+
+## 8. DynamoDB Table: `VipProgressiveCampaignQueue`
+
+Per-campaign dial queue. One item per contact pending outbound call. Items are written by the seeder Lambda and consumed (deleted) by the caller Lambda.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `campaignId` | String | PK — which branded campaign this contact belongs to |
+| `sk` | String | `{ISO8601_ts}#{uuid4}` — SK; lexicographic sort gives FIFO order |
+| `phone` | String | **PHI** — patient E.164 phone number |
+| `ttl` | Number | Unix epoch + 24h; auto-expires undialed contacts |
+
+**Access patterns:**
+
+- Seeder: `PutItem` per contact (new campaign batch)
+- Consumer: `Query pk=campaignId Limit=1` to peek at next contact
+- Caller: `DeleteItem` on `mark_dialed`; `PutItem` on `reset_to_pending`
+
+PHI: **YES — `phone` field contains patient phone number.** Never logged. Scrubbed by `StructuredLogger` if accidentally passed to it.
+
+---
+
+## 9. DynamoDB Table: `VipProgressiveAgentLocks`
+
+Single-item lock per agent. Prevents the consumer Lambda from dispatching multiple calls to the same agent concurrently.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `agentId` | String | PK — Connect agent ARN |
+| `campaignId` | String | Campaign the agent was dispatched to |
+| `lockedAt` | Number | Unix epoch when lock was acquired; used by stale-threshold condition |
+| `ttl` | Number | Unix epoch + 600s — safety-net DynamoDB TTL cleanup |
+
+**Lock semantics:**
+
+- `acquire()` uses `PutItem` with `ConditionExpression = "attribute_not_exists(agentId) OR #ttl < :now OR lockedAt < :stale_threshold"`.
+- `stale_threshold = now - 60`. A lock older than 60s is overrideable, covering the full call-setup window (22s SQS delay + ~14s Connect bridge = 36s) with buffer.
+- Lock is **not** released on successful dial — only on failure, missing phone, or via TTL/stale-threshold. This prevents CONTACT_FLOW_DISCONNECT from premature release (BD-003).
+- `release()` calls `DeleteItem pk=agentId`.
+
+PHI: **None.** `agentId` is a Connect ARN, not patient data.

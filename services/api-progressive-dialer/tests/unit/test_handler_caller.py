@@ -52,10 +52,10 @@ def test_calls_start_outbound_voice_contact():
         # ClientToken must equal contactSk for SQS-redelivery idempotency
         assert call_kwargs["client_token"] == "2026-06-16T14:00:00.000Z#uuid-1"
         mock_queue.mark_dialed.assert_called_once_with("campaign-1", "2026-06-16T14:00:00.000Z#uuid-1", "contact-001")
-        # Fix #4: lock must be released after mark_dialed succeeds
-        mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
-        )
+        # Lock must NOT be released on success — call takes ~14s to bridge after
+        # StartOutboundVoiceContact returns; releasing here caused CONTACT_FLOW_DISCONNECT.
+        # Re-dispatch is allowed via AgentLock's stale-threshold condition (60s).
+        mock_lock.release.assert_not_called()
 
 
 def test_raises_on_throttle_for_sqs_retry():
@@ -137,8 +137,14 @@ def test_first_orion_repushed_before_raise_on_throttle():
         )
 
 
-def test_lock_released_after_mark_dialed_success():
-    """Fix #4: agent lock is released once mark_dialed confirms the call is active."""
+def test_lock_held_after_mark_dialed_for_call_connect_window():
+    """Lock must NOT be released on dial success.
+
+    StartOutboundVoiceContact is async — the call takes ~14s to bridge to the agent
+    after the API returns. Releasing at mark_dialed allowed a concurrent AVAILABLE event
+    to dispatch a second call, causing CONTACT_FLOW_DISCONNECT on the first contact.
+    Re-dispatch is gated by AgentLock.acquire()'s stale-threshold condition after 60s.
+    """
     if "handler_caller" in sys.modules:
         del sys.modules["handler_caller"]
 
@@ -161,9 +167,8 @@ def test_lock_released_after_mark_dialed_success():
             lambda_handler(_make_sqs_event(correlation_id="corr0001"), None)
 
         mock_queue.mark_dialed.assert_called_once()
-        mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
-        )
+        # Lock must stay held — releasing here caused CONTACT_FLOW_DISCONNECT
+        mock_lock.release.assert_not_called()
 
 
 def test_reset_and_lock_released_when_phone_not_found():
