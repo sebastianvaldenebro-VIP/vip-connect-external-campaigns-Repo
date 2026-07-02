@@ -145,18 +145,32 @@ def _process_record(record: dict) -> None:
 
     info = extract_agent_info(agent_event)
     agent_arn = info["agent_arn"]
-    queue_arn = info["queue_arn"]
 
-    if not agent_arn or not queue_arn:
-        logger.warning("Agent event missing ARN or queue_arn — skipping")
+    if not agent_arn:
+        logger.warning("Agent event missing ARN — skipping")
         return
 
-    if not is_queue_allowed(queue_arn, _ALLOWED_QUEUE_ARNS):
-        return  # agent serves a different queue, not our branded campaign
+    # Check all queues this agent serves: DefaultOutboundQueue first, then InboundQueues.
+    # Branded campaigns are registered against the queue agents handle inbound calls on,
+    # which is in InboundQueues — not DefaultOutboundQueue (used for agent-initiated calls).
+    candidate_arns: list[str] = []
+    if info.get("queue_arn"):
+        candidate_arns.append(info["queue_arn"])
+    candidate_arns.extend(info.get("inbound_queue_arns") or [])
 
-    campaigns = _get_active_campaigns(queue_arn)
-    if not campaigns:
-        return  # no active branded campaigns for this queue
+    campaigns: list[dict] = []
+    matched_queue_arn: str | None = None
+    for q_arn in candidate_arns:
+        if not is_queue_allowed(q_arn, _ALLOWED_QUEUE_ARNS):
+            continue
+        found = _get_active_campaigns(q_arn)
+        if found:
+            campaigns = found
+            matched_queue_arn = q_arn
+            break
+
+    if not campaigns or matched_queue_arn is None:
+        return  # no active branded campaigns for any of this agent's queues
 
     # Acquire agent lock using the first (highest-priority) campaign id as metadata.
     # No blind release before acquire — that would create a race where two concurrent
@@ -214,7 +228,7 @@ def _process_record(record: dict) -> None:
         # DynamoDB (KMS-encrypted at rest) to keep PHI out of SQS and the 14-day DLQ.
         message = {
             "agentArn": agent_arn,
-            "queueArn": queue_arn,
+            "queueArn": matched_queue_arn,
             "campaignId": campaign_id,
             "contactSk": contact.sk,
             "sourcePhone": source_phone,

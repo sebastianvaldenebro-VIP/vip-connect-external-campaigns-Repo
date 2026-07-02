@@ -131,5 +131,6 @@ def build_from_env(redis_client: Any | None = None) -> RedisLeadSource:
             decode_responses=True,
             socket_timeout=10,
             socket_connect_timeout=10,
+            ssl=True,
         )
     return RedisLeadSource(redis_client=redis_client, team=team)

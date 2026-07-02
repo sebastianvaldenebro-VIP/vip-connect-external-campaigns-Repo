@@ -15,7 +15,7 @@ def is_agent_available(event: dict) -> bool:
     if event.get("EventType") != "STATE_CHANGE":
         return False
 
-    snapshot = event.get("AgentSnapshot") or {}
+    snapshot = event.get("CurrentAgentSnapshot") or event.get("AgentSnapshot") or {}
     status = snapshot.get("AgentStatus") or {}
 
     if status.get("Type") != "ROUTABLE":
@@ -31,15 +31,21 @@ def is_agent_available(event: dict) -> bool:
 
 
 def extract_agent_info(event: dict) -> dict:
-    """Extract agent ARN and default outbound queue ARN from an agent event."""
-    snapshot = event.get("AgentSnapshot") or {}
+    """Extract agent ARN and queue ARNs from an agent event.
+
+    Returns both the DefaultOutboundQueue ARN and all InboundQueue ARNs so the
+    consumer can match branded campaigns registered against any queue the agent serves.
+    """
+    snapshot = event.get("CurrentAgentSnapshot") or event.get("AgentSnapshot") or {}
     config = snapshot.get("Configuration") or {}
     routing_profile = config.get("RoutingProfile") or {}
     default_queue = routing_profile.get("DefaultOutboundQueue") or {}
+    inbound_queues = routing_profile.get("InboundQueues") or []
 
     return {
         "agent_arn": event.get("AgentARN"),
         "queue_arn": default_queue.get("ARN"),
+        "inbound_queue_arns": [q["ARN"] for q in inbound_queues if q.get("ARN")],
     }
 
 

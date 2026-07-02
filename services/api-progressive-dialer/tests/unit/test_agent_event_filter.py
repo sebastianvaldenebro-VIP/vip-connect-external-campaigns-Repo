@@ -101,3 +101,79 @@ def test_is_queue_allowed_returns_false_when_queue_not_in_set():
 def test_is_queue_allowed_returns_false_when_queue_arn_is_none():
     from agent_event_filter import is_queue_allowed
     assert is_queue_allowed(None, {"arn:aws:connect:us-east-1:123:instance/abc/queue/q1"}) is False
+
+# ── CurrentAgentSnapshot (real AWS Kinesis format) ────────────────────────────
+
+def _current_snapshot_event(status_type: str, status_name: str) -> dict:
+    """Build an event using the real Kinesis key (CurrentAgentSnapshot, not AgentSnapshot)."""
+    return {
+        "EventType": "STATE_CHANGE",
+        "AgentARN": "arn:aws:connect:us-east-1:123:instance/abc/agent/agent-001",
+        "CurrentAgentSnapshot": {
+            "AgentStatus": {
+                "Type": status_type,
+                "Name": status_name,
+                "StartTimestamp": "2026-07-01T10:00:00.000Z",
+            },
+            "Configuration": {
+                "RoutingProfile": {
+                    "DefaultOutboundQueue": {
+                        "ARN": "arn:aws:connect:us-east-1:123:instance/abc/queue/outbound"
+                    },
+                    "InboundQueues": [
+                        {"ARN": "arn:aws:connect:us-east-1:123:instance/abc/queue/inbound-1"},
+                        {"ARN": "arn:aws:connect:us-east-1:123:instance/abc/queue/inbound-2"},
+                    ],
+                    "Concurrency": [
+                        {"Channel": "VOICE", "AvailableSlots": 1, "MaximumSlots": 1}
+                    ],
+                }
+            },
+        },
+    }
+
+
+def test_is_agent_available_with_current_agent_snapshot():
+    """Real Kinesis events use CurrentAgentSnapshot — availability must be detected."""
+    assert is_agent_available(_current_snapshot_event("ROUTABLE", "Available")) is True
+
+
+def test_is_agent_available_current_snapshot_non_routable():
+    assert is_agent_available(_current_snapshot_event("CUSTOM", "Break")) is False
+
+
+def test_current_snapshot_takes_priority_over_agent_snapshot():
+    """When both keys exist (shouldn't happen but defensive), CurrentAgentSnapshot wins."""
+    event = _current_snapshot_event("ROUTABLE", "Available")
+    # Inject a conflicting AgentSnapshot that would return OFFLINE
+    event["AgentSnapshot"] = {
+        "AgentStatus": {"Type": "OFFLINE", "Name": "Offline"},
+        "Configuration": {"RoutingProfile": {"Concurrency": []}},
+    }
+    assert is_agent_available(event) is True  # CurrentAgentSnapshot wins
+
+
+def test_extract_agent_info_returns_inbound_queue_arns():
+    """extract_agent_info must return all InboundQueue ARNs alongside the outbound one."""
+    event = _current_snapshot_event("ROUTABLE", "Available")
+    info = extract_agent_info(event)
+    assert info["agent_arn"] == event["AgentARN"]
+    assert info["queue_arn"] == "arn:aws:connect:us-east-1:123:instance/abc/queue/outbound"
+    assert info["inbound_queue_arns"] == [
+        "arn:aws:connect:us-east-1:123:instance/abc/queue/inbound-1",
+        "arn:aws:connect:us-east-1:123:instance/abc/queue/inbound-2",
+    ]
+
+
+def test_extract_agent_info_inbound_queue_arns_empty_when_not_present():
+    """Events without InboundQueues must return an empty list, not raise."""
+    event = _state_change_event("ROUTABLE", "Available")
+    event["AgentARN"] = "arn:aws:connect:us-east-1:123:instance/abc/agent/agent-001"
+    event["AgentSnapshot"]["Configuration"] = {
+        "RoutingProfile": {
+            "DefaultOutboundQueue": {"ARN": "arn:aws:connect:us-east-1:123:instance/abc/queue/q1"},
+            "Concurrency": [],
+        }
+    }
+    info = extract_agent_info(event)
+    assert info["inbound_queue_arns"] == []

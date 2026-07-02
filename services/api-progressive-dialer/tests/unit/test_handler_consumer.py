@@ -233,6 +233,93 @@ class TestGsiCampaignLookup:
 
         lock.acquire.assert_not_called()
 
+    def test_finds_campaign_via_inbound_queue_when_outbound_has_none(self, mocker):
+        """DefaultOutboundQueue has no campaign; InboundQueue does — must match inbound."""
+        campaign_item = self._make_campaign_item("camp-inbound")
+
+        def _query(**kwargs):
+            q = kwargs["ExpressionAttributeValues"][":q"]["S"]
+            return {"Items": [campaign_item] if q == "arn::queue/inbound" else []}
+
+        mocker.patch("handler_consumer._get_ddb").return_value.query.side_effect = _query
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch("handler_consumer.extract_agent_info", return_value={
+            "agent_arn": "arn::agent/a1",
+            "queue_arn": "arn::queue/outbound",
+            "inbound_queue_arns": ["arn::queue/inbound"],
+        })
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.return_value = None
+
+        import handler_consumer, base64, json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        # Lock must have been acquired — campaign was found via inbound queue
+        lock.acquire.assert_called_once()
+
+    def test_no_campaigns_on_any_queue_skips_dispatch(self, mocker):
+        """Neither DefaultOutbound nor any InboundQueue has active campaigns → skip."""
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {"Items": []}
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch("handler_consumer.extract_agent_info", return_value={
+            "agent_arn": "arn::agent/a1",
+            "queue_arn": "arn::queue/outbound",
+            "inbound_queue_arns": ["arn::queue/inbound-1", "arn::queue/inbound-2"],
+        })
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+
+        import handler_consumer, base64, json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        lock.acquire.assert_not_called()
+
+    def test_uses_inbound_queue_arn_in_dispatch_when_matched(self, mocker):
+        """When campaign is found via an InboundQueue, that ARN must appear in the SQS message."""
+        from campaign_queue import Contact
+        campaign_item = self._make_campaign_item("camp-inbound")
+
+        def _query(**kwargs):
+            q = kwargs["ExpressionAttributeValues"][":q"]["S"]
+            return {"Items": [campaign_item] if q == "arn::queue/inbound" else []}
+
+        mocker.patch("handler_consumer._get_ddb").return_value.query.side_effect = _query
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch("handler_consumer.extract_agent_info", return_value={
+            "agent_arn": "arn::agent/a1",
+            "queue_arn": "arn::queue/outbound",
+            "inbound_queue_arns": ["arn::queue/inbound"],
+        })
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.return_value = Contact(
+            campaign_id="camp-inbound", contact_uuid="uuid-x",
+            sk="ts1#uuid-x", phone="+15551234567"
+        )
+        mock_fo = mocker.MagicMock()
+        mock_fo.push.return_value = True
+        mocker.patch("handler_consumer.FirstOrionClient").build_from_secret.return_value = mock_fo
+        mock_sqs = mocker.MagicMock()
+        mock_sqs.send_message.return_value = {}
+        mocker.patch("handler_consumer.boto3.client", return_value=mock_sqs)
+
+        import handler_consumer, base64, json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        sqs_call = mock_sqs.send_message.call_args
+        if sqs_call:
+            body = json.loads(sqs_call[1]["MessageBody"])
+            assert body["queueArn"] == "arn::queue/inbound"
+
 
 # ---------------------------------------------------------------------------
 # H-8: lock released on exception between acquire and SQS send

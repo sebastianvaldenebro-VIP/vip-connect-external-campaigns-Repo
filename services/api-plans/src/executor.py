@@ -219,6 +219,44 @@ def _count_branded_queue(campaign_id: str) -> int:
     return total
 
 
+def get_branded_queue_counts(branded_campaign_id: str) -> tuple[int, int]:
+    """Return (pending_count, dialed_count) for a branded campaign queue.
+
+    Queries VipProgressiveCampaignQueue twice — once filtered to PENDING/DISPATCHING,
+    once to DIALED — and returns both counts. Used by the branded-progress endpoint.
+    Raises on DDB errors; callers decide whether to swallow or propagate.
+    """
+    if not _CAMPAIGN_QUEUE_TABLE_BRANDED:
+        return (0, 0)
+    ddb = _get_ddb_client()
+    base_kwargs = dict(
+        TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+        KeyConditionExpression="campaignId = :c",
+        ExpressionAttributeValues={":c": {"S": branded_campaign_id}},
+        Select="COUNT",
+    )
+
+    def _count_with_filter(filter_expr: str, attr_values: dict) -> int:
+        kwargs = {**base_kwargs, "FilterExpression": filter_expr,
+                  "ExpressionAttributeNames": {"#s": "status"}}
+        kwargs["ExpressionAttributeValues"] = {**base_kwargs["ExpressionAttributeValues"], **attr_values}
+        total = 0
+        while True:
+            resp = ddb.query(**kwargs)
+            total += resp.get("Count", 0)
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                return total
+            kwargs["ExclusiveStartKey"] = lek
+
+    pending = _count_with_filter(
+        "#s IN (:p, :d)",
+        {":p": {"S": "PENDING"}, ":d": {"S": "DISPATCHING"}},
+    )
+    dialed = _count_with_filter("#s = :dl", {":dl": {"S": "DIALED"}})
+    return (pending, dialed)
+
+
 def _expire_branded_queue_items(campaign_id: str) -> None:
     """Set TTL=now on all PENDING/DISPATCHING items in VipProgressiveCampaignQueue.
 
@@ -2531,7 +2569,11 @@ def _start_one_campaign(
                     "Branded env vars not configured: ACTIVE_BRANDED_CAMPAIGNS_TABLE and "
                     "CAMPAIGN_QUEUE_TABLE_BRANDED must be set"
                 )
-            seg_name, _ = _create_segment(bucket, campaign)
+            pinned_arn = campaign.get("pinnedSegmentArn")
+            if pinned_arn:
+                seg_name = pinned_arn.rsplit("/", 1)[-1]
+            else:
+                seg_name, _ = _create_segment(bucket, campaign)
             seeded = _invoke_seeder(
                 campaign_id=campaign_id,
                 segment_name=seg_name,
@@ -3129,6 +3171,27 @@ class _CutoffTooCloseError(Exception):
 _MAX_SEGMENT_MEMBERS = 3000  # Derived from AWS CP limits: 60 max attributes × 50 max values/attribute = 3,000
 
 
+def _normalize_phone_e164(raw: str) -> str | None:
+    """Normalize a raw CRM phone number to E.164 (+1XXXXXXXXXX for US numbers).
+
+    Returns None for numbers that can't be normalized (missing, too short, etc).
+    Handles the common CRM patterns:
+      10 digits              → +1XXXXXXXXXX
+      11 digits starting w/1 → +1XXXXXXXXXX  (avoids double-prefix bug in sub Lambda)
+      Already E.164 (+1...)  → unchanged
+    """
+    if not raw:
+        return None
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if raw.strip().startswith("+") and len(digits) >= 10:
+        return raw.strip()
+    return None
+
+
 def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
     from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
     from vip_shared.domain.services.segment_groups_translator import (
@@ -3183,19 +3246,22 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
 
     # Preserve Redis iteration order (list + seen-set for dedup) so that when
     # the segment is truncated the most recently-added leads take priority.
+    # Collect (id, normalized_phone) pairs in one pass — both are needed for
+    # truncation and segment construction respectively.
     seen: set[str] = set()
-    redis_ids_ordered: list[str] = []
+    entries: list[tuple[str, str | None]] = []
     for record in redis_source.iter_records():
         if not rules or matches_group(record, rules, "ALL"):
             cid = str(record.get("customerid") or record.get("ID") or "").strip()
             if cid and cid not in seen:
                 seen.add(cid)
-                redis_ids_ordered.append(cid)
+                raw_phone = str(record.get("phone", "")).strip()
+                entries.append((cid, _normalize_phone_e164(raw_phone)))
 
-    if not redis_ids_ordered:
+    if not entries:
         raise _EmptySegmentError("No Redis records match campaign filters")
 
-    total_matched = len(redis_ids_ordered)
+    total_matched = len(entries)
     if total_matched > _MAX_SEGMENT_MEMBERS:
         # Truncate to the AWS CP hard limit (60 attributes × 50 values = 3,000).
         # Takes the first _MAX_SEGMENT_MEMBERS records from Redis — which are the
@@ -3206,13 +3272,19 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
             limit=_MAX_SEGMENT_MEMBERS,
             dropped=total_matched - _MAX_SEGMENT_MEMBERS,
         )
-        redis_ids_ordered = redis_ids_ordered[:_MAX_SEGMENT_MEMBERS]
+        entries = entries[:_MAX_SEGMENT_MEMBERS]
+
+    # Build segment using phones instead of Lead IDs.
+    # The seeder's _extract_phones_from_filter reads phones directly from the
+    # segment definition — no BatchGetProfile needed. Using Lead IDs here caused
+    # _EmptySegmentError because Lead UUIDs ≠ CP internal ProfileIds.
+    phones_e164 = [phone for _, phone in entries if phone]
+    if not phones_e164:
+        raise _EmptySegmentError("No Redis records with valid phone numbers match campaign filters")
 
     cp = build_cp()
     segment_name = build_segment_name(bucket, campaign)
-    segment_groups = SegmentGroupsTranslator().customer_ids_to_segment_groups(
-        redis_ids_ordered, field="ID"
-    )
+    segment_groups = SegmentGroupsTranslator().phones_to_segment_groups(phones_e164)
 
     state_str = "/".join(state_codes) if state_codes else "all"
     display_name = (

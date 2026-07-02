@@ -56,6 +56,58 @@ def test_extract_profile_ids_missing_attributes_key():
 
 
 # ---------------------------------------------------------------------------
+# _extract_phones_from_filter
+# ---------------------------------------------------------------------------
+
+def _make_phone_segment(*phone_lists):
+    """Build SegmentGroups in the phone-filter shape (phones_to_segment_groups output)."""
+    dimensions = [
+        {
+            "ProfileAttributes": {
+                "PhoneNumber": {
+                    "DimensionType": "INCLUSIVE",
+                    "Values": phones,
+                }
+            }
+        }
+        for phones in phone_lists
+    ]
+    return {"Groups": [{"Type": "ANY", "Dimensions": dimensions}]}
+
+
+def test_extract_phones_from_filter_single_chunk():
+    sg = _make_phone_segment(["+15550001111", "+15550002222"])
+    result = handler_seeder._extract_phones_from_filter(sg)
+    assert result == ["+15550001111", "+15550002222"]
+
+
+def test_extract_phones_from_filter_multiple_chunks():
+    sg = _make_phone_segment(["+15550001111"], ["+15550002222", "+15550003333"])
+    result = handler_seeder._extract_phones_from_filter(sg)
+    assert result == ["+15550001111", "+15550002222", "+15550003333"]
+
+
+def test_extract_phones_from_filter_empty_groups():
+    assert handler_seeder._extract_phones_from_filter({}) == []
+
+
+def test_extract_phones_from_filter_skips_exclusive_dimension():
+    """Only INCLUSIVE dimensions contribute phones; EXCLUSIVE ones are ignored."""
+    sg = {"Groups": [{"Dimensions": [
+        {"ProfileAttributes": {"PhoneNumber": {"DimensionType": "EXCLUSIVE", "Values": ["+15550009999"]}}},
+        {"ProfileAttributes": {"PhoneNumber": {"DimensionType": "INCLUSIVE", "Values": ["+15550001111"]}}},
+    ]}]}
+    result = handler_seeder._extract_phones_from_filter(sg)
+    assert result == ["+15550001111"]
+
+
+def test_extract_phones_from_filter_id_segment_returns_empty():
+    """ID-based segments (Attributes.ID) must not match this extractor."""
+    sg = _make_segment_groups(["id-1", "id-2"])
+    assert handler_seeder._extract_phones_from_filter(sg) == []
+
+
+# ---------------------------------------------------------------------------
 # _fetch_phones
 # ---------------------------------------------------------------------------
 
@@ -186,6 +238,58 @@ def test_lambda_handler_success_seeds_contacts():
     assert body["profilesFound"] == 2
     assert body["contactsWithPhone"] == 2
     assert mock_batch_writer.put_item.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — phone-filter segment fallback (no BatchGetProfile)
+# ---------------------------------------------------------------------------
+
+def test_lambda_handler_phone_filter_segment_seeds_without_batch_get_profile():
+    """Segments built by executor._create_segment use PhoneNumber.INCLUSIVE.
+    The seeder must extract phones directly without calling BatchGetProfile.
+    """
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentGroups": _make_phone_segment(["+15550001111", "+15550002222"])
+    }
+    mock_table = MagicMock()
+    mock_batch_writer = MagicMock()
+    mock_table.batch_writer.return_value.__enter__ = MagicMock(return_value=mock_batch_writer)
+    mock_table.batch_writer.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp), \
+         patch("handler_seeder._get_table", return_value=mock_table):
+        resp = handler_seeder.lambda_handler(
+            _api_event("camp-branded", {"segmentName": "phone-seg"}), None
+        )
+
+    # Must NOT call BatchGetProfile — phones come directly from the segment definition
+    mock_cp.batch_get_profile.assert_not_called()
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["seeded"] == 2
+    assert mock_batch_writer.put_item.call_count == 2
+
+
+def test_lambda_handler_phone_filter_empty_returns_zero_seeded_on_direct_invoke():
+    """Phone-filter segment with no phones → seeded:0 on direct invoke (not HTTP error)."""
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentGroups": _make_phone_segment([])  # segment exists but has no phones
+    }
+
+    direct_invoke_event = {
+        "campaignId": "camp-branded",
+        "segmentName": "empty-phone-seg",
+        "contactFlowId": "flow-abc",
+        "sourcePhone": "+15550001234",
+    }
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp):
+        result = handler_seeder.lambda_handler(direct_invoke_event, None)
+
+    assert result == {"seeded": 0}
+    mock_cp.batch_get_profile.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

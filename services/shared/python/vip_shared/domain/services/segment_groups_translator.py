@@ -66,6 +66,51 @@ class SegmentGroupsTranslator:
 
         return rules, combinator
 
+    def phones_to_segment_groups(
+        self, phones: list[str], *, chunk_size: int = 50
+    ) -> dict[str, Any]:
+        """Build a SegmentGroups definition matching the given E.164 phone numbers.
+
+        Uses ProfileAttributes.PhoneNumber.INCLUSIVE so the seeder's
+        _extract_phones_from_filter reads phones directly — no BatchGetProfile needed.
+        """
+        if not phones:
+            return {
+                "Include": "ALL",
+                "Groups": [
+                    {
+                        "Type": "ALL",
+                        "Dimensions": [
+                            {
+                                "ProfileAttributes": {
+                                    "PhoneNumber": {
+                                        "DimensionType": "INCLUSIVE",
+                                        "Values": ["__no_records__"],
+                                    }
+                                }
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        chunks = [phones[i : i + chunk_size] for i in range(0, len(phones), chunk_size)]
+        dimensions = [
+            {
+                "ProfileAttributes": {
+                    "PhoneNumber": {
+                        "DimensionType": "INCLUSIVE",
+                        "Values": chunk,
+                    }
+                }
+            }
+            for chunk in chunks
+        ]
+        return {
+            "Include": "ALL",
+            "Groups": [{"Type": "ANY", "Dimensions": dimensions}],
+        }
+
     def customer_ids_to_segment_groups(
         self, customer_ids: list[str], *, field: str = "ID", chunk_size: int = 50
     ) -> dict[str, Any]:

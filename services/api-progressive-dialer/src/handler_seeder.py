@@ -11,6 +11,7 @@ Flow:
 HIPAA: phone numbers are not logged. Only counts appear in logs.
 """
 import json
+import logging
 import os
 import time
 import uuid
@@ -19,12 +20,15 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 
+_LOG = logging.getLogger(__name__)
+_LOG.setLevel(logging.INFO)
+
 _ddb_table = None
 _cp_client = None
 
 _PROFILES_DOMAIN = os.environ["PROFILES_DOMAIN_NAME"]
 _QUEUE_TABLE = os.environ["CAMPAIGN_QUEUE_TABLE"]
-_BATCH_SIZE = 100  # CP BatchGetProfile max per call
+_BATCH_SIZE = 20  # CP BatchGetProfile hard limit per call
 
 
 def _get_table():
@@ -59,6 +63,24 @@ def _extract_profile_ids(segment_groups: dict) -> list:
     return ids
 
 
+def _extract_phones_from_filter(segment_groups: dict) -> list:
+    """Extract phone numbers from phone-filter segments.
+
+    Handles segments where the filter IS the phone list:
+      Groups[].Dimensions[].ProfileAttributes.PhoneNumber.DimensionType=INCLUSIVE Values[...]
+    These are created manually in the CP console (not by reconcile.py).
+    Phone numbers are PHI — not logged, only counts appear in logs.
+    """
+    phones = []
+    for group in (segment_groups.get("Groups") or []):
+        for dimension in (group.get("Dimensions") or []):
+            pa = dimension.get("ProfileAttributes") or {}
+            phone_dim = pa.get("PhoneNumber") or {}
+            if phone_dim.get("DimensionType") == "INCLUSIVE":
+                phones.extend(phone_dim.get("Values") or [])
+    return phones
+
+
 def _fetch_phones(profile_ids: list) -> list:
     """Return phone numbers for the given profile IDs using BatchGetProfile.
 
@@ -69,7 +91,8 @@ def _fetch_phones(profile_ids: list) -> list:
     phones = []
     cp = _get_cp()
     for i in range(0, len(profile_ids), _BATCH_SIZE):
-        chunk = profile_ids[i:i + _BATCH_SIZE]
+        # BatchGetProfile requires 32-char hex without hyphens
+        chunk = [pid.replace("-", "") for pid in profile_ids[i:i + _BATCH_SIZE]]
         resp = cp.batch_get_profile(
             DomainName=_PROFILES_DOMAIN,
             ProfileIds=chunk,
@@ -104,10 +127,18 @@ def lambda_handler(event: dict, _context) -> dict:
             return {"statusCode": 400, "body": json.dumps({"error": "missing campaign id"})}
         raise ValueError("missing campaignId in direct-invoke payload")
 
+    _t0 = time.monotonic()
     segment_name = body.get("segmentName")
     if not segment_name:
         err = {"error": "missing segmentName"}
         return {"statusCode": 400, "body": json.dumps(err)} if _http_mode else err
+
+    _LOG.info(json.dumps({
+        "event": "seeder_invoked",
+        "campaign_id": campaign_id,
+        "segment_name": segment_name,
+        "mode": "http" if _http_mode else "direct",
+    }))
 
     # 1. Get segment definition and extract profile IDs
     try:
@@ -126,12 +157,30 @@ def lambda_handler(event: dict, _context) -> dict:
         # Direct-invoke mode: raise so executor can handle as a real error
         raise RuntimeError(f"segment lookup failed: {type(exc).__name__}")
 
-    profile_ids = _extract_profile_ids(resp.get("SegmentGroups") or {})
-    if not profile_ids:
-        return {"statusCode": 400, "body": json.dumps({"error": "segment has no members"})}
-
-    # 2. Fetch phones via BatchGetProfile
-    phones = _fetch_phones(profile_ids)
+    segment_groups = resp.get("SegmentGroups") or {}
+    profile_ids = _extract_profile_ids(segment_groups)
+    if profile_ids:
+        # ID-list segment (built by reconcile.py) — resolve phones via BatchGetProfile
+        phones = _fetch_phones(profile_ids)
+        _LOG.info(json.dumps({
+            "event": "segment_resolved",
+            "campaign_id": campaign_id,
+            "path": "id_list",
+            "profile_ids_found": len(profile_ids),
+            "phones_resolved": len(phones),
+        }))
+    else:
+        # Fallback: phone-filter segment (created manually or by executor._create_segment)
+        phones = _extract_phones_from_filter(segment_groups)
+        _LOG.info(json.dumps({
+            "event": "segment_resolved",
+            "campaign_id": campaign_id,
+            "path": "phone_filter",
+            "phones_found": len(phones),
+        }))
+        if not phones:
+            err = {"error": "segment has no members"}
+            return {"statusCode": 400, "body": json.dumps(err)} if _http_mode else {"seeded": 0}
 
     # 3. Write to DynamoDB queue (phone is PHI — encrypted at rest via KMS CMK on the table)
     table = _get_table()
@@ -151,6 +200,13 @@ def lambda_handler(event: dict, _context) -> dict:
                 "ttl": ttl,
             })
             written += 1
+
+    _LOG.info(json.dumps({
+        "event": "seeder_complete",
+        "campaign_id": campaign_id,
+        "seeded": written,
+        "duration_ms": round((time.monotonic() - _t0) * 1000),
+    }))
 
     result = {"seeded": written}
     if _http_mode:
