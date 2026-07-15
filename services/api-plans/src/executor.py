@@ -38,6 +38,7 @@ finds all plans triggered by this plan and fires them.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -103,6 +104,7 @@ SNS_ALERTS_TOPIC_ARN: Final = os.environ.get("SNS_ALERTS_TOPIC_ARN", "")
 _PROGRESSIVE_DIALER_SEEDER_ARN: Final = os.environ.get("PROGRESSIVE_DIALER_SEEDER_ARN", "")
 _ACTIVE_BRANDED_CAMPAIGNS_TABLE: Final = os.environ.get("ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
 _CAMPAIGN_QUEUE_TABLE_BRANDED: Final = os.environ.get("CAMPAIGN_QUEUE_TABLE_BRANDED", "")
+_BRANDED_RUN_SUMMARY_TABLE: Final = os.environ.get("BRANDED_RUN_SUMMARY_TABLE", "")
 
 # Consecutive branded-poll failure tracking — keyed by brandedCampaignId.
 # Resets on a successful poll; campaign transitions to error after this many consecutive failures.
@@ -257,6 +259,38 @@ def get_branded_queue_counts(branded_campaign_id: str) -> tuple[int, int]:
     return (pending, dialed)
 
 
+def get_branded_queue_items(branded_campaign_id: str, limit: int = 50) -> list[dict]:
+    """Return up to `limit` queue items newest-first for a branded campaign.
+
+    HIPAA: phone is PHI — only phone_last4 is returned, never the full number.
+    Each item: {"phone_last4": str, "status": str, "seededAt": str}.
+    """
+    if not _CAMPAIGN_QUEUE_TABLE_BRANDED:
+        return []
+    ddb = _get_ddb_client()
+    resp = ddb.query(
+        TableName=_CAMPAIGN_QUEUE_TABLE_BRANDED,
+        KeyConditionExpression="campaignId = :c",
+        ExpressionAttributeValues={":c": {"S": branded_campaign_id}},
+        ProjectionExpression="sk, phone, #s",
+        ExpressionAttributeNames={"#s": "status"},
+        ScanIndexForward=False,
+        Limit=limit,
+    )
+    result = []
+    for raw in resp.get("Items", []):
+        sk = raw.get("sk", {}).get("S", "")
+        phone = raw.get("phone", {}).get("S", "")
+        status = raw.get("status", {}).get("S", "")
+        seeded_at = sk.split("#")[0] if "#" in sk else sk
+        result.append({
+            "phone_last4": phone[-4:] if len(phone) >= 4 else phone,
+            "status": status,
+            "seededAt": seeded_at,
+        })
+    return result
+
+
 def _expire_branded_queue_items(campaign_id: str) -> None:
     """Set TTL=now on all PENDING/DISPATCHING items in VipProgressiveCampaignQueue.
 
@@ -386,6 +420,138 @@ def _stop_branded_campaign(cs: dict) -> None:
         logger.error(
             "_stop_branded_campaign: expire queue failed for %s: %s",
             campaign_id, type(exc).__name__,
+        )
+
+
+def _write_branded_run_summary(plan_id: str, run_id: str, cs: dict) -> None:
+    """Update VipBrandedRunSummary with completion metrics after a branded campaign ends.
+
+    Uses update_item to preserve the START record's settings fields written by
+    _write_branded_run_start. Must NEVER raise — failures are logged and swallowed.
+    No phone numbers written — this table contains no PHI.
+    """
+    if not _BRANDED_RUN_SUMMARY_TABLE:
+        return
+    campaign_id = cs.get("campaignId", "")
+    branded_id = cs.get("brandedCampaignId", campaign_id)
+    if not campaign_id:
+        return
+    try:
+        pending, dialed = get_branded_queue_counts(branded_id) if branded_id else (0, 0)
+    except Exception:
+        pending, dialed = (0, 0)
+    started_at = cs.get("startedAt", "")
+    completed_at = cs.get("completedAt", _now_iso())
+    try:
+        duration = int(
+            (datetime.fromisoformat(completed_at.replace("Z", "+00:00")) -
+             datetime.fromisoformat(started_at.replace("Z", "+00:00"))).total_seconds()
+        ) if started_at else 0
+    except Exception:
+        duration = 0
+    exit_reason = cs.get("exitReason", "")
+    if exit_reason == "queue_drained":
+        final_status = "COMPLETED"
+    elif exit_reason in ("aborted", "manually_stopped", "poll_failure"):
+        final_status = "ABORTED"
+    else:
+        final_status = "ERROR"
+    try:
+        _get_ddb_client().update_item(
+            TableName=_BRANDED_RUN_SUMMARY_TABLE,
+            Key={
+                "planId": {"S": plan_id},
+                "sk":     {"S": f"{run_id}#{campaign_id}"},
+            },
+            UpdateExpression=(
+                "SET #st = :s, totalSeeded = :ts, totalDialed = :td, "
+                "exitReason = :er, completedAt = :ca, durationSeconds = :ds, "
+                "runId = if_not_exists(runId, :rid), campaignId = if_not_exists(campaignId, :cid), "
+                "brandedCampaignId = if_not_exists(brandedCampaignId, :bid), "
+                "startedAt = if_not_exists(startedAt, :sa)"
+            ),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":s":   {"S": final_status},
+                ":ts":  {"N": str(pending + dialed)},
+                ":td":  {"N": str(dialed)},
+                ":er":  {"S": exit_reason},
+                ":ca":  {"S": completed_at},
+                ":ds":  {"N": str(duration)},
+                ":rid": {"S": run_id},
+                ":cid": {"S": campaign_id},
+                ":bid": {"S": branded_id},
+                ":sa":  {"S": started_at},
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "_write_branded_run_summary: failed for %s/%s campaign %s: %s",
+            plan_id, run_id, campaign_id, type(exc).__name__,
+        )
+
+
+def _write_branded_run_start(
+    plan_id: str, run: dict, cs: dict, cfg: dict, seg_name: str, seg_arn: str, seeded: int
+) -> None:
+    """Write a START record to VipBrandedRunSummary when a branded campaign begins.
+
+    Captures all settings for audit trail. The CP segment is deleted later by
+    _stop_branded_campaign, so this is the only window to snapshot its identity.
+    PHI-safe: only last 4 digits of source phone are stored.
+    Must NEVER raise — callers must not be blocked by an audit write failure.
+    """
+    if not _BRANDED_RUN_SUMMARY_TABLE:
+        return
+    campaign_id = cs.get("campaignId", "")
+    if not campaign_id:
+        return
+    branded_id = cs.get("brandedCampaignId", campaign_id)
+    run_id = run.get("runId", "")
+    source_phone = cfg.get("sourcePhone") or cfg.get("sourcePhoneNumber", "")
+    source_phone_last4 = source_phone[-4:] if len(source_phone) >= 4 else source_phone
+
+    # Snapshot non-PHI campaign config as segment definition
+    _PHI_FIELDS = {"sourcePhone", "sourcePhoneNumber"}
+    segment_def = {k: v for k, v in cfg.items() if k not in _PHI_FIELDS}
+    segment_def["_segmentName"] = seg_name
+    segment_def["_segmentArn"] = seg_arn or ""
+
+    plan_snapshot = run.get("planSnapshot", {})
+    try:
+        _get_ddb_client().put_item(
+            TableName=_BRANDED_RUN_SUMMARY_TABLE,
+            Item={
+                "planId":               {"S": plan_id},
+                "sk":                   {"S": f"{run_id}#{campaign_id}"},
+                "runId":                {"S": run_id},
+                "campaignId":           {"S": campaign_id},
+                "brandedCampaignId":    {"S": branded_id},
+                "planName":             {"S": plan_snapshot.get("name", "")},
+                "segmentArn":           {"S": seg_arn or ""},
+                "segmentName":          {"S": seg_name or ""},
+                "segmentDefinitionJson": {"S": json.dumps(segment_def, default=str)},
+                "segmentSize":          {"N": str(seeded)},
+                "contactFlowId":        {"S": cfg.get("contactFlowId", "")},
+                "queueArn":             {"S": cfg.get("queueArn", "")},
+                "sourcePhoneLast4":     {"S": source_phone_last4},
+                "bucketIndex":          {"N": str(cs.get("bucketIndex", 0))},
+                "priority":             {"N": str(cs.get("priority", 0))},
+                "status":               {"S": "RUNNING"},
+                "startedAt":            {"S": cs.get("startedAt", _now_iso())},
+            },
+            ConditionExpression="attribute_not_exists(sk)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            logger.error(
+                "_write_branded_run_start: failed for %s/%s campaign %s: %s",
+                plan_id, run_id, campaign_id, type(exc).__name__,
+            )
+    except Exception as exc:
+        logger.error(
+            "_write_branded_run_start: failed for %s/%s campaign %s: %s",
+            plan_id, run_id, campaign_id, type(exc).__name__,
         )
 
 
@@ -767,6 +933,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                     cs["status"] = "error"
                     cs["exitReason"] = "poll_failure"
                     cs["completedAt"] = _now_iso()
+                    _write_branded_run_summary(plan_id, run_id, cs)
                     _stop_branded_campaign(cs)
                     _branded_poll_failures.pop(cs["brandedCampaignId"], None)
                 continue  # don't transition on poll error
@@ -782,6 +949,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 cs["status"] = "completed"
                 cs["exitReason"] = "queue_drained"
                 cs["completedAt"] = _now_iso()
+                _write_branded_run_summary(plan_id, run_id, cs)
                 _stop_branded_campaign(cs)
                 _emit_branded_metric("BrandedCampaignCompleted")
 
@@ -957,6 +1125,9 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                         _safe_delete_segment(cs["segmentName"])
                 # ── Branded cleanup ──
                 if cs["status"] in ("running", "creating") and cs.get("brandedCampaignId"):
+                    cs["exitReason"] = REASON_ABORTED
+                    cs["completedAt"] = now
+                    _write_branded_run_summary(plan_id, run_id, cs)
                     _stop_branded_campaign(cs)
                 # ─────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
@@ -1431,6 +1602,9 @@ def force_stop_campaign(
         if cs.get("connectCampaignId"):
             _safe_stop_campaign(cs["connectCampaignId"])
         if cs.get("brandedCampaignId"):
+            cs["exitReason"] = "manually_stopped"
+            cs["completedAt"] = _now_iso()
+            _write_branded_run_summary(plan_id, run_id, cs)
             _stop_branded_campaign(cs)
         cs["status"] = "expired"
         cs["exitReason"] = "manually_stopped"
@@ -2671,6 +2845,15 @@ def _start_one_campaign(
             return
 
         _emit_branded_metric("BrandedCampaignStarted")
+        _write_branded_run_start(
+            plan_id=run["planId"],
+            run=run,
+            cs=cs,
+            cfg=cfg,
+            seg_name=seg_name,
+            seg_arn=pinned_arn or "",
+            seeded=seeded,
+        )
         # brandedCampaignId and queueArn already set early (before try/except)
         cs["connectCampaignId"] = None
         cs["status"] = "running"
@@ -3246,17 +3429,17 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
 
     # Preserve Redis iteration order (list + seen-set for dedup) so that when
     # the segment is truncated the most recently-added leads take priority.
-    # Collect (id, normalized_phone) pairs in one pass — both are needed for
-    # truncation and segment construction respectively.
+    # Collect (id, normalized_phone, raw_phone) triples in one pass — raw_phone
+    # retained only for excluded-lead logging; not used downstream.
     seen: set[str] = set()
-    entries: list[tuple[str, str | None]] = []
+    entries: list[tuple[str, str | None, str]] = []
     for record in redis_source.iter_records():
         if not rules or matches_group(record, rules, "ALL"):
             cid = str(record.get("customerid") or record.get("ID") or "").strip()
             if cid and cid not in seen:
                 seen.add(cid)
                 raw_phone = str(record.get("phone", "")).strip()
-                entries.append((cid, _normalize_phone_e164(raw_phone)))
+                entries.append((cid, _normalize_phone_e164(raw_phone), raw_phone))
 
     if not entries:
         raise _EmptySegmentError("No Redis records match campaign filters")
@@ -3274,11 +3457,28 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
         )
         entries = entries[:_MAX_SEGMENT_MEMBERS]
 
+    # Log leads whose phone couldn't be normalized — they will not be dialed.
+    # Log last-4 digits only; full phone number is PHI and must not appear in logs.
+    excluded = [(cid, raw) for cid, phone, raw in entries if phone is None]
+    if excluded:
+        _slog.warn(
+            "segment_phones_excluded",
+            count=len(excluded),
+            excluded=[
+                {
+                    "cid": cid,
+                    "phone_last4": raw[-4:] if len(raw) >= 4 else "",
+                    "reason": "empty" if not raw else "bad_format",
+                }
+                for cid, raw in excluded[:50]
+            ],
+        )
+
     # Build segment using phones instead of Lead IDs.
     # The seeder's _extract_phones_from_filter reads phones directly from the
     # segment definition — no BatchGetProfile needed. Using Lead IDs here caused
     # _EmptySegmentError because Lead UUIDs ≠ CP internal ProfileIds.
-    phones_e164 = [phone for _, phone in entries if phone]
+    phones_e164 = [phone for _, phone, _ in entries if phone]
     if not phones_e164:
         raise _EmptySegmentError("No Redis records with valid phone numbers match campaign filters")
 
@@ -3410,6 +3610,44 @@ def _create_and_start_campaign(
     return campaign_id, segment_name
 
 
+_PLAN_PERMISSION_STATEMENT_LIMIT = 12  # proactive cleanup threshold
+
+
+def _cleanup_orphan_plan_permissions() -> None:
+    """Remove vip-plan-* Lambda policy statements whose EventBridge rule no longer exists.
+
+    Called proactively when the statement count nears the Lambda 20 KB policy limit.
+    Prevents PolicyLengthExceededException from stale statements that accumulate
+    when runs end without cleaning up their bucket-chain schedule.
+    """
+    import json as _json
+
+    lam = boto3.client("lambda")
+    ev = boto3.client("events")
+    try:
+        policy = _json.loads(lam.get_policy(FunctionName=LAMBDA_FUNCTION_ARN)["Policy"])
+    except ClientError:
+        return
+
+    orphans = []
+    for stmt in policy.get("Statement", []):
+        sid = stmt.get("Sid", "")
+        if not sid.startswith("vip-plan-"):
+            continue
+        try:
+            ev.describe_rule(Name=sid)
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                orphans.append(sid)
+
+    for sid in orphans:
+        try:
+            lam.remove_permission(FunctionName=LAMBDA_FUNCTION_ARN, StatementId=sid)
+            logger.info("Removed orphan Lambda permission: %s", sid)
+        except ClientError as exc:
+            logger.warning("Could not remove orphan permission %s: %s", sid, exc)
+
+
 def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
     import json
 
@@ -3435,8 +3673,24 @@ def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
     )
 
     rule_arn = f"arn:aws:events:us-east-1:{_account_id()}:rule/{rule_name}"
+    lam = boto3.client("lambda")
+
+    # Proactively clean up orphan vip-plan-* statements before adding a new one.
+    # Prevents PolicyLengthExceededException when stale statements accumulate
+    # (happens when runs complete without scheduleName saved in DDB).
     try:
-        boto3.client("lambda").add_permission(
+        import json as _json
+        policy = _json.loads(lam.get_policy(FunctionName=LAMBDA_FUNCTION_ARN)["Policy"])
+        plan_stmt_count = sum(
+            1 for s in policy.get("Statement", []) if s.get("Sid", "").startswith("vip-plan-")
+        )
+        if plan_stmt_count >= _PLAN_PERMISSION_STATEMENT_LIMIT:
+            _cleanup_orphan_plan_permissions()
+    except ClientError:
+        pass
+
+    try:
+        lam.add_permission(
             FunctionName=LAMBDA_FUNCTION_ARN,
             StatementId=rule_name,
             Action="lambda:InvokeFunction",
