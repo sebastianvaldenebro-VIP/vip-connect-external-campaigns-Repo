@@ -7,15 +7,18 @@ import { EnableCampaignModal } from '@/components/EnableCampaignModal';
 import { api, type ReconcileResult, type SegmentSummary, type VerifyResult } from '@/lib/api';
 import { buildSegmentGroups, type Rule } from '@/lib/segmentGroups';
 import {
-  STATE_LOCATION_MAP,
   codesForStates,
   locationsForStates,
+  useLocationMapping,
 } from '@/lib/stateLocationMap';
 
 type AvailableFilter = 'any' | 'yes' | 'no';
 
 export function SegmentNew(): ReactNode {
   const navigate = useNavigate();
+
+  // Live location mapping from DynamoDB — falls back to the static map while loading.
+  const { locationMap } = useLocationMapping();
 
   const [selectedStates, setSelectedStates] = useState<string[]>([]);
   const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
@@ -31,8 +34,8 @@ export function SegmentNew(): ReactNode {
   const [enableOpen, setEnableOpen] = useState(false);
 
   const availableLocationOptions = useMemo(
-    () => locationsForStates(selectedStates),
-    [selectedStates],
+    () => locationsForStates(selectedStates, locationMap),
+    [selectedStates, locationMap],
   );
 
   // State toggle behaviour: when a state gets added, all its locations join the
@@ -46,15 +49,15 @@ export function SegmentNew(): ReactNode {
     const removed = prevStatesRef.current.filter((s) => !curr.has(s));
 
     if (added.length > 0) {
-      const locsToAdd = locationsForStates(added);
+      const locsToAdd = locationsForStates(added, locationMap);
       setSelectedLocations((prev2) => Array.from(new Set([...prev2, ...locsToAdd])));
     }
     if (removed.length > 0) {
-      const locsToRemove = new Set(locationsForStates(removed));
+      const locsToRemove = new Set(locationsForStates(removed, locationMap));
       setSelectedLocations((prev2) => prev2.filter((l) => !locsToRemove.has(l)));
     }
     prevStatesRef.current = selectedStates;
-  }, [selectedStates]);
+  }, [selectedStates, locationMap]);
 
   const attemptsQuery = useQuery({
     queryKey: ['leads', 'distinct', 'attempt'],
@@ -69,8 +72,8 @@ export function SegmentNew(): ReactNode {
   // Auto-generated segment name — DD-MM-YYYY-STATES-GROUPS-ATTEMPTS. Operator
   // can override it by typing; nameOverride takes precedence when non-null.
   const autoName = useMemo(
-    () => buildAutoName(selectedStates, selectedGroups, selectedAttempts),
-    [selectedStates, selectedGroups, selectedAttempts],
+    () => buildAutoName(selectedStates, selectedGroups, selectedAttempts, locationMap),
+    [selectedStates, selectedGroups, selectedAttempts, locationMap],
   );
   // AWS Customer Profiles enforces ^[a-zA-Z0-9_-]+$ on SegmentDefinitionName.
   // Replace anything else (spaces, dots, slashes) with underscores so a typo
@@ -351,7 +354,7 @@ export function SegmentNew(): ReactNode {
           onClose={() => setEnableOpen(false)}
           segmentName={currentSegment.name}
           segmentArn={currentSegment.segmentArn}
-          segmentStates={codesForStates(selectedStates)}
+          segmentStates={codesForStates(selectedStates, locationMap)}
         />
       </div>
     );
@@ -448,7 +451,7 @@ export function SegmentNew(): ReactNode {
               State (multi-select)
             </label>
             <MultiSelect
-              options={STATE_LOCATION_MAP.map((g) => g.state)}
+              options={locationMap.map((g) => g.state)}
               selected={selectedStates}
               onChange={setSelectedStates}
               placeholder="Select states…"
@@ -782,13 +785,14 @@ function buildAutoName(
   states: string[],
   groups: string[],
   attempts: string[],
+  map?: readonly import('@/lib/stateLocationMap').StateGroup[],
 ): string {
   const now = new Date();
   const d = String(now.getDate());
   const m = String(now.getMonth() + 1);
   const yy = String(now.getFullYear()).slice(-2);
   const datePart = `${d}-${m}-${yy}`;
-  const statesPart = codesForStates(states).join('_') || 'all';
+  const statesPart = codesForStates(states, map).join('_') || 'all';
   // Groups and attempts share the same compound "Category / Nth Attempt"
   // shape in Redis, so tokenize them together and dedup across both. Groups
   // is where the operator usually picks attempt labels (the "Attempts" box

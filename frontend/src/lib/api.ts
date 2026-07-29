@@ -303,6 +303,46 @@ export type BucketCampaignConfig = {
   campaignFlowArn?: string;
   /** Full routing queue ARN — required for deliveryType='branded' */
   queueArn?: string;
+  /** EUM SMS origination number ARN — required for deliveryType='sms' */
+  smsOriginationNumberArn?: string;
+  /** SMS message template (≤160 chars, no PHI) — required for deliveryType='sms' */
+  smsMessageTemplate?: string;
+  /** Staff acknowledgment that template contains no PHI — required for deliveryType='sms' */
+  phiAcknowledged?: boolean;
+};
+
+export type SmsOriginationNumber = {
+  arn: string;
+  phoneNumber: string;
+  numberType: 'LONG_CODE' | 'SHORT_CODE' | 'TEN_DLC' | 'TOLL_FREE';
+  countryCode: string;
+  mps: string;
+  twoWayEnabled: boolean;
+  optOutListName: string;
+  status: string;
+};
+
+export type SmsCampaignRunRecord = {
+  planId: string;
+  sk: string;
+  smsCampaignId: string;
+  planName: string;
+  segmentName: string;
+  segmentArn: string;
+  messageTemplate: string;
+  originationNumberArn: string;
+  originationNumber: string;
+  totalEnqueued: number;
+  totalSent: number;
+  totalFailed: number;
+  totalOptedOut: number;
+  status: 'RUNNING' | 'COMPLETED' | 'ABORTED';
+  startedAt: string;
+  completedAt?: string;
+  exitReason?: string;
+  pipelineVersion: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type BucketDef = {
@@ -399,7 +439,7 @@ export type CampaignDef = {
    */
   pinnedSegmentArn?: string;
   /** Controls the Connect campaign type. Defaults to "campaign" (MANAGED). */
-  deliveryType?: 'campaign' | 'journey' | 'branded';
+  deliveryType?: 'campaign' | 'journey' | 'branded' | 'sms';
 };
 
 export type BucketDefV2 = {
@@ -433,6 +473,100 @@ export type BrandedCampaignCounts = {
 export type BrandedProgressResponse = {
   progress: Record<string, BrandedCampaignCounts>;
 };
+
+export type BrandedQueueItem = {
+  phone_last4: string;
+  status: 'PENDING' | 'DISPATCHING' | 'DIALED';
+  seededAt: string;
+};
+
+export type BrandedQueueResponse = {
+  items: Record<string, BrandedQueueItem[]>;
+};
+
+export type BrandedRunSummary = {
+  runId: string;
+  campaignId: string;
+  exitReason: string;
+  totalSeeded: number;
+  totalDialed: number;
+  startedAt: string;
+  completedAt: string;
+};
+
+export type BrandedHistoryResponse = {
+  history: BrandedRunSummary[];
+};
+
+export type BrandedCampaignRecord = {
+  planId: string;
+  sk: string;
+  runId: string;
+  campaignId: string;
+  brandedCampaignId: string;
+  planName: string;
+  segmentName: string;
+  segmentArn?: string;
+  queueArn: string;
+  sourcePhoneLast4?: string;
+  status: 'RUNNING' | 'COMPLETED' | 'ABORTED' | 'ERROR';
+  startedAt: string;
+  completedAt?: string;
+  exitReason?: string;
+  segmentSize?: number;
+  totalSeeded?: number;
+  totalDialed?: number;
+  durationSeconds?: number;
+};
+
+export type BrandedTodaySummary = {
+  date: string;
+  total: number;
+  active: number;
+  completed: number;
+  contactsDialed: number;
+  campaigns: BrandedCampaignRecord[];
+};
+
+export type ContactArtifacts = {
+  contactId: string;
+  voicemail: string | null;
+  recording: string | null;
+  transcript: string | null;
+  expiresInSeconds: number;
+};
+
+export type BrandedMetricSnapshot = {
+  brandedCampaignId: string;
+  snapshotAt: string;
+  planId?: string;
+  contactsPlaced: number;
+  contactsAnswered: number;
+  contactsVoicemail: number;
+  contactsBusy: number;
+  contactsNoAnswer: number;
+  contactsFailed?: number;
+  answerRate: string;
+  voicemailRate: string;
+  agentsAvailable: number;
+  agentsStaffed: number;
+  contactsInQueue: number;
+};
+
+export type AgentRosterEntry = {
+  agentId: string;
+  agentName: string;
+  status: string;
+  statusType: string;
+  effectiveStatus: 'Available' | 'On Call' | 'ACW' | 'Unavailable';
+  activeContactState: string;
+  statusStartTimestamp: string;
+  routingProfileId: string;
+  routingProfileName: string;
+  contactsCount: number;
+};
+
+export type RoutingProfileSummary = { id: string; name: string };
 
 export type CampaignState = {
   campaignId: string;
@@ -707,18 +841,54 @@ const realApi = {
       request<BrandedProgressResponse>(
         `/plans/${encodeURIComponent(planId)}/runs/${encodeURIComponent(runId)}/branded-progress`,
       ),
+    getBrandedQueueV2: (planId: string, runId: string) =>
+      request<BrandedQueueResponse>(
+        `/plans/${encodeURIComponent(planId)}/runs/${encodeURIComponent(runId)}/branded-queue`,
+      ),
+    getBrandedHistoryV2: (planId: string) =>
+      request<BrandedHistoryResponse>(
+        `/plans/${encodeURIComponent(planId)}/branded-history`,
+      ),
     listTemplates: () => request<{ plans: PlanSummaryV2[] }>('/templates'),
     cloneTemplate: (tid: string, body?: { name?: string }) =>
       request<PlanSummaryV2>(`/plans/from-template/${encodeURIComponent(tid)}`, {
         method: 'POST',
         body: body || {},
       }),
+    getLocationMapping: () =>
+      request<{ groups: import('./stateLocationMap').StateGroup[] }>('/location-mapping'),
   },
   previewCount: (body: { segmentGroups: unknown }) =>
     request<{ redisCount: number; segmentCount: number | null }>(
       '/segments/preview-count',
       { method: 'POST', body },
     ),
+  brandedMonitor: {
+    getTodaySummary: (date?: string) =>
+      request<BrandedTodaySummary>(
+        `/metrics/branded/today${date ? `?date=${encodeURIComponent(date)}` : ''}`,
+      ),
+    getCampaignMetrics: (campaignId: string, limit = 24) =>
+      request<{ campaignId: string; metrics: BrandedMetricSnapshot[] }>(
+        `/metrics/branded/campaigns/${encodeURIComponent(campaignId)}/metrics?limit=${limit}`,
+      ),
+    getAgentRoster: (queueId?: string) =>
+      request<{ agents: AgentRosterEntry[]; queueId: string; lastUpdated: string; routingProfiles: RoutingProfileSummary[] }>(
+        `/metrics/branded/agents${queueId ? `?queueId=${encodeURIComponent(queueId)}` : ''}`,
+      ),
+    getHistory: (planId: string, days = 30) =>
+      request<{ planId: string; days: number; history: BrandedCampaignRecord[] }>(
+        `/metrics/branded/history?planId=${encodeURIComponent(planId)}&days=${days}`,
+      ),
+  },
+  sms: {
+    listNumbers: () =>
+      request<{ originationNumbers: SmsOriginationNumber[] }>('/sms/numbers'),
+    getSmsRuns: (planId: string) =>
+      request<{ runs: SmsCampaignRunRecord[] }>(
+        `/plans/${encodeURIComponent(planId)}/sms-runs`,
+      ),
+  },
   audit: {
     list: (query?: {
       actor?: string;
@@ -734,6 +904,10 @@ const realApi = {
       request<{ entityId: string; entries: AuditEntry[] }>(
         `/audit/${encodeURIComponent(entityId)}`,
       ),
+  },
+  contacts: {
+    getArtifacts: (contactId: string) =>
+      request<ContactArtifacts>(`/contacts/${encodeURIComponent(contactId)}/artifacts`),
   },
 };
 

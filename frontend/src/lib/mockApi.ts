@@ -265,6 +265,23 @@ export const mockApi: typeof RealApi = {
     await delay(600);
     return { redisCount: 1298, segmentCount: 1250 };
   },
+  sms: {
+    listNumbers: async () => ({ originationNumbers: [] }),
+    getSmsRuns: async (_planId: string) => ({ runs: [] }),
+  },
+  brandedMonitor: {
+    getTodaySummary: async () => ({
+      date: new Date().toISOString().slice(0, 10),
+      total: 0,
+      active: 0,
+      completed: 0,
+      contactsDialed: 0,
+      campaigns: [],
+    }),
+    getCampaignMetrics: async () => ({ campaignId: '', metrics: [] }),
+    getAgentRoster: async () => ({ agents: [], queueId: '', lastUpdated: new Date().toISOString(), routingProfiles: [] }),
+    getHistory: async () => ({ planId: '', days: 30, history: [] }),
+  },
   audit: {
     list: async (query) => {
       await delay(300);
@@ -360,8 +377,18 @@ export const mockApi: typeof RealApi = {
     getBrandedProgressV2: async () => {
       throw new Error('Not implemented in mock');
     },
+    getBrandedQueueV2: async () => {
+      throw new Error('Not implemented in mock');
+    },
+    getBrandedHistoryV2: async () => ({ history: [] }),
     listTemplates: async () => ({ plans: [] }),
     cloneTemplate: async () => {
+      throw new Error('Not implemented in mock');
+    },
+    getLocationMapping: async () => ({ groups: [] }),
+  },
+  contacts: {
+    getArtifacts: async () => {
       throw new Error('Not implemented in mock');
     },
   },

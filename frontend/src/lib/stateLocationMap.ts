@@ -1,12 +1,13 @@
 /**
- * Source of truth for the State → Location mapping used by the Segment create
- * form. Each entry is the literal `location` value stored in Customer Profiles.
+ * State → Location mapping consumed by the Segment create form.
  *
- * When the operator picks one or more states, the UI narrows the Location
- * multi-select to just the locations in those states. Selecting none still
- * requires the state — the final filter becomes ``location INCLUSIVE [all
- * locations from selected states]``.
+ * Static fallback (STATE_LOCATION_MAP) is kept for components that need a
+ * synchronous reference (stateCodesFromSegmentName, reverse-lookup in
+ * stateCodesFromSegmentGroups). All interactive creation flows should use
+ * useLocationMapping() which fetches live data from VipLocationMapping DynamoDB.
  */
+import { useQuery } from '@tanstack/react-query';
+import { api } from './api';
 
 export type StateGroup = {
   /** Label shown in the UI dropdown. */
@@ -134,7 +135,9 @@ export const STATE_LOCATION_MAP: readonly StateGroup[] = [
       'TX - Arlington',
       'TX - Cedar Park',
       'TX - Cibolo Creek',
+      'TX - Cinco Ranch',
       'TX - Dallas - Addison',
+      'TX - East Dallas',
       'TX - Flower Mound',
       'TX - Fort Worth',
       'TX - Kyle',
@@ -145,32 +148,42 @@ export const STATE_LOCATION_MAP: readonly StateGroup[] = [
   },
 ];
 
-/** Flat lookup: location name → state slug (for summaries / reverse lookup). */
+/** Flat lookup: location name → state slug (for summaries / reverse lookup).
+ * Derived from the static fallback map; dynamic callers should build their own
+ * reverse map from the useLocationMapping() hook result. */
 export const LOCATION_TO_STATE: Record<string, string> = Object.fromEntries(
   STATE_LOCATION_MAP.flatMap((group) =>
     group.locations.map((loc) => [loc, group.state]),
   ),
 );
 
-export function locationsForStates(states: string[]): string[] {
-  const selected = new Set(states);
-  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).flatMap(
-    (g) => g.locations,
-  );
+/** Build a live reverse-lookup from a dynamically fetched StateGroup array. */
+export function buildLocationToState(map: readonly StateGroup[]): Record<string, string> {
+  return Object.fromEntries(map.flatMap((g) => g.locations.map((loc) => [loc, g.state])));
 }
 
-export function slugsForStates(states: string[]): string[] {
+export function locationsForStates(
+  states: string[],
+  map: readonly StateGroup[] = STATE_LOCATION_MAP,
+): string[] {
   const selected = new Set(states);
-  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).map(
-    (g) => g.slug,
-  );
+  return map.filter((g) => selected.has(g.state)).flatMap((g) => g.locations);
 }
 
-export function codesForStates(states: string[]): string[] {
+export function slugsForStates(
+  states: string[],
+  map: readonly StateGroup[] = STATE_LOCATION_MAP,
+): string[] {
   const selected = new Set(states);
-  return STATE_LOCATION_MAP.filter((g) => selected.has(g.state)).map(
-    (g) => g.code,
-  );
+  return map.filter((g) => selected.has(g.state)).map((g) => g.slug);
+}
+
+export function codesForStates(
+  states: string[],
+  map: readonly StateGroup[] = STATE_LOCATION_MAP,
+): string[] {
+  const selected = new Set(states);
+  return map.filter((g) => selected.has(g.state)).map((g) => g.code);
 }
 
 /**
@@ -204,7 +217,7 @@ export function stateCodesFromSegmentGroups(segmentGroups: unknown): string[] {
   return Array.from(found);
 }
 
-const KNOWN_STATE_CODES = new Set(STATE_LOCATION_MAP.map((g) => g.code));
+export const KNOWN_STATE_CODES = new Set(STATE_LOCATION_MAP.map((g) => g.code));
 
 /**
  * Extract a state code from a segment name like "29-4-26-TX-3NL-1202-v4".
@@ -219,4 +232,29 @@ export function stateCodesFromSegmentName(name: string): string[] {
     if (KNOWN_STATE_CODES.has(token)) return [token];
   }
   return [];
+}
+
+/**
+ * Fetch the location mapping from VipLocationMapping DynamoDB via the API.
+ * Returns the static fallback while loading so callers always have data.
+ * Cache is shared app-wide via react-query (staleTime 10 min).
+ */
+export function useLocationMapping(): {
+  locationMap: readonly StateGroup[];
+  isLoading: boolean;
+} {
+  const { data, isLoading } = useQuery({
+    queryKey: ['location-mapping'],
+    queryFn: async () => {
+      const resp = await api.plans.getLocationMapping();
+      return resp.groups;
+    },
+    staleTime: 10 * 60 * 1000, // 10 minutes — backend cache is 1h
+    retry: 2,
+  });
+
+  return {
+    locationMap: data ?? STATE_LOCATION_MAP,
+    isLoading: isLoading && !data,
+  };
 }
