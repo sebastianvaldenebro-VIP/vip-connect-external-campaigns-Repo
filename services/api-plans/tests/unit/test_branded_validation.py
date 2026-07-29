@@ -147,3 +147,80 @@ class TestBrandedCampaignValidation:
         field_names = {"queueArn", "contactFlowId", "sourcePhone"}
         reported = {f for f in field_names if any(f in e for e in errors or [])}
         assert reported == field_names
+
+
+# ── update_plan: template flag must disable EventBridge rule ──────────────────
+
+def _make_update_plan_fn(existing_plan: dict, body: dict):
+    """Return a callable update_plan with all deps mocked, plus the mock_scheduler."""
+    import importlib
+
+    mock_store = MagicMock()
+    mock_scheduler = MagicMock()
+    mock_audit = MagicMock()
+    mock_audit.record = MagicMock()
+
+    mock_store.get_plan.return_value = existing_plan
+    mock_store.put_plan.return_value = {**existing_plan, **body}
+
+    stubs = {
+        "store": mock_store,
+        "scheduler_manager": mock_scheduler,
+        "vip_shared": MagicMock(),
+        "vip_shared.application": MagicMock(),
+        "vip_shared.application.http": MagicMock(),
+        "vip_shared.infrastructure": MagicMock(),
+        "vip_shared.infrastructure.persistence": MagicMock(),
+        "vip_shared.infrastructure.persistence.audit": MagicMock(),
+    }
+    with patch.dict(sys.modules, stubs):
+        import handlers.plans as plans_mod
+        importlib.reload(plans_mod)
+
+    # patch_body returns the body dict; build_audit returns the audit mock
+    with (
+        patch.object(plans_mod, "store", mock_store),
+        patch.object(plans_mod, "scheduler_manager", mock_scheduler),
+        patch.object(plans_mod, "build_audit", return_value=mock_audit),
+        patch.object(plans_mod, "parse_body", return_value=body),
+        patch.object(plans_mod, "extract_caller", return_value=MagicMock(sub="t", email="t@t.com", ip_address="", user_agent="")),
+    ):
+        plans_mod.update_plan({}, {"id": existing_plan["planId"]})
+
+    return mock_scheduler
+
+
+class TestUpdatePlanTemplateSchedule:
+    """Regression: marking a plan as isTemplate must remove its EventBridge cron rule."""
+
+    def test_marking_as_template_deletes_eventbridge_rule(self):
+        """isTemplate=true on a time-triggered plan must delete the rule, not upsert."""
+        existing = {
+            "planId": "plan-1",
+            "name": "Plan 1",
+            "trigger": {"type": "time", "time": "08:40"},
+            "isTemplate": False,
+            "buckets": [],
+        }
+        body = {"trigger": {"type": "time", "time": "08:40"}, "isTemplate": True}
+
+        mock_scheduler = _make_update_plan_fn(existing, body)
+
+        mock_scheduler.delete_schedule.assert_called_once_with("plan-1")
+        mock_scheduler.upsert_schedule.assert_not_called()
+
+    def test_non_template_time_trigger_upserts_rule(self):
+        """isTemplate=false with a time trigger must upsert the rule."""
+        existing = {
+            "planId": "plan-2",
+            "name": "Plan 2",
+            "trigger": {"type": "manual"},
+            "isTemplate": False,
+            "buckets": [],
+        }
+        body = {"trigger": {"type": "time", "time": "09:00"}, "isTemplate": False}
+
+        mock_scheduler = _make_update_plan_fn(existing, body)
+
+        mock_scheduler.upsert_schedule.assert_called_once()
+        mock_scheduler.delete_schedule.assert_not_called()

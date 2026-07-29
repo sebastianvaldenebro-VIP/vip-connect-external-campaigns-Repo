@@ -136,6 +136,9 @@ def _process_message(body: dict) -> None:
         # contact_sk is a deterministic idempotency key — Connect deduplicates within ~7min,
         # preventing double-dials if SQS redelivers the message on Lambda failure.
         client_token=contact_sk,
+        # Store campaign/contact identifiers as contact flow attributes so the Connect
+        # CTR carries them and DescribeContact can return them for outcome resolution.
+        attributes={"brandedCampaignId": campaign_id, "contactSk": contact_sk},
     )
 
     if result.success:

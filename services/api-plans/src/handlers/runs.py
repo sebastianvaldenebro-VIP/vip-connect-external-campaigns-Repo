@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
+import boto3
+
 from vip_shared.application.http import (
     extract_caller,
     json_response,
@@ -11,6 +15,16 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 
 import executor
 import store
+
+_BRANDED_RUN_SUMMARY_TABLE = os.environ.get("BRANDED_RUN_SUMMARY_TABLE", "")
+_ddb_client = None
+
+
+def _get_ddb():
+    global _ddb_client
+    if _ddb_client is None:
+        _ddb_client = boto3.client("dynamodb")
+    return _ddb_client
 
 
 def trigger_run(event: dict, path_params: dict) -> dict:
@@ -316,3 +330,77 @@ def branded_progress(event: dict, path_params: dict) -> dict:
                 pass  # DDB transient error — omit this campaign, don't 500
 
     return json_response(200, {"progress": progress})
+
+
+def branded_queue(event: dict, path_params: dict) -> dict:
+    """Return last 50 queue items per branded campaign, newest first.
+
+    HIPAA: phone is PHI — only phone_last4 is returned (server-side masking).
+    Response: {"items": {"<campaignId>": [{"phone_last4": str, "status": str, "seededAt": str}]}}
+    """
+    plan_id = path_params["id"]
+    run_id = path_params["runId"]
+
+    run = store.get_run(plan_id, run_id)
+    if not run:
+        return json_response(
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Run {run_id} not found"}},
+        )
+
+    items: dict[str, list] = {}
+    for bs in run.get("bucketStates", []):
+        for cs in bs.get("campaignStates", []):
+            branded_id = cs.get("brandedCampaignId")
+            if not branded_id:
+                continue
+            campaign_id = cs.get("campaignId", "")
+            if not campaign_id:
+                continue
+            try:
+                items[campaign_id] = executor.get_branded_queue_items(branded_id)
+            except Exception:
+                pass
+
+    return json_response(200, {"items": items})
+
+
+def branded_history(event: dict, path_params: dict) -> dict:
+    """Return completed branded campaign summaries for a plan, newest first.
+
+    Queries VipBrandedRunSummary by planId. No PHI — phone was never written to this table.
+    Response: {"history": [{"runId", "campaignId", "exitReason", "totalSeeded",
+                             "totalDialed", "startedAt", "completedAt"}]}
+    """
+    plan_id = path_params["id"]
+    if not _BRANDED_RUN_SUMMARY_TABLE:
+        return json_response(200, {"history": []})
+
+    items = []
+    kwargs: dict = {
+        "TableName": _BRANDED_RUN_SUMMARY_TABLE,
+        "KeyConditionExpression": "planId = :p",
+        "ExpressionAttributeValues": {":p": {"S": plan_id}},
+        "ScanIndexForward": False,
+    }
+    try:
+        while True:
+            resp = _get_ddb().query(**kwargs)
+            for raw in resp.get("Items", []):
+                items.append({
+                    "runId":        raw.get("runId", {}).get("S", ""),
+                    "campaignId":   raw.get("campaignId", {}).get("S", ""),
+                    "exitReason":   raw.get("exitReason", {}).get("S", ""),
+                    "totalSeeded":  int(raw.get("totalSeeded", {}).get("N", "0")),
+                    "totalDialed":  int(raw.get("totalDialed", {}).get("N", "0")),
+                    "startedAt":    raw.get("startedAt", {}).get("S", ""),
+                    "completedAt":  raw.get("completedAt", {}).get("S", ""),
+                })
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+    except Exception as exc:
+        return json_response(500, {"error": {"code": "QUERY_FAILED", "message": type(exc).__name__}})
+
+    return json_response(200, {"history": items})

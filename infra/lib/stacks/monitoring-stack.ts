@@ -231,6 +231,116 @@ export class MonitoringStack extends cdk.Stack {
       '[WARNING] vip-plans-prestart-check EventBridge rule: failed to invoke api-plans Lambda',
     );
 
+    // ── Scheduled-run fallback counter ────────────────────────────────
+    // Fires when prestart_check had to manually trigger scheduled_run() because a vip-sched-*
+    // rule missed its Lambda invocation (resource policy statement wiped by a CDK deploy).
+    // Metric is emitted per PlanId — SEARCH aggregates across all plans.
+    // Self-healing: _ensure_scheduled_run_permission restores the missing statement at prestart,
+    // so the next day's run will succeed; this alarm surfaces the incident for investigation.
+    // NOTE: a CLI-created alarm "vip-plans-scheduled-run-fallback" may overlap — it can be deleted
+    // once this CDK-managed alarm is confirmed working in production.
+    {
+      const fallbackAlarm = new cloudwatch.Alarm(this, 'ScheduledRunFallback', {
+        metric: new cloudwatch.MathExpression({
+          expression: "SUM(SEARCH('{VIPPlans,PlanId} ScheduledRunFallback', 'Sum', 300))",
+          label: 'ScheduledRunFallback (all plans)',
+          period: MIN5,
+          usingMetrics: {},
+        }),
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        actionsEnabled: true,
+        alarmDescription:
+          '[CRITICAL] vip-sched-* rule missed Lambda invocation — prestart_check self-healed via fallback. ' +
+          'Root cause: CDK deploy recreated api-plans Lambda and wiped the resource-policy statement. ' +
+          'Verify: check CloudTrail InvokeFunction events + EventBridge FailedInvocations for the rule.',
+      });
+      fallbackAlarm.addAlarmAction(alarmAction);
+      fallbackAlarm.addOkAction(alarmAction);
+    }
+
+    // ── vip-sched-* FailedInvocations (all per-plan scheduled-run rules) ─
+    // Catches EventBridge AccessDenied (resource policy missing), throttles, or any pre-invocation
+    // failure for dynamically-created per-plan schedule rules. SEARCH covers all rule names since
+    // they are created at runtime and are not known at CDK synthesis time.
+    // NOTE: a CLI-created alarm "vip-eventbridge-plan-1-1-failed-invocations" covers Plan 1.1 only —
+    // this CDK alarm is generic and supersedes it for all plans.
+    {
+      const schedRuleAlarm = new cloudwatch.Alarm(this, 'ScheduledRunRuleFailedInvocations', {
+        metric: new cloudwatch.MathExpression({
+          expression: "SUM(SEARCH('{AWS/Events,RuleName} vip-sched FailedInvocations', 'Sum', 300))",
+          label: 'vip-sched-* FailedInvocations (all plans)',
+          period: MIN5,
+          usingMetrics: {},
+        }),
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        actionsEnabled: true,
+        alarmDescription:
+          '[CRITICAL] vip-sched-* EventBridge rule failed to invoke api-plans Lambda. ' +
+          'Root cause: Lambda resource-policy statement missing for this rule (wiped by CDK deploy). ' +
+          'Fix: api.saveSettings() per affected plan to re-run upsert_schedule() + add_permission, ' +
+          'or await next prestart_check which self-heals via _ensure_scheduled_run_permission.',
+      });
+      schedRuleAlarm.addAlarmAction(alarmAction);
+      schedRuleAlarm.addOkAction(alarmAction);
+    }
+
+    // ── Branded campaign monitoring alarms ───────────────────────────────
+    // Metrics emitted by vip-admin-branded-metrics-collector (1-min EventBridge schedule).
+    makeAlarm(
+      'BrandedCollectorErrors',
+      lambdaMetric('vip-admin-branded-metrics-collector', 'Errors', MIN5),
+      0, 2,
+      '[WARNING] branded-metrics-collector: Lambda errors — disposition snapshots may be stale',
+    );
+
+    // ActiveBrandedCampaigns = 0 during business hours (7am-7pm COT = 12:00-23:59 UTC).
+    // Only data points emitted during business hours — missing data at night is NOT_BREACHING.
+    // This alarm fires when campaigns are expected but none are running.
+    {
+      const noCampaignsAlarm = new cloudwatch.Alarm(this, 'BrandedNoActiveCampaignsBizHours', {
+        alarmName: 'vip-branded-no-active-campaigns-biz-hours',
+        metric: new cloudwatch.Metric({
+          namespace: 'VipBrandedMonitor',
+          metricName: 'ActiveBrandedCampaigns',
+          statistic: 'Maximum',
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 0,
+        evaluationPeriods: 3,
+        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        actionsEnabled: true,
+        alarmDescription:
+          '[INFO] No active branded campaigns during business hours (7am-7pm COT). ' +
+          'This is expected on non-campaign days; investigate if campaigns were scheduled.',
+      });
+      noCampaignsAlarm.addAlarmAction(alarmAction);
+      noCampaignsAlarm.addOkAction(alarmAction);
+    }
+
+    // StuckBrandedCampaigns > 0 = items in VipActiveBrandedCampaigns older than 26h.
+    // Indicates _stop_branded_campaign was not called after campaign completion.
+    // Emitted on every collector tick (not restricted to business hours).
+    makeAlarm(
+      'BrandedStuckCampaigns',
+      new cloudwatch.Metric({
+        namespace: 'VipBrandedMonitor',
+        metricName: 'StuckBrandedCampaigns',
+        statistic: 'Maximum',
+        period: MIN5,
+      }),
+      0, 2,
+      '[CRITICAL] VipActiveBrandedCampaigns: campaign(s) stuck >26h — ' +
+      '_stop_branded_campaign was not called. TTL may eventually clean up but run summary is missing. ' +
+      'Fix: verify _force_finish_internal and other exit paths call _stop_branded_campaign.',
+    );
+
     // Dashboard created via CLI (CFN exec role lacks cloudwatch:PutDashboard).
     // See: deploy-cli.sh pattern used for EventBridge rules.
     // Command stored in infra/lib/stacks/monitoring-stack.ts comments:

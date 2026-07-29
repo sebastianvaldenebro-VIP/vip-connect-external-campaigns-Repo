@@ -67,8 +67,9 @@ class FirstOrionClient:
     def push(self, *, a_number: str, b_number: str) -> bool:
         """Fire a single pre-call push. Returns True on HTTP 200, False otherwise.
 
-        HIPAA note: a_number and b_number are NOT logged here.
+        HIPAA note: full phone numbers are never logged; only last-4 digits appear in logs.
         """
+        b_last4 = b_number[-4:] if b_number else "????"
         try:
             self._ensure_token()
             resp = requests.post(
@@ -81,11 +82,11 @@ class FirstOrionClient:
                 timeout=10,
             )
             if resp.status_code == 200:
-                logger.info("First Orion push success")
+                logger.info("First Orion push success b_last4=****%s", b_last4)
                 return True
-            logger.warning("First Orion push failed status=%d", resp.status_code)
+            logger.warning("First Orion push failed status=%d b_last4=****%s", resp.status_code, b_last4)
             return False
         # auth failures and push failures both return False — callers cannot distinguish them
         except Exception as exc:
-            logger.error("First Orion push exception: %s", type(exc).__name__)
+            logger.error("First Orion push exception: %s b_last4=****%s", type(exc).__name__, b_last4)
             return False

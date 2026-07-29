@@ -81,6 +81,19 @@ class ConnectClient:
         )
         return response.get("MetricResults", [])
 
+    def get_current_user_data(
+        self,
+        filters: dict,
+        max_results: int = 100,
+    ) -> list[dict]:
+        """Per-agent real-time status data. Not PHI — agent IDs are employee identifiers."""
+        response = self._client.get_current_user_data(
+            InstanceId=self._instance_id,
+            Filters=filters,
+            MaxResults=max_results,
+        )
+        return response.get("UserDataList", [])
+
     def search_contacts(
         self,
         *,

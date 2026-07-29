@@ -12,96 +12,97 @@ Mirrors the logic in:
 
 from __future__ import annotations
 
+import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 import boto3
 
-# ── State → location values (mirrors stateLocationMap.ts) ────────────────────
+# ── State → location values — loaded from DynamoDB VipLocationMapping ─────────
+# Table PK: location (String). Each item also has stateCode, stateName, slug,
+# stateSortOrder. Cached in-process for _CACHE_TTL seconds to avoid per-request
+# scans while still picking up new locations without a Lambda deploy.
 
-_STATE_LOCATIONS: dict[str, list[str]] = {
-    "SCA": [
-        "CA - Arcadia",
-        "CA - Encino",
-        "CA - Huntington Beach",
-        "CA - Irvine",
-        "CA - Long Beach",
-        "CA - National City",
-        "CA - Newport Beach",
-        "CA - Poway",
-        "CA - San Diego",
-        "CA - Temecula",
-        "CA - Torrance",
-        "California",
-    ],
-    "NCA": ["CA - Palo Alto", "CA - Sacramento", "CA - San Jose"],
-    "CT": ["Connecticut", "CT - Farmington", "CT - Hamden", "CT - Stamford"],
-    "MD": ["DC", "Maryland", "MD - Bethesda", "MD - Bowie", "MD - Maple Lawn Office"],
-    "NJ": [
-        "New Jersey",
-        "NJ - Clifton",
-        "NJ - Edgewater",
-        "NJ - Harrison Office",
-        "NJ - Hoboken",
-        "NJ - Marlton",
-        "NJ - Morris County Office",
-        "NJ - Morristown",
-        "NJ - Paramus",
-        "NJ - Princeton",
-        "NJ - Scotch Plains",
-        "NJ - West Orange Office",
-        "NJ - West Orange Office (NEW)",
-        "NJ - Woodbridge",
-        "NJ - Woodland Park Office",
-    ],
-    "NY": [
-        "New York",
-        "NY - Brighton Beach",
-        "NY - Bronx",
-        "NY - Forest Hills",
-        "NY - Hartsdale",
-        "NY - Upper East Side",
-        "NY - Yonkers",
-        "NYC - Astoria",
-        "NYC - Bronx",
-        "NYC - Brooklyn - Williamsburg",
-        "NYC - Downtown Brooklyn",
-        "NYC - FiDi Manhattan",
-        "NYC - Midtown Manhattan",
-        "NYC - Staten Island",
-        "NYC - Williamsburg",
-    ],
-    "LI": [
-        "Long Island",
-        "NY - LI Hampton Bays",
-        "NY - LI Jericho",
-        "NY - LI Port Jefferson",
-        "NY - LI Rockville",
-        "NY - LI West Islip",
-    ],
-    "TX": [
-        "Texas",
-        "TX - Addison",
-        "TX - Arlington",
-        "TX - Cedar Park",
-        "TX - Cibolo Creek",
-        "TX - Dallas - Addison",
-        "TX - Flower Mound",
-        "TX - Fort Worth",
-        "TX - Kyle",
-        "TX - Medical Center",
-        "TX - Spring Branch",
-        "TX - Sugar Land",
-    ],
-}
+_LOCATION_TABLE = os.environ.get("LOCATION_MAPPING_TABLE", "VipLocationMapping")
+_CACHE_TTL = 3600  # 1 hour
+
+# Module-level cache — shared across warm Lambda invocations.
+_cache_by_code: dict[str, list[str]] | None = None
+_cache_groups: list[dict] | None = None
+_cache_all_locations: frozenset[str] | None = None
+_cache_ts: float = 0
+
+
+def _load_location_mapping() -> tuple[dict[str, list[str]], list[dict], frozenset[str]]:
+    """Scan VipLocationMapping and rebuild in-process caches.
+
+    Returns (by_code, groups, all_locations_set).
+    Thread-safety: Lambda is single-threaded per invocation; a concurrent
+    warm-start race is harmless — worst case it scans twice.
+    """
+    global _cache_by_code, _cache_groups, _cache_all_locations, _cache_ts
+
+    now = time.monotonic()
+    if _cache_by_code is not None and (now - _cache_ts) < _CACHE_TTL:
+        return _cache_by_code, _cache_groups, _cache_all_locations  # type: ignore[return-value]
+
+    table = boto3.resource("dynamodb").Table(_LOCATION_TABLE)
+    resp = table.scan()
+    items: list[dict] = resp.get("Items", [])
+    while "LastEvaluatedKey" in resp:
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+        items.extend(resp.get("Items", []))
+
+    by_code: dict[str, list[str]] = {}
+    groups_map: dict[str, dict] = {}
+    for item in items:
+        code = item["stateCode"]
+        loc = item["location"]
+        if code not in by_code:
+            by_code[code] = []
+            groups_map[code] = {
+                "state": item["stateName"],
+                "slug": item["slug"],
+                "code": code,
+                "stateSortOrder": int(item.get("stateSortOrder", 99)),
+                "locations": [],
+            }
+        by_code[code].append(loc)
+        groups_map[code]["locations"].append(loc)
+
+    groups = sorted(groups_map.values(), key=lambda g: g["stateSortOrder"])
+
+    _cache_by_code = by_code
+    _cache_groups = groups
+    _cache_all_locations = frozenset(items[i]["location"] for i in range(len(items)))
+    _cache_ts = now
+    return _cache_by_code, _cache_groups, _cache_all_locations
 
 
 def locations_for_state_codes(codes: list[str]) -> list[str]:
+    by_code, _, _ = _load_location_mapping()
     out: list[str] = []
     for code in codes:
-        out.extend(_STATE_LOCATIONS.get(code, []))
+        out.extend(by_code.get(code, []))
     return out
+
+
+def get_all_location_groups() -> list[dict]:
+    """Return all state groups ordered by stateSortOrder (for the API endpoint)."""
+    _, groups, _ = _load_location_mapping()
+    # Strip internal-only stateSortOrder from the API response
+    return [
+        {k: v for k, v in g.items() if k != "stateSortOrder"}
+        for g in groups
+    ]
+
+
+def all_known_locations() -> frozenset[str]:
+    """Return the flat set of all known location strings (for unknown-location detection)."""
+    _, _, known = _load_location_mapping()
+    return known
 
 
 # ── V2 campaign model → segment filter translator ─────────────────────────────

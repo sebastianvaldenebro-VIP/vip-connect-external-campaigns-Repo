@@ -145,8 +145,31 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# Fires when prestart_check had to manually trigger scheduled_run() because a vip-sched-* rule
+# missed its Lambda invocation (resource policy statement wiped by a CDK deploy).
+# Metric is emitted WITHOUT dimensions (aggregate) so this CLI alarm can catch it.
+# The per-PlanId dimension is also emitted for drill-down in CloudWatch Metrics.
+alarm \
+  --alarm-name "vip-plans-scheduled-run-fallback" \
+  --alarm-description "CRITICAL: vip-sched-* rule missed Lambda — prestart_check self-healed. Root cause: CDK deploy wiped resource policy. Fix: re-save plan settings to restore add_permission." \
+  --namespace "VIPPlans" --metric-name "ScheduledRunFallback" \
+  --statistic "Sum" --period 300 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
+# Per-plan vip-sched-* FailedInvocations alarms cannot be created here because rule names
+# are dynamic (created at runtime by upsert_schedule). Options:
+#   a) Console: Metric Math alarm with SEARCH('{AWS/Events,RuleName} vip-sched FailedInvocations')
+#   b) CLI per plan (replace PLAN_ID with the actual plan's hashed rule name):
+#      aws cloudwatch put-metric-alarm --alarm-name "vip-sched-PLAN_ID-failed-invocations" \
+#        --namespace "AWS/Events" --metric-name "FailedInvocations" \
+#        --dimensions "Name=RuleName,Value=vip-sched-PLAN_ID" \
+#        --statistic Sum --period 300 --threshold 0 \
+#        --comparison-operator GreaterThanThreshold --evaluation-periods 1 \
+#        --alarm-actions $TOPIC $R
+
 echo ""
-echo "=== 14 alarmas creadas ==="
+echo "=== 15 alarmas creadas ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the

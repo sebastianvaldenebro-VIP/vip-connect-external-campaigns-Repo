@@ -30,8 +30,15 @@ export interface ApiPlansStackProps extends cdk.StackProps {
   };
   readonly progressiveCampaignQueueTable?: dynamodb.ITable;
   readonly activeBrandedCampaignsTable?: dynamodb.ITable;
+  readonly brandedRunSummaryTable?: dynamodb.ITable;
+  readonly brandedCampaignMetricsTable?: dynamodb.ITable;
+  readonly agentSnapshotTable?: dynamodb.ITable;
   readonly progressiveDialerSeederArn?: string;
   readonly progressiveDialerDataKeyArn?: string;
+  // SMS campaign props (optional — only needed when SMS stack is deployed)
+  readonly smsCampaignQueueTable?: dynamodb.ITable;
+  readonly smsRunsTable?: dynamodb.ITable;
+  readonly smsSenderFunctionArn?: string;
 }
 
 export class ApiPlansStack extends cdk.Stack {
@@ -196,6 +203,7 @@ export class ApiPlansStack extends cdk.Stack {
           'events:PutTargets',
           'events:RemoveTargets',
           'events:DeleteRule',
+          'events:DescribeRule',
         ],
         resources: [
           `arn:aws:events:${this.region}:${this.account}:rule/vip-plan-*`,
@@ -204,11 +212,14 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
-    // Lambda self-permission — add/remove resource-based policy for EventBridge invocation
+    // Lambda self-permission — add/remove/read resource-based policy for EventBridge invocation.
+    // GetPolicy is required by _ensure_scheduled_run_permission (reads current policy to check
+    // whether the vip-sched-* statement is present before calling add_permission) and by
+    // _cleanup_orphan_plan_permissions (reads policy to find stale vip-plan-* statements).
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'LambdaSelfPermission',
-        actions: ['lambda:AddPermission', 'lambda:RemovePermission'],
+        actions: ['lambda:AddPermission', 'lambda:RemovePermission', 'lambda:GetPolicy'],
         resources: [
           `arn:aws:lambda:${this.region}:${this.account}:function:vip-admin-ui-api-plans`,
         ],
@@ -265,6 +276,18 @@ export class ApiPlansStack extends cdk.Stack {
       props.activeBrandedCampaignsTable.grantReadWriteData(role);
     }
 
+    if (props.brandedRunSummaryTable) {
+      props.brandedRunSummaryTable.grantReadWriteData(role);
+    }
+
+    if (props.brandedCampaignMetricsTable) {
+      props.brandedCampaignMetricsTable.grantReadWriteData(role);
+    }
+
+    if (props.agentSnapshotTable) {
+      props.agentSnapshotTable.grantReadWriteData(role);
+    }
+
     if (props.progressiveDialerSeederArn) {
       role.addToPolicy(
         new iam.PolicyStatement({
@@ -284,6 +307,79 @@ export class ApiPlansStack extends cdk.Stack {
         }),
       );
     }
+
+    // ── Location Mapping — builders.py scans this table to build segments ──
+    // Table created via CLI (CFN exec role limitation); imported by name.
+    const locationMappingTable = dynamodb.Table.fromTableName(
+      this,
+      'LocationMappingTable',
+      'VipLocationMapping',
+    );
+    locationMappingTable.grantReadData(role);
+
+    // ── SMS Campaign — executor polling + sender invocation ──────────
+    if (props.smsCampaignQueueTable) {
+      props.smsCampaignQueueTable.grantReadData(role);
+    }
+
+    if (props.smsRunsTable) {
+      props.smsRunsTable.grantReadWriteData(role);
+    }
+
+    if (props.smsSenderFunctionArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeSmsSender',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.smsSenderFunctionArn],
+        }),
+      );
+    }
+
+    // EUM SMS — list origination numbers (GET /sms/numbers endpoint)
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EumSmsDescribePhoneNumbers',
+        actions: ['sms-voice:DescribePhoneNumbers'],
+        resources: ['*'],
+      }),
+    );
+
+    // Contact artifacts — S3 list + presign for recordings bucket
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ContactArtifactsRecordings',
+        actions: ['s3:GetObject', 's3:ListBucket'],
+        resources: [
+          'arn:aws:s3:::amazon-connect-c5a2158755eb',
+          'arn:aws:s3:::amazon-connect-c5a2158755eb/*',
+        ],
+      }),
+    );
+
+    // Contact artifacts — S3 list + presign for voicemail bucket
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ContactArtifactsVoicemail',
+        actions: ['s3:GetObject', 's3:ListBucket'],
+        resources: [
+          'arn:aws:s3:::vmx3-recordings-vipmedicalgroup',
+          'arn:aws:s3:::vmx3-recordings-vipmedicalgroup/*',
+        ],
+      }),
+    );
+
+    // Contact artifacts — describe individual contact to resolve date prefix
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'ContactArtifactsDescribeContact',
+        actions: ['connect:DescribeContact'],
+        resources: [
+          `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}`,
+          `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}/*`,
+        ],
+      }),
+    );
 
     // ── Lambda function ──────────────────────────────────────────────
     const sharedLayer = buildSharedLayer(this);
@@ -313,6 +409,8 @@ export class ApiPlansStack extends cdk.Stack {
       securityGroups: [sg],
       environment: {
         CONNECT_INSTANCE_ID: props.connectInstanceId,
+        RECORDINGS_BUCKET: 'amazon-connect-c5a2158755eb',
+        VOICEMAIL_BUCKET: 'vmx3-recordings-vipmedicalgroup',
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
         PLANS_TABLE_NAME: this.plansTable.tableName,
         AUDIT_TABLE: props.adminAuditTable.tableName,
@@ -354,10 +452,52 @@ export class ApiPlansStack extends cdk.Stack {
       );
     }
 
+    if (props.brandedRunSummaryTable) {
+      this.lambdaFunction.addEnvironment(
+        'BRANDED_RUN_SUMMARY_TABLE',
+        props.brandedRunSummaryTable.tableName,
+      );
+    }
+
+    if (props.brandedCampaignMetricsTable) {
+      this.lambdaFunction.addEnvironment(
+        'BRANDED_CAMPAIGN_METRICS_TABLE',
+        props.brandedCampaignMetricsTable.tableName,
+      );
+    }
+
+    if (props.agentSnapshotTable) {
+      this.lambdaFunction.addEnvironment(
+        'AGENT_SNAPSHOT_TABLE',
+        props.agentSnapshotTable.tableName,
+      );
+    }
+
     if (props.progressiveDialerSeederArn) {
       this.lambdaFunction.addEnvironment(
         'PROGRESSIVE_DIALER_SEEDER_ARN',
         props.progressiveDialerSeederArn,
+      );
+    }
+
+    if (props.smsCampaignQueueTable) {
+      this.lambdaFunction.addEnvironment(
+        'SMS_CAMPAIGN_QUEUE_TABLE',
+        props.smsCampaignQueueTable.tableName,
+      );
+    }
+
+    if (props.smsRunsTable) {
+      this.lambdaFunction.addEnvironment(
+        'SMS_CAMPAIGN_RUNS_TABLE',
+        props.smsRunsTable.tableName,
+      );
+    }
+
+    if (props.smsSenderFunctionArn) {
+      this.lambdaFunction.addEnvironment(
+        'SMS_SENDER_FUNCTION_ARN',
+        props.smsSenderFunctionArn,
       );
     }
 

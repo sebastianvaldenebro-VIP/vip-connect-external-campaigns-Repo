@@ -58,5 +58,43 @@ alarm \
   --comparison-operator "GreaterThanOrEqualToThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# ── Branded campaign monitoring ───────────────────────────────────────────────
+# Metrics emitted by vip-admin-branded-metrics-collector (EventBridge rate(1 minute)).
+# Namespace: VipBrandedMonitor
+
+alarm \
+  --alarm-name "vip-branded-collector-errors" \
+  --alarm-description "WARNING: branded-metrics-collector Lambda errors — disposition snapshots may be stale" \
+  --namespace "AWS/Lambda" --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=vip-admin-branded-metrics-collector" \
+  --statistic "Sum" --period 300 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 2 --datapoints-to-alarm 2
+
+# ActiveBrandedCampaigns=0 for 15 min during business hours (7am-7pm COT = 12:00-23:59 UTC).
+# Metric only emitted during business hours; outside hours treat-missing-data=notBreaching keeps alarm silent.
+aws cloudwatch put-metric-alarm \
+  --alarm-name "vip-branded-no-active-campaigns-biz-hours" \
+  --alarm-description "INFO: No active branded campaigns during business hours (7am-7pm COT). Expected on non-campaign days; investigate if campaigns were scheduled." \
+  --namespace "VipBrandedMonitor" --metric-name "ActiveBrandedCampaigns" \
+  --statistic "Maximum" --period 300 --threshold 0 \
+  --comparison-operator "LessThanOrEqualToThreshold" \
+  --evaluation-periods 3 --datapoints-to-alarm 3 \
+  --treat-missing-data "notBreaching" \
+  --alarm-actions "$TOPIC" --ok-actions "$TOPIC" \
+  $R
+echo "OK: vip-branded-no-active-campaigns-biz-hours"
+
+# StuckBrandedCampaigns > 0 = items in VipActiveBrandedCampaigns older than 26h.
+# Emitted every minute by the collector (not restricted to business hours).
+# Root cause: _stop_branded_campaign was not called after campaign completion.
+alarm \
+  --alarm-name "vip-branded-stuck-campaigns" \
+  --alarm-description "CRITICAL: Campaign(s) stuck >26h in VipActiveBrandedCampaigns — _stop_branded_campaign was not called. TTL may eventually clean up but run summary record is missing. Verify _force_finish_internal and other exit paths." \
+  --namespace "VipBrandedMonitor" --metric-name "StuckBrandedCampaigns" \
+  --statistic "Maximum" --period 300 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 2 --datapoints-to-alarm 2
+
 echo ""
-echo "=== 5 progressive dialer alarms created ==="
+echo "=== 8 progressive dialer + branded alarms created ==="

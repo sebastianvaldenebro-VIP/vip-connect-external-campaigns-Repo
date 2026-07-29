@@ -13,6 +13,13 @@ export interface ApiMetricsStackProps extends cdk.StackProps {
   readonly dataKey: kms.IKey;
   readonly connectInstanceId: string;
   readonly permissionsBoundaryName?: string;
+  /** Branded campaign monitoring tables — optional; collector Lambda skips if absent */
+  readonly activeBrandedCampaignsTable?: dynamodb.ITable;
+  readonly brandedRunSummaryTable?: dynamodb.ITable;
+  readonly brandedCampaignMetricsTable?: dynamodb.ITable;
+  readonly agentSnapshotTable?: dynamodb.ITable;
+  /** Progressive campaign queue table — collector writes outcomes per DIALED contact */
+  readonly progressiveCampaignQueueTable?: dynamodb.ITable;
 }
 
 export class ApiMetricsStack extends cdk.Stack {
@@ -60,7 +67,10 @@ export class ApiMetricsStack extends cdk.Stack {
         actions: [
           'connect:GetMetricDataV2',
           'connect:GetCurrentMetricData',
+          'connect:GetCurrentUserData',
           'connect:SearchContacts',
+          'connect:ListRoutingProfiles',
+          'connect:DescribeUser',
         ],
         resources: [
           `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}`,
@@ -100,6 +110,16 @@ export class ApiMetricsStack extends cdk.Stack {
 
     props.dataKey.grantDecrypt(role);
 
+    // Grant api-metrics Lambda read on branded tables (needed by /metrics/branded/* endpoints)
+    if (props.brandedRunSummaryTable) {
+      props.brandedRunSummaryTable.grantReadData(role);
+    }
+    if (props.brandedCampaignMetricsTable) {
+      props.brandedCampaignMetricsTable.grantReadData(role);
+    }
+
+    const sharedLayer = buildSharedLayer(this);
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionMetrics', {
       functionName: 'vip-admin-ui-api-metrics',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -107,7 +127,7 @@ export class ApiMetricsStack extends cdk.Stack {
       code: lambda.Code.fromAsset(
         path.join(__dirname, '../../../services/api-metrics/src'),
       ),
-      layers: [buildSharedLayer(this)],
+      layers: [sharedLayer],
       memorySize: 512,
       timeout: cdk.Duration.seconds(30),
       role,
@@ -122,6 +142,110 @@ export class ApiMetricsStack extends cdk.Stack {
       },
     });
 
+    if (props.brandedRunSummaryTable) {
+      this.lambdaFunction.addEnvironment(
+        'BRANDED_RUN_SUMMARY_TABLE', props.brandedRunSummaryTable.tableName,
+      );
+    }
+    if (props.brandedCampaignMetricsTable) {
+      this.lambdaFunction.addEnvironment(
+        'BRANDED_CAMPAIGN_METRICS_TABLE', props.brandedCampaignMetricsTable.tableName,
+      );
+    }
+
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
+
+    // ── Branded Campaign Metrics Collector ────────────────────────────
+    // Polls active branded campaigns every 1 minute, writes disposition + agent snapshots.
+    // Only provisioned when the branded DDB tables are wired in (optional props).
+    if (
+      props.activeBrandedCampaignsTable &&
+      props.brandedCampaignMetricsTable &&
+      props.agentSnapshotTable
+    ) {
+      // LogGroup pre-exists (created by first CDK deploy attempt; RETAIN policy kept it).
+      // Import instead of creating to avoid AlreadyExists error.
+      const collectorLogGroup = logs.LogGroup.fromLogGroupName(
+        this, 'CollectorLogs',
+        '/aws/lambda/vip-admin-branded-metrics-collector',
+      );
+
+      const collectorRole = new iam.Role(this, 'CollectorRole', {
+        assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+        description: 'Execution role for branded campaign metrics collector',
+      });
+      collectorLogGroup.grantWrite(collectorRole);
+      props.dataKey.grantEncryptDecrypt(collectorRole);
+
+      props.activeBrandedCampaignsTable.grantReadData(collectorRole);
+      props.brandedCampaignMetricsTable.grantWriteData(collectorRole);
+      props.agentSnapshotTable.grantWriteData(collectorRole);
+
+      collectorRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'ConnectReadMetrics',
+          actions: [
+            'connect:SearchContacts',
+            'connect:GetCurrentMetricData',
+            'connect:DescribeContact',
+          ],
+          resources: [
+            `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}`,
+            `arn:aws:connect:${this.region}:${this.account}:instance/${props.connectInstanceId}/*`,
+          ],
+        }),
+      );
+
+      if (props.progressiveCampaignQueueTable) {
+        collectorRole.addToPolicy(
+          new iam.PolicyStatement({
+            sid: 'ProgressiveCampaignQueueOutcomes',
+            actions: ['dynamodb:Query', 'dynamodb:UpdateItem'],
+            resources: [props.progressiveCampaignQueueTable.tableArn],
+          }),
+        );
+      }
+
+      // PutMetricData for ActiveBrandedCampaigns + StuckBrandedCampaigns in VipBrandedMonitor namespace
+      collectorRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'CloudWatchEmitMetrics',
+          actions: ['cloudwatch:PutMetricData'],
+          resources: ['*'],
+          conditions: {
+            StringEquals: { 'cloudwatch:namespace': 'VipBrandedMonitor' },
+          },
+        }),
+      );
+
+      const collectorFn = new lambda.Function(this, 'BrandedMetricsCollector', {
+        functionName: 'vip-admin-branded-metrics-collector',
+        runtime: lambda.Runtime.PYTHON_3_12,
+        handler: 'metrics_collector_handler.lambda_handler',
+        code: lambda.Code.fromAsset(
+          path.join(__dirname, '../../../services/api-metrics/src'),
+        ),
+        layers: [sharedLayer],
+        memorySize: 256,
+        timeout: cdk.Duration.seconds(120),
+        tracing: lambda.Tracing.ACTIVE,
+        role: collectorRole,
+        logGroup: collectorLogGroup,
+        environment: {
+          ACTIVE_BRANDED_CAMPAIGNS_TABLE: props.activeBrandedCampaignsTable.tableName,
+          BRANDED_CAMPAIGN_METRICS_TABLE: props.brandedCampaignMetricsTable.tableName,
+          AGENT_SNAPSHOT_TABLE: props.agentSnapshotTable.tableName,
+          CONNECT_INSTANCE_ID: props.connectInstanceId,
+          LOG_LEVEL: 'INFO',
+          ...(props.progressiveCampaignQueueTable && {
+            PROGRESSIVE_CAMPAIGN_QUEUE_TABLE: props.progressiveCampaignQueueTable.tableName,
+          }),
+        },
+      });
+
+      // EventBridge rule created via CLI (cfn-exec-role lacks events:DescribeRule).
+      // Rule name: vip-branded-metrics-collector-1min — rate(1 minute) → this Lambda.
+      new cdk.CfnOutput(this, 'CollectorFunctionArn', { value: collectorFn.functionArn });
+    }
   }
 }

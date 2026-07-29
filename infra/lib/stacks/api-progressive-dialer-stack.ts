@@ -23,12 +23,22 @@ export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
   /** Comma-separated queue ARNs to filter agents. Empty = all queues. */
   readonly allowedQueueArns?: string;
   readonly permissionsBoundaryName?: string;
+  /**
+   * DynamoDB stream ARN for VipProgressiveCampaignQueue.
+   * Enable with: aws dynamodb update-table --table-name VipProgressiveCampaignQueue
+   *   --stream-specification StreamEnabled=true,StreamViewType=NEW_IMAGE
+   * Required to wire the kickstart Lambda ESM. Omit to deploy Lambda without ESM.
+   */
+  readonly campaignQueueStreamArn?: string;
 }
 
 export class ApiProgressiveDialerStack extends cdk.Stack {
   public readonly seederFunction: lambda.Function;
   public readonly campaignQueueTable: dynamodb.ITable;
   public readonly activeBrandedCampaignsTable: dynamodb.ITable;
+  public readonly brandedRunSummaryTable: dynamodb.ITable;
+  public readonly brandedCampaignMetricsTable: dynamodb.ITable;
+  public readonly agentSnapshotTable: dynamodb.ITable;
 
   constructor(scope: Construct, id: string, props: ApiProgressiveDialerStackProps) {
     super(scope, id, props);
@@ -45,10 +55,13 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     // ── DynamoDB: Campaign Queue ──────────────────────────────────────
     // imported — cfn-exec-role lacks kms:Decrypt on this CMK and logs:DescribeIndexPolicies;
     // table pre-created via CLI. Schema: PK=campaignId(S), SK=sk(S), PAY_PER_REQUEST, KMS CMK,
-    // PITR enabled, TTL=ttl.
-    const campaignQueueTable = dynamodb.Table.fromTableArn(
+    // PITR enabled, TTL=ttl. tableStreamArn required for kickstart DynamoEventSource.
+    const campaignQueueTable = dynamodb.Table.fromTableAttributes(
       this, 'CampaignQueueTable',
-      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipProgressiveCampaignQueue`,
+      {
+        tableArn: `arn:aws:dynamodb:${this.region}:${this.account}:table/VipProgressiveCampaignQueue`,
+        ...(props.campaignQueueStreamArn ? { tableStreamArn: props.campaignQueueStreamArn } : {}),
+      },
     );
     this.campaignQueueTable = campaignQueueTable;
 
@@ -63,6 +76,35 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       `arn:aws:dynamodb:${this.region}:${this.account}:table/VipActiveBrandedCampaigns`,
     );
     this.activeBrandedCampaignsTable = activeBrandedCampaignsTable;
+
+    // ── DynamoDB: Branded Run Summary ─────────────────────────────────
+    // imported — pre-created via CLI (cfn-exec-role lacks kms:Decrypt on CMK).
+    // Schema: PK=planId(S), SK=runId#campaignId(S), PAY_PER_REQUEST, KMS CMK, no TTL.
+    const brandedRunSummaryTable = dynamodb.Table.fromTableArn(
+      this, 'BrandedRunSummaryTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipBrandedRunSummary`,
+    );
+    this.brandedRunSummaryTable = brandedRunSummaryTable;
+
+    // ── DynamoDB: Branded Campaign Metrics ────────────────────────────
+    // Time-series disposition + agent snapshots per active branded campaign.
+    // imported — pre-created via CLI (cfn-exec-role lacks kms:Decrypt on CMK).
+    // Schema: PK=brandedCampaignId(S), SK=snapshotAt(S), GSI1=planId/snapshotAt, TTL=ttl(90d).
+    const brandedCampaignMetricsTable = dynamodb.Table.fromTableArn(
+      this, 'BrandedCampaignMetricsTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipBrandedCampaignMetrics`,
+    );
+    this.brandedCampaignMetricsTable = brandedCampaignMetricsTable;
+
+    // ── DynamoDB: Agent Snapshot ──────────────────────────────────────
+    // Per-queue agent availability history for trending and understaffed alerts.
+    // imported — pre-created via CLI (cfn-exec-role lacks kms:Decrypt on CMK).
+    // Schema: PK=queueId(S), SK=snapshotAt(S), TTL=ttl(30d).
+    const agentSnapshotTable = dynamodb.Table.fromTableArn(
+      this, 'AgentSnapshotTable',
+      `arn:aws:dynamodb:${this.region}:${this.account}:table/VipAgentSnapshot`,
+    );
+    this.agentSnapshotTable = agentSnapshotTable;
 
     // ── DynamoDB: Agent Locks ─────────────────────────────────────────
     // imported — cfn-exec-role lacks kms:Decrypt on this CMK; table pre-created via CLI.
@@ -227,6 +269,40 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       },
     });
 
+    // ── Lambda: Kickstart (DynamoDB Streams) ─────────────────────────────
+    // Fixes the event-driven gap: consumer fires only on AVAILABLE *transitions*; this
+    // Lambda fires on every INSERT to VipProgressiveCampaignQueue and dispatches to any
+    // already-AVAILABLE agent via connect:GetCurrentUserData.
+    // imported — cfn-exec-role lacks iam:PassRole; Lambda pre-created via CLI.
+    // Code updates: aws lambda update-function-code --function-name vip-admin-progressive-dialer-kickstart \
+    //   --zip-file fileb:///tmp/kickstart.zip --region us-east-1 --profile production
+    const kickstartFn = lambda.Function.fromFunctionArn(
+      this, 'KickstartFunction',
+      `arn:aws:lambda:${this.region}:${this.account}:function:vip-admin-progressive-dialer-kickstart`,
+    );
+
+    // DynamoDB stream ESM — INSERT events where NewImage.status = PENDING only.
+    // Uses EventSourceMapping (works with IFunction; DynamoEventSource.addEventSource() requires concrete Function).
+    if (props.campaignQueueStreamArn) {
+      new lambda.EventSourceMapping(this, 'KickstartEsm', {
+        target: kickstartFn,
+        eventSourceArn: props.campaignQueueStreamArn,
+        startingPosition: lambda.StartingPosition.LATEST,
+        batchSize: 10,
+        bisectBatchOnError: true,
+        filters: [
+          lambda.FilterCriteria.filter({
+            eventName: lambda.FilterRule.isEqual('INSERT'),
+            dynamodb: {
+              NewImage: {
+                status: { S: lambda.FilterRule.isEqual('PENDING') },
+              },
+            },
+          }),
+        ],
+      });
+    }
+
     // ── Alarms (created via CLI — cfn-exec-role lacks cloudwatch:PutMetricAlarm) ──
     // Run infra/scripts/create-progressive-dialer-alarms.sh after stack deploys.
 
@@ -242,5 +318,6 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'ConsumerFunctionArn', { value: consumerFn.functionArn });
     new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
     new cdk.CfnOutput(this, 'SeederFunctionArn', { value: this.seederFunction.functionArn });
+    new cdk.CfnOutput(this, 'KickstartFunctionArn', { value: kickstartFn.functionArn });
   }
 }

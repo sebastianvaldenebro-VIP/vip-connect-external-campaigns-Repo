@@ -28,7 +28,7 @@ _cp_client = None
 
 _PROFILES_DOMAIN = os.environ["PROFILES_DOMAIN_NAME"]
 _QUEUE_TABLE = os.environ["CAMPAIGN_QUEUE_TABLE"]
-_BATCH_SIZE = 20  # CP BatchGetProfile hard limit per call
+_SEARCH_BATCH_SIZE = 1  # SearchProfiles: customerid key accepts exactly 1 value per call
 
 
 def _get_table():
@@ -46,11 +46,12 @@ def _get_cp():
 
 
 def _extract_profile_ids(segment_groups: dict) -> list:
-    """Parse all customer/profile IDs from SegmentGroups.
+    """Parse all customer IDs from SegmentGroups (Attributes.ID.Values).
 
     reconcile.py builds segments via SegmentGroupsTranslator.customer_ids_to_segment_groups,
     which produces this nesting:
       Groups[].Dimensions[].ProfileAttributes.Attributes.ID.Values[...]
+    These are lead UUIDs (customerid), not CP internal ProfileIds.
     Note the Attributes key between ProfileAttributes and the field name — a direct
     ProfileAttributes.ID lookup always returns None and yields an empty list.
     """
@@ -81,23 +82,26 @@ def _extract_phones_from_filter(segment_groups: dict) -> list:
     return phones
 
 
-def _fetch_phones(profile_ids: list) -> list:
-    """Return phone numbers for the given profile IDs using BatchGetProfile.
+def _fetch_phones(customer_ids: list) -> list:
+    """Return phone numbers by searching CP profiles by customerid.
 
-    Profiles without PhoneNumber are silently skipped (no logging of PHI).
+    Attributes.ID values in segments are lead UUIDs (customerid), not CP
+    internal ProfileIds. BatchGetProfile requires internal ProfileIds, so
+    SearchProfiles(KeyName='customerid') is used instead.
+    Profiles without PhoneNumber are silently skipped.
     """
-    if not profile_ids:
+    if not customer_ids:
         return []
     phones = []
     cp = _get_cp()
-    for i in range(0, len(profile_ids), _BATCH_SIZE):
-        # BatchGetProfile requires 32-char hex without hyphens
-        chunk = [pid.replace("-", "") for pid in profile_ids[i:i + _BATCH_SIZE]]
-        resp = cp.batch_get_profile(
+    for i in range(0, len(customer_ids), _SEARCH_BATCH_SIZE):
+        chunk = customer_ids[i:i + _SEARCH_BATCH_SIZE]
+        resp = cp.search_profiles(
             DomainName=_PROFILES_DOMAIN,
-            ProfileIds=chunk,
+            KeyName="customerid",
+            Values=chunk,
         )
-        for profile in (resp.get("Profiles") or []):
+        for profile in (resp.get("Items") or []):
             phone = profile.get("PhoneNumber")
             if phone:
                 phones.append(phone)

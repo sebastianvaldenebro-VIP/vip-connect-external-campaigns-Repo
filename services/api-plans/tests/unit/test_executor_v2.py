@@ -2836,6 +2836,56 @@ def test_fire_bucket_chains_skips_templates():
     mock_start.assert_not_called()
 
 
+def test_scheduled_run_skips_template_and_logs(caplog):
+    """scheduled_run must return 'is_template' and log a warning for template plans."""
+    import executor
+    import logging
+
+    template_plan = _make_plan([])
+    template_plan["isTemplate"] = True
+
+    with (
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.get_plan", return_value=template_plan),
+        patch("executor.start_run") as mock_start,
+    ):
+        with caplog.at_level(logging.DEBUG):
+            result = executor.scheduled_run("plan-tmpl")
+
+    assert result == {"ok": True, "reason": "is_template"}
+    mock_start.assert_not_called()
+
+
+def test_prestart_fallback_skips_template_plans():
+    """prestart_check fallback must not emit the ScheduledRunFallback metric for template plans."""
+    import executor
+
+    now_cot = datetime(2025, 1, 1, 9, 41, tzinfo=None)  # 09:41 COT → delta == -1 for 08:40 trigger
+
+    template_plan = _make_plan([])
+    template_plan["planId"] = "plan-tmpl"
+    template_plan["isTemplate"] = True
+    template_plan["trigger"] = {"type": "time", "time": "08:40"}
+
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[template_plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.scheduled_run") as mock_scheduled_run,
+        patch("boto3.client") as mock_boto,
+    ):
+        executor.prestart_check()
+
+    mock_scheduled_run.assert_not_called()
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
 # B2-D: force_start_campaign startedAt reset
 
 
@@ -3631,7 +3681,8 @@ class TestStartBrandedCampaign:
         call_kwargs = lam.invoke.call_args.kwargs or lam.invoke.call_args[1]
         raw_payload = call_kwargs.get("Payload") or lam.invoke.call_args[0][0].get("Payload")
         payload = json.loads(raw_payload)
-        assert payload["campaignId"] == "bc-1"
+        # campaignId is now a deterministic uuid5(planId#runId#bucket#campaign)
+        assert payload["campaignId"] == "51577901-1d23-54c8-a268-6ab3b2acd289"
         assert payload["segmentName"] == "seg-name"
 
     def test_writes_vip_active_branded_campaigns(self, mocker):
@@ -3652,8 +3703,8 @@ class TestStartBrandedCampaign:
         ddb.put_item.assert_called_once()
         item = ddb.put_item.call_args.kwargs["Item"]
         assert item["pk"]["S"] == "QUEUE#arn:aws:connect:::queue/q1"
-        assert item["sk"]["S"] == "CAMPAIGN#bc-1"
-        assert item["campaignId"]["S"] == "bc-1"
+        assert item["sk"]["S"] == "CAMPAIGN#51577901-1d23-54c8-a268-6ab3b2acd289"
+        assert item["campaignId"]["S"] == "51577901-1d23-54c8-a268-6ab3b2acd289"
 
     def test_sets_status_running_and_branded_campaign_id(self, mocker):
         import json
@@ -3672,7 +3723,7 @@ class TestStartBrandedCampaign:
         _start_one_campaign(run, plan, 0, 0)
 
         assert cs["status"] == "running"
-        assert cs["brandedCampaignId"] == "bc-1"
+        assert cs["brandedCampaignId"] == "51577901-1d23-54c8-a268-6ab3b2acd289"
         assert cs["queueArn"] == "arn:aws:connect:::queue/q1"
         assert cs["connectCampaignId"] is None
 
@@ -3687,13 +3738,15 @@ class TestStartBrandedCampaign:
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 0}).encode())
         }
         ddb = mocker.patch("executor._get_ddb_client").return_value
+        # Isolate _stop_branded_campaign's expire call (tested separately in TestStopBrandedCampaign)
+        mocker.patch("executor._expire_branded_queue_items")
 
         from executor import _start_one_campaign
         cs = run["bucketStates"][0]["campaignStates"][0]
         _start_one_campaign(run, plan, 0, 0)
 
         assert cs["status"] == "completed"
-        ddb.put_item.assert_not_called()  # no entry written when empty
+        ddb.put_item.assert_called_once()  # lock claimed before invoking seeder
 
     def test_seeder_error_sets_error_status(self, mocker):
         run, plan = self._make_run_with_branded()
@@ -3709,7 +3762,7 @@ class TestStartBrandedCampaign:
         _start_one_campaign(run, plan, 0, 0)
 
         assert cs["status"] == "error"
-        ddb.put_item.assert_not_called()
+        ddb.put_item.assert_called_once()  # lock was claimed before seeder ran
 
     def test_does_not_call_create_and_start_campaign(self, mocker):
         import json
@@ -4359,7 +4412,7 @@ class TestBL1ExpireOnSeederException:
 
         executor._start_one_campaign(run, plan, 0, 0)
 
-        expire.assert_called_once_with("bc-bl1")
+        expire.assert_called_once_with("deb4e78c-8a2f-58fc-858a-c14812bb839b")
         assert cs["status"] == "error"
 
 
@@ -4371,9 +4424,10 @@ class TestH1ExpireOnDdbWriteFailure:
         mocker.patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
         mocker.patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue")
 
-    def test_expire_called_on_ddb_write_failure(self, mocker):
-        """When put_item to VipActiveBrandedCampaigns raises (non-conditional),
-        _expire_branded_queue_items must be called so stranded contacts are cleaned up.
+    def test_expire_not_called_on_ddb_lock_failure(self, mocker):
+        """When put_item (the distributed lock) raises a non-conditional error,
+        the seeder was never invoked — no contacts exist to expire.
+        _expire_branded_queue_items must NOT be called and status must be 'error'.
         """
         import executor
         from botocore.exceptions import ClientError
@@ -4384,7 +4438,7 @@ class TestH1ExpireOnDdbWriteFailure:
             "executor._create_segment",
             return_value=("seg-h1", "arn:seg-h1"),
         )
-        mocker.patch("executor._invoke_seeder", return_value=5)
+        invoke_seeder = mocker.patch("executor._invoke_seeder")
         ddb = mocker.patch("executor._get_ddb_client").return_value
         ddb.put_item.side_effect = ClientError(
             {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"}},
@@ -4394,7 +4448,8 @@ class TestH1ExpireOnDdbWriteFailure:
 
         executor._start_one_campaign(run, plan, 0, 0)
 
-        expire.assert_called_once_with("bc-h1")
+        invoke_seeder.assert_not_called()  # lock failed before seeder could run
+        expire.assert_not_called()         # no contacts exist to expire
         assert cs["status"] == "error"
 
 

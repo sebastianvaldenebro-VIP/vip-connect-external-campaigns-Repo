@@ -74,6 +74,16 @@ const GROUPS = [
           </svg>
         ),
       },
+      {
+        to: '/plans/branded-monitor',
+        label: 'Branded Monitor',
+        icon: (
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0">
+            <rect x="2" y="4" width="16" height="12" rx="2" />
+            <path d="M6 14V10M10 14V8M14 14V6" strokeLinecap="round" />
+          </svg>
+        ),
+      },
     ],
   },
 ] as const;

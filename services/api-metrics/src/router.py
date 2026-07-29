@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from handlers import audit as audit_handler
+from handlers import branded as branded_handler
 from handlers import metrics as metrics_handler
 
 Handler = Callable[[dict, dict], dict]
@@ -17,6 +18,11 @@ ROUTES: dict[str, Handler] = {
     "GET /metrics/queues/{queueId}": metrics_handler.get_queue_realtime,
     "GET /metrics/current": metrics_handler.get_current_realtime,
     "GET /metrics/dispositions": metrics_handler.get_dispositions,
+    # Branded campaign monitoring
+    "GET /metrics/branded/today": branded_handler.get_today_summary,
+    "GET /metrics/branded/campaigns/{brandedCampaignId}/metrics": branded_handler.get_campaign_metrics,
+    "GET /metrics/branded/agents": branded_handler.get_agent_roster,
+    "GET /metrics/branded/history": branded_handler.get_history,
     # Audit log (read-only)
     "GET /audit": audit_handler.list_audit_entries,
     "GET /audit/{entityId}": audit_handler.get_entity_history,

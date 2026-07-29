@@ -112,19 +112,18 @@ def test_extract_phones_from_filter_id_segment_returns_empty():
 # ---------------------------------------------------------------------------
 
 def test_fetch_phones_skips_profiles_without_phone_number():
-    profile_ids = ["p1", "p2", "p3"]
+    customer_ids = ["cid-1", "cid-2", "cid-3"]
     mock_cp = MagicMock()
-    mock_cp.batch_get_profile.return_value = {
-        "Profiles": [
-            {"ProfileId": "p1", "PhoneNumber": "+15550001111"},
-            {"ProfileId": "p2"},                        # no PhoneNumber — must be skipped
-            {"ProfileId": "p3", "PhoneNumber": "+15550002222"},
-        ],
-        "Errors": [],
-    }
+    # customerid accepts exactly 1 value per call — side_effect per call
+    mock_cp.search_profiles.side_effect = [
+        {"Items": [{"PhoneNumber": "+15550001111"}]},
+        {"Items": [{}]},                                # no PhoneNumber — must be skipped
+        {"Items": [{"PhoneNumber": "+15550002222"}]},
+    ]
     with patch("handler_seeder._get_cp", return_value=mock_cp):
-        phones = handler_seeder._fetch_phones(profile_ids)
+        phones = handler_seeder._fetch_phones(customer_ids)
     assert phones == ["+15550001111", "+15550002222"]
+    assert mock_cp.search_profiles.call_count == 3
 
 
 def test_fetch_phones_empty_list():
@@ -214,13 +213,10 @@ def test_lambda_handler_success_seeds_contacts():
             }]
         }
     }
-    mock_cp.batch_get_profile.return_value = {
-        "Profiles": [
-            {"ProfileId": "p1", "PhoneNumber": "+15550001111"},
-            {"ProfileId": "p2", "PhoneNumber": "+15550002222"},
-        ],
-        "Errors": [],
-    }
+    mock_cp.search_profiles.side_effect = [
+        {"Items": [{"PhoneNumber": "+15550001111"}]},
+        {"Items": [{"PhoneNumber": "+15550002222"}]},
+    ]
     mock_table = MagicMock()
     mock_batch_writer = MagicMock()
     mock_table.batch_writer.return_value.__enter__ = MagicMock(return_value=mock_batch_writer)
@@ -369,10 +365,7 @@ class TestDirectInvocation:
                 }]
             }
         }
-        mock_cp.batch_get_profile.return_value = {
-            "Profiles": [{"ProfileId": "p1", "PhoneNumber": "+15551234567"}],
-            "Errors": [],
-        }
+        mock_cp.search_profiles.return_value = {"Items": [{"PhoneNumber": "+15551234567"}]}
         mocker.patch("handler_seeder._get_cp", return_value=mock_cp)
         mock_table = MagicMock()
         mock_batch_writer = MagicMock()

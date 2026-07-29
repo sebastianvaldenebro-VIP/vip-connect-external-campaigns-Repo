@@ -22,6 +22,8 @@ import { PlansScheduler } from '@/pages/PlansScheduler';
 import { PlansTemplates } from '@/pages/PlansTemplates';
 import { PlansToday } from '@/pages/PlansToday';
 import { PlansGuide } from '@/pages/PlansGuide';
+import { BrandedMonitor } from '@/pages/BrandedMonitor';
+import { ContactArtifacts } from '@/pages/ContactArtifacts';
 import { Segments } from '@/pages/Segments';
 
 export default function App(): ReactNode {
@@ -54,9 +56,11 @@ export default function App(): ReactNode {
           <Route path="templates" element={<PlansTemplates />} />
           <Route path="scheduler" element={<PlansScheduler />} />
           <Route path="guide" element={<PlansGuide />} />
+          <Route path="branded-monitor" element={<BrandedMonitor />} />
         </Route>
         <Route path="/profiles" element={<Profiles />} />
         <Route path="/audit" element={<Audit />} />
+        <Route path="/contact-artifacts" element={<ContactArtifacts />} />
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

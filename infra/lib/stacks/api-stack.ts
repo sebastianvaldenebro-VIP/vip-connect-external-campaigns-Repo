@@ -218,6 +218,26 @@ export class ApiStack extends cdk.Stack {
       authorizer,
     });
 
+    // ── Branded Campaign Monitor routes ─────────────────────────────
+    for (const path of [
+      '/metrics/branded/today',
+      '/metrics/branded/agents',
+      '/metrics/branded/history',
+    ]) {
+      this.httpApi.addRoutes({
+        path,
+        methods: [apigatewayv2.HttpMethod.GET],
+        integration: metricsIntegration,
+        authorizer,
+      });
+    }
+    this.httpApi.addRoutes({
+      path: '/metrics/branded/campaigns/{brandedCampaignId}/metrics',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: metricsIntegration,
+      authorizer,
+    });
+
     // ── Profiles routes ────────────────────────────────────────────
     this.httpApi.addRoutes({
       path: '/profiles/search',
@@ -278,6 +298,28 @@ export class ApiStack extends cdk.Stack {
         authorizer,
       });
     }
+
+    // ── SMS routes ───────────────────────────────────────────────────
+    for (const [path, methods] of [
+      ['/sms/numbers', [apigatewayv2.HttpMethod.GET]],
+      ['/plans/{id}/sms-runs', [apigatewayv2.HttpMethod.GET]],
+      ['/location-mapping', [apigatewayv2.HttpMethod.GET]],
+    ] as [string, apigatewayv2.HttpMethod[]][]) {
+      this.httpApi.addRoutes({
+        path,
+        methods,
+        integration: plansIntegration,
+        authorizer,
+      });
+    }
+
+    // ── Contact artifacts route ──────────────────────────────────────
+    this.httpApi.addRoutes({
+      path: '/contacts/{contactId}/artifacts',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: plansIntegration,
+      authorizer,
+    });
 
     // ── Progressive Dialer routes ────────────────────────────────────
     this.httpApi.addRoutes({
