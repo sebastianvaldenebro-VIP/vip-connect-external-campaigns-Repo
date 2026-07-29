@@ -86,7 +86,17 @@ def upsert_schedule(plan_id: str, trigger: dict) -> None:
     )
     events.put_targets(
         Rule=rule_name,
-        Targets=[{"Id": "lambda", "Arn": LAMBDA_FUNCTION_ARN, "Input": input_payload}],
+        Targets=[{
+            "Id": "lambda",
+            "Arn": LAMBDA_FUNCTION_ARN,
+            "Input": input_payload,
+            # Retry up to 2 times within 5 minutes if the Lambda invocation fails.
+            # Without this, a single transient failure silently drops the scheduled run.
+            "RetryPolicy": {
+                "MaximumRetryAttempts": 2,
+                "MaximumEventAgeInSeconds": 300,
+            },
+        }],
     )
 
     rule_arn = f"arn:aws:events:us-east-1:{_account_id()}:rule/{rule_name}"
