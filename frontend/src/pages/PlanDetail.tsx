@@ -6,6 +6,9 @@ import { Button, Spinner } from '@/components/ui';
 import {
   api,
   type BrandedCampaignCounts,
+  type BrandedMetricSnapshot,
+  type BrandedQueueItem,
+  type BrandedRunSummary,
   type BucketDefV2,
   type BucketStateV2,
   type CampaignDef,
@@ -14,6 +17,7 @@ import {
   type PlanRunV2,
   type PlanSummaryV2,
   type PlanTrigger,
+  type SmsCampaignRunRecord,
 } from '@/lib/api';
 import { buildChainMap } from '@/lib/chainMap';
 
@@ -157,6 +161,8 @@ function CampaignCard({
   onForceStop,
   onSkip,
   brandedCounts,
+  brandedQueue,
+  smsRun,
 }: {
   cs: CampaignState;
   campaignDef?: CampaignDef | null;
@@ -168,6 +174,8 @@ function CampaignCard({
   onForceStop?: () => void;
   onSkip?: () => void;
   brandedCounts?: BrandedCampaignCounts;
+  brandedQueue?: BrandedQueueItem[];
+  smsRun?: SmsCampaignRunRecord;
 }) {
   const durMin = campaignDurMin(campaignDef, bucketDef);
   const isTimeBased = bucketDef?.run_mode === 'time_based';
@@ -185,6 +193,18 @@ function CampaignCard({
     ...(etaDate ? [{ label: 'ETA', value: fmtTime(etaDate) }] : []),
     ...(isTimeBased && durMin > 0 ? [{ label: 'Dur', value: `${durMin}m` }] : []),
   ];
+
+  // Fetch live metrics for active branded campaigns (answer/voicemail rate)
+  const brandedCampaignId = (cs as CampaignState & { brandedCampaignId?: string }).brandedCampaignId;
+  const isBrandedRunning = campaignDef?.deliveryType === 'branded' && cs.status === 'running';
+  const brandedMetricQuery = useQuery({
+    queryKey: ['branded-metrics-detail', brandedCampaignId],
+    queryFn: () => api.brandedMonitor.getCampaignMetrics(brandedCampaignId!, 1),
+    enabled: isBrandedRunning && !!brandedCampaignId,
+    refetchInterval: 30_000,
+    staleTime: 30_000,
+  });
+  const latestMetric: BrandedMetricSnapshot | undefined = brandedMetricQuery.data?.metrics?.[0];
 
   const isError = cs.status === 'error';
   const statusBorderLeft: Record<string, string> = {
@@ -216,6 +236,11 @@ function CampaignCard({
           {campaignDef?.deliveryType === 'branded' && (
             <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 leading-none">
               Branded
+            </span>
+          )}
+          {campaignDef?.deliveryType === 'sms' && (
+            <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-700 leading-none">
+              SMS
             </span>
           )}
         </div>
@@ -269,38 +294,108 @@ function CampaignCard({
       {cs.leadCount != null && (
         <div className="text-xs text-gray-400">{cs.leadCount.toLocaleString()} leads</div>
       )}
-      {campaignDef?.deliveryType === 'branded' && brandedCounts != null && (
-        <div className="space-y-1">
-          {/* Bug 5 fix: clamp pct to [0, 100] so a backend counting race (dialed > total)
-              never renders ">100%" text or a bar wider than its container. */}
-          {(() => {
-            const pct = brandedCounts.total > 0
-              ? Math.min(100, Math.round((brandedCounts.dialed / brandedCounts.total) * 100))
-              : 0;
-            return (
-              <>
-                <div className="flex items-center justify-between text-[10px] text-gray-500">
-                  <span>
-                    <span className="font-medium text-green-600">{brandedCounts.dialed}</span>
-                    {' dialed · '}
-                    <span className="font-medium text-amber-600">{brandedCounts.pending}</span>
-                    {' pending'}
-                  </span>
-                  {brandedCounts.total > 0 && (
-                    <span className="text-gray-400">{pct}%</span>
-                  )}
-                </div>
-                {brandedCounts.total > 0 && (
-                  <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-green-400 rounded-full transition-all duration-500"
-                      style={{ width: `${pct}%` }}
-                    />
+      {campaignDef?.deliveryType === 'branded' && (
+        brandedCounts != null ? (
+          <div className="space-y-1">
+            {/* Bug 5 fix: clamp pct to [0, 100] so a backend counting race (dialed > total)
+                never renders ">100%" text or a bar wider than its container. */}
+            {(() => {
+              const pct = brandedCounts.total > 0
+                ? Math.min(100, Math.round((brandedCounts.dialed / brandedCounts.total) * 100))
+                : 0;
+              return (
+                <>
+                  <div className="flex items-center justify-between text-[10px] text-gray-500">
+                    <span>
+                      <span className="font-medium text-green-600">{brandedCounts.dialed}</span>
+                      {' dialed · '}
+                      <span className="font-medium text-amber-600">{brandedCounts.pending}</span>
+                      {' pending'}
+                    </span>
+                    {brandedCounts.total > 0 && (
+                      <span className="text-gray-400">{pct}%</span>
+                    )}
                   </div>
-                )}
-              </>
-            );
-          })()}
+                  {brandedCounts.total > 0 && (
+                    <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-green-400 rounded-full transition-all duration-500"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                  )}
+                  {latestMetric && (
+                    <div className="flex items-center gap-3 text-[11px] mt-0.5">
+                      <span className="text-green-600 font-medium">Answer {latestMetric.answerRate}%</span>
+                      <span className="text-blue-600">VM {latestMetric.voicemailRate}%</span>
+                      <span className="text-gray-400">
+                        Agents {latestMetric.agentsAvailable}/{latestMetric.agentsStaffed}
+                      </span>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+            {brandedQueue && brandedQueue.length > 0 && (
+              <div className="mt-1 max-h-[128px] overflow-y-auto rounded border border-gray-100">
+                <table className="w-full text-[10px] border-collapse">
+                  <thead className="sticky top-0 bg-white">
+                    <tr className="text-gray-400 border-b border-gray-100">
+                      <th className="text-left px-1.5 py-0.5 font-medium">Status</th>
+                      <th className="text-left px-1.5 py-0.5 font-medium">Phone</th>
+                      <th className="text-right px-1.5 py-0.5 font-medium">Time</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brandedQueue.map((item, i) => (
+                      <tr key={i} className="border-b border-gray-50 last:border-0">
+                        <td className="px-1.5 py-0.5">
+                          {item.status === 'DIALED' ? (
+                            <span className="text-green-600 font-medium">✓ DIALED</span>
+                          ) : item.status === 'DISPATCHING' ? (
+                            <span className="text-amber-600 font-medium">● CALLING</span>
+                          ) : (
+                            <span className="text-gray-400">PENDING</span>
+                          )}
+                        </td>
+                        <td className="px-1.5 py-0.5 font-mono text-gray-600">···-{item.phone_last4}</td>
+                        <td className="px-1.5 py-0.5 text-right text-gray-400">{fmtTime(item.seededAt)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-[10px] text-gray-400 animate-pulse">Loading progress…</div>
+        )
+      )}
+      {campaignDef?.deliveryType === 'sms' && smsRun && (
+        <div className="text-[10px] text-gray-500 space-y-1">
+          <div className="flex items-center gap-3">
+            <span>
+              <span className="font-medium text-green-600">{smsRun.totalSent}</span>
+              {' sent · '}
+              <span className="font-medium text-red-500">{smsRun.totalFailed}</span>
+              {' failed · '}
+              <span className="text-gray-400">{smsRun.totalOptedOut}</span>
+              {' opted out'}
+            </span>
+            {smsRun.totalEnqueued > 0 && (
+              <span className="text-gray-400 ml-auto">
+                {Math.round(((smsRun.totalSent + smsRun.totalFailed + smsRun.totalOptedOut) / smsRun.totalEnqueued) * 100)}%
+              </span>
+            )}
+          </div>
+          {smsRun.totalEnqueued > 0 && (
+            <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-green-400 rounded-full transition-all duration-500"
+                style={{ width: `${Math.min(100, Math.round(((smsRun.totalSent + smsRun.totalFailed + smsRun.totalOptedOut) / smsRun.totalEnqueued) * 100))}%` }}
+              />
+            </div>
+          )}
         </div>
       )}
       {cs.exitReason && cs.exitReason !== 'completed' && (
@@ -336,6 +431,8 @@ function BucketSection({
   onForceStopCampaign,
   onSkipCampaign,
   brandedProgress,
+  brandedQueue,
+  smsRunsMap,
 }: {
   bs: BucketStateV2;
   bucketDef?: BucketDefV2 | null;
@@ -348,6 +445,8 @@ function BucketSection({
   onForceStopCampaign?: (campaignIndex: number) => void;
   onSkipCampaign?: (campaignIndex: number) => void;
   brandedProgress?: Record<string, BrandedCampaignCounts>;
+  brandedQueue?: Record<string, BrandedQueueItem[]>;
+  smsRunsMap?: Record<string, SmsCampaignRunRecord>;
 }) {
   const plannedStart = computePlannedStart(plan, run, index);
   const durMin = bucketDef?.duration_minutes ?? 0;
@@ -450,6 +549,8 @@ function BucketSection({
                   onForceStop={onForceStopCampaign ? () => onForceStopCampaign(ci) : undefined}
                   onSkip={onSkipCampaign ? () => onSkipCampaign(ci) : undefined}
                   brandedCounts={brandedProgress?.[cs.campaignId]}
+                  brandedQueue={brandedQueue?.[cs.campaignId]}
+                  smsRun={smsRunsMap?.[(cs as CampaignState & { smsCampaignId?: string }).smsCampaignId ?? '']}
                 />
               </div>
             );
@@ -585,6 +686,9 @@ export function PlanDetail(): ReactNode {
   const hasBrandedCampaigns = isRunActive && snapshotBuckets.some(
     (b) => b.campaigns?.some((c) => c.deliveryType === 'branded'),
   );
+  const hasSmsCampaigns = snapshotBuckets.some(
+    (b) => b.campaigns?.some((c) => c.deliveryType === 'sms'),
+  );
 
   const brandedProgressQuery = useQuery({
     queryKey: ['branded-progress', id, planQuery.data?.latestRun?.runId],
@@ -596,8 +700,38 @@ export function PlanDetail(): ReactNode {
       return api.plans.getBrandedProgressV2(id, runId);
     },
     enabled: !!id && hasBrandedCampaigns && !!planQuery.data?.latestRun?.runId,
-    refetchInterval: isRunActive ? 30_000 : false,
+    refetchInterval: isRunActive ? 10_000 : false,
   });
+
+  const brandedQueueQuery = useQuery({
+    queryKey: ['branded-queue', id, planQuery.data?.latestRun?.runId],
+    queryFn: () => {
+      const runId = planQuery.data?.latestRun?.runId;
+      if (!id || !runId) return Promise.resolve({ items: {} });
+      return api.plans.getBrandedQueueV2(id, runId);
+    },
+    enabled: !!id && hasBrandedCampaigns && !!planQuery.data?.latestRun?.runId,
+    refetchInterval: isRunActive ? 10_000 : false,
+  });
+
+  const brandedHistoryQuery = useQuery({
+    queryKey: ['branded-history', id],
+    queryFn: () => id ? api.plans.getBrandedHistoryV2(id) : Promise.resolve({ history: [] }),
+    enabled: !!id && hasBrandedCampaigns,
+    staleTime: 60_000,
+  });
+
+  const smsRunsQuery = useQuery({
+    queryKey: ['sms-runs', id],
+    queryFn: () => api.sms.getSmsRuns(id!),
+    enabled: !!id && hasSmsCampaigns,
+    refetchInterval: isRunActive ? 15_000 : false,
+    staleTime: 10_000,
+  });
+  const smsRunsMap: Record<string, SmsCampaignRunRecord> = {};
+  for (const run of smsRunsQuery.data?.runs ?? []) {
+    smsRunsMap[run.smsCampaignId] = run;
+  }
 
   const triggerMutation = useMutation({
     mutationFn: (startBucketIndex?: number) => api.plans.triggerRunV2(id!, startBucketIndex),
@@ -921,6 +1055,8 @@ export function PlanDetail(): ReactNode {
                       ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'skip' })
                       : undefined}
                     brandedProgress={isCurrentRunDisplayed ? brandedProgressQuery.data?.progress : undefined}
+                    brandedQueue={isCurrentRunDisplayed ? brandedQueueQuery.data?.items : undefined}
+                    smsRunsMap={hasSmsCampaigns ? smsRunsMap : undefined}
                   />
                 );
               })}
@@ -996,6 +1132,57 @@ export function PlanDetail(): ReactNode {
                         <td className="px-4 py-2.5 text-xs text-gray-500">
                           {fmtElapsed(r.startedAt, r.completedAt)}
                         </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        )}
+
+        {/* ── Branded campaign history ─────────────────────────────────────────── */}
+        {hasBrandedCampaigns && (brandedHistoryQuery.data?.history?.length ?? 0) > 0 && (
+          <details className="group" open>
+            <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 select-none list-none flex items-center gap-2">
+              <span className="group-open:rotate-90 transition-transform inline-block text-gray-400">▶</span>
+              Branded dialer history ({brandedHistoryQuery.data!.history.length})
+            </summary>
+            <div className="mt-3 bg-white rounded-xl border border-gray-200 overflow-hidden">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b border-gray-100">
+                  <tr>
+                    {['Run', 'Campaign', 'Dialed', 'Total', '%', 'Resultado', 'Duración'].map((h) => (
+                      <th key={h} className="px-4 py-2.5 text-left text-[11px] font-semibold tracking-wider text-gray-400 uppercase">
+                        {h}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {brandedHistoryQuery.data!.history.map((r: BrandedRunSummary) => {
+                    const pct = r.totalSeeded > 0
+                      ? Math.min(100, Math.round((r.totalDialed / r.totalSeeded) * 100))
+                      : 0;
+                    return (
+                      <tr key={`${r.runId}#${r.campaignId}`} className="hover:bg-gray-50">
+                        <td className="px-4 py-2.5 font-mono text-xs text-gray-400">{r.runId.slice(0, 13)}</td>
+                        <td className="px-4 py-2.5 text-xs text-gray-700">{r.campaignId}</td>
+                        <td className="px-4 py-2.5 text-xs font-medium text-green-600">{r.totalDialed}</td>
+                        <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded}</td>
+                        <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded > 0 ? `${pct}%` : '—'}</td>
+                        <td className="px-4 py-2.5">
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                            r.exitReason === 'queue_drained'
+                              ? 'bg-green-100 text-green-700'
+                              : r.exitReason === 'manually_stopped'
+                                ? 'bg-amber-100 text-amber-700'
+                                : 'bg-gray-100 text-gray-500'
+                          }`}>
+                            {r.exitReason || '—'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 text-xs text-gray-400">{fmtElapsed(r.startedAt, r.completedAt)}</td>
                       </tr>
                     );
                   })}

@@ -15,6 +15,7 @@ import {
   type PlanSummaryV2,
   type PlanTrigger,
   type Queue,
+  type SmsOriginationNumber,
 } from '@/lib/api';
 import { STATE_DEFAULT_PHONES } from '@/lib/areaCodeMap';
 
@@ -521,6 +522,7 @@ function CampaignCard({
   canRemove,
   queues,
   contactFlows,
+  smsNumbers,
 }: {
   campaign: CampaignDef;
   bucketIndex: number;
@@ -532,6 +534,7 @@ function CampaignCard({
   canRemove: boolean;
   queues: Queue[];
   contactFlows: ContactFlow[];
+  smsNumbers: SmsOriginationNumber[];
 }) {
   const cfg = campaign.campaignConfig ?? { ...DEFAULT_CAMPAIGN_CONFIG };
   const [configOpen, setConfigOpen] = useState(false);
@@ -592,15 +595,20 @@ function CampaignCard({
     const shouldUpdateName = isAutoNamed();
     prevAutoNameRef.current = newAutoName;
     const isOnlyNewLeadGroup = groups.length === 1 && groups[0] === 'New Lead / New Lead';
-    const autoQueue = isOnlyNewLeadGroup ? HIGH_PRIORITY_QUEUE_ID : GENERIC_QUEUE_ID;
+    const autoQueueId = isOnlyNewLeadGroup ? HIGH_PRIORITY_QUEUE_ID : GENERIC_QUEUE_ID;
     const shouldUpdateQueue = !cfg.queueId || CANONICAL_QUEUE_IDS.has(cfg.queueId);
+    const autoQueueArn = queues.find((q) => q.id === autoQueueId)?.arn ?? '';
+    const canonicalQueueArns = new Set(queues.filter((q) => CANONICAL_QUEUE_IDS.has(q.id)).map((q) => q.arn));
+    const shouldUpdateQueueArn =
+      campaign.deliveryType === 'branded' && (!cfg.queueArn || canonicalQueueArns.has(cfg.queueArn));
     onChange({
       ...campaign,
       groups,
       name: shouldUpdateName ? newAutoName : campaign.name,
       campaignConfig: {
         ...cfg,
-        ...(shouldUpdateQueue ? { queueId: autoQueue } : {}),
+        ...(shouldUpdateQueue ? { queueId: autoQueueId } : {}),
+        ...(shouldUpdateQueueArn && autoQueueArn ? { queueArn: autoQueueArn } : {}),
       },
     });
   };
@@ -733,12 +741,29 @@ function CampaignCard({
               <label className="block text-xs font-semibold text-gray-700 mb-1">Delivery type</label>
               <select
                 value={campaign.deliveryType ?? 'campaign'}
-                onChange={(e) => onChange({ ...campaign, deliveryType: e.target.value as 'campaign' | 'journey' | 'branded' })}
+                onChange={(e) => {
+                  const newType = e.target.value as 'campaign' | 'journey' | 'branded' | 'sms';
+                  if (newType === 'branded') {
+                    const isOnlyNewLead =
+                      campaign.groups.length === 1 && campaign.groups[0] === 'New Lead / New Lead';
+                    const autoQueueId = isOnlyNewLead ? HIGH_PRIORITY_QUEUE_ID : GENERIC_QUEUE_ID;
+                    const autoQueueArn = queues.find((q) => q.id === autoQueueId)?.arn ?? '';
+                    setConfigOpen(true);
+                    onChange({
+                      ...campaign,
+                      deliveryType: newType,
+                      campaignConfig: { ...cfg, ...(autoQueueArn ? { queueArn: autoQueueArn } : {}) },
+                    });
+                  } else {
+                    onChange({ ...campaign, deliveryType: newType });
+                  }
+                }}
                 className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
               >
                 <option value="campaign">Campaign</option>
                 <option value="journey">Journey</option>
                 <option value="branded">Branded (Progressive)</option>
+                <option value="sms">SMS (Text)</option>
               </select>
             </div>
 
@@ -799,8 +824,58 @@ function CampaignCard({
               </div>
             )}
 
-            {/* Per-campaign Connect config */}
-            <div>
+            {/* SMS config — shown only for deliveryType='sms' */}
+            {campaign.deliveryType === 'sms' && (
+              <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-3 space-y-3">
+                <p className="text-xs font-semibold text-amber-700">SMS Configuration</p>
+                <div className="space-y-1">
+                  <label className="block text-xs font-medium text-gray-600">Origination Number</label>
+                  <select
+                    value={cfg.smsOriginationNumberArn ?? ''}
+                    onChange={(e) => updateCfg({ smsOriginationNumberArn: e.target.value })}
+                    className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  >
+                    <option value="">— Select origination number —</option>
+                    {smsNumbers.map((n) => (
+                      <option key={n.arn} value={n.arn}>
+                        {n.phoneNumber} ({n.numberType})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-xs font-medium text-gray-600">
+                    Message Template{' '}
+                    <span className="text-gray-400">({(cfg.smsMessageTemplate ?? '').length}/160)</span>
+                  </label>
+                  <textarea
+                    maxLength={160}
+                    value={cfg.smsMessageTemplate ?? ''}
+                    onChange={(e) => updateCfg({ smsMessageTemplate: e.target.value })}
+                    placeholder="Your appointment is confirmed. Reply STOP to opt out."
+                    className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  />
+                  <p className="text-[10px] text-amber-600">
+                    Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
+                  </p>
+                </div>
+                <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={cfg.phiAcknowledged ?? false}
+                    onChange={(e) => updateCfg({ phiAcknowledged: e.target.checked })}
+                    className="mt-0.5 accent-amber-500"
+                  />
+                  <span className="text-gray-600">
+                    I confirm this message does <strong>not</strong> contain protected health information (PHI) —
+                    no patient names, dates, diagnoses, medications, or account numbers.
+                  </span>
+                </label>
+              </div>
+            )}
+
+            {/* Per-campaign Connect config — hidden for SMS */}
+            {campaign.deliveryType !== 'sms' && <div>
               <button
                 type="button"
                 onClick={() => setConfigOpen((o) => !o)}
@@ -897,7 +972,7 @@ function CampaignCard({
                   )}
                 </div>
               )}
-            </div>
+            </div>}
           </div>
         )}
       </div>
@@ -917,6 +992,7 @@ function DagCanvas({
   onRemove,
   queues,
   contactFlows,
+  smsNumbers,
 }: {
   campaigns: CampaignDef[];
   bucketIndex: number;
@@ -927,6 +1003,7 @@ function DagCanvas({
   onRemove: (index: number) => void;
   queues: Queue[];
   contactFlows: ContactFlow[];
+  smsNumbers: SmsOriginationNumber[];
 }) {
   const stages = useMemo(() => assignStages(campaigns), [campaigns]);
   const maxStage = Math.max(0, ...Array.from(stages.values()));
@@ -957,6 +1034,7 @@ function DagCanvas({
                   canRemove={campaigns.length > 1}
                   queues={queues}
                   contactFlows={contactFlows}
+                  smsNumbers={smsNumbers}
                 />
               );
             })}
@@ -978,6 +1056,7 @@ function BucketEditor({
   canRemove,
   queues,
   contactFlows,
+  smsNumbers,
 }: {
   bucket: BucketDefV2;
   bucketIndex: number;
@@ -987,6 +1066,7 @@ function BucketEditor({
   canRemove: boolean;
   queues: Queue[];
   contactFlows: ContactFlow[];
+  smsNumbers: SmsOriginationNumber[];
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [expandedCampaignId, setExpandedCampaignId] = useState<string | null>(null);
@@ -1153,6 +1233,7 @@ function BucketEditor({
               onRemove={removeCampaign}
               queues={queues}
               contactFlows={contactFlows}
+              smsNumbers={smsNumbers}
             />
           </div>
         </div>
@@ -1258,6 +1339,13 @@ export function PlanNew() {
   });
   const contactFlows = contactFlowsData?.contactFlows ?? [];
 
+  const { data: smsNumbersData } = useQuery({
+    queryKey: ['sms', 'numbers'],
+    queryFn: () => api.sms.listNumbers(),
+    staleTime: 5 * 60_000,
+  });
+  const smsNumbers = smsNumbersData?.originationNumbers ?? [];
+
   const overlaps = useMemo(() => detectOverlaps(buckets), [buckets]);
 
   const saveMutation = useMutation({
@@ -1296,6 +1384,12 @@ export function PlanNew() {
         if (c.states.length === 0 && !c.pinnedSegmentArn) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} has no states selected.`); return; }
         if (c.run_type === 'custom' && (!c.run_duration_minutes || c.run_duration_minutes < 1)) {
           setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1} needs a duration > 0 minutes.`); return;
+        }
+        if (c.deliveryType === 'sms') {
+          const cfg = c.campaignConfig;
+          if (!cfg?.smsOriginationNumberArn) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: select an SMS origination number.`); return; }
+          if (!cfg?.smsMessageTemplate) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: SMS message template is required.`); return; }
+          if (!cfg?.phiAcknowledged) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: confirm the message contains no PHI before saving.`); return; }
         }
       }
     }
@@ -1498,6 +1592,7 @@ export function PlanNew() {
                   canRemove={buckets.length > 1}
                   queues={queues}
                   contactFlows={contactFlows}
+                  smsNumbers={smsNumbers}
                 />
               </div>
             </div>
