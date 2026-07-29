@@ -13,6 +13,7 @@ const NAV = [
   { to: '/plans', label: 'Plans' },
   { to: '/profiles', label: 'Profiles' },
   { to: '/audit', label: 'Audit' },
+  { to: '/contact-artifacts', label: 'Artifacts' },
 ] as const;
 
 export function Layout(): ReactNode {
