@@ -1,0 +1,520 @@
+
+<title>VIP Connect — Resource Directory</title>
+<style>
+:root {
+  --bg:       #F5F3EF;
+  --surface:  #FFFFFF;
+  --ink:      #1A1916;
+  --ink-2:    #6B6860;
+  --ink-3:    #A09D98;
+  --accent:   #B85000;
+  --accent-lt:#FEF0E6;
+  --border:   #E0DCD6;
+  --row-alt:  #FAF8F5;
+  --tag-user: #EEF2FF;
+  --tag-user-ink: #3730A3;
+  --tag-queue:#F0FDF4;
+  --tag-queue-ink:#166534;
+  --tag-tf:   #FFF7ED;
+  --tag-tf-ink:#9A3412;
+  --copy-flash:#DCFCE7;
+  --shadow: 0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme:dark) {
+  :root {
+    --bg:       #131412;
+    --surface:  #1C1E1A;
+    --ink:      #E5E2DC;
+    --ink-2:    #8A877F;
+    --ink-3:    #5A5855;
+    --accent:   #D4692A;
+    --accent-lt:#2A1808;
+    --border:   #2A2C28;
+    --row-alt:  #1F211D;
+    --tag-user: #1E1B4B;
+    --tag-user-ink:#A5B4FC;
+    --tag-queue:#052E16;
+    --tag-queue-ink:#86EFAC;
+    --tag-tf:   #431407;
+    --tag-tf-ink:#FDBA74;
+    --copy-flash:#14532D;
+    --shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="light"] {
+  --bg:#F5F3EF; --surface:#FFFFFF; --ink:#1A1916; --ink-2:#6B6860; --ink-3:#A09D98;
+  --accent:#B85000; --accent-lt:#FEF0E6; --border:#E0DCD6; --row-alt:#FAF8F5;
+  --tag-user:#EEF2FF; --tag-user-ink:#3730A3; --tag-queue:#F0FDF4; --tag-queue-ink:#166534;
+  --tag-tf:#FFF7ED; --tag-tf-ink:#9A3412; --copy-flash:#DCFCE7; --shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+}
+:root[data-theme="dark"] {
+  --bg:#131412; --surface:#1C1E1A; --ink:#E5E2DC; --ink-2:#8A877F; --ink-3:#5A5855;
+  --accent:#D4692A; --accent-lt:#2A1808; --border:#2A2C28; --row-alt:#1F211D;
+  --tag-user:#1E1B4B; --tag-user-ink:#A5B4FC; --tag-queue:#052E16; --tag-queue-ink:#86EFAC;
+  --tag-tf:#431407; --tag-tf-ink:#FDBA74; --copy-flash:#14532D; --shadow:0 1px 3px rgba(0,0,0,.3);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  line-height: 1.5;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ─── */
+.topbar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.topbar-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.brand-name {
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+.brand-tag {
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.search-wrap {
+  flex: 1;
+  min-width: 180px;
+  max-width: 380px;
+  position: relative;
+}
+.search-wrap svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ink-3);
+  pointer-events: none;
+  width: 14px;
+  height: 14px;
+}
+#search {
+  width: 100%;
+  padding: 7px 10px 7px 32px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 0.15s;
+}
+#search:focus { border-color: var(--accent); }
+#search::placeholder { color: var(--ink-3); }
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  cursor: pointer;
+  color: var(--ink-2);
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Tabs ─── */
+.tabs-wrap {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 53px;
+  z-index: 90;
+}
+.tabs {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 20px;
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  padding: 10px 14px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--ink-2);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transition: color 0.15s, border-color 0.15s;
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  letter-spacing: 0.01em;
+}
+.tab:hover { color: var(--ink); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.count {
+  font-size: 0.65rem;
+  font-weight: 700;
+  background: var(--accent-lt);
+  color: var(--accent);
+  padding: 1px 5px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.tab.active .count { background: var(--accent); color: #fff; }
+
+/* ── Content ─── */
+.content {
+  flex: 1;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+  width: 100%;
+}
+.panel { display: none; }
+.panel.active { display: block; }
+
+.section-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.section-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.result-count {
+  font-size: 0.72rem;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.table-wrap { overflow-x: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+thead th {
+  text-align: left;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+}
+tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+tbody tr:nth-child(even) { background: var(--row-alt); }
+tbody tr:hover { background: var(--accent-lt); }
+tbody tr.copy-flash { background: var(--copy-flash) !important; transition: none; }
+td {
+  padding: 8px 12px;
+  vertical-align: middle;
+  color: var(--ink-2);
+  line-height: 1.35;
+}
+td.name {
+  color: var(--ink);
+  font-weight: 500;
+  max-width: 320px;
+}
+td.id {
+  font-family: 'Cascadia Code','Consolas','Courier New',monospace;
+  font-size: 0.73rem;
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+td.id:hover { text-decoration: underline; }
+td.id::after {
+  content: ' ⎘';
+  font-size: 0.65rem;
+  opacity: 0.4;
+}
+.type-badge {
+  display: inline-block;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.badge-user  { background: var(--tag-user);  color: var(--tag-user-ink); }
+.badge-queue { background: var(--tag-queue); color: var(--tag-queue-ink); }
+.badge-tf    { background: var(--tag-tf);    color: var(--tag-tf-ink); }
+.badge-did   { background: var(--border);    color: var(--ink-2); }
+
+.empty-state {
+  text-align: center;
+  padding: 48px 20px;
+  color: var(--ink-3);
+  font-size: 0.85rem;
+}
+
+.copy-toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  background: var(--ink);
+  color: var(--bg);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-family: 'Cascadia Code','Consolas',monospace;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+  z-index: 999;
+  max-width: 280px;
+  word-break: break-all;
+}
+.copy-toast.show { opacity: 1; transform: translateY(0); }
+</style>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-name">VIP Connect</span>
+      <span class="brand-tag">Resource Directory</span>
+    </div>
+    <div class="search-wrap">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l3 3"/>
+      </svg>
+      <input id="search" type="search" placeholder="Filter by name or ID…" autocomplete="off">
+    </div>
+    <button class="theme-toggle" onclick="toggleTheme()">
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zM8 13V3a5 5 0 010 10z"/></svg>
+      Theme
+    </button>
+  </div>
+</div>
+
+<div class="tabs-wrap">
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('queues',this)">
+      Standard Queues <span class="count" id="count-queues">0</span>
+    </button>
+    <button class="tab" onclick="switchTab('routing',this)">
+      Routing Profiles <span class="count" id="count-routing">0</span>
+    </button>
+    <button class="tab" onclick="switchTab('phones',this)">
+      Phone Numbers <span class="count" id="count-phones">0</span>
+    </button>
+    <button class="tab" onclick="switchTab('qc',this)">
+      Quick Connects <span class="count" id="count-qc">0</span>
+    </button>
+    <button class="tab" onclick="switchTab('prompts',this)">
+      Prompts <span class="count" id="count-prompts">0</span>
+    </button>
+  </div>
+</div>
+
+<div class="content">
+
+  <!-- QUEUES -->
+  <div class="panel active" id="panel-queues">
+    <div class="section-meta">
+      <span class="section-title">Standard Queues — Instance 6b3f17ba</span>
+      <span class="result-count" id="rc-queues"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl-queues">
+        <thead><tr><th>Queue Name</th><th>Queue ID</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty-state" id="empty-queues" style="display:none">No queues match your search.</div>
+    </div>
+  </div>
+
+  <!-- ROUTING PROFILES -->
+  <div class="panel" id="panel-routing">
+    <div class="section-meta">
+      <span class="section-title">Routing Profiles</span>
+      <span class="result-count" id="rc-routing"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl-routing">
+        <thead><tr><th>Profile Name</th><th>Profile ID</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty-state" id="empty-routing" style="display:none">No profiles match.</div>
+    </div>
+  </div>
+
+  <!-- PHONE NUMBERS -->
+  <div class="panel" id="panel-phones">
+    <div class="section-meta">
+      <span class="section-title">Claimed Phone Numbers</span>
+      <span class="result-count" id="rc-phones"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl-phones">
+        <thead><tr><th>Number</th><th>Description</th><th>Type</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty-state" id="empty-phones" style="display:none">No numbers match.</div>
+    </div>
+  </div>
+
+  <!-- QUICK CONNECTS -->
+  <div class="panel" id="panel-qc">
+    <div class="section-meta">
+      <span class="section-title">Quick Connects</span>
+      <span class="result-count" id="rc-qc"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl-qc">
+        <thead><tr><th>Name</th><th>Type</th><th>ID</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty-state" id="empty-qc" style="display:none">No quick connects match.</div>
+    </div>
+  </div>
+
+  <!-- PROMPTS -->
+  <div class="panel" id="panel-prompts">
+    <div class="section-meta">
+      <span class="section-title">Prompts</span>
+      <span class="result-count" id="rc-prompts"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="tbl-prompts">
+        <thead><tr><th>Prompt Name</th><th>Prompt ID</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty-state" id="empty-prompts" style="display:none">No prompts match.</div>
+    </div>
+  </div>
+
+</div>
+
+<div class="copy-toast" id="toast"></div>
+
+<script>
+const DATA = {
+  queues: [
+    ["BasicQueue","0ef8ba89-8910-4bc4-a288-8db2b7512893"],["Pain Treatment Clinic OB","1046dde5-826b-493f-9853-06f71f309a80"],["SMSqueue","ae27e7de-49ed-4be8-94b3-13ca86318095"],["TestSMSQueue","a0ac660e-9f03-488b-871f-3dc86dd2b4a7"],["VIP Medical OB","ab71942a-b166-4d59-9197-f89e45934e64"],["VIP test","eb308429-d5c8-40e5-b8a3-45d47e358847"],["Vein Treatment Clinic OB","7da87516-bc68-4bd8-9b29-ea2fc83880d1"],["Vein and Pain Treatment Center OB","f71e68f6-8802-47bb-aa74-02381c6fe633"],["agents","ee129237-7068-418e-9a2e-5fb358228e0e"],["agents outbound","fc5e3102-44f1-4986-baaa-055ee92e0a98"],["agents voicemail","f928dc58-29f9-4e24-b800-e60da218269c"],["appoinment services specialist","867aa10b-fc21-4191-be50-6e9b6cec3f03"],["appointment services","19f0b5b9-8875-4a47-88f3-8593af239963"],["appointment services management","8207823a-7f5a-4139-b2f6-2079ca11fe47"],["bill scrub","173beb76-c9fa-48a1-900f-e06f18938216"],["collections","5c015129-26d2-4809-8167-95f4cf684833"],["conservative calls","b4c17929-4d5c-4e6f-a209-21d917d799ec"],["credentialing","6a26f564-497d-4469-b92b-8350fe1c5dad"],["existing patient","78a601cc-8aac-49c7-9b6b-755857711aee"],["existing patient spanish","9cb3815e-bbf2-4ac1-914c-02212667f86a"],["existing patient voicemail","0bc17c5b-7061-40a0-994d-d19cf9b05248"],["fd astoria","83b7c7c6-cf7b-4a3a-b117-341ac6cd1ea0"],["fd bethesda","e69c44f8-9680-45c9-8a0c-8dc7fac48224"],["fd bowie","7ed24c54-4dc8-49d5-b551-f6635d5f556a"],["fd brighton beach","0168594b-f139-42fc-9cc6-2fbbd314fdd1"],["fd bronx","9e2c080a-0a11-40a3-98f5-888551dac4b9"],["fd brooklyn","9bbe41dd-c5c4-4cf8-aaf0-67f14faa70b4"],["fd central park","75cdaf8d-b0b0-46c6-b357-9193f8cf39c5"],["fd clifton","3212501e-24a3-4242-aa40-4e757806dc66"],["fd connecticut region","bfb708d1-39e8-4e05-9819-522e87d42e62"],["fd edgewater","0d7345f4-cfba-4e32-b531-166417cb5009"],["fd fidi","da905254-dd03-43af-8fe0-f4788a82333e"],["fd forest hills","de4742f7-d05f-4ca4-9fba-5278c01e065f"],["fd harrison","b03a1769-e661-4207-9a67-a05ca1072583"],["fd hartsdale","395247a5-fb1b-4c62-b458-d92c3a9d7c72"],["fd hoboken","f01d61e6-a5ca-4d73-a066-8eb4b0786444"],["fd huntington beach","3b4e6b15-de79-4022-8bcc-8d49fb0c7174"],["fd irvine","8956b7e8-d2bf-40bb-af50-c71d488d1be3"],["fd jericho","760a420f-d832-458d-be39-5125e52d839e"],["fd maple lawn","3318bf80-9b08-4d49-a97f-4f9e75460ed0"],["fd midtown","8aaee4fb-363b-4131-a357-f7f7fd5a7920"],["fd morris county","4f2b6684-9abf-45dc-ab0d-4187137ed06b"],["fd morristown","e2357dff-a3fb-4cb9-b132-9a81ba48bb7c"],["fd national city","fa52ecfa-5b22-4c16-8996-c4c5963fd74d"],["fd newport beach","e670fac8-36a8-433a-b4cd-8e910e8bdb64"],["fd palo alto","e191175c-0107-477e-b890-b60642c7da54"],["fd paramus","9d4230e3-73cb-4de9-a80d-94e6955a5d0d"],["fd park hill","dc725464-e421-48f8-a23e-e7e263d9e3b0"],["fd port jefferson","c5c18b65-4ff5-4fbb-b0e4-f1e501ef641f"],["fd poway","15b8dda7-c757-457e-b0b2-7839682fe152"],["fd princeton","ebf33fd5-8b5c-4f62-a31f-56da22bc0d29"],["fd san diego","8e91897e-9a6d-4242-87dd-4c413398e4af"],["fd san jose","4807a135-c8a0-4378-b71b-478c4391da4a"],["fd scotch plains","d39243eb-c420-4ce9-a392-0ef504f6dce6"],["fd temecula","ef356fe5-9aad-43ce-9094-87c0a946ce9c"],["fd texas region","4757abaf-f0e6-450e-9c6e-5e100c05ed28"],["fd upper east side","1e63fc43-e18d-4a45-8ce6-dae65f0a6f02"],["fd west islip","dd0a3723-d425-41ae-a7de-06709f0f5bff"],["fd west orange","820fdd71-2cfc-474d-8635-18561ca3733c"],["fd woodbridge","205f2a37-32cc-4561-8208-f51dde8be501"],["fd woodland park","512606a9-e6d6-4072-b96c-558408d55392"],["fd yonkers","d052dbe4-4a32-478e-92ff-cbfe259aecd0"],["fibroid","b16212a8-5c15-4ff6-ad50-2fbd1c139281"],["high priority agents outbounds","6aa59c69-1d1a-4ec1-9ed2-6730402b9437"],["hmo referrals","7837e03e-3666-4764-85c0-78c6033a0a35"],["insurance verification","2ef58f90-6220-4f69-8809-58be817ddd83"],["medical records","bf4e3a89-e476-4b7d-a426-9db1b5a591ec"],["medical staff","83dd63d0-21fb-4cb5-b817-3ac542c885bf"],["patient accounting team","28718887-13b1-47be-8fe2-bdf5e9298668"],["patient success team","620e0ae3-ed49-4189-becb-594693aadf70"],["patient sucess team voicemails","ab186d4b-0941-4547-94e9-81867f825375"],["physician outreach","0d38173b-114d-4b36-9cf3-e96d5e28d857"],["physician referral team","777f26d2-f536-4623-9cf9-415278c38604"],["post verification","7cfb1cdc-9a76-49b5-9cdb-c75acd48de5e"],["post verification spanish","89ee39d0-138b-4937-a791-a831b18832fe"],["ps - escalation management","25a9b875-ef3b-483c-9037-639d882045bf"],["ps - escalation team lead","1aeadfd9-01ef-424d-b816-2eda458eadeb"],["rcm - tiffany","7b9a8858-34c4-44c6-8b3f-d50aa7562b58"],["referrals voicemail","846ad2bd-844e-42fa-818f-06baf8ebe097"],["repricing team - negotiations","70d52841-1a50-4b33-8884-2baadc95099c"],["repricing team - repricing","cf6078b8-6c35-4b25-a305-e8e8028627d0"],["russian speakers","8cdcbf26-c483-477e-ba24-eaa4d9d0fb79"],["spanish speakers","39f287ad-eea0-4a72-b3fb-8edd91fbb951"],["statement expert","7cc523bb-1349-4cf9-902c-6f3715c8c4b9"],["verification pain escalation","f3af485a-582d-42bc-a5bb-60a85e5edfd8"]
+  ],
+  routing: [
+    ["Appointment Services Agent","c34bbd92-0e6f-4063-bb12-16d5164c4ecb"],["Appointment Services Management","d8788d93-08a6-4a7f-b8c7-0971095d08ca"],["Appointment Services Specialist","5f73c4f6-3025-474c-989a-9fe238867db9"],["Basic Routing Profile","90f4299c-531b-43a2-a5ca-f5b18583f955"],["Conservative Calls","03b45241-150f-4581-ab5b-35780cc08b22"],["Front Desk CT","d58270a1-74ec-45a9-8361-ed843889ee8a"],["Front Desk LI","c193f98c-0c59-44b5-b29f-08a6c808655c"],["Front Desk LI 2","f26e4164-517b-4f43-abe6-4a3e887b8eb5"],["Front Desk LI 3","deb4bc13-93b5-4351-abcf-349af52ca38e"],["Front Desk MD","12ed0d56-a483-4418-8372-10e52aab4c35"],["Front Desk NJ (Hailie)","f58a2115-5100-4df1-839c-b7f62495f3b2"],["Front Desk NJ 2","1d1c28cb-2aae-4d48-8353-49e28f428d3e"],["Front Desk NJ 3","e9107de4-9cea-4710-8b9a-3aae40dabce5"],["Front Desk NJ 4","ccfb7a8d-7049-4eba-af3c-57540971c777"],["Front Desk NJ 5","39cf6c75-affe-4b32-ad29-fb32f372f536"],["Front Desk NYC","49355522-75c7-482c-879a-401a98c2a3a1"],["Front Desk NYC 2","3260021b-7dec-4cd1-8a90-7926fce65579"],["Front Desk NYC 3","f49b177f-6730-4980-8306-3e6a2e303e47"],["Front Desk NYC 4","b71b2f68-e06c-4a27-8c48-dfa458e4cdcb"],["Front Desk NYC 5","277db2b3-1a36-409d-821b-37ace95401a8"],["Front Desk North CA","1cbf219d-2027-4d48-aa29-702b4f4ce268"],["Front Desk South CA","fdb4a5b6-d427-40fb-823c-061c43900a61"],["Front Desk South CA 2","a49779a1-71b6-47dd-8fda-d1be2ea9a384"],["Front Desk South CA 3","88c8fdef-50b3-4941-afac-842f9de752fb"],["Front Desk TX","e7a844fd-c09f-4950-a02d-8fa87293ec60"],["HMO Referral Agent","9dcb82c6-097e-47c0-a5e0-f131a5f0bd52"],["IV - Agent","a360da81-02ca-4956-9c73-ca4ffe736316"],["IV - Agent + Escalation","118be141-61c2-4f74-96cd-7f5f6e5440ca"],["Medical Records","2b6b13d5-2de6-4af9-a2da-422700487604"],["Medical Staff","c137f359-f3e6-4921-b658-bdbb9229555d"],["PC - Existing Patient","55d61b8d-a78b-460f-b62d-5e8d5eb4c63d"],["PC - Existing Patient Spanish","2937aedd-c07f-4c98-97bb-c84a22660dde"],["PC - Hybrid All","af3ced39-fd6a-4b74-9353-27a9206b600b"],["PC - Hybrid PV","e18c373e-14ff-4a6e-8c64-00d6571b03b4"],["PC - Hybrid Spanish Speakers","3bd9d050-1126-4f87-bb15-8dd71fdc83ea"],["PC - New Leads","801628a7-1770-43db-acac-71f955cd54dd"],["PC - New Leads OB","95ee59df-cd45-47ef-84b4-8e40f8dc6c1a"],["PC - New Leads OB + Spanish","a35e3cf9-f4dc-4425-b660-3bd3d6dd9475"],["PC - New Leads Spanish","5ce83493-7334-44ce-b82e-5f36802b8f00"],["PS - Management","63bb0ba1-bc3e-4b59-9879-7ee686128150"],["PS - Success Coordinator","c219bd42-b03b-43f6-bc22-5b38341a29fa"],["PS - Success Specialist","03d023c6-fbda-4cd6-b8ce-429c4bf62ac5"],["Pain Outbound Routing Profile","ec449a5e-750b-45c5-84ba-8cf274b55ac3"],["Physician Outreach","5f4c05a7-9783-4cab-bc5e-222680a828f2"],["Physician Referral Agent","ce42d6b5-63a9-4bf1-ae2e-190e4967ad87"],["RCM - Bill Scrub","d88e5a13-e0fc-4ae9-9660-8f1b61f29b7e"],["RCM - Collections","6e22c675-f05b-4e30-b9ac-08171fe3234d"],["RCM - Credentialing","01082c73-24f0-4168-858f-3b1d747efade"],["RCM - Patient Accounting","f7be3e29-55c7-4e93-877d-bfbc0e4cf0db"],["RCM - Repricing (negotiations)","379b7040-4901-45f1-9784-b368b6e0b790"],["RCM - Repricing (repricing)","f37129d1-c478-4e26-88ba-0d81d5801e17"],["RCM - Tiffany","5e6ad9d7-ccae-4106-b80c-4cf2a735ece4"],["Referral Agent - All","3d253b18-d554-44e1-ac0d-60ed81223e9d"],["SMS-Emergency-line","4f2b329e-df73-4e26-a610-b4e7b53ff043"],["Test MJ","fd3c89e7-0494-42ea-aa4a-4e562bd1d1a9"],["VIP Medical Group","2e4ca9a7-b065-4458-9cbf-cda31ea9778e"],["VIP Test","1a75fe20-2e59-43ff-a5b2-c23de3b527d3"],["Vein Outbound Profile","48aaf00a-5d1a-4a79-9cb8-494a690949d6"],["Vein and Pain Treatment Center","4fe0b7d7-2454-49d3-b3e1-eb4354a764fc"]
+  ],
+  phones: [
+    ["+19174754669","Test VIP","DID"],["+19174105288","NY - Physician Outreach (Referrals)","DID"],["+16314497507","NY - Long Island Vein Leads","DID"],["+19173384545","Patient Success Team","DID"],["+14753656590","CT - Vein Leads","DID"],["+19734949693","NJ - Pain Leads","DID"],["+12152533852","PA - Front Desk","DID"],["+18007068998","Daily Verification Team","TOLL_FREE"],["+19174105044","RCM - Repricing Team (Negotiations)","DID"],["+19739434224","NJ - Fibroid","DID"],["+18007576658","Physician Referral Team","TOLL_FREE"],["+13018594542","old MD - Patient Success - TEST","DID"],["+19179608772","Physician Referral Team","DID"],["+19735673532","Physician Outreach (Referrals)","DID"],["+19174105634","NYC - Pain Leads","DID"],["+19174104944","RCM - Credentialing","DID"],["+12034086696","CT - Front Desk","DID"],["+19174105562","VIP Medical","DID"],["+18582950501","South CA - Front Desk","DID"],["+17377074575","TX - Physician Outreach (Referrals)","DID"],["+19177685707","Test Jason","DID"],["+19175819799","RCM - Repricing team (Repricing)","DID"],["+16692010667","North CA - Front Desk","DID"],["+16694674988","CA - San Jose Leads","DID"],["+19735006768","NJ - Front Desk","DID"],["+19179203006","NYC - Front Desk","DID"],["+13019006334","MD - Capital Area Front Desk","DID"],["+18447844313","TEST","DID"],["+18445945914","Test Hubspot","DID"],["+16232592025","Engineering Team Automation Number","DID"],["+18337312402","—","TOLL_FREE"],["+17854706377","—","DID"],["+17372523505","TX - Front Desk","DID"],["+19177684088","RCM - Tiffany number","DID"],["+12154009167","PA - Vein Leads","DID"],["+13018594566","MD - Maryland Leads","DID"],["+18009404017","Toll Free Leads","TOLL_FREE"],["+19174104893","RCM - Bill Scrub Team","DID"],["+16198660441","CA - Physician Outreach (Referrals)","DID"],["+18888050424","Insurance Verification","TOLL_FREE"],["+19174104950","RCM - Collections","DID"],["+18588686651","CA - San Diego Leads","DID"],["+19174105649","NYC - Vein Leads","DID"],["+16314503772","NY - Long Island Front Desk","DID"],["+14092482010","—","DID"],["+14753656603","CT - Physician Outreach (Referrals)","DID"],["+19174105516","NY - Russian Speakers","DID"],["+18554810365","—","TOLL_FREE"],["+18008195944","Spanish Speakers","TOLL_FREE"],["+18005834451","HMO Referrals","TOLL_FREE"],["+19174104930","RCM - Patient Accounting Team","DID"],["+19734949660","NJ - Vein Leads","DID"],["+19174105627","Supervisor Patient Success Team","DID"],["+15126508970","TX - Vein Leads","DID"],["+19177685814","—","DID"]
+  ],
+  qc: [
+    ["AS - Maria Uy","USER","599606af-316b-4933-88fe-c53460767e6b"],["Block Number","QUEUE","c13a44fb-718a-4c4e-8321-29897bdaa264"],["FD CT/TX - Melissa Pieffer","USER","c39a11e7-c692-4e3c-bed1-64f69652f09b"],["FD CT/TX - Nicole Skelton","USER","817febf6-25b9-4015-b06c-55c586657c82"],["FD MD - Andrew Wilson","USER","b7e8f762-5f6e-41e0-bbe1-1078e288a12e"],["FD MD - Donna Akers","USER","31ffa129-8bbc-4fd5-b555-92b7471aaa76"],["FD NJ - Hailie Mack","USER","0bb51074-262d-4870-bc43-b51cb4e9fc74"],["FD NJ - Marcela Salazar","USER","66f533c6-e2f0-41cd-8153-47c52da90841"],["FD NY - Annerys Ramirez","USER","82c4b0f9-2d0b-4bb5-9079-f8880f39d3d2"],["PC - Veronica B","USER","0ddfdbc7-6603-4961-af76-6b261372255c"],["PC - Aila Posadas","USER","4c86de71-6014-4018-b8f9-5c785a1db155"],["PC - Alejandro Hincapie","USER","e0a75c74-594a-412f-bb88-939f2172fb81"],["PC - Alex Restrepo","USER","3e650c5e-48ee-4539-b366-ea2250bacc12"],["PC - Alexander Ryan","USER","53c829fa-6e80-476b-807c-6a821403f54b"],["PC - Almebeth Moreno","USER","6a090d32-0ee0-46b6-be13-149f6e741a71"],["PC - Anakarina Villarroel","USER","bbc575ff-1723-40ef-aa5e-fc7a726ef661"],["PC - Ashley Martinez","USER","a0d1c39d-ad21-4238-b03d-87d42ab7804b"],["PC - Bill Valle","USER","17d1e296-3dbb-4387-b87a-521af2284563"],["PC - Camilo Jaramillo","USER","2ca31a53-931d-480e-a7b2-a32ea8e4d527"],["PC - Candance Tan","USER","0e08535f-0a47-42ee-8da0-034906ef92fa"],["PC - Cheska Pendon","USER","9c84ecd1-df21-474d-8f2c-ea881fbcfbeb"],["PC - Cindy Guzman","USER","6a202932-07cc-4056-ae26-3ac1a5dad52b"],["PC - Cristobal Vanegas","USER","2039a1f1-af42-4ebc-bcf0-e0de6cafa668"],["PC - David Jimenez","USER","444c3ff8-4561-4485-940a-ef543667d0fa"],["PC - Farlie Galan","USER","a008a67b-6f62-499b-bf68-3075ee0befb5"],["PC - Francis Aquino","USER","768b9868-3a5c-4ebe-9d84-be1852595e4d"],["PC - Jeremy Ouano","USER","0ab53657-03a3-480b-b27a-4cae51aae682"],["PC - Joelys Fuentes","USER","60645d23-3c73-4c40-9c12-6707a8677a8b"],["PC - Jonell Gaviola","USER","fb6d99f9-ab5c-4d68-b11e-54627a7dccdd"],["PC - Jose Hernandez","USER","6efd4e8b-d1d0-4f24-96d0-e314ea1b039c"],["PC - Josue Bellon","USER","05e3eeb4-12b6-4409-8ea8-8111d77c112e"],["PC - Joy Labis","USER","aa8c5bd4-41f4-46b7-b0e8-01201dcd3002"],["PC - Juan Arango","USER","c120aa37-713b-49e5-88f1-92415ea3ef17"],["PC - Juan Bustamente","USER","575d7bc3-14af-4f3e-8a4e-2b1826ca02a9"],["PC - Juan Pelaez","USER","52f1bd61-2ca2-4b67-92b8-9f68fa8a20b7"],["PC - Juliana Torres","USER","b315c090-a85e-4bb5-9cb5-982b3a1cf289"],["PC - Karen Martinez","USER","8e0b94de-426b-420a-bfc3-5fbb1dc75822"],["PC - Karl Bustamente","USER","1a3f3729-9305-4e96-bcf0-306cf5b77cd4"],["PC - Kathrina Galendez","USER","4ee15daa-a634-4aba-9d55-96057d2b2dd5"],["PC - Katlen Salcedo","USER","30fd3213-fc6e-42a2-b64c-16d8147afe3b"],["PC - Kelly Puerta","USER","8cb3303a-252c-44ba-b1b5-0d976d6dcfdd"],["PC - Louiella Dalura","USER","a37f8628-a3df-4a34-8a66-2351d59a9596"],["PC - Lovely Acierto","USER","2a6e74e6-caa7-4bd2-a821-fcb9b3a05d06"],["PC - Lucksor Pantoja","USER","a536267e-4943-4555-9f14-d149de4b9e62"],["PC - Luis Quiceno","USER","36fcdfba-46e8-4b12-ba16-9297584c1a48"],["PC - Luis Serna","USER","f58e7756-efe6-42c9-9553-598142c73b90"],["PC - Maria Suarez","USER","5a6f94ea-a4cc-4aaa-acf5-9ad3a32c44ad"],["PC - Marialys Rodriguez","USER","2678265b-2c7a-4185-a232-79e8aa7fc145"],["PC - Marianiel Coco","USER","791b6099-2e10-4441-8c2f-f28ed6dc2c03"],["PC - Mauricio Restrepo","USER","232a1fb4-32cf-4dd3-bee2-02398b237128"],["PC - Melody Gamotin","USER","f33d2d50-c31d-4cdd-820b-9752e3d0a9be"],["PC - Natasha Maldonado","USER","ce7a85df-3484-4c68-9b6c-c01b6211cb89"],["PC - Nicolas Martinez","USER","138f3711-9c9e-4a74-b681-f472bd8638ae"],["PC - Pablo Arcila","USER","1e50b4f9-8333-4629-a63a-8f0c270d08ef"],["PC - Quinie Sasa","USER","18f1e26b-a81a-4f76-b4d1-fec726ab3953"],["PC - Samuel Trejos","USER","ec60b3c1-7951-4a96-8401-d39bfe57889d"],["PC - Tatiana Franco","USER","128cb54e-42e7-4cb6-b674-a3f99ee37ad3"],["PS - Alex Caballero","USER","bd22079a-201b-47ec-b79f-ba4c72ac5a07"],["PS - Alexander Uribe","USER","807bc1ec-af37-4363-b13c-5e951381624a"],["PS - Ana Tamara","USER","c87f46f0-f884-48f0-91a6-94f50e046a4e"],["PS - Camila Arboleda","USER","cce4b2dc-d22b-450d-86bb-9aeb541fce69"],["PS - Camilo Vargas","USER","4b810154-fb80-4d9d-b702-6aeb7bee593c"],["PS - Daniel Moreno","USER","f40ad5f2-d4e1-4889-b544-a7d09116e8df"],["PS - Danilo Antiquera","USER","74c2c8dc-06d0-49af-80d3-cd2bf2dc4a4d"],["PS - David Vargas","USER","b45cdd5c-21a1-4c25-8743-efdd27fda9b8"],["PS - Dhomas Abid","USER","92a05926-0172-4cfe-af11-7395f6839a9e"],["PS - Ediel Corujo","USER","d6c74d89-118d-48fa-8513-019c86bf9fbe"],["PS - Elle Azombrado","USER","762d7162-08ad-4b7b-9971-7b03d4cfec34"],["PS - Frances Rosado","USER","9deb72aa-f3d3-4035-8b71-bf3f298f8e30"],["PS - Jea Balaga","USER","391864bf-33ba-4e30-ba58-0880f9b07bd7"],["PS - Laura Mercado","USER","656acaf7-9484-4e2f-bf9d-20ae2467af6d"],["PS - Marriane Jacob","USER","1a87d953-04d0-458a-8abd-0028ea5ca7d9"],["PS - Maya Rodriguez","USER","37fa21c1-61b4-4e22-8578-2571c0bea529"],["PS - Miguel V","USER","94126b02-c60c-4aea-89b2-0cce2bb245dc"],["PS - Mireisa Gonzalez","USER","f7e9201e-108f-42cc-8c38-6fa79213e858"],["PS - Nicolas Angel","USER","f1508f77-8d99-47b6-9988-53814e3eeb16"],["PS - Rena Recio","USER","850a5854-d1af-4ca2-89e0-d376e72fa49e"],["PS - Reyvin Obach","USER","337f0f45-2942-4755-a105-5fe737d381fd"],["PS - Thelma Libatog","USER","ee94b071-b940-4626-bcb5-ef0665fcd3a0"],["PS - Tania Martinez","USER","55c80695-28a9-4259-b476-c6b5780e4ffc"],["TX FD - Evelyn Romero","USER","30048f84-5311-4922-814a-c28f508d9b90"],["TX FD - Melissa Pieffer","USER","72bf2890-6ce7-43a1-a305-9d43a9397097"],["TX FD - Nicole Skelton","USER","cdba8d68-17cb-49d5-bc75-be97422421cf"],["Training team","USER","faeddf95-e56e-4976-8a8a-01b597335c48"],["agents","QUEUE","7d595d15-f5a8-4bdb-b6df-9af829ef2e47"],["appoinment services specialist","QUEUE","523ebf6e-4d15-40dc-87d7-0fcd13eb531f"],["appointment services","QUEUE","2203776a-17da-4f98-a279-687eb8b09e20"],["appointment services management","QUEUE","4f39b5f7-e1b3-4594-858b-20d34fa628a0"],["existing patient","QUEUE","a3f253ac-42fd-442a-8347-0c82bbab4323"],["existing patient spanish","QUEUE","ac09c769-cefd-413a-a427-696a010dfa21"],["fd astoria","QUEUE","9ef3f12d-12fa-4c3a-9a21-5d79ce34c15c"],["fd bethesda","QUEUE","4c3974dd-2332-42da-88c7-28d4e232080f"],["fd bowie","QUEUE","434703ab-53e3-4824-9408-5437759760ae"],["fd brighton beach","QUEUE","0006f7c0-03a1-468c-96b7-a24d23ec9fc1"],["fd bronx","QUEUE","9b42b9aa-81de-46a2-abb7-bfb9698ea35a"],["fd brooklyn","QUEUE","6e05993d-6eae-48fc-a7f0-79a98fd88ee5"],["fd central park","QUEUE","f312f3e7-3020-4e36-ae72-6af12c33b054"],["fd clifton","QUEUE","1057d658-6d10-41b0-81a1-8c060e0e083b"],["fd connecticut region","QUEUE","76949bee-dcc1-4a89-9222-a923c754744a"],["fd edgewater","QUEUE","89d9067a-6b4d-4277-a03b-24b177e58fd6"],["fd fidi","QUEUE","b8283d71-60c7-404c-92ba-a89261498ca7"],["fd forest hills","QUEUE","1af79647-db01-4698-b298-646dc8ad6353"],["fd harrison","QUEUE","f86fb38b-b311-4e8b-8910-741d8c9c1639"],["fd hartsdale","QUEUE","449ec805-c0f1-4188-a146-98ccc1ef43b3"],["fd hoboken","QUEUE","99a7d225-5a3e-438a-9a96-41ea3c364b44"],["fd huntington beach","QUEUE","55a1e92a-9489-422c-91bf-7b4673b52590"],["fd irvine","QUEUE","6a4966ed-edc7-4c77-a460-ea0eed339c9f"],["fd jericho","QUEUE","ee0f7d56-d887-41f1-914b-ac5ce0e6431b"],["fd maple lawn","QUEUE","ed81b920-7d56-4e47-bb95-d8d4efc54728"],["fd midtown","QUEUE","a4e92292-cf8f-400a-b110-02a9052b54d0"],["fd morris county","QUEUE","7557c52c-3013-4ae6-8d0a-5bf18d653d41"],["fd morristown","QUEUE","53ec1511-3348-4dde-9b58-231186140e68"],["fd national city","QUEUE","11ef8231-c22b-4454-9642-e7fa559cd494"],["fd newport beach","QUEUE","8f0b52e7-aef3-4ab3-884a-2cc5759c6aa9"],["fd palo alto","QUEUE","e9b16115-be77-4774-ae54-80b09132fc43"],["fd paramus","QUEUE","f09d0dbd-71c1-47cd-94ef-e7edac0290f3"],["fd park hill","QUEUE","c55a0cef-6634-4ea3-9a67-0b441e6199c5"],["fd port jefferson","QUEUE","7d448851-9dff-45c3-b2a4-b5093c823f69"],["fd poway","QUEUE","70376706-8bbb-4286-b159-e5b3cc171b30"],["fd princeton","QUEUE","73662f05-5121-4b88-b426-d10bded3f9ac"],["fd san diego","QUEUE","6776f866-177d-4255-a7fb-3ed5b7e896a8"],["fd san jose","QUEUE","7ea2dfb1-f8df-43a7-8cb0-5b52e0c7977d"],["fd scotch plains","QUEUE","128ec19a-4c18-417f-b8bf-01731c227a55"],["fd temecula","QUEUE","6f588131-90b1-410d-8df4-24c443ad6ff1"],["fd texas region","QUEUE","05f74350-9fcf-4795-b2f1-b3a270eb227c"],["fd upper east side","QUEUE","1a0607f3-326b-44b2-bcf5-5480fe23f824"],["fd west islip","QUEUE","c053a90b-6d1b-4019-90ef-80e4afe4f051"],["fd west orange","QUEUE","4d90ddb7-6bec-4e24-b516-ae2680c1649f"],["fd woodbridge","QUEUE","4c777fe3-f97a-4d74-81fc-d0f63df15852"],["fd woodland park","QUEUE","f3b9aedf-3ed5-4da7-b128-add9e0f7e938"],["fd yonkers","QUEUE","a018a4a3-ebec-48cf-b557-21aada26e8a1"],["fibroid","QUEUE","a3510011-12ee-485a-bd53-4b9aac0b7c32"],["hmo referrals","QUEUE","0ddd3c33-c2ab-4ab0-b45b-69e2239a257b"],["new leads","QUEUE","75565a7e-afc1-43a2-90f6-0a083eff7d5c"],["patient success team","QUEUE","add563ae-88aa-4f33-9eff-4b7ba65fb247"],["physician outreach","QUEUE","30e52753-5a2d-490b-bb8e-8732506e77ed"],["physician referral team","QUEUE","7511983c-e3cd-45ce-8abb-1a26d2f5ef91"],["post verification","QUEUE","14576447-02d8-451d-8db4-8e359fc0d84b"],["post verification spanish","QUEUE","40ed861c-0c40-42e4-80db-93cc802d309f"],["ps - escalation management","QUEUE","ec1292eb-b161-48ab-b665-400ffd289345"],["ps - escalation supervisor","QUEUE","1356f55d-d6f4-41fd-8078-1a418851b746"],["ps - escalation team lead","QUEUE","e0a48fb7-2546-4449-8a8b-d5c39564d1a6"],["rcm - bill scrub","QUEUE","28636a56-a291-4ea9-b7cc-d8c1d4e53ffb"],["rcm - chesney roxas","USER","508ec79f-be1d-4883-a23f-73b28c1f474d"],["rcm - collections","QUEUE","7611b3a5-73ef-4c89-9db6-50e041841017"],["rcm - credentialing","QUEUE","29b4b804-28a3-4fb4-98ff-68ded1ee08eb"],["rcm - pt accounting team","QUEUE","5a483a8b-e3f8-4e68-b1a7-66a78715698a"],["rcm - repricing team (negotiations)","QUEUE","a88e6692-685f-480b-9126-74fb397ea676"],["rcm - repricing team (repricing and reimbursement)","QUEUE","9325cac9-2add-42de-886a-bb0f51ae9572"],["rcm - tiffany","USER","3b265254-b121-4f9d-af24-14e68053bb76"],["russian speakers","QUEUE","e8f064b9-ad80-4e8a-9702-84fab4e0f3d9"],["spanish speakers","QUEUE","9c002425-fbbb-4486-b5bb-533b64782d23"],["statement expert","QUEUE","b7436042-4f17-4823-8d20-c8fdaec48d38"],["verification pain escalation","QUEUE","a01d7bd0-091f-4598-8b63-1015c1a3aa0f"]
+  ],
+  prompts: [
+    ["Autovoicemail_CT","c698aa27-ec29-4449-8b33-bfd78f756d06"],["Autovoicemail_Cancellation_CT","914c5e79-9a68-481c-9010-894c9c623958"],["Autovoicemail_Cancellation_LI","db14239b-33bc-48cb-ad68-1581989e4673"],["Autovoicemail_Cancellation_MD","db906d6a-d870-41d5-bbe1-5112f71ae481"],["Autovoicemail_Cancellation_NJ","d6b13d0b-bfc0-465b-a788-b748e8eb3bb2"],["Autovoicemail_Cancellation_NJ_Pain","1aa67049-6d74-4497-a274-71aec5a40c89"],["Autovoicemail_Cancellation_NYC","d487d9cf-6a6e-4800-83f2-9c3f84e7de1e"],["Autovoicemail_Cancellation_NYC_Pain","74551535-aa57-43a3-b2bb-067282912387"],["Autovoicemail_Cancellation_NorthCA","1ecf89d9-1a2d-4c05-9ac6-2b3f14a96785"],["Autovoicemail_Cancellation_PA","7806f4a3-37f5-43b5-bc54-0678894826d8"],["Autovoicemail_Cancellation_SouthCA","ae7e8ffe-18a8-4f7f-a5b4-c85a5c6d35d6"],["Autovoicemail_Cancellation_TX","4bb072ab-9c40-4cb3-b44e-afa552718dd2"],["Autovoicemail_MD","f5614fe6-1530-41c0-9cd3-cc92054db8b7"],["Autovoicemail_NJ_Pain","2142ecaa-4f4c-485f-8508-9cea22b2b818"],["Autovoicemail_NJ_Vein","744304fd-0c9b-4f18-a376-d7b313ab48b5"],["Autovoicemail_NYC_Pain","6e0b53cb-25d0-4ef3-8700-911ef3c19e7f"],["Autovoicemail_NYC_Vein","38dd5fa9-ec1c-485f-966f-71eaef042bfe"],["Autovoicemail_NY_LI","69d41415-65c2-4b5b-bfae-3c93e1627545"],["Autovoicemail_NorthCA","4dd6b291-35bc-4d15-b56b-0100350e7235"],["Autovoicemail_SouthCA","97649817-ac1a-4908-a85a-ec778c391133"],["Autovoicemail_TX","a7b3fd83-1535-4bea-bdb9-7fb696be9b4c"],["Autovoicemail_Tollfree","252cf80c-7076-4188-8fde-8410fb631cc0"],["Beep.wav","5694e9e0-eae0-44e6-b3ca-40ffe78b8d1d"],["CustomerHold.wav","2e4559da-5d88-4c02-bc56-264feb3de87f"],["CustomerQueue.wav","bb783e19-a46e-462b-bea2-9ef582304395"],["FPC_Afterhours","2412cc36-ec27-4924-8064-c5b66d1da604"],["FPC_Greeting","6c989cce-a697-49a7-b36b-4a14f37be1d4"],["FPC_IVR_BusyAgent_Voicemail","81ebd703-67c7-4cf5-a28c-919a4a36d611"],["FPC_IVR_SpecialDaysClosed","2ca45eb9-5568-4547-89c3-b2312260e3b2"],["IVR_CallBack_1stPrompt_RUS","0d1cfa91-7a17-40d7-ab2b-2133ce2d2390"],["IVR_CallBack_1stPrompt_SPA","5dd00a2a-82a4-466d-a127-44e5297252c1"],["IVR_CallBack_2ndPrompt","d9bcf536-5ec9-4228-9804-82a183f9bcd8"],["IVR_CallBack_2ndPrompt_RUS","229ebb73-c825-4a90-aa65-fb08a95073b3"],["IVR_CallBack_2ndPrompt_SPA","2ba9e819-e17f-4d88-8dde-08a873ed35d2"],["IVR_CallRecording_Eng","6788569a-1652-48a1-b22c-fddf57ccced0"],["IVR_CallRecording_Spa","e37e3624-5e1a-4b1c-b523-3fa25890e252"],["IVR_Eng_VoicemailInfo","c7c070c5-0f26-4fea-adaa-a79a33e09e94"],["IVR_EnterNumber","c2eeb0dc-c8d1-4906-b9c8-23ade8b79165"],["IVR_EnterNumber_RUS","f8530bd7-5c19-43a5-ba3e-041d531610b7"],["IVR_EnterNumber_SPA","992f747c-88d0-46c0-ada1-9e49f23d8e07"],["IVR_InvalidNumber","693ae935-f94b-4363-b960-83218ef3a75e"],["IVR_InvalidNumber_RUS","fea8e453-d1e9-42ee-801d-4694543c739f"],["IVR_InvalidNumber_SPA","17479fdb-a79b-45c3-9778-741e8b6d259b"],["IVR_RUS_UnsuccesfulCallback","f3a408ae-64f1-4855-a3ab-c545ea2673e7"],["IVR_RUS_VoicemailInfo","0c323015-5ca4-4975-94a0-2e86d01f1eed"],["IVR_RUS_VoicemailSaved","2c92c3c6-069b-406d-8b5d-ba48d1759a44"],["IVR_Russian_CallRecording","7e0d983b-0086-4184-a6b0-a0724641dfdf"],["IVR_Russian_Routing","710609af-3ff9-433d-8857-174c1b357297"],["IVR_SPA_UnsuccesfulCallback","85af20e3-c284-4293-a59c-8c41d601b85d"],["IVR_SPA_VoicemailInfo","facc67cc-e3e4-4a3a-a2f2-5cf67868fc64"],["IVR_SPA_VoicemailSaved","11aca36b-b97a-4b59-bc4d-732cacaa5963"],["IVR_VoicemailSaved","15d66bb3-8ef5-4ee8-9801-cbaacb377d2b"],["Music_Jazz_MyTimetoFly","f32637a9-2dff-4ad4-bfd7-dc21b0177798"],["Music_Pop_ThisAndThatIsLife","01b22ad7-aa77-462c-9528-93cd52284d52"],["Music_Pop_ThrowYourselfInFrontOfIt","ea2ececf-7286-4767-91cd-70887243402d"],["Music_Rock_EverywhereTheSunShines","9dfbe0fa-fa5d-43fc-84d9-365f8f908af9"],["Outbound Recording Shorter","240920de-c119-4e2c-852c-50ede40f128b"],["Outbound_Recording_Prompt","cf68a437-ca48-400f-aeef-3138ae072139"],["RUS_IVR_BusyAgent_Voicemail","4a42e979-0cdd-47e6-a06e-bc30458d9f0d"],["Russian Greeting/Waiting","aa3025ec-f353-4750-8a2d-8fa88c17ed3a"],["SPA_IVR_BusyAgent_Voicemail","ed8b70f2-0776-4375-8b21-8a56d889c2c7"],["SPA_IVR_GreetingWaiting","fb6d9396-13c9-40ca-90b9-239370db5921"],["VIP_IVR_Afterhours","5294ba02-0f6f-43b0-8643-c7c253dd233a"],["VIP_IVR_BusyAgent_CallBack","e08991ee-cb97-4e8d-a790-654825feb154"],["VIP_IVR_BusyAgent_Voicemail","a3f24914-0587-4011-b341-c7525d455998"],["VIP_IVR_CallBack 1st Prompt","bfbaa28c-6eb6-482f-aa9d-8d186daad0c7"],["VIP_IVR_Greeting","36aed4a4-0402-4758-9a25-bb2a343fed86"],["VIP_IVR_NewLead_ExistingPatient","9dd95de8-ce2b-4331-8153-c0a40e7baab6"],["VIP_IVR_SpecialDaysClosed","f5219660-0db8-456e-a953-6dc4b39555e7"],["VIP_IVR_SuccesfulCallBack","5916b5b0-a980-4209-a06c-09289523111c"],["VIP_IVR_SuccesfulCallBack_RUS","a7cece25-59a3-4f15-953b-40482f99dcc5"],["VIP_IVR_SuccesfulCallBack_SPA","597d17d4-d058-49f9-8d13-236870c3b2a9"],["VIP_IVR_UnsuccesfulCallBack","99b72f6b-4e40-478e-a874-b000357c96d8"],["asa","77348d29-6ab1-46c1-a723-4d9a04b07e87"],["hold_music","c1a99f66-4190-483b-a3bd-c4bc498f9f0c"]
+  ]
+};
+
+let currentTab = 'queues';
+let toastTimer;
+
+function render(tabId, query) {
+  const q = query.toLowerCase().trim();
+  const configs = {
+    queues:  { data: DATA.queues,   tableId: 'tbl-queues',  emptyId: 'empty-queues',  rcId: 'rc-queues',  countId: 'count-queues',  renderRow: (r) => `<td class="name">${r[0]}</td><td class="id" onclick="copyId('${r[1]}')">${r[1]}</td>` },
+    routing: { data: DATA.routing,  tableId: 'tbl-routing', emptyId: 'empty-routing', rcId: 'rc-routing', countId: 'count-routing', renderRow: (r) => `<td class="name">${r[0]}</td><td class="id" onclick="copyId('${r[1]}')">${r[1]}</td>` },
+    phones:  { data: DATA.phones,   tableId: 'tbl-phones',  emptyId: 'empty-phones',  rcId: 'rc-phones',  countId: 'count-phones',  renderRow: (r) => `<td class="id" onclick="copyId('${r[0]}')" style="color:var(--ink);font-size:0.82rem">${r[0]}</td><td class="name" style="font-weight:400">${r[1]}</td><td><span class="type-badge ${r[2]==='TOLL_FREE'?'badge-tf':'badge-did'}">${r[2]}</span></td>` },
+    qc:      { data: DATA.qc,       tableId: 'tbl-qc',      emptyId: 'empty-qc',      rcId: 'rc-qc',      countId: 'count-qc',      renderRow: (r) => `<td class="name">${r[0]}</td><td><span class="type-badge ${r[1]==='USER'?'badge-user':'badge-queue'}">${r[1]}</span></td><td class="id" onclick="copyId('${r[2]}')">${r[2]}</td>` },
+    prompts: { data: DATA.prompts,  tableId: 'tbl-prompts', emptyId: 'empty-prompts', rcId: 'rc-prompts', countId: 'count-prompts', renderRow: (r) => `<td class="name">${r[0]}</td><td class="id" onclick="copyId('${r[1]}')">${r[1]}</td>` },
+  };
+
+  Object.entries(configs).forEach(([tid, cfg]) => {
+    const rows = cfg.data.filter(r => !q || r.join(' ').toLowerCase().includes(q));
+    const tbody = document.querySelector(`#${cfg.tableId} tbody`);
+    tbody.innerHTML = rows.map(r => `<tr>${cfg.renderRow(r)}</tr>`).join('');
+    document.getElementById(cfg.emptyId).style.display = rows.length ? 'none' : 'block';
+    document.getElementById(cfg.rcId).textContent = q ? `${rows.length} of ${cfg.data.length}` : `${cfg.data.length} items`;
+    document.getElementById(cfg.countId).textContent = rows.length;
+  });
+}
+
+function switchTab(id, btn) {
+  currentTab = id;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + id).classList.add('active');
+}
+
+function copyId(id) {
+  navigator.clipboard.writeText(id).catch(() => {});
+  const toast = document.getElementById('toast');
+  toast.textContent = id;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+function toggleTheme() {
+  const root = document.documentElement;
+  const cur = root.getAttribute('data-theme');
+  const dark = window.matchMedia('(prefers-color-scheme:dark)').matches;
+  if (!cur) { root.setAttribute('data-theme', dark ? 'light' : 'dark'); }
+  else if (cur === 'dark') { root.setAttribute('data-theme', 'light'); }
+  else { root.removeAttribute('data-theme'); }
+}
+
+document.getElementById('search').addEventListener('input', e => render(currentTab, e.target.value));
+render(currentTab, '');
+</script>
