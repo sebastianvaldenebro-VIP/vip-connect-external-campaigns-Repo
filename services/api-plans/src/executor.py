@@ -51,6 +51,7 @@ from botocore.exceptions import ClientError
 
 from builders import (
     _JOURNEY_FLOW_NAME,
+    all_known_locations,
     build_campaign_params,
     build_segment_name,
     campaign_to_segment_filters,
@@ -145,6 +146,11 @@ def _is_branded(campaign: dict) -> bool:
     return campaign.get("deliveryType") == "branded"
 
 
+def _is_sms(campaign: dict) -> bool:
+    """Return True if this campaign uses the EUM SMS bulk delivery channel."""
+    return campaign.get("deliveryType") == "sms"
+
+
 # ── Branded dialer boto3 singletons ──────────────────────────────────────────
 
 _lambda_client = None
@@ -219,6 +225,116 @@ def _count_branded_queue(campaign_id: str) -> int:
             break
         kwargs["ExclusiveStartKey"] = lek
     return total
+
+
+def _count_sms_queue(campaign_id: str) -> int:
+    """Count PENDING items in VipSmsCampaignQueue for polling SMS campaign completion.
+
+    Returns 0 when the queue is drained (all messages sent/failed/opted-out).
+    Paginates through all DDB pages — mirrors _count_branded_queue pattern.
+    Callers must handle exceptions without transitioning state.
+    """
+    table = boto3.resource("dynamodb").Table(
+        os.environ.get("SMS_CAMPAIGN_QUEUE_TABLE", "VipSmsCampaignQueue")
+    )
+    kwargs: dict = {
+        "KeyConditionExpression": "campaignId = :cid",
+        "FilterExpression": "#s IN (:p, :s)",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+            ":cid": campaign_id,
+            ":p": "PENDING",
+            ":s": "SENDING",
+        },
+        "Select": "COUNT",
+    }
+    total = 0
+    while True:
+        resp = table.query(**kwargs)
+        total += resp.get("Count", 0)
+        if total > 0:
+            return total  # early exit — non-zero means not drained
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return total
+
+
+def _stop_sms_campaign(cs: dict) -> None:
+    """Mark the VipSmsCampaignRuns record as ABORTED for a stopped SMS campaign.
+
+    Uses the primary key stored in cs (_smsRunsPlanId, _smsRunsSk) for a direct
+    update_item — no table scan needed.
+    Non-fatal — a failure here does not abort the plan-level stop.
+    """
+    campaign_id = cs.get("smsCampaignId", "")
+    plan_id = cs.get("_smsRunsPlanId", "")
+    sk = cs.get("_smsRunsSk", "")
+    if not campaign_id or not plan_id or not sk:
+        return
+    try:
+        now_iso = _now_utc().isoformat()
+        boto3.resource("dynamodb").Table(
+            os.environ.get("SMS_CAMPAIGN_RUNS_TABLE", "VipSmsCampaignRuns")
+        ).update_item(
+            Key={"planId": plan_id, "sk": sk},
+            UpdateExpression="SET #s = :a, completedAt = :t, exitReason = :r, updatedAt = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":a": "ABORTED",
+                ":t": now_iso,
+                ":r": cs.get("exitReason", "aborted"),
+            },
+        )
+    except Exception as exc:
+        logger.warning("_stop_sms_campaign error: %s", type(exc).__name__)
+
+
+def _complete_sms_campaign(cs: dict) -> None:
+    """Mark the VipSmsCampaignRuns record as COMPLETED for a queue-drained campaign.
+
+    Uses the primary key stored in cs (_smsRunsPlanId, _smsRunsSk) for a direct
+    update_item — no table scan needed.
+    Non-fatal — a failure here does not block plan-level completion.
+    """
+    campaign_id = cs.get("smsCampaignId", "")
+    plan_id = cs.get("_smsRunsPlanId", "")
+    sk = cs.get("_smsRunsSk", "")
+    if not campaign_id or not plan_id or not sk:
+        return
+    try:
+        now_iso = _now_utc().isoformat()
+        boto3.resource("dynamodb").Table(
+            os.environ.get("SMS_CAMPAIGN_RUNS_TABLE", "VipSmsCampaignRuns")
+        ).update_item(
+            Key={"planId": plan_id, "sk": sk},
+            UpdateExpression="SET #s = :c, completedAt = :t, exitReason = :r, updatedAt = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":c": "COMPLETED",
+                ":t": now_iso,
+                ":r": cs.get("exitReason", "queue_drained"),
+            },
+        )
+    except Exception as exc:
+        logger.warning("_complete_sms_campaign error: %s", type(exc).__name__)
+
+
+def _invoke_sms_sender(**kwargs: object) -> None:
+    """Invoke the SMS Sender Lambda synchronously (mirrors _invoke_seeder pattern)."""
+    import json as _json
+
+    response = _get_lambda_client().invoke(
+        FunctionName=os.environ["SMS_SENDER_FUNCTION_ARN"],
+        InvocationType="RequestResponse",
+        Payload=_json.dumps(kwargs).encode(),
+    )
+    if response.get("FunctionError"):
+        payload_bytes = response["Payload"].read()
+        raise RuntimeError(
+            f"SMS Sender Lambda error: {payload_bytes[:200]!r}"
+        )
 
 
 def get_branded_queue_counts(branded_campaign_id: str) -> tuple[int, int]:
@@ -773,6 +889,7 @@ def scheduled_run(plan_id: str) -> dict:
         _slog.error("scheduled_run_plan_not_found", plan_id=plan_id)
         return {"ok": False, "reason": "plan_not_found"}
     if plan.get("isTemplate") or plan.get("is_template"):
+        _slog.info("scheduled_run_skipped_template", plan_id=plan_id)
         return {"ok": True, "reason": "is_template"}
     if not _within_working_hours(plan):
         _slog.info("scheduled_run_outside_hours", plan_id=plan_id)
@@ -953,6 +1070,27 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _stop_branded_campaign(cs)
                 _emit_branded_metric("BrandedCampaignCompleted")
 
+        elif cs.get("smsCampaignId") and cs["status"] == "running":
+            # SMS campaign: poll VipSmsCampaignQueue PENDING count
+            try:
+                pending = _count_sms_queue(cs["smsCampaignId"])
+            except Exception as _poll_exc:
+                logger.warning(
+                    "tick: SMS queue poll failed for %s: %s",
+                    cs["smsCampaignId"], type(_poll_exc).__name__,
+                )
+                continue  # don't transition on poll error
+
+            if pending == 0:
+                logger.info(
+                    "tick: SMS campaign %s queue drained — completing",
+                    cs["smsCampaignId"],
+                )
+                cs["status"] = "completed"
+                cs["exitReason"] = "queue_drained"
+                cs["completedAt"] = _now_iso()
+                _complete_sms_campaign(cs)
+
     # Fire plans triggered by a specific campaign completing
     newly_completed = {
         cs["campaignId"]
@@ -1129,7 +1267,12 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                     cs["completedAt"] = now
                     _write_branded_run_summary(plan_id, run_id, cs)
                     _stop_branded_campaign(cs)
-                # ─────────────────────
+                # ── SMS cleanup ──────
+                elif cs["status"] == "running" and cs.get("smsCampaignId"):
+                    cs["exitReason"] = REASON_ABORTED
+                    cs["completedAt"] = now
+                    _stop_sms_campaign(cs)
+                # ────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
                     cs["status"] = "cancelled"
                     cs["exitReason"] = REASON_ABORTED
@@ -1179,11 +1322,16 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
             # ── Branded cleanup ──
             if cs["status"] in ("running", "creating") and cs.get("brandedCampaignId"):
                 _stop_branded_campaign(cs)
-            # ─────────────────────
+            # ── SMS cleanup ──────
+            elif cs["status"] == "running" and cs.get("smsCampaignId"):
+                _stop_sms_campaign(cs)
+            # ────────────────────
             if cs["status"] in ("running", "warming", "queued", "creating"):
                 cs["status"] = "completed"
                 cs["exitReason"] = "force_finished"
                 cs["completedAt"] = now
+                if cs.get("brandedCampaignId"):
+                    _write_branded_run_summary(run["planId"], run["runId"], cs)
         _delete_bucket_schedule_safe(run, bi)
         if bucket_def := (plan.get("buckets") or [])[bi : bi + 1]:
             if bucket_def[0].get("cleanup", bucket_def[0].get("deleteAfter", True)):
@@ -1542,6 +1690,8 @@ def skip_campaign(
             _safe_stop_campaign(cs["connectCampaignId"])
         if cs.get("brandedCampaignId") and cs["status"] == "running":
             _stop_branded_campaign(cs)
+        elif cs.get("smsCampaignId") and cs["status"] == "running":
+            _stop_sms_campaign(cs)
 
         cs["status"] = "cancelled"
         cs["exitReason"] = "skipped"
@@ -1606,6 +1756,10 @@ def force_stop_campaign(
             cs["completedAt"] = _now_iso()
             _write_branded_run_summary(plan_id, run_id, cs)
             _stop_branded_campaign(cs)
+        elif cs.get("smsCampaignId"):
+            cs["exitReason"] = "manually_stopped"
+            cs["completedAt"] = _now_iso()
+            _stop_sms_campaign(cs)
         cs["status"] = "expired"
         cs["exitReason"] = "manually_stopped"
         cs["completedAt"] = _now_iso()
@@ -1852,8 +2006,8 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
 
     next_bucket = plan["buckets"][next_index]
     for ci, campaign in enumerate(next_bucket.get("campaigns", [])):
-        if _is_branded(campaign):
-            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
+        if _is_branded(campaign) or _is_sms(campaign):
+            continue  # branded/SMS campaigns have no warmup phase — start directly in _start_one_campaign
         if not campaign.get("dependsOn"):
             cs = next_bucket_state["campaignStates"][ci]
             camp_name = campaign.get("name") or campaign.get("id", "?")
@@ -2172,8 +2326,8 @@ def _prestart_plan(target_plan_id: str) -> None:
     )  # carry over successes from prior calls
     attempted = 0
     for campaign in stage1_campaigns:
-        if _is_branded(campaign):
-            continue  # branded campaigns have no warmup phase — start directly in _start_one_campaign
+        if _is_branded(campaign) or _is_sms(campaign):
+            continue  # branded/SMS campaigns have no warmup phase — start directly in _start_one_campaign
         camp_id = campaign.get("id") or campaign.get("campaignId")
         if camp_id in already_warmed:
             continue  # already warmed in a previous prestart_check tick — skip
@@ -2289,18 +2443,112 @@ def _prestart_after_campaign(upstream_plan_id: str, campaign_id: str) -> None:
             )
 
 
+def _ensure_scheduled_run_permission(plan_id: str) -> None:
+    """Verify the EventBridge scheduled_run rule exists AND has permission to invoke this Lambda.
+
+    Guards two failure modes detected 4-6 min before trigger:
+    1. Missing rule: EventBridge rule was deleted (e.g., console accident). Recreates it
+       from the plan's trigger config via upsert_schedule.
+    2. Missing Lambda permission: a CDK deploy that recreates the function wipes custom
+       add_permission statements. Re-adds the statement so the cron can fire today.
+    """
+    import json as _json
+
+    from scheduler_manager import _rule_name, LAMBDA_FUNCTION_ARN, _account_id, upsert_schedule
+
+    rule_name = _rule_name(plan_id)
+
+    # ── 1. Verify the EventBridge rule itself exists ─────────────────────────
+    events = boto3.client("events")
+    rule_exists = True
+    try:
+        events.describe_rule(Name=rule_name)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+            rule_exists = False
+        # Any other error: assume rule exists, fall through to permission check
+
+    if not rule_exists:
+        plan = get_plan(plan_id)
+        trigger = (plan or {}).get("trigger") if plan else None
+        if not trigger or trigger.get("type") != "time":
+            _slog.error(
+                "scheduled_run_rule_missing_no_trigger",
+                plan_id=plan_id,
+                rule_name=rule_name,
+            )
+            return
+        try:
+            upsert_schedule(plan_id, trigger)
+            _slog.warn(
+                "scheduled_run_rule_recreated",
+                plan_id=plan_id,
+                rule_name=rule_name,
+                reason="rule_was_missing_before_trigger",
+            )
+        except Exception as exc:
+            _slog.error(
+                "scheduled_run_rule_recreate_failed",
+                plan_id=plan_id,
+                rule_name=rule_name,
+                error=str(exc),
+            )
+        # upsert_schedule adds the Lambda permission — no need to re-add below
+        return
+
+    # ── 2. Rule exists — verify Lambda invoke permission ────────────────────
+    lam = boto3.client("lambda")
+    try:
+        policy = _json.loads(lam.get_policy(FunctionName=LAMBDA_FUNCTION_ARN)["Policy"])
+        existing_sids = {s.get("Sid", "") for s in policy.get("Statement", [])}
+        if rule_name in existing_sids:
+            return  # already present — nothing to do
+    except ClientError:
+        return  # can't read policy; skip silently
+
+    # Permission is missing — re-add it before the cron fires
+    rule_arn = f"arn:aws:events:us-east-1:{_account_id()}:rule/{rule_name}"
+    try:
+        lam.add_permission(
+            FunctionName=LAMBDA_FUNCTION_ARN,
+            StatementId=rule_name,
+            Action="lambda:InvokeFunction",
+            Principal="events.amazonaws.com",
+            SourceArn=rule_arn,
+        )
+        _slog.warn(
+            "scheduled_run_permission_restored",
+            plan_id=plan_id,
+            rule_name=rule_name,
+            reason="permission_was_missing_before_trigger",
+        )
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code != "ResourceConflictException":
+            _slog.error(
+                "scheduled_run_permission_restore_failed",
+                plan_id=plan_id,
+                rule_name=rule_name,
+                error=str(exc),
+            )
+
+
 def prestart_check() -> dict:
     """Scan all plans and pre-warm any with a time-based trigger starting within 5 minutes.
 
     Called by handler.py for `action == "prestart_check"` (EventBridge rate(1 min)).
+    Also serves as a fallback trigger for plans whose scheduled_run EventBridge cron
+    invocation failed — detected at delta=-1 (one minute after trigger time).
     """
     _COT = timezone(timedelta(hours=-5))
     now_cot = datetime.now(_COT)
     now_hhmm = now_cot.hour * 60 + now_cot.minute
     warmed: list[str] = []
+    fallback_triggered: list[str] = []
 
-    # Single scan shared by both the prestart and stuck-run loops below
+    # Shared across both the prestart and stuck-run loops below.
     all_plans = list_plans()
+    cw = boto3.client("cloudwatch")
 
     for plan in all_plans:
         trigger = plan.get("trigger") or {}
@@ -2312,9 +2560,13 @@ def prestart_check() -> dict:
         try:
             t_h, t_m = (int(x) for x in time_str.split(":"))
             trigger_hhmm = t_h * 60 + t_m
-            # Pre-warm if trigger is 4–6 minutes away (5 ± 1 tolerance)
             delta = trigger_hhmm - now_hhmm
             if 4 <= delta <= 6:
+                # Pre-warm: trigger is 4–6 minutes away (5 ± 1 tolerance).
+                # Also verify EventBridge has Lambda invoke permission — a CDK deploy
+                # that recreates the function wipes custom add_permission statements,
+                # silently preventing the scheduled_run cron from invoking the Lambda.
+                _ensure_scheduled_run_permission(plan["planId"])
                 _slog.info(
                     "prestart_check_warming_plan",
                     plan_id=plan["planId"],
@@ -2324,6 +2576,57 @@ def prestart_check() -> dict:
                 )
                 _prestart_plan(plan["planId"])
                 warmed.append(plan["planId"])
+            elif delta == -1:
+                # Fallback trigger: the EventBridge cron should have fired ~80 seconds ago.
+                # If no run was started in the last 3 minutes, the cron invocation failed.
+                if plan.get("isTemplate") or plan.get("is_template"):
+                    continue  # templates never start runs; fallback metric would be a false alarm
+                latest = get_latest_run(plan["planId"])
+                already_started = False
+                if latest and latest.get("status") == "running":
+                    already_started = True
+                elif latest and latest.get("startedAt"):
+                    try:
+                        started_at = datetime.fromisoformat(
+                            latest["startedAt"].replace("Z", "+00:00")
+                        )
+                        if (_now_utc() - started_at).total_seconds() < 180:
+                            already_started = True
+                    except Exception:
+                        pass
+                if already_started:
+                    continue
+                _slog.warn(
+                    "prestart_fallback_triggered",
+                    plan_id=plan["planId"],
+                    plan_name=plan.get("name"),
+                    trigger_time=time_str,
+                    reason="no_run_found_80s_after_scheduled_trigger",
+                )
+                try:
+                    # Emit twice: with PlanId (for per-plan drill-down) and without
+                    # (for the aggregate CLI alarm that can't use SEARCH expressions).
+                    cw.put_metric_data(
+                        Namespace="VIPPlans",
+                        MetricData=[
+                            {
+                                "MetricName": "ScheduledRunFallback",
+                                "Value": 1,
+                                "Unit": "Count",
+                                "Dimensions": [{"Name": "PlanId", "Value": plan["planId"]}],
+                            },
+                            {
+                                "MetricName": "ScheduledRunFallback",
+                                "Value": 1,
+                                "Unit": "Count",
+                                "Dimensions": [],
+                            },
+                        ],
+                    )
+                except Exception as cw_exc:
+                    _slog.error("prestart_fallback_metric_failed", error=str(cw_exc))
+                scheduled_run(plan["planId"])
+                fallback_triggered.append(plan["planId"])
         except Exception as exc:
             _slog.error(
                 "prestart_check_plan_failed",
@@ -2333,13 +2636,18 @@ def prestart_check() -> dict:
                 error_type=type(exc).__name__,
             )
 
-    _slog.info("prestart_check_done", warmed_count=len(warmed), warmed_plan_ids=warmed)
+    _slog.info(
+        "prestart_check_done",
+        warmed_count=len(warmed),
+        warmed_plan_ids=warmed,
+        fallback_count=len(fallback_triggered),
+        fallback_plan_ids=fallback_triggered,
+    )
 
     # ── Stuck run detection ───────────────────────────────────────────────────
     # Emit a CloudWatch metric for any run that has been "running" longer than
     # _STUCK_RUN_HOURS without completing. A CW alarm on this metric pages oncall.
     stuck: list[str] = []
-    cw = boto3.client("cloudwatch")
     for plan in all_plans:
         plan_id = plan.get("planId")
         if not plan_id:
@@ -2383,7 +2691,7 @@ def prestart_check() -> dict:
     if stuck:
         logger.warning("prestart_check: %d stuck run(s): %s", len(stuck), stuck)
 
-    return {"warmed": warmed, "stuck": stuck}
+    return {"warmed": warmed, "stuck": stuck, "fallback_triggered": fallback_triggered}
 
 
 # ── Campaign chain triggers ────────────────────────────────────────────────────
@@ -2733,55 +3041,36 @@ def _start_one_campaign(
     if _is_branded(campaign):
         cfg = campaign.get("campaignConfig", {})
         queue_arn = cfg.get("queueArn", "")
-        campaign_id = cs["campaignId"]
+        # Deterministic per-run UUID — unique per run so queue + metrics never
+        # mix across runs or concurrent plans. Deterministic so re-invocations
+        # within the same run don't seed duplicate queue partitions.
+        campaign_id = str(
+            uuid.uuid5(
+                uuid.UUID("c5a6d9e3-3456-7890-1234-f7a8b9c0d1e2"),
+                f"{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
+            )
+        )
         # Set these early so abort/stop paths can find them even if seeder fails mid-flight
         cs["brandedCampaignId"] = campaign_id
         cs["queueArn"] = queue_arn
-        try:
-            if not _ACTIVE_BRANDED_CAMPAIGNS_TABLE or not _CAMPAIGN_QUEUE_TABLE_BRANDED:
-                raise ValueError(
-                    "Branded env vars not configured: ACTIVE_BRANDED_CAMPAIGNS_TABLE and "
-                    "CAMPAIGN_QUEUE_TABLE_BRANDED must be set"
-                )
-            pinned_arn = campaign.get("pinnedSegmentArn")
-            if pinned_arn:
-                seg_name = pinned_arn.rsplit("/", 1)[-1]
-            else:
-                seg_name, _ = _create_segment(bucket, campaign)
-            seeded = _invoke_seeder(
-                campaign_id=campaign_id,
-                segment_name=seg_name,
-                contact_flow_id=cfg["contactFlowId"],
-                source_phone=cfg.get("sourcePhone") or cfg.get("sourcePhoneNumber", ""),
-            )
-        except Exception as exc:
+
+        # Guard: fail fast before claiming the distributed lock
+        if not _ACTIVE_BRANDED_CAMPAIGNS_TABLE or not _CAMPAIGN_QUEUE_TABLE_BRANDED:
             logger.error(
-                "_start_one_campaign[%d/%d]: branded seeder failed: %s",
-                bucket_index,
-                campaign_index,
-                type(exc).__name__,
-            )
-            _emit_branded_metric("BrandedSeederError")
-            # No VipActiveBrandedCampaigns record exists yet (put_item runs
-            # later), so only the queue needs clearing — calling
-            # _stop_branded_campaign here would be a redundant second expire
-            # plus a no-op conditional delete.
-            _safe_expire_branded_queue(
-                campaign_id, f"seeder[{bucket_index}/{campaign_index}]"
+                "_start_one_campaign[%d/%d]: branded env vars not configured",
+                bucket_index, campaign_index,
             )
             cs["status"] = "error"
             cs["exitReason"] = REASON_ERROR
-            cs["errorDetail"] = type(exc).__name__
+            cs["errorDetail"] = "missing_env_vars"
             cs["completedAt"] = now_iso
             return
 
-        if seeded == 0:
-            cs["status"] = "completed"
-            cs["exitReason"] = "empty_segment"
-            cs["completedAt"] = now_iso
-            return
-
-        # Write entry to VipActiveBrandedCampaigns
+        # ── Step 1: Claim the slot via atomic put_item — distributed lock ────────
+        # This MUST happen before _invoke_seeder. A ConditionalCheckFailedException
+        # here means a concurrent invocation already registered this campaign_id and
+        # is in the process of seeding. We return immediately to avoid a duplicate
+        # seed — which would double the queue and double-dial every contact.
         bucket_end_epoch = int((now + timedelta(hours=24)).timestamp())
         try:
             _get_ddb_client().put_item(
@@ -2803,44 +3092,72 @@ def _start_one_campaign(
             )
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                # Another invocation already registered this campaign — idempotent, treat as success
+                # Concurrent invocation already won the lock and is seeding.
+                # Mark our state as running (the winner is handling it) and bail.
                 logger.warning(
-                    "_start_one_campaign[%d/%d]: branded active-campaigns record already exists "
-                    "for %s — concurrent start detected, proceeding",
-                    bucket_index,
-                    campaign_index,
-                    campaign_id,
+                    "_start_one_campaign[%d/%d]: campaign %s already registered — "
+                    "concurrent start detected, skipping duplicate seed",
+                    bucket_index, campaign_index, campaign_id,
                 )
-            else:
-                logger.error(
-                    "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
-                    bucket_index,
-                    campaign_index,
-                    type(exc).__name__,
-                )
-                _emit_branded_metric("BrandedStartError")
-                _safe_expire_branded_queue(
-                    campaign_id, f"ddb-write[{bucket_index}/{campaign_index}]"
-                )
-                cs["status"] = "error"
-                cs["exitReason"] = REASON_ERROR
-                cs["errorDetail"] = type(exc).__name__
-                cs["completedAt"] = now_iso
+                cs["status"] = "running"
                 return
-        except Exception as exc:
             logger.error(
-                "_start_one_campaign[%d/%d]: branded DDB write failed: %s",
-                bucket_index,
-                campaign_index,
-                type(exc).__name__,
+                "_start_one_campaign[%d/%d]: branded DDB lock failed: %s",
+                bucket_index, campaign_index, type(exc).__name__,
             )
             _emit_branded_metric("BrandedStartError")
-            _safe_expire_branded_queue(
-                campaign_id, f"ddb-write[{bucket_index}/{campaign_index}]"
-            )
             cs["status"] = "error"
             cs["exitReason"] = REASON_ERROR
             cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
+            return
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded DDB lock failed: %s",
+                bucket_index, campaign_index, type(exc).__name__,
+            )
+            _emit_branded_metric("BrandedStartError")
+            cs["status"] = "error"
+            cs["exitReason"] = REASON_ERROR
+            cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
+            return
+
+        # ── Step 2: We hold the lock — seed the queue ────────────────────────────
+        # VipActiveBrandedCampaigns record now exists. On any failure below,
+        # _stop_branded_campaign cleans up both the record and the queue.
+        try:
+            pinned_arn = campaign.get("pinnedSegmentArn")
+            if pinned_arn:
+                seg_name = pinned_arn.rsplit("/", 1)[-1]
+            else:
+                seg_name, _ = _create_segment(bucket, campaign)
+            seeded = _invoke_seeder(
+                campaign_id=campaign_id,
+                segment_name=seg_name,
+                contact_flow_id=cfg["contactFlowId"],
+                source_phone=cfg.get("sourcePhone") or cfg.get("sourcePhoneNumber", ""),
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: branded seeder failed: %s",
+                bucket_index, campaign_index, type(exc).__name__,
+            )
+            _emit_branded_metric("BrandedSeederError")
+            # VipActiveBrandedCampaigns record exists (put_item succeeded above),
+            # so use _stop_branded_campaign to clean up both record and queue.
+            _stop_branded_campaign(cs)
+            cs["status"] = "error"
+            cs["exitReason"] = REASON_ERROR
+            cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
+            return
+
+        if seeded == 0:
+            # Empty segment — release the lock and mark complete
+            _stop_branded_campaign(cs)
+            cs["status"] = "completed"
+            cs["exitReason"] = "empty_segment"
             cs["completedAt"] = now_iso
             return
 
@@ -2859,6 +3176,57 @@ def _start_one_campaign(
         cs["status"] = "running"
         return
     # ── End branded path ──────────────────────────────────────────────────────
+
+    # ── SMS path — EUM SMS bulk delivery via Lambda + SQS ────────────────────
+    if _is_sms(campaign):
+        cfg = campaign.get("campaignConfig", {})
+        # Deterministic smsCampaignId — same key on re-invocation prevents duplicate
+        # sender Lambda calls from generating orphaned VipSmsCampaignQueue items.
+        sms_campaign_id = str(
+            uuid.uuid5(
+                uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+                f"{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
+            )
+        )
+        cs["smsCampaignId"] = sms_campaign_id
+        # Store run key in cs so _stop/_complete_sms_campaign can update DDB without a scan
+        cs["_smsRunsPlanId"] = run["planId"]
+        cs["_smsRunsSk"] = f"{run['runId']}#{sms_campaign_id}"
+        cs["status"] = "running"
+        cs["startedAt"] = now_iso
+        try:
+            pinned_arn = campaign.get("pinnedSegmentArn")
+            if pinned_arn:
+                seg_name = pinned_arn.rsplit("/", 1)[-1]
+                seg_arn = pinned_arn
+            else:
+                seg_name, seg_arn = _create_segment(bucket, campaign)
+            cs["segmentName"] = seg_name
+            cs["segmentArn"] = seg_arn
+            _invoke_sms_sender(
+                campaignId=sms_campaign_id,
+                planId=run["planId"],
+                runId=run["runId"],
+                planName=plan.get("name", ""),
+                segmentArn=seg_arn,
+                segmentName=seg_name,
+                messageTemplate=cfg.get("smsMessageTemplate", ""),
+                originationNumberArn=cfg.get("smsOriginationNumberArn", ""),
+                originationNumber=cfg.get("smsOriginationNumber", ""),
+            )
+        except Exception as exc:
+            logger.error(
+                "_start_one_campaign[%d/%d]: SMS sender failed: %s",
+                bucket_index,
+                campaign_index,
+                type(exc).__name__,
+            )
+            cs["status"] = "error"
+            cs["exitReason"] = REASON_ERROR
+            cs["errorDetail"] = type(exc).__name__
+            cs["completedAt"] = now_iso
+        return
+    # ── End SMS path ──────────────────────────────────────────────────────────
 
     if cs.get("connectCampaignId"):
         if cs.get("warmupStarted"):
@@ -3431,15 +3799,61 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
     # the segment is truncated the most recently-added leads take priority.
     # Collect (id, normalized_phone, raw_phone) triples in one pass — raw_phone
     # retained only for excluded-lead logging; not used downstream.
+    # Also scan every record's location field against the global known-locations
+    # set; any unknown value triggers a CloudWatch metric so ops can add it to
+    # VipLocationMapping before leads get silently dropped from segments.
+    # Fault-tolerant: if the DynamoDB lookup fails, skip detection rather than
+    # aborting segment creation (detection is non-critical telemetry).
+    try:
+        known_locs: frozenset[str] = all_known_locations()
+    except Exception as _exc:
+        logger.warning("all_known_locations fetch failed, skipping detection: %s", _exc)
+        known_locs = frozenset()
+    unknown_locs: set[str] = set()
     seen: set[str] = set()
     entries: list[tuple[str, str | None, str]] = []
     for record in redis_source.iter_records():
+        loc_val = str(record.get("location", "")).strip()
+        if loc_val and loc_val not in known_locs:
+            unknown_locs.add(loc_val)
         if not rules or matches_group(record, rules, "ALL"):
             cid = str(record.get("customerid") or record.get("ID") or "").strip()
             if cid and cid not in seen:
                 seen.add(cid)
                 raw_phone = str(record.get("phone", "")).strip()
                 entries.append((cid, _normalize_phone_e164(raw_phone), raw_phone))
+
+    if unknown_locs:
+        _slog.warn("unknown_locations_detected", locations=sorted(unknown_locs))
+        try:
+            loc_list = sorted(unknown_locs)
+            cw = boto3.client("cloudwatch")
+            # Per-location dimensional metrics (for CloudWatch console drill-down).
+            for i in range(0, len(loc_list), 20):
+                cw.put_metric_data(
+                    Namespace="VipConnect/ProgressiveDialer",
+                    MetricData=[
+                        {
+                            "MetricName": "UnknownLocation",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [{"Name": "Location", "Value": loc}],
+                        }
+                        for loc in loc_list[i : i + 20]
+                    ],
+                )
+            # Dimensionless total — this is what the CloudWatch alarm watches.
+            # Dimensional and dimensionless metrics are separate time series in CW.
+            cw.put_metric_data(
+                Namespace="VipConnect/ProgressiveDialer",
+                MetricData=[{
+                    "MetricName": "UnknownLocation",
+                    "Value": len(loc_list),
+                    "Unit": "Count",
+                }],
+            )
+        except Exception as exc:
+            logger.warning("unknown_location metric emit failed: %s", type(exc).__name__)
 
     if not entries:
         raise _EmptySegmentError("No Redis records match campaign filters")

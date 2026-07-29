@@ -2,6 +2,7 @@
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { ApiCampaignsStack } from '../lib/stacks/api-campaigns-stack';
+import { ApiSmsStack } from '../lib/stacks/api-sms-stack';
 import { ApiMetricsStack } from '../lib/stacks/api-metrics-stack';
 import { ApiProgressiveDialerStack } from '../lib/stacks/api-progressive-dialer-stack';
 import { ApiPlansStack } from '../lib/stacks/api-plans-stack';
@@ -113,16 +114,6 @@ const campaigns = new ApiCampaignsStack(app, 'VipAdminApiCampaignsStack', {
   permissionsBoundaryName,
 });
 
-// 5. api-metrics Lambda
-const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
-  env,
-  description: 'api-metrics Lambda — CloudWatch + audit log queries',
-  adminAuditTable: data.adminAuditTable,
-  dataKey: data.dataKey,
-  connectInstanceId,
-  permissionsBoundaryName,
-});
-
 // 6a. Progressive Branded Dialer stack — moved before ApiPlansStack so its
 // public properties (seederFunction, campaignQueueTable, activeBrandedCampaignsTable)
 // can be passed as props to ApiPlansStack.
@@ -148,6 +139,40 @@ const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDial
   firstOrionSecretArn,
   profilesDomainName,
   permissionsBoundaryName,
+  campaignQueueStreamArn: 'arn:aws:dynamodb:us-east-1:165505826690:table/VipProgressiveCampaignQueue/stream/2026-07-23T00:43:38.549',
+});
+
+// 5. api-metrics Lambda (instantiated after progressiveDialer to reference branded tables)
+const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
+  env,
+  description: 'api-metrics Lambda — CloudWatch + audit log queries + branded campaign monitor',
+  adminAuditTable: data.adminAuditTable,
+  dataKey: data.dataKey,
+  connectInstanceId,
+  permissionsBoundaryName,
+  activeBrandedCampaignsTable:     progressiveDialer.activeBrandedCampaignsTable,
+  brandedRunSummaryTable:          progressiveDialer.brandedRunSummaryTable,
+  brandedCampaignMetricsTable:     progressiveDialer.brandedCampaignMetricsTable,
+  agentSnapshotTable:              progressiveDialer.agentSnapshotTable,
+  progressiveCampaignQueueTable:   progressiveDialer.campaignQueueTable,
+});
+
+// 6b. SMS Campaign stack — sender + processor Lambdas + SQS
+// Before deploying, ensure these CLI resources exist (Phase 0):
+//   - EUM SMS Config Set:  vip-sms-config-set
+//   - EUM SMS Opt-Out List: vip-sms-opt-out
+//   - DDB tables: VipSmsCampaignQueue, VipSmsCampaignRuns (pre-created via CLI)
+//   - SQS queues: vip-sms-campaign-queue + vip-sms-campaign-queue-dlq (pre-created via CLI)
+//   - IAM roles: vip-sms-sender-role, vip-sms-processor-role (pre-created via CLI)
+//   - Log groups: /aws/lambda/vip-admin-sms-sender, /aws/lambda/vip-admin-sms-processor
+const smsStack = new ApiSmsStack(app, 'VipAdminApiSmsStack', {
+  env,
+  description: 'SMS Campaign — bulk SMS via EUM SMS, SQS-driven processor',
+  dataKeyArn: progressiveDialerDataKeyArn,
+  profilesDomainName,
+  smsConfigSetName: (app.node.tryGetContext('smsConfigSetName') as string) ?? 'vip-sms-config-set',
+  smsOptOutListName: (app.node.tryGetContext('smsOptOutListName') as string) ?? 'vip-sms-opt-out',
+  permissionsBoundaryName,
 });
 
 // 6. api-plans Lambda + DynamoDB plans table
@@ -161,10 +186,16 @@ const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   permissionsBoundaryName,
   redis: redisConfig,
   redisVpc: redisVpcConfig,
-  progressiveCampaignQueueTable: progressiveDialer.campaignQueueTable,
-  activeBrandedCampaignsTable:   progressiveDialer.activeBrandedCampaignsTable,
-  progressiveDialerSeederArn:    progressiveDialer.seederFunction.functionArn,
+  progressiveCampaignQueueTable:  progressiveDialer.campaignQueueTable,
+  activeBrandedCampaignsTable:    progressiveDialer.activeBrandedCampaignsTable,
+  brandedRunSummaryTable:         progressiveDialer.brandedRunSummaryTable,
+  brandedCampaignMetricsTable:    progressiveDialer.brandedCampaignMetricsTable,
+  agentSnapshotTable:             progressiveDialer.agentSnapshotTable,
+  progressiveDialerSeederArn:     progressiveDialer.seederFunction.functionArn,
   progressiveDialerDataKeyArn:   progressiveDialerDataKeyArn,
+  smsCampaignQueueTable:          smsStack.smsCampaignQueueTable,
+  smsRunsTable:                   smsStack.smsRunsTable,
+  smsSenderFunctionArn:           smsStack.smsSenderFunction.functionArn,
 });
 
 // 7. api-profiles Lambda

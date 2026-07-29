@@ -11,8 +11,15 @@ from vip_shared.application.http import (
 )
 from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
 
+import builders
 import scheduler_manager
 import store
+
+
+def get_location_mapping(event: dict, _path_params: dict) -> dict:
+    """Return all state/location groups from VipLocationMapping DynamoDB table."""
+    groups = builders.get_all_location_groups()
+    return json_response(200, {"groups": groups})
 
 
 def list_plans(event: dict, _path_params: dict) -> dict:
@@ -186,17 +193,24 @@ def update_plan(event: dict, path_params: dict) -> dict:
     updated = {**existing, **{k: v for k, v in body.items() if k in allowed}}
     plan = store.put_plan(updated)
 
+    is_template = updated.get("isTemplate") or updated.get("is_template")
+    had_time_trigger = existing.get("trigger", {}).get("type") == "time"
+
     new_trigger = body.get("trigger")
     if new_trigger is not None:
-        if new_trigger.get("type") == "time":
+        if is_template:
+            # Templates never run on a cron — remove the rule if one exists
+            if had_time_trigger:
+                scheduler_manager.delete_schedule(plan_id)
+        elif new_trigger.get("type") == "time":
             scheduler_manager.upsert_schedule(plan_id, new_trigger)
-        elif existing.get("trigger", {}).get("type") == "time":
+        elif had_time_trigger:
             # Trigger changed away from "time" — remove the EventBridge rule
             scheduler_manager.delete_schedule(plan_id)
 
     new_schedule = body.get("schedule")
     if new_schedule is not None:
-        if new_schedule.get("enabled"):
+        if new_schedule.get("enabled") and not is_template:
             scheduler_manager.upsert_schedule(plan_id, new_schedule)
         else:
             scheduler_manager.delete_schedule(plan_id)
@@ -392,6 +406,58 @@ def _validate_branded_campaign(campaign: dict, bucket_name: str, ci: int) -> lis
     return errors
 
 
+def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[str]:
+    """Return validation errors for an SMS campaign's required config fields + PHI guard."""
+    import re as _re
+
+    errors = []
+    cfg = campaign.get("campaignConfig") or {}
+    prefix = f"bucket '{bucket_name}' campaign[{ci}]"
+
+    tmpl = cfg.get("smsMessageTemplate", "")
+    if not tmpl:
+        errors.append(f"{prefix}: deliveryType='sms' requires campaignConfig.smsMessageTemplate")
+    elif len(tmpl) > 160:
+        errors.append(
+            f"{prefix}: smsMessageTemplate must be ≤160 chars (got {len(tmpl)})"
+        )
+    else:
+        # Active PHI detection — block templates with identifiable information
+        _PHI_PATTERNS = [
+            (_re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "SSN-like number"),
+            (_re.compile(r"\b\d{3}\s\d{2}\s\d{4}\b"), "SSN-like number"),
+            (_re.compile(r"\S+@\S+\.\S+"), "email address"),
+            (_re.compile(r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b"), "date with day/month"),
+            (_re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "ISO date (possible DOB)"),
+            (_re.compile(r"\b\d{7,}\b"), "long numeric ID (possible MRN/account)"),
+            (_re.compile(r"https?://"), "URL"),
+            (_re.compile(r"\{\{[^}]+\}\}"), "template placeholder"),
+            (_re.compile(r"\$\{[^}]+\}"), "template placeholder"),
+            (
+                _re.compile(r"\b(?:diagnosis|dx|condition|prescribed|medication)\b", _re.IGNORECASE),
+                "clinical term",
+            ),
+        ]
+        violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(tmpl)]
+        if violations:
+            errors.append(
+                f"{prefix}: smsMessageTemplate may contain PHI — detected: "
+                f"{', '.join(violations)}. Remove identifying information."
+            )
+
+    if not cfg.get("smsOriginationNumberArn"):
+        errors.append(
+            f"{prefix}: deliveryType='sms' requires campaignConfig.smsOriginationNumberArn"
+        )
+
+    if not cfg.get("phiAcknowledged"):
+        errors.append(
+            f"{prefix}: deliveryType='sms' requires campaignConfig.phiAcknowledged=true"
+        )
+
+    return errors
+
+
 def _validate_plan_body(plan_body: dict) -> list[str]:
     """Validate plan body; return a list of error strings (empty means valid)."""
     errors: list[str] = []
@@ -401,6 +467,10 @@ def _validate_plan_body(plan_body: dict) -> list[str]:
             if campaign.get("deliveryType") == "branded":
                 errors.extend(
                     _validate_branded_campaign(campaign, bucket_name, ci)
+                )
+            elif campaign.get("deliveryType") == "sms":
+                errors.extend(
+                    _validate_sms_campaign(campaign, bucket_name, ci)
                 )
     return errors
 

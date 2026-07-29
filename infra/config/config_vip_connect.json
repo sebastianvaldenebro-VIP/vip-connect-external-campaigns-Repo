@@ -7,6 +7,36 @@
         "bookmark_bucket": "config-json-etl-jobs",
         "bookmark_column": "extracted_at"
       }
+    },
+    {
+      "source": {
+        "name": "branded_campaign_runs",
+        "bookmark_bucket": "config-json-etl-jobs",
+        "bookmark_column": "extracted_at",
+        "target_table": "BRANDED_CAMPAIGN_RUNS",
+        "pk_columns": "plan_id,sk",
+        "load_type": "merge"
+      }
+    },
+    {
+      "source": {
+        "name": "branded_campaign_metrics",
+        "bookmark_bucket": "config-json-etl-jobs",
+        "bookmark_column": "extracted_at",
+        "target_table": "BRANDED_CAMPAIGN_METRICS",
+        "pk_columns": "branded_campaign_id,snapshot_at",
+        "load_type": "merge"
+      }
+    },
+    {
+      "source": {
+        "name": "sms_campaign_runs",
+        "bookmark_bucket": "config-json-etl-jobs",
+        "bookmark_column": "extracted_at",
+        "target_table": "SMS_CAMPAIGN_RUNS",
+        "pk_columns": "plan_id,sk",
+        "load_type": "merge"
+      }
     }
   ]
 }
