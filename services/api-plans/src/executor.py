@@ -194,6 +194,27 @@ def _emit_branded_metric(metric_name: str, value: float = 1.0) -> None:
         logger.warning("_emit_branded_metric %s failed: %s", metric_name, type(exc).__name__)
 
 
+def _emit_dispatch_stalled_metric(campaign_id: str) -> None:
+    """Emit CampaignDispatchStalled to VIPPlans when a campaign reverts to "queued"
+    instead of advancing (Redis rebuilding, empty segment retry). Applies to any
+    delivery type, not just branded — unlike _emit_branded_metric.
+
+    Fire-and-forget — failures are logged but never raised.
+    """
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="VIPPlans",
+            MetricData=[{
+                "MetricName": "CampaignDispatchStalled",
+                "Value": 1,
+                "Unit": "Count",
+                "Dimensions": [{"Name": "CampaignId", "Value": campaign_id}],
+            }],
+        )
+    except Exception as exc:
+        logger.warning("_emit_dispatch_stalled_metric failed: %s", type(exc).__name__)
+
+
 def _count_branded_queue(campaign_id: str) -> int:
     """Count PENDING+DISPATCHING items in VipProgressiveCampaignQueue for this campaign.
 
@@ -1178,8 +1199,9 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
     # ── 3. Dispatch newly-unblocked campaigns (fixed-point until stable) ──────
     changed = True
+    _stalled: set[int] = set()
     while changed:
-        changed = _dispatch_ready_campaigns(run, plan, bucket_index)
+        changed = _dispatch_ready_campaigns(run, plan, bucket_index, _stalled)
 
     # ── 3b. Eagerly start cross-bucket campaigns whose deps are now satisfied ─
     if _dispatch_cross_bucket_ready(run, plan, bucket_index):
@@ -1700,8 +1722,9 @@ def skip_campaign(
         plan = run.get("planSnapshot") or get_plan(plan_id) or {}
         try:
             changed = True
+            _stalled: set[int] = set()
             while changed:
-                changed = _dispatch_ready_campaigns(run, plan, bucket_index)
+                changed = _dispatch_ready_campaigns(run, plan, bucket_index, _stalled)
 
             if _all_campaigns_terminal(run, bucket_index):
                 _advance_bucket(run, plan, bucket_index, reason="all_campaigns_done")
@@ -1817,8 +1840,9 @@ def _start_bucket(run: dict, index: int) -> None:
 
     # Dispatch stage-1 campaigns — _dispatch_ready_campaigns saves internally per wave (B1-A)
     changed = True
+    _stalled: set[int] = set()
     while changed:
-        changed = _dispatch_ready_campaigns(run, plan, index)
+        changed = _dispatch_ready_campaigns(run, plan, index, _stalled)
 
     # Chain-start next bucket immediately if it is marked parallel
     next_index = index + 1
@@ -1943,8 +1967,9 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
 
     # Dispatch any newly unblocked campaigns — saves internally per wave (B1-A)
     changed = True
+    _stalled: set[int] = set()
     while changed:
-        changed = _dispatch_ready_campaigns(run, plan, bucket_index)
+        changed = _dispatch_ready_campaigns(run, plan, bucket_index, _stalled)
 
     # Final save — persists warming activations + schedule.
     # B1-A's dispatch saves already wrote the run if any campaigns were dispatched; this
@@ -2212,8 +2237,9 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
                                 exc,
                             )
                     changed = True
+                    _stalled: set[int] = set()
                     while changed:
-                        changed = _dispatch_ready_campaigns(run, plan, next_index)
+                        changed = _dispatch_ready_campaigns(run, plan, next_index, _stalled)
                     save_run(run)
                     return
 
@@ -2872,10 +2898,20 @@ def _dispatch_cross_bucket_ready(
     return True
 
 
-def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
+def _dispatch_ready_campaigns(
+    run: dict, plan: dict, bucket_index: int, stalled: set[int] | None = None
+) -> bool:
     """Start any campaigns whose dependencies are now satisfied.
 
     Returns True if any state change occurred (used for fixed-point loop).
+
+    stalled: campaign indices that reverted to "queued" without real progress in a
+    PRIOR call within the same fixed-point loop (same tick, same Lambda invocation).
+    Excluded from Phase 2 so a transient failure (e.g. Redis mid-rebuild) isn't
+    retried immediately on every loop iteration — only on the next external tick.
+    Callers own this set across their `while changed:` loop; pass the same set
+    instance each call so it accumulates. Indices left in "queued" after Phase 4
+    are added to it here.
 
     Two-phase claim prevents duplicate Connect campaigns when save_run races:
       Phase 1 — Recovery: reset any "creating" back to "queued" (prior tick failed mid-flight)
@@ -2884,6 +2920,8 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
       Phase 4 — Start: Connect API calls for each claimed campaign
       Phase 5 — Confirm: save final statuses (connectCampaignId etc.)
     """
+    if stalled is None:
+        stalled = set()
     bucket = plan["buckets"][bucket_index]
     bucket_state = run["bucketStates"][bucket_index]
 
@@ -2943,6 +2981,8 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
     newly_ready: list[int] = []
     # Phase 2 — Identify
     for ci, campaign in enumerate(bucket.get("campaigns", [])):
+        if ci in stalled:
+            continue
         cs = bucket_state["campaignStates"][ci]
         if cs["status"] != "queued":
             continue
@@ -2988,7 +3028,29 @@ def _dispatch_ready_campaigns(run: dict, plan: dict, bucket_index: int) -> bool:
     if newly_ready:
         save_run(run)
 
-    return True
+    # A campaign left in "queued" after Phase 4 didn't actually advance — e.g.
+    # _start_one_campaign hit _RedisRebuildingError and reverted it to retry on
+    # the NEXT external tick. Mark it stalled so THIS call's Phase 2 (on the next
+    # `while changed:` iteration) skips it — otherwise a genuinely-progressing
+    # dependency chain elsewhere in the bucket keeps changed=True, and the stalled
+    # campaign gets re-identified as newly_ready and retried against Redis on every
+    # iteration for as long as the chain keeps the loop alive, with no backoff.
+    # Reporting changed=True unconditionally here (the original bug) busy-looped
+    # even a single stalled campaign with no chain involved: ~90 retries / 19s in
+    # one invocation, exhausting reserved concurrency.
+    made_progress = False
+    for ci in newly_ready:
+        cs = bucket_state["campaignStates"][ci]
+        if cs["status"] == "queued":
+            stalled.add(ci)
+            # _start_one_campaign already logs why (Redis rebuilding / empty segment
+            # retry) — this metric is for alerting: those paths only warn today, so
+            # a long Redis outage would otherwise go unnoticed until an operator goes
+            # looking. One CW alarm on this metric covers all revert-to-queued causes.
+            _emit_dispatch_stalled_metric(cs.get("campaignId", "unknown"))
+        else:
+            made_progress = True
+    return made_progress
 
 
 def _find_campaign_state(run: dict, campaign_id: str) -> dict | None:
@@ -3725,20 +3787,26 @@ _MAX_SEGMENT_MEMBERS = 3000  # Derived from AWS CP limits: 60 max attributes × 
 def _normalize_phone_e164(raw: str) -> str | None:
     """Normalize a raw CRM phone number to E.164 (+1XXXXXXXXXX for US numbers).
 
-    Returns None for numbers that can't be normalized (missing, too short, etc).
-    Handles the common CRM patterns:
+    Returns None for numbers that can't be normalized (missing, too short,
+    invalid NANP area code, etc). Handles the common CRM patterns:
       10 digits              → +1XXXXXXXXXX
       11 digits starting w/1 → +1XXXXXXXXXX  (avoids double-prefix bug in sub Lambda)
       Already E.164 (+1...)  → unchanged
+    A NANP area code (NPA) can never start with 0 or 1 — a 10-digit CRM value
+    that does is truncated/malformed data (a digit was lost upstream), not a
+    normalizable number. Blindly prepending '+1' to it produces an undialable
+    number that bypasses segment_phones_excluded (which only fires on None).
     """
     if not raw:
         return None
     digits = "".join(c for c in raw if c.isdigit())
-    if len(digits) == 10:
+    if len(digits) == 10 and digits[0] not in "01":
         return "+1" + digits
-    if len(digits) == 11 and digits.startswith("1"):
+    if len(digits) == 11 and digits.startswith("1") and digits[1] not in "01":
         return "+" + digits
     if raw.strip().startswith("+") and len(digits) >= 10:
+        if len(digits) == 11 and digits.startswith("1") and digits[1] in "01":
+            return None
         return raw.strip()
     return None
 

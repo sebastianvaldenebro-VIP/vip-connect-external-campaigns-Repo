@@ -103,6 +103,22 @@ def _make_plan(buckets: list) -> dict:
     }
 
 
+def _started_mock(run: dict, bucket_index: int, status: str = "running"):
+    """side_effect for a mocked _start_one_campaign that mimics real behavior:
+    advancing cs["status"] away from "queued". Without this, _dispatch_ready_campaigns'
+    made_progress check (added to prevent the Redis-rebuilding busy-loop) sees every
+    mocked campaign as stuck in "queued" and reports changed=False, which is only
+    correct for the _RedisRebuildingError/_EmptySegmentError revert path.
+    """
+
+    def _side_effect(_run, _plan, _bucket_index, campaign_index):
+        _run["bucketStates"][bucket_index]["campaignStates"][campaign_index][
+            "status"
+        ] = status
+
+    return _side_effect
+
+
 def _make_run(
     plan: dict,
     bucket_states: list,
@@ -207,6 +223,159 @@ def test_all_campaigns_terminal_error_counts_as_terminal():
     assert executor._all_campaigns_terminal(run, 0) is True
 
 
+# ── _dispatch_ready_campaigns: Redis-rebuilding busy-loop guard ──────────────
+# Regression coverage for the production incident where tick()'s `while changed:`
+# fixed-point loop re-invoked _dispatch_ready_campaigns immediately (no backoff)
+# whenever a campaign was reverted to "queued" mid-Phase-4 — busy-looping against
+# Redis (~90 retries in 19s in one Lambda invocation) until it timed out or Redis
+# finished rebuilding, exhausting the 5 reserved concurrency slots and triggering
+# the vip-plans-throttles CloudWatch alarm.
+
+
+def test_dispatch_reports_no_progress_when_campaign_reverted_to_queued():
+    """A campaign left in 'queued' after Phase 4 (e.g. _RedisRebuildingError revert)
+    must not report changed=True — that would busy-loop tick()'s fixed-point retry."""
+    import executor
+
+    plan = _make_plan(
+        [
+            _bucket_def("b0", [_campaign_def("c1")]),
+        ]
+    )
+    run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c1", "queued")])],
+    )
+
+    # No side_effect — mimics _start_one_campaign's real behavior on
+    # _RedisRebuildingError: it reverts cs["status"] back to "queued" and returns.
+    with (
+        patch("executor.save_run"),
+        patch("executor._start_one_campaign") as start,
+        patch("boto3.client"),
+    ):
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    start.assert_called_once()
+    assert changed is False
+
+
+def test_dispatch_reports_progress_when_some_campaigns_advance():
+    """If at least one of the newly-ready campaigns advances past 'queued',
+    changed=True — the fixed-point loop should keep dispatching the rest."""
+    import executor
+
+    plan = _make_plan(
+        [
+            _bucket_def("b0", [_campaign_def("c1"), _campaign_def("c2")]),
+        ]
+    )
+    run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c1", "queued"), _campaign_state("c2", "queued")])],
+    )
+
+    def _mixed_side_effect(_run, _plan, _bucket_index, campaign_index):
+        # c1 (index 0) advances; c2 (index 1) hits Redis-rebuilding and reverts.
+        if campaign_index == 0:
+            _run["bucketStates"][0]["campaignStates"][0]["status"] = "running"
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _mixed_side_effect
+        changed = executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert start.call_count == 2
+    assert changed is True
+
+
+def test_dispatch_excludes_stalled_campaign_on_subsequent_call():
+    """A campaign marked stalled by a prior call (same `while changed:` loop, same
+    tick) must NOT be re-attempted on a later call with the same `stalled` set —
+    even though it's still "queued" and would otherwise re-qualify in Phase 2."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c1")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c1", "queued")])])
+    stalled: set[int] = set()
+
+    with (
+        patch("executor.save_run"),
+        patch("executor._start_one_campaign") as start,
+        patch("boto3.client"),
+    ):
+        first = executor._dispatch_ready_campaigns(run, plan, 0, stalled)
+        second = executor._dispatch_ready_campaigns(run, plan, 0, stalled)
+
+    assert first is False
+    assert second is False
+    assert stalled == {0}
+    start.assert_called_once()  # NOT called again on the second pass
+
+
+def test_dispatch_stalled_stage1_campaign_not_retried_while_dependency_chain_progresses():
+    """A stage-1 campaign stuck in Redis-rebuilding must stop being retried once
+    marked stalled, even while an UNRELATED dependency chain in the same bucket
+    keeps the `while changed:` loop alive across multiple calls."""
+    import executor
+
+    plan = _make_plan(
+        [
+            _bucket_def(
+                "b0",
+                [
+                    _campaign_def("c1"),  # stage-1, independent — stalls on Redis
+                    _campaign_def("c2"),  # parent of the chain
+                    _campaign_def("c3", depends_on=["c2"]),  # child, unlocks after c2
+                ],
+            ),
+        ]
+    )
+    run = _make_run(
+        plan,
+        [
+            _bucket_state(
+                "b0",
+                [
+                    _campaign_state("c1", "queued"),
+                    _campaign_state("c2", "queued"),
+                    _campaign_state("c3", "queued"),
+                ],
+            )
+        ],
+    )
+    stalled: set[int] = set()
+
+    def _side_effect(_run, _plan, _bucket_index, campaign_index):
+        if campaign_index == 0:
+            return  # c1: Redis-rebuilding revert — stays "queued" (mocked default)
+        # c2 (and later c3) advance for real.
+        _run["bucketStates"][0]["campaignStates"][campaign_index]["status"] = "running"
+
+    with (
+        patch("executor.save_run"),
+        patch("executor._start_one_campaign") as start,
+        patch("boto3.client"),
+    ):
+        start.side_effect = _side_effect
+        # Pass 1: c1 and c2 are newly_ready (c3 still blocked). c1 stalls, c2 advances.
+        changed = executor._dispatch_ready_campaigns(run, plan, 0, stalled)
+        assert changed is True
+        assert stalled == {0}
+        assert start.call_count == 2  # c1, c2
+
+        # Pass 2 (same tick, loop continues because changed was True): c3 now
+        # unblocked by c2="running"->terminal isn't quite right for this dep model,
+        # so simulate c2 reaching a terminal state before pass 2.
+        run["bucketStates"][0]["campaignStates"][1]["status"] = "completed"
+        changed = executor._dispatch_ready_campaigns(run, plan, 0, stalled)
+
+    # c1 must NOT be retried again — only c3 (newly unblocked by c2) is attempted.
+    assert start.call_count == 3
+    call_indices = [c.args[3] for c in start.call_args_list]
+    assert call_indices == [0, 1, 2]
+    assert changed is True  # c3 advanced
+
+
 # ── _dispatch_ready_campaigns: stage-1 auto-start ────────────────────────────
 
 
@@ -227,6 +396,7 @@ def test_dispatch_stage1_starts_immediately():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 0)
         changed = executor._dispatch_ready_campaigns(run, plan, 0)
 
     assert changed is True
@@ -271,6 +441,7 @@ def test_dispatch_stage2_starts_after_parent_completes():
     run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 0)
         changed = executor._dispatch_ready_campaigns(run, plan, 0)
 
     start.assert_called_once_with(run, plan, 0, 1)
@@ -293,12 +464,13 @@ def test_dispatch_dependent_starts_after_parent_error():
     run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 0)
         changed = executor._dispatch_ready_campaigns(run, plan, 0)
 
     start.assert_called_once_with(run, plan, 0, 1)
     assert changed is True
-    # c2 status is set to "creating" during Phase 3 claim, then reverted to "queued"
-    # by _start_one_campaign (mocked) — assert it was dispatched, not cancelled.
+    # c2 status is set to "creating" during Phase 3 claim, then advanced by
+    # _start_one_campaign (mocked) — assert it was dispatched, not cancelled.
     assert c2.get("exitReason") != "parent_cancelled"
 
 
@@ -397,6 +569,7 @@ def test_dispatch_cross_bucket_dep_starts_after_parent_completes():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 1)
         changed = executor._dispatch_ready_campaigns(run, plan, 1)
 
     start.assert_called_once_with(run, plan, 1, 0)
@@ -424,6 +597,7 @@ def test_dispatch_cross_bucket_dep_starts_after_parent_cancelled():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 1)
         changed = executor._dispatch_ready_campaigns(run, plan, 1)
 
     start.assert_called_once_with(run, plan, 1, 0)
@@ -452,6 +626,7 @@ def test_dispatch_cross_bucket_dep_starts_after_parent_error():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 1)
         changed = executor._dispatch_ready_campaigns(run, plan, 1)
 
     start.assert_called_once_with(run, plan, 1, 0)
@@ -506,6 +681,7 @@ def test_dispatch_sequential_stage1_starts_when_previous_bucket_done():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 1)
         changed = executor._dispatch_ready_campaigns(run, plan, 1)
 
     start.assert_called_once()
@@ -534,6 +710,7 @@ def test_dispatch_parallel_bucket_starts_immediately():
     )
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 1)
         changed = executor._dispatch_ready_campaigns(run, plan, 1)
 
     start.assert_called_once()
@@ -652,6 +829,34 @@ def test_tick_does_not_advance_when_campaigns_still_running():
         executor.tick("plan-1", "run-1", 0)
 
     advance.assert_not_called()
+
+
+def test_tick_redis_rebuilding_does_not_busy_loop_within_one_invocation():
+    """End-to-end regression for the production incident: a queued campaign that
+    hits _RedisRebuildingError (mocked here via _start_one_campaign leaving status
+    untouched — its real behavior on that error) must be attempted exactly ONCE per
+    tick() call, not retried in a tight loop until the Lambda times out.
+
+    Real incident: RequestId 4dd76121-... on 2026-08-12T18:06:37Z — _start_one_campaign
+    was called ~90 times in 19s inside a single Lambda invocation because tick()'s
+    `while changed:` fixed-point loop had no way to know the campaign hadn't advanced.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "queued")])])
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor._start_one_campaign") as start,  # no side_effect: stays "queued"
+        patch("executor._dispatch_cross_bucket_ready", return_value=False),
+        patch("executor._past_daily_cutoff", return_value=False),
+        patch("executor.save_run"),
+        patch("boto3.client"),
+    ):
+        executor.tick("plan-1", "run-1", 0)
+
+    start.assert_called_once()  # NOT busy-looped
 
 
 # ── tick: time-based expiry ───────────────────────────────────────────────────
@@ -4665,3 +4870,56 @@ class TestH5ConsecutivePollFailures:
 
         # Counter must be cleared after transition
         assert "bc-poll-h5" not in executor._branded_poll_failures
+
+
+class TestNormalizePhoneE164:
+    """_normalize_phone_e164 must never emit an E.164 value with an invalid NANP
+    area code (NPA). NPAs can't start with 0 or 1 — a 10-digit CRM value that
+    already starts with 0/1 is malformed input, not a normalizable phone number,
+    and blindly prepending '+1' to it produces an undialable number that's
+    silently dialed anyway (segment_phones_excluded only fires on None).
+    """
+
+    def test_normalizes_valid_10_digit_number(self):
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("2125551234") == "+12125551234"
+
+    def test_normalizes_valid_11_digit_number_with_leading_1(self):
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("12125551234") == "+12125551234"
+
+    def test_passes_through_already_e164(self):
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("+12125551234") == "+12125551234"
+
+    def test_returns_none_for_empty_string(self):
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("") is None
+
+    def test_rejects_10_digit_value_starting_with_1(self):
+        """Malformed CRM value '1347XXXXXXX' (10 digits, NPA would be 134 —
+        invalid, NPAs can't start with 1). Must not become '+11347XXXXXXX'.
+        """
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("1347555123") is None
+
+    def test_rejects_10_digit_value_starting_with_0(self):
+        """Malformed/placeholder CRM value '0000000000' (NPA 000 — invalid).
+        Must not become '+10000000000'.
+        """
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("0000000000") is None
+
+    def test_rejects_already_e164_with_invalid_npa(self):
+        """Same NPA-starts-with-0/1 defect, but arriving pre-formatted with a
+        '+' prefix — must be rejected by the passthrough branch too.
+        """
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("+11347555123") is None
+
+    def test_rejects_11_digit_leading_1_with_invalid_npa(self):
+        """11-digit value starting with '1' (the country code), but the NPA
+        that follows also starts with '1' — invalid NPA, not a valid US number.
+        """
+        from executor import _normalize_phone_e164
+        assert _normalize_phone_e164("11347555123") is None
