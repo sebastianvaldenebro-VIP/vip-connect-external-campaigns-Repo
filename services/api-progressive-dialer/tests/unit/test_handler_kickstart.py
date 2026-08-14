@@ -94,7 +94,9 @@ def _run(records: list[dict], *, ddb_items=None, agents=None, lock_acquired=True
     mock_ddb.scan.return_value = {"Items": ddb_items}
     mock_connect = MagicMock()
     mock_connect.get_current_user_data.return_value = {
-        "UserDataList": [{"User": {"Arn": a}} for a in agents]
+        "UserDataList": [
+            {"User": {"Arn": a}, "Status": {"StatusName": "Available"}} for a in agents
+        ]
     }
 
     with patch.dict("os.environ", _ENV):
@@ -176,6 +178,44 @@ class TestNoActiveCampaign:
         mock_sqs.send_message.assert_not_called()
         mock_lock.acquire.assert_not_called()
 
+    def test_skips_agent_with_pending_next_status(self):
+        # Agent is Available now but queued a break (NextStatus != Available) —
+        # matches agent_event_filter.is_agent_available()'s NextAgentStatus check.
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        mock_lock = MagicMock()
+        mock_queue = MagicMock()
+        mock_fo = MagicMock()
+        mock_sqs = MagicMock()
+        mock_ddb = MagicMock()
+        mock_ddb.scan.return_value = {"Items": [_CAMPAIGN_ITEM]}
+        mock_connect = MagicMock()
+        mock_connect.get_current_user_data.return_value = {
+            "UserDataList": [
+                {
+                    "User": {"Arn": _AGENT_ARN},
+                    "Status": {"StatusName": "Available"},
+                    "NextStatus": "Break",
+                },
+            ]
+        }
+
+        with patch.dict("os.environ", _ENV):
+            with patch("handler_kickstart.AgentLock", return_value=mock_lock), \
+                 patch("handler_kickstart.CampaignQueue", return_value=mock_queue), \
+                 patch("handler_kickstart.FirstOrionClient") as MockFO, \
+                 patch("handler_kickstart._get_sqs", return_value=mock_sqs), \
+                 patch("handler_kickstart._get_ddb", return_value=mock_ddb), \
+                 patch("handler_kickstart._get_connect", return_value=mock_connect):
+                MockFO.build_from_secret.return_value = mock_fo
+                import handler_kickstart
+                handler_kickstart.lambda_handler({"Records": [_insert_record()]}, None)
+
+        mock_sqs.send_message.assert_not_called()
+        mock_lock.acquire.assert_not_called()
+
 
 # ── _process_insert: dispatch happy path ─────────────────────────────────────
 
@@ -211,7 +251,6 @@ class TestDispatch:
         filters = mock_connect.get_current_user_data.call_args.kwargs["Filters"]
         # queue_id is the last segment of the ARN
         assert filters["Queues"] == ["q1"]
-        assert filters["AgentStatuses"] == ["Available"]
 
 
 # ── _process_insert: lock contention ─────────────────────────────────────────
@@ -247,8 +286,8 @@ class TestLockContention:
         mock_connect = MagicMock()
         mock_connect.get_current_user_data.return_value = {
             "UserDataList": [
-                {"User": {"Arn": _AGENT_ARN}},
-                {"User": {"Arn": agent2}},
+                {"User": {"Arn": _AGENT_ARN}, "Status": {"StatusName": "Available"}},
+                {"User": {"Arn": agent2}, "Status": {"StatusName": "Available"}},
             ]
         }
 

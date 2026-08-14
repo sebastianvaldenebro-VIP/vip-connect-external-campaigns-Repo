@@ -104,6 +104,9 @@ def _get_available_agents(queue_id: str) -> list[str]:
     Uses connect:GetCurrentUserData which reflects real-time agent state,
     unlike the Kinesis agent event stream which only fires on state transitions.
     Paginates through all results.
+    Mirrors agent_event_filter.is_agent_available()'s NextStatus check — an agent
+    who queued a break (NextStatus set to a non-Available status) will go offline
+    after their current contact, so kickstart must skip them like the consumer does.
     HIPAA: agent ARNs are not PHI — no masking required.
     """
     agents: list[str] = []
@@ -118,6 +121,9 @@ def _get_available_agents(queue_id: str) -> list[str]:
         for user in resp.get("UserDataList", []):
             status_name = user.get("Status", {}).get("StatusName", "")
             if status_name != "Available":
+                continue
+            next_status = user.get("NextStatus")
+            if next_status and next_status != "Available":
                 continue
             arn = user.get("User", {}).get("Arn")
             if arn:

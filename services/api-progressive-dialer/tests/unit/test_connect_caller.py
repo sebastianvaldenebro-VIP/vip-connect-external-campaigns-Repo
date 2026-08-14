@@ -30,7 +30,11 @@ def test_dial_passes_correct_params():
     # Phone number must NOT appear in the logged call — verify it IS passed
     assert call_kwargs["DestinationPhoneNumber"] == "+15551234567"
     assert call_kwargs["QueueId"] == "queue-001"
-    assert call_kwargs["TrafficType"] == "GENERAL"
+    assert call_kwargs["TrafficType"] == "CAMPAIGN"
+    assert call_kwargs["AnswerMachineDetectionConfig"] == {
+        "EnableAnswerMachineDetection": True,
+        "AwaitAnswerMachinePrompt": True,
+    }
 
 
 def test_dial_returns_failure_on_throttle():

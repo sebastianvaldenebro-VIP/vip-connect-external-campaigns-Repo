@@ -1,8 +1,11 @@
 """Wrapper for StartOutboundVoiceContact.
 
 Hardcodes the AMD contact flow (3d24320b-c1e3-40f3-90a2-b6867ef70c85) and
-TrafficType=GENERAL (AMD detection happens inside the contact flow, not via
-EnableAnswerMachineDetection=true, so no CAMPAIGN quota increase is needed).
+TrafficType=CAMPAIGN with AnswerMachineDetectionConfig enabled — the flow's
+CheckOutboundCallStatus block reads the AMD result Connect computes platform-side
+during call setup; that computation only runs when EnableAnswerMachineDetection=true,
+which the API requires TrafficType=CAMPAIGN for. Requires the "Concurrent campaign
+active calls per instance" quota (L-E908C3A1) to be > 0 on this Connect instance.
 
 Throttle limit: 2 RPS / 5 burst shared per account+region. Lambda 2 reserved
 concurrency is set to 2 in the CDK stack to stay within this limit.
@@ -58,7 +61,11 @@ class ConnectCaller:
             "ContactFlowId": self._contact_flow_id,
             "DestinationPhoneNumber": destination_phone,
             "QueueId": queue_id,
-            "TrafficType": "GENERAL",
+            "TrafficType": "CAMPAIGN",
+            "AnswerMachineDetectionConfig": {
+                "EnableAnswerMachineDetection": True,
+                "AwaitAnswerMachinePrompt": True,
+            },
         }
         if source_phone:
             kwargs["SourcePhoneNumber"] = source_phone
