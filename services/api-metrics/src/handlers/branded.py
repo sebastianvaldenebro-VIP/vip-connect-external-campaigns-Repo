@@ -32,6 +32,31 @@ _connect = boto3.client("connect")
 # Lives for the lifetime of the Lambda container (warm starts reuse it).
 _user_name_cache: dict[str, str] = {}
 _rp_name_cache: dict[str, str] = {}  # routingProfileId → name
+_status_type_cache: dict[str, str] = {}  # agent status ARN → Type (ROUTABLE/OFFLINE/CUSTOM)
+
+# Statuses that represent a planned multi-day absence rather than a break —
+# must not trip the frontend's "Extended break" alert.
+_INTENTIONAL_ABSENCE_STATUSES = {"Out of the Office", "Vacation"}
+
+# A contact in state ENDED only reflects active after-call-work while recent.
+# GetCurrentUserData can keep returning an ENDED contact long after the
+# agent moved on, which would otherwise pin them in "ACW" indefinitely.
+_ACW_MAX_AGE_SECONDS = 300
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(raw) -> datetime | None:
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    try:
+        return datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
 
 
 def _agent_display_name(user_id: str) -> str:
@@ -143,6 +168,25 @@ def _routing_profile_ids() -> list[str]:
     return ids[:100]  # GetCurrentUserData accepts max 100
 
 
+def _status_type_for_arn(status_arn: str) -> str:
+    """Resolve an agent status ARN to its Type (ROUTABLE/OFFLINE/CUSTOM).
+
+    GetCurrentUserData's AgentStatusReference never returns Type — only
+    StatusArn, StatusName, StatusStartTimestamp. ListAgentStatuses is the only
+    API that carries Type, keyed by status Id (the ARN's last path segment).
+    Cached for the container's lifetime; refreshed once per cold cache miss.
+    """
+    if not _status_type_cache:
+        try:
+            resp = _connect.list_agent_statuses(InstanceId=_CONNECT_INSTANCE_ID, MaxResults=100)
+            for s in resp.get("AgentStatusSummaryList", []):
+                _status_type_cache[s["Id"]] = s.get("Type", "CUSTOM")
+        except Exception as exc:
+            logger.warning("list_agent_statuses: %s", type(exc).__name__)
+    status_id = status_arn.rsplit("/", 1)[-1] if status_arn else ""
+    return _status_type_cache.get(status_id, "CUSTOM")
+
+
 def get_agent_roster(event: dict, context: object) -> dict:
     """Return live agent roster from Connect GetCurrentUserData."""
     if not _CONNECT_INSTANCE_ID:
@@ -171,13 +215,20 @@ def get_agent_roster(event: dict, context: object) -> dict:
         )
         _CONNECTED = {"CONNECTED", "CONNECTED_ONHOLD", "INCOMING", "CONNECTING"}
         _ACW = {"ENDED"}
+        now = _now()
         for ud in resp.get("UserDataList", []):
             status = ud.get("Status", {})
             contacts = ud.get("Contacts", [])
-            status_type = status.get("StatusType", "CUSTOM")
+            status_name = status.get("StatusName", "")
+            status_type = _status_type_for_arn(status.get("StatusArn", ""))
 
             active = next((c for c in contacts if c.get("AgentContactState") in _CONNECTED), None)
-            acw = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
+            acw_candidate = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
+            acw = None
+            if acw_candidate:
+                started = _parse_ts(acw_candidate.get("StateStartTimestamp"))
+                if started and (now - started).total_seconds() <= _ACW_MAX_AGE_SECONDS:
+                    acw = acw_candidate
 
             if active:
                 effective = "On Call"
@@ -191,6 +242,9 @@ def get_agent_roster(event: dict, context: object) -> dict:
             elif status_type == "ROUTABLE":
                 effective = "Available"
                 effective_ts = status.get("StatusStartTimestamp", "")
+            elif status_type == "OFFLINE":
+                effective = "Offline"
+                effective_ts = status.get("StatusStartTimestamp", "")
             else:
                 effective = "Unavailable"
                 effective_ts = status.get("StatusStartTimestamp", "")
@@ -200,10 +254,11 @@ def get_agent_roster(event: dict, context: object) -> dict:
             agents.append({
                 "agentId": user_id,
                 "agentName": _agent_display_name(user_id),
-                "status": status.get("StatusName", ""),
+                "status": status_name,
                 "statusType": status_type,
                 "effectiveStatus": effective,
                 "statusStartTimestamp": str(effective_ts) if effective_ts else "",
+                "isIntentionalAbsence": status_name in _INTENTIONAL_ABSENCE_STATUSES,
                 "routingProfileId": rp_id,
                 "routingProfileName": _rp_name_cache.get(rp_id, rp_id),
                 "contactsCount": len(contacts),

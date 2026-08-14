@@ -70,6 +70,7 @@ export class ApiMetricsStack extends cdk.Stack {
           'connect:GetCurrentUserData',
           'connect:SearchContacts',
           'connect:ListRoutingProfiles',
+          'connect:ListAgentStatuses',
           'connect:DescribeUser',
         ],
         resources: [

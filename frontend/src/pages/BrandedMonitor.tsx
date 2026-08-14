@@ -118,7 +118,7 @@ function aggregateMetrics(metrics: (BrandedMetricSnapshot | undefined)[]): {
 function agentIdleAlert(agent: AgentRosterEntry): 'idle' | 'break' | null {
   const elapsed = elapsedMinutes(agent.statusStartTimestamp);
   if (agent.effectiveStatus === 'Available' && elapsed > 10) return 'idle';
-  if (agent.effectiveStatus === 'Unavailable' && elapsed > 20) return 'break';
+  if (agent.effectiveStatus === 'Unavailable' && !agent.isIntentionalAbsence && elapsed > 20) return 'break';
   return null;
 }
 
@@ -143,10 +143,11 @@ function StatusBadge({ status }: { status: string }): ReactNode {
     MIXED: 'bg-orange-100 text-orange-700',
     Available: 'bg-green-100 text-green-700', 'On Call': 'bg-blue-100 text-blue-700',
     ACW: 'bg-purple-100 text-purple-700',   Unavailable: 'bg-gray-100 text-gray-600',
+    Offline: 'bg-gray-100 text-gray-400',
   };
   const labels: Record<string, string> = {
     RUNNING: 'Running', COMPLETED: 'Completed', ABORTED: 'Aborted', ERROR: 'Error', MIXED: 'Partial',
-    Unavailable: 'Away',
+    Unavailable: 'Away', Offline: 'Offline',
   };
   return (
     <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${variants[status] ?? 'bg-gray-100 text-gray-600'}`}>
@@ -705,7 +706,7 @@ function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated }: {
         const available = pa.filter(a => a.effectiveStatus === 'Available').length;
         const onCall    = pa.filter(a => a.effectiveStatus === 'On Call').length;
         const acw       = pa.filter(a => a.effectiveStatus === 'ACW').length;
-        const online    = pa.filter(a => a.effectiveStatus !== 'Unavailable').length;
+        const online    = pa.filter(a => a.effectiveStatus !== 'Unavailable' && a.effectiveStatus !== 'Offline').length;
         const lowAgents = available < 2;
         return (
           <div key={profileId} className={`rounded-xl border p-4 space-y-3 ${lowAgents ? 'border-red-200 bg-red-50' : 'border-gray-200 bg-white'}`}>
@@ -923,7 +924,7 @@ function LiveView({ date, onDateChange }: { date: string; onDateChange: (d: stri
 
 type AlertFilter = 'all' | 'alerts' | 'idle' | 'break';
 type SortCol     = 'name' | 'status' | 'time';
-const STATUS_ORDER: Record<string, number> = { Available: 0, 'On Call': 1, ACW: 2, Unavailable: 3 };
+const STATUS_ORDER: Record<string, number> = { Available: 0, 'On Call': 1, ACW: 2, Unavailable: 3, Offline: 4 };
 
 function AgentsKpiBar({ agents }: { agents: AgentRosterEntry[] }): ReactNode {
   const total         = agents.length;
@@ -1034,6 +1035,7 @@ function AgentsView(): ReactNode {
     { key: 'On Call', label: 'On Call' },
     { key: 'ACW', label: 'ACW' },
     { key: 'Unavailable', label: 'Away' },
+    { key: 'Offline', label: 'Offline' },
   ];
   const ALERT_FILTERS: { key: AlertFilter; label: string }[] = [
     { key: 'all',    label: 'All agents' },

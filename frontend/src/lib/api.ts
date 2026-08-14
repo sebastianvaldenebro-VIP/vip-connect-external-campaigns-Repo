@@ -558,7 +558,8 @@ export type AgentRosterEntry = {
   agentName: string;
   status: string;
   statusType: string;
-  effectiveStatus: 'Available' | 'On Call' | 'ACW' | 'Unavailable';
+  effectiveStatus: 'Available' | 'On Call' | 'ACW' | 'Unavailable' | 'Offline';
+  isIntentionalAbsence: boolean;
   activeContactState: string;
   statusStartTimestamp: string;
   routingProfileId: string;
