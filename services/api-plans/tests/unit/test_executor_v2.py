@@ -3065,7 +3065,7 @@ def test_prestart_fallback_skips_template_plans():
     """prestart_check fallback must not emit the ScheduledRunFallback metric for template plans."""
     import executor
 
-    now_cot = datetime(2025, 1, 1, 9, 41, tzinfo=None)  # 09:41 COT → delta == -1 for 08:40 trigger
+    now_cot = datetime(2025, 1, 1, 8, 41, tzinfo=None)  # 08:41 COT → delta == -1 for 08:40 trigger
 
     template_plan = _make_plan([])
     template_plan["planId"] = "plan-tmpl"
@@ -3089,6 +3089,165 @@ def test_prestart_fallback_skips_template_plans():
 
     mock_scheduled_run.assert_not_called()
     mock_boto.return_value.put_metric_data.assert_not_called()
+
+
+def test_prestart_fallback_skips_plans_outside_working_hours():
+    """prestart_check fallback must not fire ScheduledRunFallback when today isn't
+    an allowed working day for the plan — absence of a run is expected, not a missed cron.
+    """
+    import executor
+
+    now_cot = datetime(2025, 1, 1, 8, 41, tzinfo=None)  # Wednesday, 08:41 COT -> delta=-1 for 08:40
+
+    plan = _make_plan([])
+    plan["planId"] = "plan-wed-off"
+    plan["trigger"] = {"type": "time", "time": "08:40"}
+    plan["workingHours"] = {"days": ["MON", "TUE", "THU", "FRI", "SAT", "SUN"]}  # no WED
+
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.scheduled_run") as mock_scheduled_run,
+        patch("boto3.client") as mock_boto,
+    ):
+        executor.prestart_check()
+
+    mock_scheduled_run.assert_not_called()
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
+def test_prestart_prewarm_skips_plans_outside_working_hours():
+    """prestart_check pre-warm must not warm campaigns (or touch EventBridge permissions)
+    when today isn't an allowed working day for the plan.
+    """
+    import executor
+
+    now_cot = datetime(2025, 1, 1, 8, 35, tzinfo=None)  # Wednesday, 08:35 COT -> delta=5 for 08:40
+
+    plan = _make_plan([])
+    plan["planId"] = "plan-wed-off"
+    plan["trigger"] = {"type": "time", "time": "08:40"}
+    plan["workingHours"] = {"days": ["MON", "TUE", "THU", "FRI", "SAT", "SUN"]}  # no WED
+
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor._ensure_scheduled_run_permission") as mock_ensure_perm,
+        patch("executor._prestart_plan") as mock_prestart_plan,
+        patch("boto3.client"),
+    ):
+        result = executor.prestart_check()
+
+    mock_ensure_perm.assert_not_called()
+    mock_prestart_plan.assert_not_called()
+    assert result["warmed"] == []
+
+
+def test_prestart_prewarm_and_fallback_still_fire_on_allowed_day():
+    """Regression guard: a plan whose allowed days include today must still be
+    pre-warmed and still trigger the fallback exactly as before this fix.
+    """
+    import executor
+
+    prewarm_plan = _make_plan([])
+    prewarm_plan["planId"] = "plan-wed-on"
+    prewarm_plan["trigger"] = {"type": "time", "time": "08:40"}
+    prewarm_plan["workingHours"] = {"days": ["WED"]}
+
+    now_cot = datetime(2025, 1, 1, 8, 35, tzinfo=None)  # Wednesday, delta=5
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[prewarm_plan]),
+        patch("executor._ensure_scheduled_run_permission") as mock_ensure_perm,
+        patch("executor._prestart_plan") as mock_prestart_plan,
+        patch("boto3.client"),
+    ):
+        result = executor.prestart_check()
+
+    mock_ensure_perm.assert_called_once_with("plan-wed-on")
+    mock_prestart_plan.assert_called_once_with("plan-wed-on")
+    assert result["warmed"] == ["plan-wed-on"]
+
+    fallback_plan = _make_plan([])
+    fallback_plan["planId"] = "plan-wed-on"
+    fallback_plan["trigger"] = {"type": "time", "time": "08:40"}
+    fallback_plan["workingHours"] = {"days": ["WED"]}
+
+    now_cot_fallback = datetime(2025, 1, 1, 8, 41, tzinfo=None)  # Wednesday, delta=-1
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot_fallback,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[fallback_plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.scheduled_run") as mock_scheduled_run,
+        patch("boto3.client") as mock_boto,
+    ):
+        executor.prestart_check()
+
+    mock_scheduled_run.assert_called_once_with("plan-wed-on")
+    mock_boto.return_value.put_metric_data.assert_called_once()
+
+
+def test_is_working_day_no_working_hours_configured():
+    """No workingHours at all -> unrestricted, always a working day."""
+    import executor
+
+    assert executor._is_working_day(_make_plan([])) is True
+
+
+def test_is_working_day_no_days_list_configured():
+    """workingHours present but no 'days' key -> unrestricted, always a working day."""
+    import executor
+
+    plan = _make_plan([])
+    plan["workingHours"] = {"startTime": "08:00"}
+    assert executor._is_working_day(plan) is True
+
+
+def test_is_working_day_today_allowed():
+    import executor
+
+    plan = _make_plan([])
+    plan["workingHours"] = {"days": ["WED"]}
+    fake_now = datetime(2025, 1, 1, 12, 0, tzinfo=None)  # Wednesday
+
+    with patch("executor.datetime", **{"now.return_value": fake_now}):
+        assert executor._is_working_day(plan) is True
+
+
+def test_is_working_day_today_not_allowed():
+    import executor
+
+    plan = _make_plan([])
+    plan["workingHours"] = {"days": ["MON", "TUE", "THU", "FRI", "SAT", "SUN"]}
+    fake_now = datetime(2025, 1, 1, 12, 0, tzinfo=None)  # Wednesday, not in list
+
+    with patch("executor.datetime", **{"now.return_value": fake_now}):
+        assert executor._is_working_day(plan) is False
 
 
 # B2-D: force_start_campaign startedAt reset

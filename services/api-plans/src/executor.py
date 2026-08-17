@@ -2588,6 +2588,8 @@ def prestart_check() -> dict:
             trigger_hhmm = t_h * 60 + t_m
             delta = trigger_hhmm - now_hhmm
             if 4 <= delta <= 6:
+                if not _is_working_day(plan):
+                    continue  # plan doesn't run today; skip pre-warm to avoid wasted Connect warmup
                 # Pre-warm: trigger is 4–6 minutes away (5 ± 1 tolerance).
                 # Also verify EventBridge has Lambda invoke permission — a CDK deploy
                 # that recreates the function wipes custom add_permission statements,
@@ -2607,6 +2609,8 @@ def prestart_check() -> dict:
                 # If no run was started in the last 3 minutes, the cron invocation failed.
                 if plan.get("isTemplate") or plan.get("is_template"):
                     continue  # templates never start runs; fallback metric would be a false alarm
+                if not _is_working_day(plan):
+                    continue  # plan doesn't run today; absence of a run is expected, not a missed cron
                 latest = get_latest_run(plan["planId"])
                 already_started = False
                 if latest and latest.get("status") == "running":
@@ -4363,6 +4367,21 @@ def _now_cot_hhmm() -> int:
     return now.hour * 60 + now.minute
 
 
+def _is_working_day(plan: dict) -> bool:
+    """Return True if today (COT) is an allowed day for the plan.
+
+    If workingHours or workingHours.days is not configured, always returns True (no restriction).
+    """
+    wh = plan.get("workingHours")
+    if not wh:
+        return True
+    allowed_days = wh.get("days") or []
+    if not allowed_days:
+        return True
+    day_abbr = _DAY_ABBR[datetime.now(_COT_TZ).weekday()]
+    return day_abbr in allowed_days
+
+
 def _within_working_hours(plan: dict) -> bool:
     """Return True if current COT time/day is within plan's workingHours window.
 
@@ -4371,11 +4390,9 @@ def _within_working_hours(plan: dict) -> bool:
     wh = plan.get("workingHours")
     if not wh:
         return True
-    now_cot = datetime.now(_COT_TZ)
-    day_abbr = _DAY_ABBR[now_cot.weekday()]
-    allowed_days = wh.get("days") or []
-    if allowed_days and day_abbr not in allowed_days:
+    if not _is_working_day(plan):
         return False
+    now_cot = datetime.now(_COT_TZ)
     start = wh.get("startTime", "00:00")
     end = wh.get(
         "endTime", "24:00"
