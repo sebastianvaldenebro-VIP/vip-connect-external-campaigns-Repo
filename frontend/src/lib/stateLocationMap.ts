@@ -248,6 +248,19 @@ export function stateCodesFromSegmentName(
 }
 
 /**
+ * Resolve the live location map, falling back to STATE_LOCATION_MAP when
+ * there's no usable live data yet — either because the query hasn't
+ * resolved, or because it resolved to an empty array (e.g. the preview-mode
+ * mock fixture returns `{ groups: [] }`). An empty array is not "live data
+ * we should trust"; it's the same missing-data case as `undefined`.
+ */
+export function resolveLocationMap(
+  data: readonly StateGroup[] | undefined,
+): readonly StateGroup[] {
+  return data && data.length > 0 ? data : STATE_LOCATION_MAP;
+}
+
+/**
  * Fetch the location mapping from VipLocationMapping DynamoDB via the API.
  * Returns the static fallback while loading so callers always have data.
  * Cache is shared app-wide via react-query (staleTime 10 min).
@@ -267,7 +280,7 @@ export function useLocationMapping(): {
   });
 
   return {
-    locationMap: data ?? STATE_LOCATION_MAP,
+    locationMap: resolveLocationMap(data),
     isLoading: isLoading && !data,
   };
 }

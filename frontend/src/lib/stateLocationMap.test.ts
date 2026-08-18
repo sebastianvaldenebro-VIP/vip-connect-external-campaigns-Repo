@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   buildLocationToState,
   codesFromMap,
+  resolveLocationMap,
+  STATE_LOCATION_MAP,
   stateCodesFromSegmentGroups,
   stateCodesFromSegmentName,
   type StateGroup,
@@ -12,6 +14,20 @@ const testMap: readonly StateGroup[] = [
   { state: 'Texas', slug: 'Texas', code: 'TX', locations: ['Texas', 'TX - Addison'] },
   { state: 'Pennsylvania', slug: 'Pennsylvania', code: 'PA', locations: ['PA - Center City'] },
 ];
+
+describe('resolveLocationMap', () => {
+  it('returns the live map when it is non-empty', () => {
+    expect(resolveLocationMap(testMap)).toBe(testMap);
+  });
+
+  it('falls back to STATE_LOCATION_MAP when data is undefined (query still loading)', () => {
+    expect(resolveLocationMap(undefined)).toBe(STATE_LOCATION_MAP);
+  });
+
+  it('falls back to STATE_LOCATION_MAP when data is an empty array (regression: preview-mode fixture returns groups: [])', () => {
+    expect(resolveLocationMap([])).toBe(STATE_LOCATION_MAP);
+  });
+});
 
 describe('codesFromMap', () => {
   it('returns the set of state codes present in the map', () => {
