@@ -11,7 +11,7 @@ import {
   type SegmentSummary,
   type VerifyResult,
 } from '@/lib/api';
-import { stateCodesFromSegmentGroups, stateCodesFromSegmentName } from '@/lib/stateLocationMap';
+import { stateCodesFromSegmentGroups, stateCodesFromSegmentName, useLocationMapping } from '@/lib/stateLocationMap';
 import { formatDateTime } from '@/lib/utils';
 
 type SegSortKey = 'name' | 'created';
@@ -353,11 +353,12 @@ function SegmentRow({
     queryFn: () => api.segments.get(segment.name),
     enabled: enableOpen,
   });
+  const { locationMap } = useLocationMapping();
   const segmentStates = detail.data
-    ? (stateCodesFromSegmentGroups(detail.data.segmentGroups).length > 0
-        ? stateCodesFromSegmentGroups(detail.data.segmentGroups)
-        : stateCodesFromSegmentName(segment.name))
-    : stateCodesFromSegmentName(segment.name);
+    ? (stateCodesFromSegmentGroups(detail.data.segmentGroups, locationMap).length > 0
+        ? stateCodesFromSegmentGroups(detail.data.segmentGroups, locationMap)
+        : stateCodesFromSegmentName(segment.name, locationMap))
+    : stateCodesFromSegmentName(segment.name, locationMap);
 
   return (
     <tr className="border-b border-gray-100 last:border-0 hover:bg-gray-50/50 transition-colors">
