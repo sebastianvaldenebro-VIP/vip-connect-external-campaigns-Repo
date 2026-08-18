@@ -18,7 +18,7 @@ const DEFAULT_FLOW_NAME = '*Agent-staffed Campaign AMD';
 // State code → substrings to search for in campaign flow names.
 // Canonical flows are named "campaign-<STATE>" (e.g. "campaign-NJ").
 // Legacy entries handle the old hand-crafted flow names.
-const STATE_FLOW_PATTERNS: Record<string, string[]> = {
+export const STATE_FLOW_PATTERNS: Record<string, string[]> = {
   NY:  ['campaign-NY', 'NY'],
   LI:  ['campaign-LI', 'LI', 'Long Island'],
   NJ:  ['campaign-NJ', 'NJ'],
@@ -29,12 +29,12 @@ const STATE_FLOW_PATTERNS: Record<string, string[]> = {
   SCA: ['campaign-SCA', 'SCA', 'South CA'],
 };
 
-function suggestCampaignFlow(
+export function suggestCampaignFlow(
   campaignFlows: ContactFlow[],
   states: string[],
 ): ContactFlow | undefined {
   for (const state of states) {
-    const patterns = STATE_FLOW_PATTERNS[state] ?? [state];
+    const patterns = STATE_FLOW_PATTERNS[state] ?? [`campaign-${state}`];
     // Try patterns in priority order: canonical `campaign-<STATE>` first,
     // legacy name substrings as fallback.
     for (const pattern of patterns) {
