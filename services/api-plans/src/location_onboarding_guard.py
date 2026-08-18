@@ -38,15 +38,33 @@ def _table():
     return _ddb_table
 
 
-def _is_first_occurrence_of_state(state_code: str, exclude_location: str) -> bool:
-    """True if no OTHER item in the table already has this stateCode."""
+def _is_first_occurrence_of_state(state_code: str, exclude_locations: set) -> bool:
+    """True if no item OUTSIDE this batch's own inserts already has this stateCode.
+
+    `exclude_locations` must contain every location belonging to this
+    stateCode that was INSERTed in the *current* Streams batch (not just the
+    single triggering record) — sibling INSERTs for a brand-new state land in
+    the same batch and are already durably committed to the table by the
+    time we scan, so excluding only one of them would make every sibling
+    record see the others and wrongly conclude the state pre-existed.
+
+    Known residual limitation (accepted, not hidden): if a new state's
+    locations are onboarded in a burst LARGER than this Lambda's
+    batchSize (10) and span multiple separate Streams batches/invocations,
+    cross-batch siblings are NOT excluded here and the alert can still be
+    suppressed for the batches that land after the first one. This Lambda
+    is an ops alarm, not a safety-critical control, so cross-invocation
+    dedup (e.g. a DynamoDB lock table) is intentionally not built for that
+    edge case.
+    """
     resp = _table().scan(
-        FilterExpression="stateCode = :code AND #loc <> :loc",
-        ExpressionAttributeNames={"#loc": "location"},
-        ExpressionAttributeValues={":code": state_code, ":loc": exclude_location},
+        FilterExpression="stateCode = :code",
+        ExpressionAttributeValues={":code": state_code},
         ProjectionExpression="#loc",
+        ExpressionAttributeNames={"#loc": "location"},
     )
-    return len(resp.get("Items", [])) == 0
+    other_locations = {item["location"] for item in resp.get("Items", [])} - exclude_locations
+    return len(other_locations) == 0
 
 
 def _notify_missing_phone(state_code: str, location: str) -> None:
@@ -77,6 +95,7 @@ def _notify_missing_phone(state_code: str, location: str) -> None:
 
 
 def lambda_handler(event: dict, _context) -> None:
+    inserts = []
     for record in event.get("Records", []):
         if record.get("eventName") != "INSERT":
             continue
@@ -89,14 +108,29 @@ def lambda_handler(event: dict, _context) -> None:
         if not state_code or not location:
             continue
 
-        canonical_phone = image.get("canonicalPhone")
+        inserts.append((state_code, location, image.get("canonicalPhone")))
 
+    # Group this batch's own inserted locations by stateCode so that
+    # sibling INSERTs (e.g. a brand-new state's locations added together in
+    # one BatchWriteItem) can all be excluded from the "does this state
+    # already exist" scan below — not just the one record currently being
+    # processed. See _is_first_occurrence_of_state docstring for why.
+    locations_by_state: dict = {}
+    for state_code, location, _ in inserts:
+        locations_by_state.setdefault(state_code, set()).add(location)
+
+    alerted_states = set()
+    for state_code, location, canonical_phone in inserts:
         if canonical_phone:
             continue
 
-        if not _is_first_occurrence_of_state(state_code, location):
+        if state_code in alerted_states:
             continue
 
+        if not _is_first_occurrence_of_state(state_code, locations_by_state[state_code]):
+            continue
+
+        alerted_states.add(state_code)
         _LOG.info(json.dumps({
             "event": "location_onboarding_missing_phone_detected",
             "state_code": state_code,

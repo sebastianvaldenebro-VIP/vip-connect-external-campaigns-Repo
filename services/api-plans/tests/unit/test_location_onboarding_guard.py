@@ -30,7 +30,7 @@ def test_alarms_when_new_state_has_no_canonical_phone(monkeypatch):
             published.append(kwargs)
 
     monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
-    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_location: True)
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_locations: True)
 
     event = {"Records": [_insert_record("WA - Seattle", "WA", None)]}
     guard.lambda_handler(event, None)
@@ -49,7 +49,7 @@ def test_no_alarm_when_new_state_has_canonical_phone(monkeypatch):
             published.append(kwargs)
 
     monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
-    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_location: True)
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_locations: True)
 
     event = {"Records": [_insert_record("WA - Seattle", "WA", "+12065551234")]}
     guard.lambda_handler(event, None)
@@ -65,7 +65,7 @@ def test_no_alarm_when_state_already_existed(monkeypatch):
             published.append(kwargs)
 
     monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
-    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_location: False)
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_locations: False)
 
     event = {"Records": [_insert_record("NJ - New Town", "NJ", None)]}
     guard.lambda_handler(event, None)
@@ -93,3 +93,79 @@ def test_ignores_non_insert_events(monkeypatch):
     guard.lambda_handler(event, None)
 
     assert published == []
+
+
+def test_bulk_insert_of_same_new_state_alerts_exactly_once(monkeypatch):
+    """Regression for the bug this fix round addresses: when a brand-new
+    state's locations are added together (realistic onboarding pattern —
+    today's PA data already has multiple location rows per state, and any
+    future new state will likely be onboarded the same way), all INSERT
+    records land in the same Streams batch and are already durably
+    committed by the time this Lambda scans. Excluding only the single
+    triggering record's own location (the old, buggy behavior) would make
+    every sibling see the others and wrongly conclude the state pre-existed
+    — silencing the alert entirely. The fix excludes the full batch-sibling
+    set per stateCode and dedupes so exactly ONE alert fires per stateCode
+    per invocation, regardless of how many sibling records qualify.
+    """
+    published = []
+
+    class FakeSns:
+        def publish(self, **kwargs):
+            published.append(kwargs)
+
+    seen_exclude_sets = []
+
+    def fake_first_occurrence(code, exclude_locations):
+        seen_exclude_sets.append(exclude_locations)
+        # Simulate the real scan: the only items with this stateCode are
+        # the batch's own siblings, so once they're all excluded nothing
+        # else remains -> True (first occurrence).
+        return True
+
+    monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", fake_first_occurrence)
+
+    event = {
+        "Records": [
+            _insert_record("ZZ - Townsville", "ZZ", None),
+            _insert_record("ZZ - Villageburg", "ZZ", None),
+        ]
+    }
+    guard.lambda_handler(event, None)
+
+    assert len(published) == 1
+    assert published[0]["MessageAttributes"]["stateCode"]["StringValue"] == "ZZ"
+    # Both sibling locations must have been passed as the exclude set, not
+    # just the location of whichever record happened to trigger the alert.
+    assert seen_exclude_sets[0] == {"ZZ - Townsville", "ZZ - Villageburg"}
+
+
+def test_bulk_insert_same_new_state_one_with_phone_still_alerts(monkeypatch):
+    """Within one batch, if one sibling location already has canonicalPhone
+    set but another sibling for the SAME brand-new state does not, we
+    still alert. Rationale: the alert means "this state's onboarding is
+    incomplete" — the state as a whole isn't fully configured until every
+    location has a canonical phone, so the location still missing one
+    should still trigger the ops alarm even though a sibling is already
+    set up correctly.
+    """
+    published = []
+
+    class FakeSns:
+        def publish(self, **kwargs):
+            published.append(kwargs)
+
+    monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_locations: True)
+
+    event = {
+        "Records": [
+            _insert_record("ZZ - Townsville", "ZZ", "+12065551234"),
+            _insert_record("ZZ - Villageburg", "ZZ", None),
+        ]
+    }
+    guard.lambda_handler(event, None)
+
+    assert len(published) == 1
+    assert published[0]["MessageAttributes"]["stateCode"]["StringValue"] == "ZZ"
