@@ -100,12 +100,15 @@ function aggregateMetrics(metrics: (BrandedMetricSnapshot | undefined)[]): {
   placed: number; answered: number; voicemail: number; busy: number; noAnswer: number;
   answerRate: string; voicemailRate: string;
 } {
+  // API fields are typed as number but can arrive as numeric strings (Decimal
+  // round-tripped through JSON) — Number(...) guards against 0 + "13" === "013"
+  // string concatenation instead of numeric addition.
   const valid = metrics.filter(Boolean) as BrandedMetricSnapshot[];
-  const placed    = valid.reduce((s, m) => s + m.contactsPlaced, 0);
-  const answered  = valid.reduce((s, m) => s + m.contactsAnswered, 0);
-  const voicemail = valid.reduce((s, m) => s + m.contactsVoicemail, 0);
-  const busy      = valid.reduce((s, m) => s + m.contactsBusy, 0);
-  const noAnswer  = valid.reduce((s, m) => s + m.contactsNoAnswer, 0);
+  const placed    = valid.reduce((s, m) => s + Number(m.contactsPlaced), 0);
+  const answered  = valid.reduce((s, m) => s + Number(m.contactsAnswered), 0);
+  const voicemail = valid.reduce((s, m) => s + Number(m.contactsVoicemail), 0);
+  const busy      = valid.reduce((s, m) => s + Number(m.contactsBusy), 0);
+  const noAnswer  = valid.reduce((s, m) => s + Number(m.contactsNoAnswer), 0);
   return {
     placed, answered, voicemail, busy, noAnswer,
     answerRate:    placed > 0 ? ((answered / placed) * 100).toFixed(1) : '0.0',
@@ -179,9 +182,9 @@ function KpiHeader({ summary, allMetrics }: {
   summary: BrandedTodaySummary;
   allMetrics: BrandedMetricSnapshot[];
 }): ReactNode {
-  const totalAnswered  = allMetrics.reduce((s, m) => s + m.contactsAnswered, 0);
-  const totalVoicemail = allMetrics.reduce((s, m) => s + m.contactsVoicemail, 0);
-  const totalAttempts  = allMetrics.reduce((s, m) => s + m.contactsPlaced, 0) || summary.contactsDialed;
+  const totalAnswered  = allMetrics.reduce((s, m) => s + Number(m.contactsAnswered), 0);
+  const totalVoicemail = allMetrics.reduce((s, m) => s + Number(m.contactsVoicemail), 0);
+  const totalAttempts  = allMetrics.reduce((s, m) => s + Number(m.contactsPlaced), 0) || summary.contactsDialed;
   const failed         = summary.campaigns.filter(c => c.status === 'ABORTED' || c.status === 'ERROR').length;
   const answerRate     = totalAttempts > 0 ? ((totalAnswered / totalAttempts) * 100).toFixed(1) : null;
   const vmRate         = totalAttempts > 0 ? ((totalVoicemail / totalAttempts) * 100).toFixed(1) : null;
@@ -388,7 +391,7 @@ function PlanGroupCard({
   const runningCount   = group.campaigns.filter(c => c.status === 'RUNNING').length;
   const completedCount = group.campaigns.filter(c => c.status === 'COMPLETED').length;
   const failedCount    = group.campaigns.filter(c => c.status === 'ABORTED' || c.status === 'ERROR').length;
-  const totalSeeded    = group.campaigns.reduce((s, c) => s + (c.segmentSize ?? c.totalSeeded ?? 0), 0);
+  const totalSeeded    = group.campaigns.reduce((s, c) => s + Number(c.segmentSize ?? c.totalSeeded ?? 0), 0);
   const isFailed       = group.status === 'FAILED';
   const isRunning      = group.status === 'RUNNING';
   const runtimeSec     = elapsedSeconds(group.startedAt);
@@ -483,8 +486,11 @@ function PlanDetailView({
 
   const allMetrics    = [...metricsMap.values()];
   const agg           = aggregateMetrics(allMetrics);
-  const totalSeeded   = group.campaigns.reduce((s, c) => s + (c.segmentSize ?? c.totalSeeded ?? 0), 0);
-  const totalDialed   = group.campaigns.reduce((s, c) => s + (c.totalDialed ?? 0), 0);
+  const totalSeeded   = group.campaigns.reduce((s, c) => s + Number(c.segmentSize ?? c.totalSeeded ?? 0), 0);
+  const totalDialed   = group.campaigns.reduce(
+    (s, c) => s + Number(c.totalDialed ?? metricsMap.get(c.brandedCampaignId)?.contactsPlaced ?? 0),
+    0,
+  );
   const allLoaded     = campaignMetricsQueries.every(q => !q.isLoading);
 
   // Average seconds-per-contact across all campaigns (for pace comparison).
