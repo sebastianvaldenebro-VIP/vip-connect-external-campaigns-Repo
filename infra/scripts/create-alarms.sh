@@ -157,6 +157,21 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# Fires when a campaign keeps reverting to "queued" instead of advancing (Redis
+# mid-rebuild, empty segment) for 5 CONSECUTIVE 1-minute ticks — i.e. stalled ~5min+,
+# not a normal transient blip (the fixed-point loop already tolerates single-tick
+# reverts by design, see _dispatch_ready_campaigns's `stalled` set). A brief Redis
+# rebuild self-heals in 1-2 ticks and should NOT page; this only fires when it doesn't.
+# Metric emitted WITHOUT dimensions (aggregate) so this CLI alarm can catch it.
+# The per-CampaignId dimension is also emitted for drill-down in CloudWatch Metrics.
+alarm \
+  --alarm-name "vip-plans-campaign-dispatch-stalled" \
+  --alarm-description "WARNING: a campaign has been stalled (reverting to queued, not advancing) for 5+ consecutive minutes — check Redis lead-list rebuild status or _create_segment errors." \
+  --namespace "VIPPlans" --metric-name "CampaignDispatchStalled" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 5 --datapoints-to-alarm 5
+
 # Per-plan vip-sched-* FailedInvocations alarms cannot be created here because rule names
 # are dynamic (created at runtime by upsert_schedule). Options:
 #   a) Console: Metric Math alarm with SEARCH('{AWS/Events,RuleName} vip-sched FailedInvocations')
@@ -169,7 +184,7 @@ alarm \
 #        --alarm-actions $TOPIC $R
 
 echo ""
-echo "=== 15 alarmas creadas ==="
+echo "=== 16 alarmas creadas ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the

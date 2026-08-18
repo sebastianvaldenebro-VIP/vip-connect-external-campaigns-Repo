@@ -199,17 +199,29 @@ def _emit_dispatch_stalled_metric(campaign_id: str) -> None:
     instead of advancing (Redis rebuilding, empty segment retry). Applies to any
     delivery type, not just branded — unlike _emit_branded_metric.
 
+    Emitted twice, same convention as ScheduledRunFallback: with CampaignId (for
+    per-campaign drill-down) and without dimensions (aggregate, so a single CLI
+    alarm can watch "any campaign stalled" without a Metric Math/SEARCH alarm).
+
     Fire-and-forget — failures are logged but never raised.
     """
     try:
         boto3.client("cloudwatch").put_metric_data(
             Namespace="VIPPlans",
-            MetricData=[{
-                "MetricName": "CampaignDispatchStalled",
-                "Value": 1,
-                "Unit": "Count",
-                "Dimensions": [{"Name": "CampaignId", "Value": campaign_id}],
-            }],
+            MetricData=[
+                {
+                    "MetricName": "CampaignDispatchStalled",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "CampaignId", "Value": campaign_id}],
+                },
+                {
+                    "MetricName": "CampaignDispatchStalled",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [],
+                },
+            ],
         )
     except Exception as exc:
         logger.warning("_emit_dispatch_stalled_metric failed: %s", type(exc).__name__)

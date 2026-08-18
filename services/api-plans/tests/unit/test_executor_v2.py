@@ -109,10 +109,20 @@ def _started_mock(run: dict, bucket_index: int, status: str = "running"):
     made_progress check (added to prevent the Redis-rebuilding busy-loop) sees every
     mocked campaign as stuck in "queued" and reports changed=False, which is only
     correct for the _RedisRebuildingError/_EmptySegmentError revert path.
+
+    `bucket_index` is accepted for call-site clarity/documentation only — the real
+    bucket_index is always taken from the call's own `_bucket_index` arg (the one
+    _dispatch_ready_campaigns actually passes), so a stale/mismatched value here
+    can't silently mutate the wrong bucket's state.
     """
 
     def _side_effect(_run, _plan, _bucket_index, campaign_index):
-        _run["bucketStates"][bucket_index]["campaignStates"][campaign_index][
+        assert _bucket_index == bucket_index, (
+            f"_started_mock(bucket_index={bucket_index}) called for bucket "
+            f"{_bucket_index} — pass the real bucket_index used in the test's "
+            f"_dispatch_ready_campaigns()/tick() call"
+        )
+        _run["bucketStates"][_bucket_index]["campaignStates"][campaign_index][
             "status"
         ] = status
 
@@ -490,6 +500,7 @@ def test_dispatch_dependent_starts_after_parent_cancelled():
     run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 0)
         executor._dispatch_ready_campaigns(run, plan, 0)
 
     start.assert_called_once_with(run, plan, 0, 1)
@@ -512,6 +523,7 @@ def test_dispatch_dependent_starts_after_parent_expired():
     run = _make_run(plan, [_bucket_state("b0", [c1, c2])])
 
     with patch("executor.save_run"), patch("executor._start_one_campaign") as start:
+        start.side_effect = _started_mock(run, 0)
         executor._dispatch_ready_campaigns(run, plan, 0)
 
     start.assert_called_once_with(run, plan, 0, 1)
