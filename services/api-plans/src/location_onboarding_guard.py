@@ -56,6 +56,12 @@ def _is_first_occurrence_of_state(state_code: str, exclude_locations: set) -> bo
     is an ops alarm, not a safety-critical control, so cross-invocation
     dedup (e.g. a DynamoDB lock table) is intentionally not built for that
     edge case.
+
+    Also accepted: this Scan has no LastEvaluatedKey pagination loop, unlike
+    every other Scan in this codebase — safe only because VipLocationMapping
+    is small (~76-90 items, well under a single Scan page). If the table
+    grows past that, this would need the same pagination loop builders.py
+    and the backfill script already use.
     """
     resp = _table().scan(
         FilterExpression="stateCode = :code",
