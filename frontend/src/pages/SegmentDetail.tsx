@@ -11,7 +11,7 @@ import {
   type ReconcileResult,
   type VerifyResult,
 } from '@/lib/api';
-import { stateCodesFromSegmentGroups, stateCodesFromSegmentName } from '@/lib/stateLocationMap';
+import { stateCodesFromSegmentGroups, stateCodesFromSegmentName, useLocationMapping } from '@/lib/stateLocationMap';
 import { formatDateTime } from '@/lib/utils';
 
 type EstimateResult = { totalCount: number | null; at: string };
@@ -21,6 +21,7 @@ export function SegmentDetail(): ReactNode {
   const { id = '' } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const { locationMap } = useLocationMapping();
 
   const [estimate, setEstimate] = useState<EstimateResult | 'pending' | null>(null);
   const [snapshotStatus, setSnapshotStatus] = useState<string | null>(null);
@@ -220,9 +221,9 @@ export function SegmentDetail(): ReactNode {
         segmentName={seg.name}
         segmentArn={seg.segmentArn}
         segmentStates={
-          stateCodesFromSegmentGroups(seg.segmentGroups).length > 0
-            ? stateCodesFromSegmentGroups(seg.segmentGroups)
-            : stateCodesFromSegmentName(seg.name)
+          stateCodesFromSegmentGroups(seg.segmentGroups, locationMap).length > 0
+            ? stateCodesFromSegmentGroups(seg.segmentGroups, locationMap)
+            : stateCodesFromSegmentName(seg.name, locationMap)
         }
       />
 
