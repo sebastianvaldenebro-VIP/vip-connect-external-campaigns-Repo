@@ -196,6 +196,7 @@ const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   smsCampaignQueueTable:          smsStack.smsCampaignQueueTable,
   smsRunsTable:                   smsStack.smsRunsTable,
   smsSenderFunctionArn:           smsStack.smsSenderFunction.functionArn,
+  locationMappingStreamArn:       'arn:aws:dynamodb:us-east-1:165505826690:table/VipLocationMapping/stream/2026-08-18T21:05:11.209',
 });
 
 // 7. api-profiles Lambda

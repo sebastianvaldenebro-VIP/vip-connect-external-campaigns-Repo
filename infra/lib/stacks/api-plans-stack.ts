@@ -5,6 +5,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import { DynamoEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as path from 'path';
@@ -39,6 +40,11 @@ export interface ApiPlansStackProps extends cdk.StackProps {
   readonly smsCampaignQueueTable?: dynamodb.ITable;
   readonly smsRunsTable?: dynamodb.ITable;
   readonly smsSenderFunctionArn?: string;
+  // Location Onboarding Guard — DynamoDB stream ARN for VipLocationMapping.
+  // Enable with: aws dynamodb update-table --table-name VipLocationMapping
+  //   --stream-specification StreamEnabled=true,StreamViewType=NEW_IMAGE
+  // Omit to deploy without the guard Lambda's event source wired.
+  readonly locationMappingStreamArn?: string;
 }
 
 export class ApiPlansStack extends cdk.Stack {
@@ -317,6 +323,15 @@ export class ApiPlansStack extends cdk.Stack {
     );
     locationMappingTable.grantReadData(role);
 
+    // ── Location Onboarding Guard — same physical table, second CDK
+    // reference so we can expose its stream ARN (fromTableName can't).
+    const locationMappingTableWithStream = props.locationMappingStreamArn
+      ? dynamodb.Table.fromTableAttributes(this, 'LocationMappingTableStream', {
+          tableArn: `arn:aws:dynamodb:${this.region}:${this.account}:table/VipLocationMapping`,
+          tableStreamArn: props.locationMappingStreamArn,
+        })
+      : undefined;
+
     // ── SMS Campaign — executor polling + sender invocation ──────────
     if (props.smsCampaignQueueTable) {
       props.smsCampaignQueueTable.grantReadData(role);
@@ -498,6 +513,64 @@ export class ApiPlansStack extends cdk.Stack {
       this.lambdaFunction.addEnvironment(
         'SMS_SENDER_FUNCTION_ARN',
         props.smsSenderFunctionArn,
+      );
+    }
+
+    // ── Location Onboarding Guard — detects a brand-new state appearing in
+    // VipLocationMapping with no canonicalPhone set, alarms via SNS.
+    // No Connect permissions — flow auto-creation is handled elsewhere
+    // (builders.resolve_campaign_flow_arn, called from executor.py).
+    if (locationMappingTableWithStream) {
+      const guardRole = new iam.Role(this, 'LocationOnboardingGuardRole', {
+        assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+        managedPolicies: [
+          iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+        ],
+        ...(props.permissionsBoundaryName
+          ? { permissionsBoundary: iam.ManagedPolicy.fromManagedPolicyName(this, 'GuardBoundary', props.permissionsBoundaryName) }
+          : {}),
+      });
+      locationMappingTableWithStream.grantStreamRead(guardRole);
+      locationMappingTableWithStream.grantReadData(guardRole);
+      alertsTopic.grantPublish(guardRole);
+
+      const guardLogGroup = new logs.LogGroup(this, 'LocationOnboardingGuardLogs', {
+        logGroupName: '/aws/lambda/vip-location-onboarding-guard',
+        retention: logs.RetentionDays.ONE_YEAR,
+        encryptionKey: props.dataKey,
+        removalPolicy: cdk.RemovalPolicy.RETAIN,
+      });
+
+      const guardFunction = new lambda.Function(this, 'LocationOnboardingGuardFunction', {
+        functionName: 'vip-location-onboarding-guard',
+        runtime: lambda.Runtime.PYTHON_3_12,
+        handler: 'location_onboarding_guard.lambda_handler',
+        code: lambda.Code.fromAsset(
+          path.join(__dirname, '../../../services/api-plans/src'),
+        ),
+        memorySize: 256,
+        timeout: cdk.Duration.seconds(30),
+        role: guardRole,
+        logGroup: guardLogGroup,
+        reservedConcurrentExecutions: 1,
+        environment: {
+          SNS_ALERTS_TOPIC_ARN: alertsTopic.topicArn,
+          LOCATION_MAPPING_TABLE: 'VipLocationMapping',
+          LOG_LEVEL: 'INFO',
+        },
+      });
+
+      guardFunction.addEventSource(
+        new DynamoEventSource(locationMappingTableWithStream, {
+          startingPosition: lambda.StartingPosition.LATEST,
+          batchSize: 10,
+          retryAttempts: 2,
+          filters: [
+            lambda.FilterCriteria.filter({
+              eventName: lambda.FilterRule.isEqual('INSERT'),
+            }),
+          ],
+        }),
       );
     }
 
