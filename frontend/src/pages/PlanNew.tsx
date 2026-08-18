@@ -18,10 +18,9 @@ import {
   type SmsOriginationNumber,
 } from '@/lib/api';
 import { STATE_DEFAULT_PHONES } from '@/lib/areaCodeMap';
+import { useLocationMapping } from '@/lib/stateLocationMap';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-const STATE_CODES = ['NY', 'NJ', 'LI', 'CT', 'MD', 'TX', 'NCA', 'SCA'];
 
 const RUN_TYPE_LABELS: Record<CampaignRunType, string> = {
   full: 'Until 7 PM EST',
@@ -538,6 +537,8 @@ function CampaignCard({
 }) {
   const cfg = campaign.campaignConfig ?? { ...DEFAULT_CAMPAIGN_CONFIG };
   const [configOpen, setConfigOpen] = useState(false);
+  const { locationMap } = useLocationMapping();
+  const stateCodes = locationMap.map((g) => g.code);
 
   const prevAutoNameRef = useRef(autoNameCampaign(campaign.states, campaign.groups));
 
@@ -678,7 +679,7 @@ function CampaignCard({
             <div>
               <label className="block text-xs font-semibold text-gray-700 mb-1.5">States</label>
               <div className="flex flex-wrap gap-2">
-                {STATE_CODES.map((code) => (
+                {stateCodes.map((code) => (
                   <label key={code} className="flex items-center gap-1 text-xs cursor-pointer">
                     <input
                       type="checkbox"
