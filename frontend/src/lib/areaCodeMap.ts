@@ -12,6 +12,7 @@ export const STATE_DEFAULT_PHONES: Record<string, string> = {
   TX:         '+15126508970',
   SCA:        '+18588686651',  // South CA
   NCA:        '+16694674988',  // North CA
+  PA:         '+12154009167',  // PA - Vein Leads (Philadelphia, area code 215)
 };
 
 /** Normalize any phone format to digits-only for comparison (strips +, spaces, dashes). */
@@ -54,6 +55,7 @@ export function pickPhoneForStates<T extends { number: string }>(
     CT:  ['203', '475', '860', '959'],
     MD:  ['240', '301', '410', '443', '667'],
     LI:  ['516', '631'],
+    PA:  ['215'],
   };
   const targetCodes = new Set<string>();
   for (const state of states) {
