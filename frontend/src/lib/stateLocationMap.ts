@@ -162,6 +162,11 @@ export function buildLocationToState(map: readonly StateGroup[]): Record<string,
   return Object.fromEntries(map.flatMap((g) => g.locations.map((loc) => [loc, g.state])));
 }
 
+/** Build a live set of known state codes from a dynamically fetched StateGroup array. */
+export function codesFromMap(map: readonly StateGroup[]): Set<string> {
+  return new Set(map.map((g) => g.code));
+}
+
 export function locationsForStates(
   states: string[],
   map: readonly StateGroup[] = STATE_LOCATION_MAP,
@@ -194,10 +199,14 @@ export function codesForStates(
  * Returns an empty array when the segment has no `location` filter or when
  * none of its location values are recognized in `STATE_LOCATION_MAP`.
  */
-export function stateCodesFromSegmentGroups(segmentGroups: unknown): string[] {
+export function stateCodesFromSegmentGroups(
+  segmentGroups: unknown,
+  map: readonly StateGroup[] = STATE_LOCATION_MAP,
+): string[] {
   const found = new Set<string>();
   const groups = (segmentGroups as { Groups?: unknown[] } | undefined)?.Groups;
   if (!Array.isArray(groups)) return [];
+  const locationToState = buildLocationToState(map);
   for (const group of groups) {
     const dimensions = (group as { Dimensions?: unknown[] }).Dimensions;
     if (!Array.isArray(dimensions)) continue;
@@ -207,9 +216,9 @@ export function stateCodesFromSegmentGroups(segmentGroups: unknown): string[] {
       const locationAttr = attrs?.location;
       if (!locationAttr || !Array.isArray(locationAttr.Values)) continue;
       for (const value of locationAttr.Values) {
-        const stateName = LOCATION_TO_STATE[value];
+        const stateName = locationToState[value];
         if (!stateName) continue;
-        const code = STATE_LOCATION_MAP.find((g) => g.state === stateName)?.code;
+        const code = map.find((g) => g.state === stateName)?.code;
         if (code) found.add(code);
       }
     }
@@ -227,9 +236,13 @@ export const KNOWN_STATE_CODES = new Set(STATE_LOCATION_MAP.map((g) => g.code));
  * Reconciled segments have SegmentGroups as a static ID list (no location filter),
  * so this is the reliable fallback for auto-selecting campaign flow and phone.
  */
-export function stateCodesFromSegmentName(name: string): string[] {
+export function stateCodesFromSegmentName(
+  name: string,
+  map: readonly StateGroup[] = STATE_LOCATION_MAP,
+): string[] {
+  const knownCodes = codesFromMap(map);
   for (const token of name.toUpperCase().split('-')) {
-    if (KNOWN_STATE_CODES.has(token)) return [token];
+    if (knownCodes.has(token)) return [token];
   }
   return [];
 }
