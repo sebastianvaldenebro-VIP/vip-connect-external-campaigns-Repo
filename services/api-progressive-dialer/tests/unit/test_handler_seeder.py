@@ -267,6 +267,69 @@ def test_lambda_handler_phone_filter_segment_seeds_without_batch_get_profile():
     assert mock_batch_writer.put_item.call_count == 2
 
 
+def test_lambda_handler_mixed_id_list_and_phone_filter_merges_both():
+    """A hand-crafted CP segment can OR an Attributes.ID filter group with a
+    PhoneNumber filter group (e.g. adding one extra test contact to an
+    otherwise ID-list segment). The seeder must seed members from BOTH groups,
+    not just whichever one _extract_profile_ids finds first.
+    """
+    id_group = _make_segment_groups(["p1", "p2"])
+    phone_group = _make_phone_segment(["+15550009999"])
+    mixed_groups = {"Groups": id_group["Groups"] + phone_group["Groups"]}
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {"SegmentGroups": mixed_groups}
+    mock_cp.search_profiles.side_effect = [
+        {"Items": [{"PhoneNumber": "+15550001111"}]},
+        {"Items": [{"PhoneNumber": "+15550002222"}]},
+    ]
+    mock_table = MagicMock()
+    mock_batch_writer = MagicMock()
+    mock_table.batch_writer.return_value.__enter__ = MagicMock(return_value=mock_batch_writer)
+    mock_table.batch_writer.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp), \
+         patch("handler_seeder._get_table", return_value=mock_table):
+        resp = handler_seeder.lambda_handler(
+            _api_event("camp-mixed", {"segmentName": "mixed-seg"}), None
+        )
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    # 2 phones resolved from the ID-list group + 1 phone from the phone-filter group
+    assert body["seeded"] == 3
+    assert mock_batch_writer.put_item.call_count == 3
+    seeded_phones = {call.kwargs["Item"]["phone"] for call in mock_batch_writer.put_item.call_args_list}
+    assert seeded_phones == {"+15550001111", "+15550002222", "+15550009999"}
+
+
+def test_lambda_handler_mixed_dedupes_overlapping_phone():
+    """If the same phone would be seeded via both the ID-list and the
+    phone-filter group, it must only be written once.
+    """
+    id_group = _make_segment_groups(["p1"])
+    phone_group = _make_phone_segment(["+15550001111"])  # same phone p1 resolves to
+    mixed_groups = {"Groups": id_group["Groups"] + phone_group["Groups"]}
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {"SegmentGroups": mixed_groups}
+    mock_cp.search_profiles.return_value = {"Items": [{"PhoneNumber": "+15550001111"}]}
+    mock_table = MagicMock()
+    mock_batch_writer = MagicMock()
+    mock_table.batch_writer.return_value.__enter__ = MagicMock(return_value=mock_batch_writer)
+    mock_table.batch_writer.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch("handler_seeder._get_cp", return_value=mock_cp), \
+         patch("handler_seeder._get_table", return_value=mock_table):
+        resp = handler_seeder.lambda_handler(
+            _api_event("camp-mixed-dupe", {"segmentName": "mixed-dupe-seg"}), None
+        )
+
+    body = json.loads(resp["body"])
+    assert body["seeded"] == 1
+    assert mock_batch_writer.put_item.call_count == 1
+
+
 def test_lambda_handler_phone_filter_empty_returns_zero_seeded_on_direct_invoke():
     """Phone-filter segment with no phones → seeded:0 on direct invoke (not HTTP error)."""
     mock_cp = MagicMock()

@@ -163,28 +163,34 @@ def lambda_handler(event: dict, _context) -> dict:
 
     segment_groups = resp.get("SegmentGroups") or {}
     profile_ids = _extract_profile_ids(segment_groups)
-    if profile_ids:
-        # ID-list segment (built by reconcile.py) — resolve phones via BatchGetProfile
-        phones = _fetch_phones(profile_ids)
-        _LOG.info(json.dumps({
-            "event": "segment_resolved",
-            "campaign_id": campaign_id,
-            "path": "id_list",
-            "profile_ids_found": len(profile_ids),
-            "phones_resolved": len(phones),
-        }))
-    else:
-        # Fallback: phone-filter segment (created manually or by executor._create_segment)
-        phones = _extract_phones_from_filter(segment_groups)
-        _LOG.info(json.dumps({
-            "event": "segment_resolved",
-            "campaign_id": campaign_id,
-            "path": "phone_filter",
-            "phones_found": len(phones),
-        }))
-        if not phones:
-            err = {"error": "segment has no members"}
-            return {"statusCode": 400, "body": json.dumps(err)} if _http_mode else {"seeded": 0}
+    filter_phones = _extract_phones_from_filter(segment_groups)
+
+    # ID-list segment (built by reconcile.py) — resolve phones via SearchProfiles.
+    id_list_phones = _fetch_phones(profile_ids) if profile_ids else []
+
+    # Merge both paths — a segment's ID-list filter group and phone-filter group
+    # are OR'd together (e.g. a hand-crafted CP segment mixing both), so resolving
+    # only one silently drops members that match exclusively via the other.
+    # Dedupe in case the same profile matches both groups.
+    seen: set = set()
+    phones = []
+    for phone in id_list_phones + filter_phones:
+        if phone not in seen:
+            seen.add(phone)
+            phones.append(phone)
+
+    _LOG.info(json.dumps({
+        "event": "segment_resolved",
+        "campaign_id": campaign_id,
+        "profile_ids_found": len(profile_ids),
+        "id_list_phones_resolved": len(id_list_phones),
+        "filter_phones_found": len(filter_phones),
+        "total_phones_after_dedupe": len(phones),
+    }))
+
+    if not phones:
+        err = {"error": "segment has no members"}
+        return {"statusCode": 400, "body": json.dumps(err)} if _http_mode else {"seeded": 0}
 
     # 3. Write to DynamoDB queue (phone is PHI — encrypted at rest via KMS CMK on the table)
     table = _get_table()
