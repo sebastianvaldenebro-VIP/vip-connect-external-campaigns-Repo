@@ -533,6 +533,7 @@ export class ApiPlansStack extends cdk.Stack {
       locationMappingTableWithStream.grantStreamRead(guardRole);
       locationMappingTableWithStream.grantReadData(guardRole);
       alertsTopic.grantPublish(guardRole);
+      props.dataKey.grantEncryptDecrypt(guardRole);
 
       const guardLogGroup = new logs.LogGroup(this, 'LocationOnboardingGuardLogs', {
         logGroupName: '/aws/lambda/vip-location-onboarding-guard',

@@ -40,6 +40,16 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# ── location-onboarding-guard ────────────────────────────────────────────────
+alarm \
+  --alarm-name "vip-location-onboarding-guard-errors" \
+  --alarm-description "CRITICAL: location onboarding guard Lambda errors - new-state phone alert may be silently failing" \
+  --namespace "AWS/Lambda" --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=vip-location-onboarding-guard" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
 # ── feeder ────────────────────────────────────────────────────────────────────
 alarm \
   --alarm-name "vip-feeder-errors" \
@@ -184,7 +194,7 @@ alarm \
 #        --alarm-actions $TOPIC $R
 
 echo ""
-echo "=== 16 alarmas creadas ==="
+echo "=== 17 alarmas creadas ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the

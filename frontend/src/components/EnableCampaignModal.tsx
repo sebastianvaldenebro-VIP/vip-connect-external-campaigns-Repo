@@ -314,8 +314,14 @@ export function EnableCampaignModal({
               />
               <DefaultRow
                 label="Campaign flow"
-                value={resolved.campaignFlow ? resolved.campaignFlow.name : '—'}
-                tone={resolved.campaignFlow ? 'ok' : 'bad'}
+                value={
+                  effectiveCampaignFlowArn
+                    ? resolved.campaignFlow?.arn === effectiveCampaignFlowArn
+                      ? resolved.campaignFlow.name
+                      : 'Resolved via backend'
+                    : '—'
+                }
+                tone={effectiveCampaignFlowArn ? 'ok' : 'bad'}
               />
               <DefaultRow
                 label="Phone number"

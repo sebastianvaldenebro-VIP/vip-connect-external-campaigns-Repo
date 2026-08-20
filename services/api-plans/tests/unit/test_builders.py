@@ -19,6 +19,7 @@ from builders import (  # noqa: E402
     build_campaign_params,
     get_all_location_groups,
     locations_for_state_codes,
+    resolve_campaign_flow_arn,
 )
 
 # ── DynamoDB stub — used by all tests that touch the location mapping ──────────
@@ -351,3 +352,79 @@ def test_all_known_locations_does_not_contain_unknown():
     known = all_known_locations()
     assert "TX - Unknown Clinic" not in known
     assert "ZZ - Nowhere" not in known
+
+
+# ── resolve_campaign_flow_arn ────────────────────────────────────────────────
+#
+# Regression for the concurrent-create race: this function now has 2 real
+# callers (the sequential executor, and the Enable-Campaign modal via the new
+# HTTP endpoint) that can race for the same brand-new state. If our
+# create_contact_flow loses the race (DuplicateResourceException or similar),
+# we must re-list once and return the winner's ARN instead of None — a bare
+# None from this path used to raise a ValueError that killed a live run even
+# though the flow now actually exists.
+
+
+class _FakeConnectClient:
+    """Minimal boto3 Connect client stub for resolve_campaign_flow_arn tests."""
+
+    def __init__(self, list_responses, create_side_effect=None):
+        # list_responses: sequence of ContactFlowSummaryList payloads, consumed
+        # in order across successive list_contact_flows calls.
+        self._list_responses = list(list_responses)
+        self._create_side_effect = create_side_effect
+
+    def list_contact_flows(self, **kwargs):
+        payload = self._list_responses.pop(0) if self._list_responses else []
+        return {"ContactFlowSummaryList": payload}
+
+    def create_contact_flow(self, **kwargs):
+        if self._create_side_effect is not None:
+            raise self._create_side_effect
+        return {"ContactFlowArn": "arn:aws:connect:us-east-1:165505826690:instance/x/contact-flow/new"}
+
+    def tag_resource(self, **kwargs):
+        return {}
+
+
+def test_resolve_campaign_flow_arn_returns_existing_match():
+    fake_client = _FakeConnectClient(
+        list_responses=[[{"Name": "campaign-PA", "Arn": "arn:existing"}]],
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+    assert arn == "arn:existing"
+
+
+def test_resolve_campaign_flow_arn_auto_creates_when_missing():
+    fake_client = _FakeConnectClient(list_responses=[[]])
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+    assert arn == "arn:aws:connect:us-east-1:165505826690:instance/x/contact-flow/new"
+
+
+def test_resolve_campaign_flow_arn_returns_winner_arn_on_concurrent_create_race():
+    """create_contact_flow raises (a concurrent caller won the race). The
+    fix re-lists once, finds the winner's flow, and returns its ARN instead
+    of None.
+    """
+    fake_client = _FakeConnectClient(
+        list_responses=[
+            [],  # first list: nothing found -> attempt create
+            [{"Name": "campaign-PA", "Arn": "arn:winner"}],  # retry list after create failure
+        ],
+        create_side_effect=Exception("DuplicateResourceException"),
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+    assert arn == "arn:winner"
+
+
+def test_resolve_campaign_flow_arn_returns_none_when_create_and_retry_both_fail():
+    fake_client = _FakeConnectClient(
+        list_responses=[[], []],
+        create_side_effect=Exception("boom"),
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+    assert arn is None

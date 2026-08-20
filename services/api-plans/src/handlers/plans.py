@@ -29,14 +29,35 @@ def resolve_campaign_flow(event: dict, _path_params: dict) -> dict:
     which already has connect:CreateContactFlow — this just exposes it over HTTP
     so the frontend can stop guessing flow names client-side."""
     body = parse_body(event)
-    states = body.get("states") or []
-    if not states:
+    caller = extract_caller(event)
+    states = body.get("states")
+    if (
+        not isinstance(states, list)
+        or not states
+        or not all(isinstance(s, str) for s in states)
+    ):
         return json_response(
             400,
-            {"error": {"code": "BAD_REQUEST", "message": "states is required and must be non-empty"}},
+            {
+                "error": {
+                    "code": "BAD_REQUEST",
+                    "message": "states must be a non-empty list of strings",
+                }
+            },
         )
 
     arn = builders.resolve_campaign_flow_arn(states, executor.CONNECT_INSTANCE_ID)
+
+    build_audit().record(
+        entity_type="campaign_flow",
+        entity_id=arn or ",".join(states),
+        action="resolve",
+        actor_sub=caller.sub,
+        actor_email=caller.email,
+        ip_address=caller.ip_address,
+        user_agent=caller.user_agent,
+        after={"states": states, "arn": arn},
+    )
     return json_response(200, {"arn": arn})
 
 

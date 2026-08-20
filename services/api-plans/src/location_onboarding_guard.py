@@ -14,7 +14,7 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer
 
 _LOG = logging.getLogger(__name__)
-_LOG.setLevel(logging.INFO)
+_LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _SNS_ALERTS_TOPIC_ARN = os.environ["SNS_ALERTS_TOPIC_ARN"]
 _LOCATION_MAPPING_TABLE = os.environ["LOCATION_MAPPING_TABLE"]
@@ -78,9 +78,14 @@ def _notify_missing_phone(state_code: str, location: str) -> None:
     message = (
         f"A new location ({location}) introduced state code '{state_code}' to "
         f"VipLocationMapping, but no canonicalPhone attribute is set for it.\n\n"
-        f"Set canonicalPhone (and areaCodes) on this state's VipLocationMapping "
-        f"items before enabling campaigns for it — see "
-        f"infra/scripts/backfill-location-canonical-phone.py for the pattern."
+        f"IMPORTANT: canonicalPhone on VipLocationMapping is not yet the live "
+        f"source of truth for phone selection — that is still "
+        f"frontend/src/lib/areaCodeMap.ts (STATE_DEFAULT_PHONES / "
+        f"STATE_AREA_CODES). To actually fix outbound calling for this state, "
+        f"add its canonical phone number and area codes to areaCodeMap.ts AND "
+        f"set canonicalPhone/areaCodes on this state's VipLocationMapping items "
+        f"(see infra/scripts/backfill-location-canonical-phone.py for the "
+        f"pattern) so this alarm reflects reality going forward."
     )
     try:
         _sns_client().publish(
@@ -93,11 +98,12 @@ def _notify_missing_phone(state_code: str, location: str) -> None:
             },
         )
     except Exception as exc:
-        _LOG.warning(
+        _LOG.error(
             "location_onboarding_guard: SNS publish failed (topic=%s): %s",
             _SNS_ALERTS_TOPIC_ARN,
             exc,
         )
+        raise
 
 
 def lambda_handler(event: dict, _context) -> None:

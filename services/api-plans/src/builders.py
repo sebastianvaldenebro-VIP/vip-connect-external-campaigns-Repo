@@ -419,6 +419,27 @@ def resolve_campaign_flow_arn(
         return flow_arn
     except Exception as exc:
         logger.error("failed to auto-create campaign flow %s: %s", canonical_name, exc)
+        # A concurrent caller may have created it between our list and our
+        # create attempt (this function now has 2 real callers: the
+        # sequential executor, and the Enable-Campaign modal via HTTP —
+        # a genuine race, not hypothetical). Re-list once before giving up.
+        try:
+            retry_resp = connect.list_contact_flows(
+                InstanceId=connect_instance_id, ContactFlowTypes=["CAMPAIGN"],
+            )
+            retry_match = next(
+                (f for f in retry_resp.get("ContactFlowSummaryList", [])
+                 if f["Name"] == canonical_name),
+                None,
+            )
+            if retry_match:
+                return retry_match["Arn"]
+        except Exception as retry_exc:
+            logger.error(
+                "resolve_campaign_flow_arn: retry list_contact_flows also failed for %s: %s",
+                canonical_name,
+                retry_exc,
+            )
         return None
 
 

@@ -78,3 +78,39 @@ def test_resolve_campaign_flow_requires_states(monkeypatch):
     event = {"body": '{"states": []}'}
     resp = plans_handler.resolve_campaign_flow(event, {})
     assert resp["statusCode"] == 400
+
+
+def test_resolve_campaign_flow_rejects_bare_string_states(monkeypatch):
+    """A bare string is truthy and iterable in Python — states="PA" must be
+    rejected, not silently accepted and later truncated to state_codes[0]
+    == "P" inside builders.resolve_campaign_flow_arn.
+    """
+    event = {"body": '{"states": "PA"}'}
+    resp = plans_handler.resolve_campaign_flow(event, {})
+    assert resp["statusCode"] == 400
+
+
+def test_resolve_campaign_flow_rejects_non_string_elements(monkeypatch):
+    event = {"body": '{"states": ["PA", 123]}'}
+    resp = plans_handler.resolve_campaign_flow(event, {})
+    assert resp["statusCode"] == 400
+
+
+def test_resolve_campaign_flow_records_audit_entry(monkeypatch):
+    monkeypatch.setattr(
+        plans_handler.builders,
+        "resolve_campaign_flow_arn",
+        lambda states, instance_id: "arn:aws:connect:us-east-1:165505826690:instance/x/contact-flow/y",
+    )
+    fake_audit = MagicMock()
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: fake_audit)
+
+    event = {"body": '{"states": ["PA"]}'}
+    resp = plans_handler.resolve_campaign_flow(event, {})
+
+    assert resp["statusCode"] == 200
+    fake_audit.record.assert_called_once()
+    call_kwargs = fake_audit.record.call_args.kwargs
+    assert call_kwargs["entity_type"] == "campaign_flow"
+    assert call_kwargs["action"] == "resolve"
+    assert call_kwargs["after"]["states"] == ["PA"]
