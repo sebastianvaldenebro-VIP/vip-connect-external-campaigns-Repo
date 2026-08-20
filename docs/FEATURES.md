@@ -315,3 +315,29 @@ Operators can now configure each campaign in a plan bucket as **Campaign** (defa
 - `executor.py`: reads `campaign.deliveryType` in both `_create_and_start_campaign` and `_create_campaign_only` (pre-warm path)
 
 **Files:** `services/api-plans/src/builders.py`, `services/api-plans/src/executor.py`, `frontend/src/lib/api.ts`, `frontend/src/pages/PlanNew.tsx`, `frontend/src/pages/PlanDetail.tsx`
+
+## 2026-08-18 — Mapeo dinámico de estados/locations + Location Onboarding Guard
+
+### Segments/SegmentDetail/PlanNew leen `VipLocationMapping` en vivo en vez de mapas hardcodeados
+
+`Segments.tsx`, `SegmentDetail.tsx` y `PlanNew.tsx` (el checklist de "States" del editor de campaign) tenían cada uno su propia copia estática de la lista de estados (`STATE_LOCATION_MAP`, y un 4to array independiente en `PlanNew.tsx`), que nunca se sincronizaban con la tabla DynamoDB `VipLocationMapping` — Pennsylvania y otras locations nuevas no aparecían en ningún lado hasta que alguien actualizaba manualmente cada copia. Los tres ahora usan `useLocationMapping()` (react-query, ya existente, antes solo parcialmente adoptado) como fuente única de verdad; los mapas estáticos quedan solo como fallback mientras la query resuelve.
+
+**Archivos:** `frontend/src/lib/stateLocationMap.ts`, `frontend/src/pages/Segments.tsx`, `frontend/src/pages/SegmentDetail.tsx`, `frontend/src/pages/PlanNew.tsx`.
+
+### Teléfono/área canónicos de Pennsylvania
+
+`STATE_DEFAULT_PHONES.PA = '+12154009167'` y `STATE_AREA_CODES.PA = ['215']` agregados a `areaCodeMap.ts` (verificados en vivo contra Connect: `list-phone-numbers-v2`).
+
+**Archivos:** `frontend/src/lib/areaCodeMap.ts`.
+
+### `EnableCampaignModal` resuelve el campaign flow vía backend, con fallback al heurístico de cliente
+
+El botón "Enable Campaign" de Segments dependía 100% de una búsqueda de substring en el nombre de los contact flows ya cargados en el cliente (`suggestCampaignFlow`). Ahora llama primero a `POST /plans/resolve-campaign-flow` (nuevo endpoint, wrapper delgado sobre `builders.resolve_campaign_flow_arn`, ya usado por el executor de Plans — auto-crea el flow `campaign-<ESTADO>` si no existe), y solo si esa llamada falla o no encuentra nada cae al heurístico de cliente existente. Cierra la clase de bug de la sección de Bug Log de abajo para cualquier estado futuro sin tocar código.
+
+**Archivos:** `frontend/src/lib/api.ts`, `frontend/src/components/EnableCampaignModal.tsx`, `services/api-plans/src/handlers/plans.py`, `services/api-plans/src/router.py`, `infra/lib/stacks/api-stack.ts`.
+
+### Location Onboarding Guard — alarma SNS cuando un estado nuevo no tiene teléfono canónico
+
+Nuevo Lambda (`vip-location-onboarding-guard`, sin permisos de Connect — solo detección + alerta) triggereado por DynamoDB Streams (`INSERT`) sobre `VipLocationMapping`. Cuando aparece un `stateCode` genuinamente nuevo (ninguna otra location comparte ese código) sin el atributo `canonicalPhone` seteado, publica a `vip-plans-alerts` (mismo topic/formato que las alertas existentes de `executor.py`). Nota importante: `canonicalPhone` en `VipLocationMapping` todavía **no** es la fuente de verdad real para selección de teléfono en producción — eso sigue siendo `frontend/src/lib/areaCodeMap.ts` — el mensaje de la alerta señala esto explícitamente para no confundir a operaciones. Backfill de `canonicalPhone`/`areaCodes` para los 9 estados existentes: `infra/scripts/backfill-location-canonical-phone.py` (creado, **no ejecutado en producción** — corresponde a Sebastian decidir cuándo correrlo).
+
+**Archivos:** `services/api-plans/src/location_onboarding_guard.py`, `infra/lib/stacks/api-plans-stack.ts`, `infra/scripts/create-alarms.sh`, `infra/scripts/backfill-location-canonical-phone.py`.
