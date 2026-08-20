@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
 os.environ["SNS_ALERTS_TOPIC_ARN"] = "arn:aws:sns:us-east-1:165505826690:vip-plans-alerts"
@@ -169,3 +171,21 @@ def test_bulk_insert_same_new_state_one_with_phone_still_alerts(monkeypatch):
 
     assert len(published) == 1
     assert published[0]["MessageAttributes"]["stateCode"]["StringValue"] == "ZZ"
+
+
+def test_sns_publish_failure_reraises_so_lambda_errors_metric_fires(monkeypatch):
+    """The CRITICAL fix this Lambda exists for: a publish failure (e.g. a
+    missing KMS grant on the SSE-encrypted topic) must propagate out of
+    lambda_handler, not be swallowed — otherwise the alarm's own failures
+    are invisible and the feature ships as a silent no-op."""
+    class FailingSns:
+        def publish(self, **kwargs):
+            raise RuntimeError("KMSAccessDeniedException: simulated")
+
+    monkeypatch.setattr(guard, "_sns_client", lambda: FailingSns())
+    monkeypatch.setattr(guard, "_is_first_occurrence_of_state", lambda code, exclude_locations: True)
+
+    event = {"Records": [_insert_record("ZZ - Townsville", "ZZ", None)]}
+
+    with pytest.raises(RuntimeError, match="KMSAccessDeniedException"):
+        guard.lambda_handler(event, None)

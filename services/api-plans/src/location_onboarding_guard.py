@@ -14,7 +14,8 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer
 
 _LOG = logging.getLogger(__name__)
-_LOG.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+_level = logging.getLevelName(os.environ.get("LOG_LEVEL", "INFO").upper())
+_LOG.setLevel(_level if isinstance(_level, int) else logging.INFO)
 
 _SNS_ALERTS_TOPIC_ARN = os.environ["SNS_ALERTS_TOPIC_ARN"]
 _LOCATION_MAPPING_TABLE = os.environ["LOCATION_MAPPING_TABLE"]
