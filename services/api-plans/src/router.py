@@ -14,6 +14,7 @@ Handler = Callable[[dict, dict], dict]
 ROUTES: dict[str, Handler] = {
     # Location mapping (source of truth in DynamoDB)
     "GET /location-mapping": plans_handler.get_location_mapping,
+    "POST /plans/resolve-campaign-flow": plans_handler.resolve_campaign_flow,
     # Plan CRUD
     "GET /plans": plans_handler.list_plans,
     "POST /plans": plans_handler.create_plan,

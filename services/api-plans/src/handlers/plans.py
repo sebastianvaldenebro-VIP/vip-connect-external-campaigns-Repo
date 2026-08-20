@@ -12,6 +12,7 @@ from vip_shared.application.http import (
 from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
 
 import builders
+import executor
 import scheduler_manager
 import store
 
@@ -20,6 +21,20 @@ def get_location_mapping(event: dict, _path_params: dict) -> dict:
     """Return all state/location groups from VipLocationMapping DynamoDB table."""
     groups = builders.get_all_location_groups()
     return json_response(200, {"groups": groups})
+
+
+def resolve_campaign_flow(event: dict, _path_params: dict) -> dict:
+    """Resolve (and auto-create if missing) the canonical campaign flow ARN
+    for the given states. Thin wrapper over builders.resolve_campaign_flow_arn,
+    which already has connect:CreateContactFlow — this just exposes it over HTTP
+    so the frontend can stop guessing flow names client-side."""
+    body = parse_body(event)
+    states = body.get("states") or []
+    if not states:
+        return json_response(400, {"error": {"code": "BAD_REQUEST", "message": "states is required and must be non-empty"}})
+
+    arn = builders.resolve_campaign_flow_arn(states, executor.CONNECT_INSTANCE_ID)
+    return json_response(200, {"arn": arn})
 
 
 def list_plans(event: dict, _path_params: dict) -> dict:

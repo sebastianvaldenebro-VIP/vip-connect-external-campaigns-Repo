@@ -279,6 +279,7 @@ export class ApiStack extends cdk.Stack {
     // ── Plans routes ────────────────────────────────────────────────
     for (const [path, methods] of [
       ['/plans', [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST]],
+      ['/plans/resolve-campaign-flow', [apigatewayv2.HttpMethod.POST]],
       ['/plans/{id}', [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.PUT, apigatewayv2.HttpMethod.DELETE]],
       ['/templates', [apigatewayv2.HttpMethod.GET]],
       ['/plans/from-template/{tid}', [apigatewayv2.HttpMethod.POST]],
