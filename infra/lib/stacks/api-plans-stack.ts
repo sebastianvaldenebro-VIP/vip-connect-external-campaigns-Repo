@@ -539,12 +539,14 @@ export class ApiPlansStack extends cdk.Stack {
         { mutable: false },
       );
 
-      const guardLogGroup = new logs.LogGroup(this, 'LocationOnboardingGuardLogs', {
-        logGroupName: '/aws/lambda/vip-location-onboarding-guard',
-        retention: logs.RetentionDays.ONE_YEAR,
-        encryptionKey: props.dataKey,
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
-      });
+      // Created by an earlier deploy attempt (RemovalPolicy.RETAIN survived
+      // that attempt's rollback) — import rather than re-create, same
+      // pattern as every other externally-created resource in this stack.
+      const guardLogGroup = logs.LogGroup.fromLogGroupName(
+        this,
+        'LocationOnboardingGuardLogs',
+        '/aws/lambda/vip-location-onboarding-guard',
+      );
 
       const guardFunction = new lambda.Function(this, 'LocationOnboardingGuardFunction', {
         functionName: 'vip-location-onboarding-guard',
