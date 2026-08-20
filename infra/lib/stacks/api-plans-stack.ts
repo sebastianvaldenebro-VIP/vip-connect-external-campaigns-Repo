@@ -521,19 +521,23 @@ export class ApiPlansStack extends cdk.Stack {
     // No Connect permissions — flow auto-creation is handled elsewhere
     // (builders.resolve_campaign_flow_arn, called from executor.py).
     if (locationMappingTableWithStream) {
-      const guardRole = new iam.Role(this, 'LocationOnboardingGuardRole', {
-        assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-        managedPolicies: [
-          iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
-        ],
-        ...(props.permissionsBoundaryName
-          ? { permissionsBoundary: iam.ManagedPolicy.fromManagedPolicyName(this, 'GuardBoundary', props.permissionsBoundaryName) }
-          : {}),
-      });
-      locationMappingTableWithStream.grantStreamRead(guardRole);
-      locationMappingTableWithStream.grantReadData(guardRole);
-      alertsTopic.grantPublish(guardRole);
-      props.dataKey.grantEncryptDecrypt(guardRole);
+      // Role created via CLI (CFN exec role lacks iam:CreateRole under the
+      // EngineeringPermissionBoundary — same limitation documented elsewhere
+      // in this stack, e.g. CampaignExporterFunction below). Imported
+      // read-only; { mutable: false } makes any accidental .grantXxx() call
+      // on it fail loudly at synth time instead of silently at deploy time,
+      // since every permission it needs is already in its inline policy
+      // (location-onboarding-guard-inline): DynamoDB Streams + table read on
+      // VipLocationMapping, sns:Publish on vip-plans-alerts, and
+      // kms:Decrypt/GenerateDataKey* on the data CMK (required because
+      // vip-plans-alerts is SSE-KMS-encrypted and grantPublish alone does
+      // not authorize KMS access to an encrypted topic).
+      const guardRole = iam.Role.fromRoleArn(
+        this,
+        'LocationOnboardingGuardRole',
+        'arn:aws:iam::165505826690:role/vip-location-onboarding-guard-role',
+        { mutable: false },
+      );
 
       const guardLogGroup = new logs.LogGroup(this, 'LocationOnboardingGuardLogs', {
         logGroupName: '/aws/lambda/vip-location-onboarding-guard',
