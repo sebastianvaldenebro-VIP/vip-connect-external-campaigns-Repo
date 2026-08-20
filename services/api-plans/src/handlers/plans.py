@@ -31,7 +31,10 @@ def resolve_campaign_flow(event: dict, _path_params: dict) -> dict:
     body = parse_body(event)
     states = body.get("states") or []
     if not states:
-        return json_response(400, {"error": {"code": "BAD_REQUEST", "message": "states is required and must be non-empty"}})
+        return json_response(
+            400,
+            {"error": {"code": "BAD_REQUEST", "message": "states is required and must be non-empty"}},
+        )
 
     arn = builders.resolve_campaign_flow_arn(states, executor.CONNECT_INSTANCE_ID)
     return json_response(200, {"arn": arn})
