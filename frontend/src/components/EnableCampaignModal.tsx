@@ -147,6 +147,12 @@ export function EnableCampaignModal({
   useEffect(() => {
     if (!open || segmentStates.length === 0) return;
     let cancelled = false;
+    // Clear the previous resolution immediately — otherwise, while this new
+    // lookup is in flight, effectiveCampaignFlowArn would keep pointing at
+    // the ARN resolved for the PRIOR segmentStates (e.g. the name-derived
+    // fallback before the segment detail query resolves), inconsistent with
+    // resolved.campaignFlow (synchronous, already reflecting the new state).
+    setBackendResolvedArn(undefined);
     resolveCampaignFlowArn(
       (flows.data?.contactFlows ?? []).filter((f) => f.contactFlowType === 'CAMPAIGN'),
       segmentStates,
