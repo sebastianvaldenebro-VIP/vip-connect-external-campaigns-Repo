@@ -386,6 +386,9 @@ export const mockApi: typeof RealApi = {
       throw new Error('Not implemented in mock');
     },
     getLocationMapping: async () => ({ groups: [] }),
+    // No backend to call in preview mode — always defer to the client-side
+    // suggestCampaignFlow heuristic (the intended fallback behavior).
+    resolveCampaignFlow: async () => ({ arn: null }),
   },
   contacts: {
     getArtifacts: async () => {

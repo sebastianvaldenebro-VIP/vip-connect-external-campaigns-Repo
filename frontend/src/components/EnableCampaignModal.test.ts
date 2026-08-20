@@ -27,3 +27,41 @@ describe('suggestCampaignFlow', () => {
     expect(STATE_FLOW_PATTERNS.PA).toBeUndefined();
   });
 });
+
+describe('resolveCampaignFlowArn (backend-first, client-heuristic fallback)', () => {
+  it('prefers the backend-resolved ARN when available', async () => {
+    const { resolveCampaignFlowArn } = await import('./EnableCampaignModal');
+    const flows = [flow('campaign-CT')];
+    const backendArn = 'arn:aws:connect:us-east-1:165505826690:instance/x/contact-flow/backend-resolved';
+    const result = await resolveCampaignFlowArn(
+      flows,
+      ['PA'],
+      async () => ({ arn: backendArn }),
+    );
+    expect(result).toBe(backendArn);
+  });
+
+  it('falls back to the client-side heuristic when the backend call throws', async () => {
+    const { resolveCampaignFlowArn } = await import('./EnableCampaignModal');
+    const flows = [flow('campaign-NY')];
+    const result = await resolveCampaignFlowArn(
+      flows,
+      ['NY'],
+      async () => {
+        throw new Error('network error');
+      },
+    );
+    expect(result).toBe(flows[0].arn);
+  });
+
+  it('falls back to the client-side heuristic when the backend returns null', async () => {
+    const { resolveCampaignFlowArn } = await import('./EnableCampaignModal');
+    const flows = [flow('campaign-NY')];
+    const result = await resolveCampaignFlowArn(
+      flows,
+      ['NY'],
+      async () => ({ arn: null }),
+    );
+    expect(result).toBe(flows[0].arn);
+  });
+});

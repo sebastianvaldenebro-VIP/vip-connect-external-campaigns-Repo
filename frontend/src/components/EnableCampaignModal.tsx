@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 
@@ -45,6 +45,28 @@ export function suggestCampaignFlow(
     }
   }
   return undefined;
+}
+
+/**
+ * Resolve the campaign flow ARN for the given states, preferring the
+ * backend's resolve_campaign_flow_arn (which auto-creates the canonical
+ * flow if missing) over the client-side name-search heuristic. Falls back
+ * to the client-side result if the backend call fails or finds nothing —
+ * never regress below what suggestCampaignFlow alone already provided.
+ */
+export async function resolveCampaignFlowArn(
+  campaignFlows: ContactFlow[],
+  states: string[],
+  callBackend: (states: string[]) => Promise<{ arn: string | null }>,
+): Promise<string | undefined> {
+  const clientArn = suggestCampaignFlow(campaignFlows, states)?.arn;
+  try {
+    const { arn } = await callBackend(states);
+    if (arn) return arn;
+  } catch {
+    // fall through to the client-side result
+  }
+  return clientArn;
 }
 
 function isNewLeadNewLeadGroup(segmentGroups: unknown): boolean {
@@ -120,7 +142,24 @@ export function EnableCampaignModal({
     return { queue, flow, phone, campaignFlow, isHighPriority };
   }, [queues.data, flows.data, phones.data, segmentStates, segmentGroups]);
 
-  const effectiveCampaignFlowArn = resolved.campaignFlow?.arn ?? '';
+  const [backendResolvedArn, setBackendResolvedArn] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!open || segmentStates.length === 0) return;
+    let cancelled = false;
+    resolveCampaignFlowArn(
+      (flows.data?.contactFlows ?? []).filter((f) => f.contactFlowType === 'CAMPAIGN'),
+      segmentStates,
+      (states) => api.plans.resolveCampaignFlow(states),
+    ).then((arn) => {
+      if (!cancelled) setBackendResolvedArn(arn);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, flows.data, segmentStates]);
+
+  const effectiveCampaignFlowArn = backendResolvedArn ?? resolved.campaignFlow?.arn ?? '';
 
   const loading = queues.isPending || flows.isPending || phones.isPending;
   const errors: string[] = [];

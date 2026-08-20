@@ -858,6 +858,11 @@ const realApi = {
       }),
     getLocationMapping: () =>
       request<{ groups: import('./stateLocationMap').StateGroup[] }>('/location-mapping'),
+    resolveCampaignFlow: (states: string[]) =>
+      request<{ arn: string | null }>('/plans/resolve-campaign-flow', {
+        method: 'POST',
+        body: { states },
+      }),
   },
   previewCount: (body: { segmentGroups: unknown }) =>
     request<{ redisCount: number; segmentCount: number | null }>(
