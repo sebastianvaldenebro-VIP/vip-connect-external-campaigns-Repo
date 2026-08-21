@@ -122,6 +122,14 @@ _DAILY_CUTOFF_HOUR: Final = 19  # 7 PM COT = 00:00 UTC
 # Runs active longer than this many hours without completing are flagged as stuck.
 _STUCK_RUN_HOURS: Final = 4
 
+# A "running" bucket with zero campaigns in one of these statuses for
+# _NO_ACTIVE_CAMPAIGN_MINUTES is flagged — catches a tick that crashed before
+# ever creating the bucket's campaigns (see BD-013), long before StuckRun
+# would (that only fires after _STUCK_RUN_HOURS of the whole run, not this
+# specific bucket-level symptom).
+_NO_ACTIVE_CAMPAIGN_MINUTES: Final = 5
+_ACTIVE_CAMPAIGN_STATUSES: Final = frozenset({"creating", "warming", "running"})
+
 # ── Campaign exit reasons ─────────────────────────────────────────────────────
 
 REASON_COMPLETED: Final = "completed"
@@ -2740,7 +2748,20 @@ def prestart_check() -> dict:
                             "Value": 1,
                             "Unit": "Count",
                             "Dimensions": [{"Name": "PlanId", "Value": plan_id}],
-                        }
+                        },
+                        # Aggregate (no dimensions) so a single CLI alarm can
+                        # watch "any run stuck" directly — same convention as
+                        # ScheduledRunFallback/CampaignDispatchStalled/
+                        # NoActiveCampaign. Previously PlanId-only, so no CW
+                        # alarm could cheaply watch it — this metric had been
+                        # firing every minute for 22+ hours during BD-013 with
+                        # no alarm able to catch it.
+                        {
+                            "MetricName": "StuckRun",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [],
+                        },
                     ],
                 )
             except Exception as exc:
@@ -2751,7 +2772,84 @@ def prestart_check() -> dict:
     if stuck:
         logger.warning("prestart_check: %d stuck run(s): %s", len(stuck), stuck)
 
-    return {"warmed": warmed, "stuck": stuck, "fallback_triggered": fallback_triggered}
+    # ── No-active-campaign detection ─────────────────────────────────────────
+    # A run can look healthy (status="running", error=None) while its current
+    # bucket has sat for minutes with zero campaigns actively progressing —
+    # exactly what happened in BD-013: the tick that should have created the
+    # bucket's campaigns crashed silently, and nothing else ever surfaced it.
+    # StuckRun (above) only catches this after _STUCK_RUN_HOURS (4h); this
+    # catches the same failure mode within minutes.
+    no_active: list[str] = []
+    for plan in all_plans:
+        plan_id = plan.get("planId")
+        if not plan_id:
+            continue
+        try:
+            latest = get_latest_run(plan_id)
+        except Exception:
+            continue
+        if not latest or latest.get("status") != "running":
+            continue
+        for bucket_state in latest.get("bucketStates", []):
+            if bucket_state.get("status") != "running":
+                continue
+            started = bucket_state.get("startedAt")
+            if not started:
+                continue
+            minutes = (_now_utc() - datetime.fromisoformat(started)).total_seconds() / 60
+            if minutes < _NO_ACTIVE_CAMPAIGN_MINUTES:
+                continue
+            campaign_states = bucket_state.get("campaignStates", [])
+            if any(cs.get("status") in _ACTIVE_CAMPAIGN_STATUSES for cs in campaign_states):
+                continue
+            run_id = latest.get("runId", "unknown")
+            logger.warning(
+                "prestart_check: no active campaign for %.0f min plan=%s run=%s bucket=%s",
+                minutes,
+                plan_id,
+                run_id,
+                bucket_state.get("bucketId", "?"),
+            )
+            no_active.append(plan_id)
+            try:
+                cw.put_metric_data(
+                    Namespace="VIPPlans",
+                    MetricData=[
+                        {
+                            "MetricName": "NoActiveCampaign",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [{"Name": "PlanId", "Value": plan_id}],
+                        },
+                        {
+                            "MetricName": "NoActiveCampaign",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [],
+                        },
+                    ],
+                )
+            except Exception as exc:
+                logger.error(
+                    "prestart_check: NoActiveCampaign metric failed for %s: %s",
+                    plan_id,
+                    exc,
+                )
+            break  # one alert per plan per tick — remaining buckets can't also be "running"
+
+    if no_active:
+        logger.warning(
+            "prestart_check: %d plan(s) with no active campaign: %s",
+            len(no_active),
+            no_active,
+        )
+
+    return {
+        "warmed": warmed,
+        "stuck": stuck,
+        "fallback_triggered": fallback_triggered,
+        "no_active_campaign": no_active,
+    }
 
 
 # ── Campaign chain triggers ────────────────────────────────────────────────────

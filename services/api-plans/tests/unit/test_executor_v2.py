@@ -3229,6 +3229,101 @@ def test_prestart_prewarm_skips_plans_outside_working_hours():
     assert result["warmed"] == []
 
 
+# ── No-active-campaign detection (BD-013 follow-up) ───────────────────────────
+
+
+def test_prestart_flags_running_bucket_with_no_active_campaign_after_5_min():
+    """A bucket stuck at status='running' for 5+ minutes with every campaign
+    still 'queued' (none creating/warming/running) must emit NoActiveCampaign
+    — this is the exact BD-013 shape: the tick that should have created the
+    bucket's campaigns crashed, so nothing ever left 'queued'.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan, [_bucket_state("b0", [_campaign_state("c0", "queued")], status="running")]
+    )
+    now_utc = datetime(2026, 5, 8, 10, 6, tzinfo=timezone.utc)  # 6 min after startedAt
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == ["plan-1"]
+    calls = mock_boto.return_value.put_metric_data.call_args_list
+    assert len(calls) == 1
+    metric_data = calls[0].kwargs["MetricData"]
+    assert metric_data[0]["MetricName"] == "NoActiveCampaign"
+    assert metric_data[0]["Dimensions"] == [{"Name": "PlanId", "Value": "plan-1"}]
+    assert metric_data[1]["Dimensions"] == [], (
+        "must also emit the no-dimension aggregate, same convention as "
+        "CampaignDispatchStalled, so one CLI alarm can watch it directly"
+    )
+
+
+def test_prestart_does_not_flag_before_5_minutes():
+    """A bucket that just started (< 5 min ago) with no active campaign yet must
+    NOT be flagged — campaigns take a few seconds to create; this is normal, not
+    the BD-013 failure mode.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan, [_bucket_state("b0", [_campaign_state("c0", "queued")], status="running")]
+    )
+    now_utc = datetime(2026, 5, 8, 10, 2, tzinfo=timezone.utc)  # 2 min after startedAt
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == []
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
+def test_prestart_does_not_flag_bucket_with_an_active_campaign():
+    """A bucket running 5+ minutes with at least one campaign actually
+    creating/warming/running must NOT be flagged — this is healthy, not stalled.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan, [_bucket_state("b0", [_campaign_state("c0", "running")], status="running")]
+    )
+    now_utc = datetime(2026, 5, 8, 10, 10, tzinfo=timezone.utc)  # 10 min after startedAt
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == []
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
 def test_prestart_prewarm_and_fallback_still_fire_on_allowed_day():
     """Regression guard: a plan whose allowed days include today must still be
     pre-warmed and still trigger the fallback exactly as before this fix.

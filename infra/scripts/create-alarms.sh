@@ -182,6 +182,35 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 5 --datapoints-to-alarm 5
 
+# Fires when a "running" run has gone _STUCK_RUN_HOURS (4h) without completing.
+# Metric had ONLY the PlanId dimension until BD-013 (no aggregate emission, so
+# no CLI alarm could watch it) — it fired every minute for 22+ hours during
+# that incident with nothing able to catch it. Now emitted with an aggregate
+# (no-dimension) datapoint too, same convention as the other alarms here.
+alarm \
+  --alarm-name "vip-plans-stuck-run" \
+  --alarm-description "CRITICAL: a plan run has been 'running' for 4+ hours without completing — check for a crashed tick (CloudWatch Logs Insights: tick_unhandled_error) or a genuinely wedged bucket." \
+  --namespace "VIPPlans" --metric-name "StuckRun" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
+# Fires when a "running" bucket has gone _NO_ACTIVE_CAMPAIGN_MINUTES (5) with
+# zero campaigns in creating/warming/running status — the tick that should
+# have created the bucket's campaigns crashed before any campaign existed
+# (BD-013's exact shape; CampaignDispatchStalled above only catches a campaign
+# that ALREADY existed reverting to queued, not this "never even started" case).
+# The 5-minute debounce is already inside prestart_check's own emission
+# condition, so 1 datapoint here is enough — no additional evaluation-period
+# debounce needed on top of it.
+alarm \
+  --alarm-name "vip-plans-no-active-campaign" \
+  --alarm-description "CRITICAL: a plan run has had no active campaign for 5+ minutes — the tick that should have created this bucket's campaigns likely crashed silently. Check CloudWatch Logs Insights for 'tick_unhandled_error' or 'no active campaign for' with this plan's id." \
+  --namespace "VIPPlans" --metric-name "NoActiveCampaign" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
 # Per-plan vip-sched-* FailedInvocations alarms cannot be created here because rule names
 # are dynamic (created at runtime by upsert_schedule). Options:
 #   a) Console: Metric Math alarm with SEARCH('{AWS/Events,RuleName} vip-sched FailedInvocations')
