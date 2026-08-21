@@ -182,18 +182,17 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 5 --datapoints-to-alarm 5
 
-# Fires when a "running" run has gone _STUCK_RUN_HOURS (4h) without completing.
-# Metric had ONLY the PlanId dimension until BD-013 (no aggregate emission, so
-# no CLI alarm could watch it) — it fired every minute for 22+ hours during
-# that incident with nothing able to catch it. Now emitted with an aggregate
-# (no-dimension) datapoint too, same convention as the other alarms here.
-alarm \
-  --alarm-name "vip-plans-stuck-run" \
-  --alarm-description "CRITICAL: a plan run has been 'running' for 4+ hours without completing — check for a crashed tick (CloudWatch Logs Insights: tick_unhandled_error) or a genuinely wedged bucket." \
-  --namespace "VIPPlans" --metric-name "StuckRun" \
-  --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
+# NOT WIRED UP — StuckRun's own definition is unfit to alarm on directly.
+# _STUCK_RUN_HOURS measures time since the RUN STARTED, not time since it
+# last made progress. This plan's own repeat/multi-bucket design legitimately
+# runs 12+ hours a day (verified live 2026-08-21: a genuinely healthy run,
+# actively advancing bucket-by-bucket, tripped this within minutes of the
+# alarm being created, at 27.5h total age). Alarming on it as-is would page
+# on every normal long-running plan, every day — worse than no alarm at all.
+# Fixing this needs the metric itself redefined (e.g. time since the CURRENT
+# bucket's own startedAt, not the run's) — not done in this pass. The
+# aggregate emission added for BD-013 is left in code (harmless, useful for
+# manual CloudWatch Metrics inspection) but no alarm watches it.
 
 # Fires when a "running" bucket has gone _NO_ACTIVE_CAMPAIGN_MINUTES (5) with
 # zero campaigns in creating/warming/running status — the tick that should
@@ -223,7 +222,7 @@ alarm \
 #        --alarm-actions $TOPIC $R
 
 echo ""
-echo "=== 19 alarmas creadas ==="
+echo "=== 18 alarmas creadas ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the
