@@ -68,6 +68,7 @@ from store import (
     get_latest_run,
     list_plans,
     lock_plan_run,
+    record_bucket_schedule_name,
     save_run,
     unlock_plan_run,
     update_plan_pending_warmup,
@@ -2298,9 +2299,26 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
         # The EventBridge rule was already deleted above. Reschedule it so the bucket
         # is not stranded forever with no tick to drive it forward.
         try:
-            _schedule_tick(
+            sched = _schedule_tick(
                 plan_id=run["planId"], run_id=run["runId"], bucket_index=bucket_index
             )
+            # save_run() above just failed its version check, so the new
+            # schedule name can't ride along on that write — persist it
+            # directly (bypassing the version lock) so it can still be found
+            # and deleted once this bucket completes. Skipping this step is
+            # exactly how orphaned vip-plan-* rules/permissions accumulate
+            # until they hit the Lambda policy's hard size limit (BD-013).
+            try:
+                record_bucket_schedule_name(
+                    run["planId"], run["runId"], bucket_index, sched
+                )
+            except ClientError as _sched_exc:
+                logger.error(
+                    "_advance_bucket[%d]: failed to persist rescheduled tick name %s: %s",
+                    bucket_index,
+                    sched,
+                    _sched_exc,
+                )
             logger.info(
                 "_advance_bucket[%d]: ConcurrentWriteError — rescheduled tick for retry",
                 bucket_index,

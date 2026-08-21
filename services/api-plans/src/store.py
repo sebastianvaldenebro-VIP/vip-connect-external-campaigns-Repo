@@ -302,6 +302,27 @@ def save_run(run: dict) -> None:
         raise
 
 
+def record_bucket_schedule_name(
+    plan_id: str, run_id: str, bucket_index: int, schedule_name: str
+) -> None:
+    """Persist a bucket's EventBridge schedule name directly, bypassing the
+    run's normal version-conditional write (save_run).
+
+    Recovery-only helper: used when save_run's optimistic-lock write has
+    already failed with ConcurrentWriteError but a replacement schedule still
+    needs to be recorded somewhere. Without this, the schedule name is never
+    persisted, so nothing can ever find and delete the EventBridge rule (or
+    its Lambda permission) once the bucket completes — it becomes a permanent
+    orphan that silently consumes space in the Lambda's resource policy until
+    it hits AWS's hard size limit (see BD-013).
+    """
+    _table().update_item(
+        Key={"pk": f"PLAN#{plan_id}", "sk": f"RUN#{run_id}"},
+        UpdateExpression=f"SET bucketStates[{bucket_index}].scheduleName = :sched",
+        ExpressionAttributeValues={":sched": schedule_name},
+    )
+
+
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
 

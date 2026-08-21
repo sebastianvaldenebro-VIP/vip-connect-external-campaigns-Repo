@@ -48,6 +48,30 @@ def lambda_handler(event: dict, context) -> dict:
                 run_id=run_id,
                 bucket_index=bucket_index,
             )
+            # This exception otherwise disappears silently: the run's status
+            # stays "running" with no error field set, the invocation still
+            # returns normally (no Lambda Errors metric), and nothing else
+            # ever surfaces it. A tick crashing here means the run WILL NOT
+            # recover on its own (see BD-013 — a PolicyLengthExceededException
+            # from orphaned EventBridge permissions stalled a run for 23h with
+            # zero alerting before this was added).
+            executor._notify_sns(
+                subject=f"[VIP Plans] Tick crashed, run may be stuck (plan={plan_id[:8]})",
+                detail=(
+                    f"Bucket {bucket_index} tick for plan {plan_id} / run {run_id} "
+                    f"raised an unhandled exception and could not advance:\n{exc}\n\n"
+                    f"The run's status stays 'running' with no error field set — it "
+                    f"will not recover on its own. Check CloudWatch Logs Insights for "
+                    f"'tick_unhandled_error' with this plan_id/run_id, fix the "
+                    f"underlying issue, then use the force-start endpoint on the "
+                    f"stuck bucket."
+                ),
+                attributes={
+                    "alertType": "tick_unhandled_error",
+                    "planId": plan_id,
+                    "runId": run_id,
+                },
+            )
             return {"ok": False, "error": str(exc)}
 
     if action == "scheduled_run":

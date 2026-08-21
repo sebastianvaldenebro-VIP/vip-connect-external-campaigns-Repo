@@ -230,3 +230,24 @@ def test_save_run_increments_version_and_uses_condition():
     assert call_kwargs["ExpressionAttributeValues"][":current_v"] == 3, (
         "ConditionExpression must check the PRE-increment version to reject concurrent stale writers"
     )
+
+
+def test_record_bucket_schedule_name_bypasses_version_lock():
+    """record_bucket_schedule_name must use update_item on the specific bucket's
+    scheduleName path, with no ConditionExpression/version check — it's the
+    recovery write used when save_run's own version-locked write already
+    failed, so it must succeed regardless of the run's current _version.
+    """
+    table = _mock_table()
+    with patch("store._table", return_value=table):
+        store.record_bucket_schedule_name("plan-1", "run-1", 3, "vip-plan-p1-run-r1-b3")
+
+    table.update_item.assert_called_once()
+    call_kwargs = table.update_item.call_args[1]
+    assert call_kwargs["Key"] == {"pk": "PLAN#plan-1", "sk": "RUN#run-1"}
+    assert "ConditionExpression" not in call_kwargs, (
+        "Must not carry a version condition — this write exists precisely to "
+        "succeed after the version-conditional save_run already failed"
+    )
+    assert call_kwargs["UpdateExpression"] == "SET bucketStates[3].scheduleName = :sched"
+    assert call_kwargs["ExpressionAttributeValues"][":sched"] == "vip-plan-p1-run-r1-b3"

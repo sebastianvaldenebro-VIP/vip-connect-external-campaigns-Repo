@@ -2681,12 +2681,73 @@ def test_advance_bucket_reschedules_on_concurrent_write():
             "executor.save_run", side_effect=ConcurrentWriteError("version mismatch")
         ),
         patch("executor._schedule_tick") as mock_sched,
+        patch("executor.record_bucket_schedule_name"),
         patch("executor._fire_bucket_chains"),
     ):
         with pytest.raises(ConcurrentWriteError):
             executor._advance_bucket(run, plan, 0, "all_campaigns_done")
 
     mock_sched.assert_called_once_with(plan_id="plan-1", run_id="run-1", bucket_index=0)
+
+
+def test_advance_bucket_persists_rescheduled_tick_name_on_concurrent_write():
+    """BD-013 regression: the rescheduled tick's name from the ConcurrentWriteError
+    path above must be persisted (bypassing the version lock save_run just failed),
+    or the resulting EventBridge rule + Lambda permission can never be found again to
+    delete once the bucket completes — becoming a permanent orphan that accumulates
+    until it hits the Lambda resource policy's hard 20KB size limit and silently
+    stalls a completely unrelated run's bucket transition (root-caused 2026-08-21
+    after a run sat "running" for 23h with bucket 7 never starting).
+    """
+    import executor
+    from store import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "completed")])])
+
+    with (
+        patch("executor._delete_bucket_schedule_safe"),
+        patch(
+            "executor.save_run", side_effect=ConcurrentWriteError("version mismatch")
+        ),
+        patch("executor._schedule_tick", return_value="vip-plan-plan1-run-run1-b0"),
+        patch("executor.record_bucket_schedule_name") as mock_record,
+        patch("executor._fire_bucket_chains"),
+    ):
+        with pytest.raises(ConcurrentWriteError):
+            executor._advance_bucket(run, plan, 0, "all_campaigns_done")
+
+    mock_record.assert_called_once_with(
+        "plan-1", "run-1", 0, "vip-plan-plan1-run-run1-b0"
+    )
+
+
+def test_advance_bucket_survives_record_schedule_name_failure_on_concurrent_write():
+    """If persisting the rescheduled tick's name also fails, _advance_bucket must
+    still re-raise ConcurrentWriteError (not mask it with the secondary failure) —
+    the original error is what the caller/tick handler needs to see and retry on.
+    """
+    import executor
+    from store import ConcurrentWriteError
+    from botocore.exceptions import ClientError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(plan, [_bucket_state("b0", [_campaign_state("c0", "completed")])])
+
+    with (
+        patch("executor._delete_bucket_schedule_safe"),
+        patch(
+            "executor.save_run", side_effect=ConcurrentWriteError("version mismatch")
+        ),
+        patch("executor._schedule_tick", return_value="vip-plan-plan1-run-run1-b0"),
+        patch(
+            "executor.record_bucket_schedule_name",
+            side_effect=ClientError({"Error": {"Code": "Foo"}}, "UpdateItem"),
+        ),
+        patch("executor._fire_bucket_chains"),
+    ):
+        with pytest.raises(ConcurrentWriteError):
+            executor._advance_bucket(run, plan, 0, "all_campaigns_done")
 
 
 # ── Bug C fix: _start_bucket cleans orphan EventBridge rule on ConcurrentWriteError ─
