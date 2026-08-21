@@ -4262,6 +4262,86 @@ def _cleanup_orphan_plan_permissions() -> None:
             logger.warning("Could not remove orphan permission %s: %s", sid, exc)
 
 
+def janitor_cleanup_orphan_schedules() -> dict:
+    """Daily sweep: delete every vip-plan-* EventBridge rule (and its Lambda
+    permission) that no currently-running run references anymore.
+
+    Fixes _cleanup_orphan_plan_permissions' blind spot (BD-013): that function
+    only catches a permission whose rule is ALREADY gone — it does nothing for
+    a rule that's still alive but nothing tracks anymore, which is exactly
+    what an incomplete ConcurrentWriteError recovery can produce. This is the
+    "daily janitor" this repo's own runbook (RUNBOOKS.md RB-001, "Prevention")
+    documented as the fix but that was never actually built.
+
+    Safety: does NOT decompose the truncated 8-char plan/run IDs embedded in
+    a rule's name (vip-plan-{planId[:8]}-run-{runId[:8]}-b{bucketIndex}) —
+    those truncations can collide and are not safe to reverse uniquely. It
+    instead collects the exact, full scheduleName strings currently recorded
+    on every plan's LATEST run (only a run that's actually "running" needs
+    its schedule to survive — a completed/aborted run's schedule is stale by
+    definition, whether or not the janitor ever "sees" it), and deletes any
+    vip-plan-* rule whose full name isn't in that set. Exact-string
+    membership, no ambiguity.
+    """
+    protected: set[str] = set()
+    for plan in list_plans():
+        plan_id = plan.get("planId")
+        if not plan_id:
+            continue
+        try:
+            latest = get_latest_run(plan_id)
+        except Exception:
+            continue
+        if not latest or latest.get("status") != "running":
+            continue
+        for bucket_state in latest.get("bucketStates", []):
+            sched = bucket_state.get("scheduleName")
+            if sched:
+                protected.add(sched)
+
+    events = boto3.client("events")
+    deleted: list[str] = []
+    failed: list[str] = []
+    kwargs: dict = {"NamePrefix": "vip-plan-"}
+    while True:
+        resp = events.list_rules(**kwargs)
+        for rule in resp.get("Rules", []):
+            name = rule["Name"]
+            if name in protected:
+                continue
+            try:
+                _delete_schedule_safe(name)
+                deleted.append(name)
+            except Exception as exc:
+                failed.append(name)
+                logger.error("janitor: failed to delete orphan rule %s: %s", name, exc)
+        token = resp.get("NextToken")
+        if not token:
+            break
+        kwargs["NextToken"] = token
+
+    if deleted:
+        logger.warning(
+            "janitor: deleted %d orphan vip-plan-* rule(s): %s", len(deleted), deleted
+        )
+        _notify_sns(
+            subject=f"[VIP Plans] Janitor cleaned up {len(deleted)} orphaned schedule(s)",
+            detail=(
+                f"Deleted {len(deleted)} vip-plan-* EventBridge rule(s) (and their "
+                f"Lambda permissions) that no currently-running run referenced "
+                f"anymore:\n{deleted}\n\n"
+                f"This is routine cleanup, not necessarily a problem — but if this "
+                f"count is consistently large or growing, something is still "
+                f"creating untracked schedules (see BD-013)."
+            ),
+            attributes={"alertType": "janitor_cleanup", "deletedCount": len(deleted)},
+        )
+    if failed:
+        logger.error("janitor: failed to delete %d rule(s): %s", len(failed), failed)
+
+    return {"deleted": deleted, "failed": failed}
+
+
 def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
     import json
 

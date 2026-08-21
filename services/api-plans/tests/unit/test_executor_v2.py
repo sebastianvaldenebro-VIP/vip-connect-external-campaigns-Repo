@@ -3324,6 +3324,149 @@ def test_prestart_does_not_flag_bucket_with_an_active_campaign():
     mock_boto.return_value.put_metric_data.assert_not_called()
 
 
+# ── Janitor: daily orphan-schedule cleanup (BD-013 follow-up) ────────────────
+
+
+def test_janitor_deletes_rule_not_referenced_by_any_running_run():
+    """A vip-plan-* rule that no currently-running run's bucketState.scheduleName
+    points to must be deleted — this is the actual orphan-detection gap
+    _cleanup_orphan_plan_permissions can't cover (its rule is still alive).
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c0", "running")], schedule_name="vip-plan-p1-run-r1-b0")],
+    )
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns") as mock_notify,
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.return_value = {
+            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}, {"Name": "vip-plan-orphan-rule"}]
+        }
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == ["vip-plan-orphan-rule"]
+    mock_delete.assert_called_once_with("vip-plan-orphan-rule")
+    mock_notify.assert_called_once()
+
+
+def test_janitor_preserves_the_current_running_bucket_schedule():
+    """The rule backing the currently-running run's own bucket must survive —
+    this is the exact rule the tick mechanism still needs.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c0", "running")], schedule_name="vip-plan-p1-run-r1-b0")],
+    )
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns"),
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.return_value = {
+            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
+        }
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == []
+    mock_delete.assert_not_called()
+
+
+def test_janitor_treats_non_running_plans_schedules_as_fair_game():
+    """If a plan's latest run isn't 'running' (completed/aborted), NONE of its
+    scheduleNames protect anything — a finished run never needs its tick
+    again, whether or not the janitor happens to look at it.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    finished_run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c0", "completed")], schedule_name="vip-plan-p1-run-r1-b0")],
+        status="completed",
+    )
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=finished_run),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns") as mock_notify,
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.return_value = {
+            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
+        }
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == ["vip-plan-p1-run-r1-b0"]
+    mock_delete.assert_called_once_with("vip-plan-p1-run-r1-b0")
+    mock_notify.assert_called_once()
+
+
+def test_janitor_paginates_through_all_rules():
+    """list_rules is paginated (NextToken) — the janitor must follow every
+    page, not just the first, or it silently misses a growing tail of orphans.
+    """
+    import executor
+
+    with (
+        patch("executor.list_plans", return_value=[]),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns"),
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.side_effect = [
+            {"Rules": [{"Name": "vip-plan-a"}], "NextToken": "page2"},
+            {"Rules": [{"Name": "vip-plan-b"}]},
+        ]
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert sorted(result["deleted"]) == ["vip-plan-a", "vip-plan-b"]
+    assert mock_delete.call_count == 2
+    second_call_kwargs = mock_boto.return_value.list_rules.call_args_list[1].kwargs
+    assert second_call_kwargs.get("NextToken") == "page2"
+
+
+def test_janitor_does_not_notify_when_nothing_was_orphaned():
+    """No deletions -> no SNS noise. This runs daily; alerting on a clean run
+    every single day would be exactly the kind of alarm fatigue this whole
+    fix is trying to avoid."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan,
+        [_bucket_state("b0", [_campaign_state("c0", "running")], schedule_name="vip-plan-p1-run-r1-b0")],
+    )
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("executor._delete_schedule_safe"),
+        patch("executor._notify_sns") as mock_notify,
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.return_value = {
+            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
+        }
+        executor.janitor_cleanup_orphan_schedules()
+
+    mock_notify.assert_not_called()
+
+
 def test_prestart_prewarm_and_fallback_still_fire_on_allowed_day():
     """Regression guard: a plan whose allowed days include today must still be
     pre-warmed and still trigger the fallback exactly as before this fix.

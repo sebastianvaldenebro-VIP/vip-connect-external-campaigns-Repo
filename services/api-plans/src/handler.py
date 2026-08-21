@@ -104,6 +104,16 @@ def lambda_handler(event: dict, context) -> dict:
             _logger.error("prestart_check_error", error=str(exc))
             return {"ok": False, "error": str(exc)}
 
+    if action == "janitor":
+        _logger.info("janitor_received")
+        try:
+            result = executor.janitor_cleanup_orphan_schedules()
+            _logger.info("janitor_done", deleted=len(result.get("deleted", [])))
+            return {"ok": True, **result}
+        except Exception as exc:
+            _logger.error("janitor_error", error=str(exc))
+            return {"ok": False, "error": str(exc)}
+
     # HTTP API event
     route_key = event.get("routeKey") or event.get("requestContext", {}).get(
         "routeKey", ""
