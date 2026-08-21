@@ -218,6 +218,17 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
+    // events:ListRules does not support resource-level restriction (must be
+    // Resource: "*") — needed by janitor_cleanup_orphan_schedules to page
+    // through every vip-plan-* rule looking for orphans (BD-013 follow-up).
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'EventBridgeListRules',
+        actions: ['events:ListRules'],
+        resources: ['*'],
+      }),
+    );
+
     // Lambda self-permission — add/remove/read resource-based policy for EventBridge invocation.
     // GetPolicy is required by _ensure_scheduled_run_permission (reads current policy to check
     // whether the vip-sched-* statement is present before calling add_permission) and by
