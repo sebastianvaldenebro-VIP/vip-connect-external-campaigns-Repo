@@ -218,16 +218,25 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
-    // events:ListRules does not support resource-level restriction (must be
-    // Resource: "*") — needed by janitor_cleanup_orphan_schedules to page
-    // through every vip-plan-* rule looking for orphans (BD-013 follow-up).
-    role.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'EventBridgeListRules',
-        actions: ['events:ListRules'],
-        resources: ['*'],
-      }),
-    );
+    // events:ListRules granted via CLI, NOT here — CDK deploy attempted this
+    // exact statement and failed: the CFN exec role itself is denied
+    // iam:PutRolePolicy on this role by EngineeringPermissionBoundary (a
+    // stricter block than the iam:CreateRole one documented elsewhere in
+    // this file — this one applies to UPDATING an existing CDK-managed
+    // role's policy, not just creating a new role). The rollback then also
+    // failed the same way, requiring `cloudformation continue-update-rollback
+    // --resources-to-skip FunctionRoleDefaultPolicy...` to recover. A human
+    // SSO session (broader privilege than the CFN exec role) applied the
+    // grant directly instead: `aws iam put-role-policy --role-name
+    // VipAdminApiPlansStack-FunctionRole111A5701-mSfFlCntjbO0 --policy-name
+    // events-list-rules-cli --policy-document '{"Version":"2012-10-17",
+    // "Statement":[{"Sid":"EventBridgeListRules","Effect":"Allow","Action":
+    // "events:ListRules","Resource":"*"}]}'`. Needed by
+    // janitor_cleanup_orphan_schedules (BD-013 follow-up) to page through
+    // every vip-plan-* rule looking for orphans. Do NOT re-add this to CDK —
+    // any future deploy of this stack will hit the exact same
+    // UPDATE_ROLLBACK_FAILED unless this role itself is ever recreated from
+    // scratch (in which case the CLI grant is lost and must be re-applied).
 
     // Lambda self-permission — add/remove/read resource-based policy for EventBridge invocation.
     // GetPolicy is required by _ensure_scheduled_run_permission (reads current policy to check
