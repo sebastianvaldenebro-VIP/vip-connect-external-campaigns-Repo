@@ -341,3 +341,13 @@ El botón "Enable Campaign" de Segments dependía 100% de una búsqueda de subst
 Nuevo Lambda (`vip-location-onboarding-guard`, sin permisos de Connect — solo detección + alerta) triggereado por DynamoDB Streams (`INSERT`) sobre `VipLocationMapping`. Cuando aparece un `stateCode` genuinamente nuevo (ninguna otra location comparte ese código) sin el atributo `canonicalPhone` seteado, publica a `vip-plans-alerts` (mismo topic/formato que las alertas existentes de `executor.py`). Nota importante: `canonicalPhone` en `VipLocationMapping` todavía **no** es la fuente de verdad real para selección de teléfono en producción — eso sigue siendo `frontend/src/lib/areaCodeMap.ts` — el mensaje de la alerta señala esto explícitamente para no confundir a operaciones. Backfill de `canonicalPhone`/`areaCodes` para los 9 estados existentes: `infra/scripts/backfill-location-canonical-phone.py` (creado, **no ejecutado en producción** — corresponde a Sebastian decidir cuándo correrlo).
 
 **Archivos:** `services/api-plans/src/location_onboarding_guard.py`, `infra/lib/stacks/api-plans-stack.ts`, `infra/scripts/create-alarms.sh`, `infra/scripts/backfill-location-canonical-phone.py`.
+
+## 2026-08-21 — Janitor diario para reglas huérfanas de EventBridge (BD-013 follow-up)
+
+Nueva acción `janitor` en el Lambda `vip-admin-ui-api-plans` (reutiliza la función existente, sin Lambda nuevo), disparada por una regla de EventBridge diaria (`vip-plans-janitor-daily`, `cron(0 4 * * ? *)`). Construye el "daily janitor" que `RUNBOOKS.md` (RB-001) documentaba como prevención pero nunca se implementó — solo existía `_cleanup_orphan_plan_permissions()`, que tiene un punto ciego (no detecta huérfanos cuyo rule de EventBridge sigue vivo).
+
+El janitor compara el nombre completo de cada regla `vip-plan-*` contra el conjunto de `scheduleName` realmente registrados en el run **activo** de cada plan (nunca decodifica los IDs truncados a 8 caracteres del nombre de la regla — inseguro, pueden colisionar). Borra lo que no está referenciado; avisa por SNS (`vip-plans-alerts`) solo si borró algo, para no generar ruido diario.
+
+**Archivos:** `services/api-plans/src/executor.py` (`janitor_cleanup_orphan_schedules`), `services/api-plans/src/handler.py`, `services/api-plans/tests/unit/test_executor_v2.py`.
+
+**Nota de infraestructura:** el permiso `events:ListRules` que necesita esta función no se pudo otorgar vía CDK — el exec role de CloudFormation tiene bloqueado `iam:PutRolePolicy` sobre roles ya existentes (más estricto que el bloqueo ya conocido de `iam:CreateRole`). Se otorgó directamente vía CLI con una sesión humana; documentado en `api-plans-stack.ts` para que nadie lo vuelva a agregar a CDK.
