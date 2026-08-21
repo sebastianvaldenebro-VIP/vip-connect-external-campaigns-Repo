@@ -223,7 +223,7 @@ alarm \
 #        --alarm-actions $TOPIC $R
 
 echo ""
-echo "=== 17 alarmas creadas ==="
+echo "=== 19 alarmas creadas ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the
