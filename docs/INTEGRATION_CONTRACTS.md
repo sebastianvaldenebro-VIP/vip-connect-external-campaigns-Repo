@@ -145,7 +145,9 @@ For each external system the platform integrates with: purpose, auth, key API ca
 **Rule naming:**
 
 - `vip-plan-{runId}-{bucketIndex}` — per-bucket tick (1/min)
-- `vip-sched-prestart-check` — prestart_check rule (1/min, account-wide)
+- `vip-plans-prestart-check` — prestart_check rule (1/min, account-wide). Note:
+  `vip-sched-*` is a DIFFERENT prefix, used exclusively by per-plan daily time
+  triggers (see scheduler_manager.py) — do not confuse the two when diagnosing.
 
 **Lifecycle:**
 
@@ -160,7 +162,8 @@ For each external system the platform integrates with: purpose, auth, key API ca
 
 **Re-wiring checklist:**
 1. Grant Lambda role `events:Put*`/`events:Delete*`/`lambda:AddPermission` on its own ARN.
-2. Pre-create `vip-sched-prestart-check` rule pointing to api-plans Lambda OR allow code to create it on first call.
+2. Pre-create `vip-plans-prestart-check` rule pointing to api-plans Lambda (target Input
+   `{"action":"prestart_check"}`) OR allow code to create it on first call.
 
 ---
 
@@ -192,15 +195,24 @@ For each external system the platform integrates with: purpose, auth, key API ca
 
 **Topic:** `arn:aws:sns:us-east-1:165505826690:vip-plans-alerts` (imported by ARN, not CDK-managed — see ADR-005).
 
-**Purpose:** Operational alerts for failed runs, stuck runs, and pre-warm exhaustion. Subscribers are operator email addresses.
+**Purpose:** Operational alerts for aborted/errored runs and campaign-level failures. Subscribers are operator email addresses.
 
 **Authentication:** Lambda role grants `sns:Publish` on the topic.
 
-**Key calls:** `Publish(TopicArn, Subject, Message)` from `executor.py` on:
+**Key calls:** `Publish(TopicArn, Subject, Message)` via `executor._notify_sns()`. Verified
+call sites (2026-08-21 — the previous list here did not match the code):
 
-- Stuck run detected (`> 4 h running` per `_STUCK_RUN_HOURS`)
-- Pre-warm exhausted retries
-- Run transitioned to `failed`
+- Run aborted — campaigns deleted externally from Connect before completing
+- Run completed with errors
+- Campaign throttled / Connect service quota exceeded
+- Campaign creation failed (two call sites, same event shape)
+- Campaign deleted externally from Connect
+- Janitor cleanup summary (orphaned `vip-plan-*`/`vip-sched-*` schedules deleted)
+- `tick_unhandled_error` (called from `handler.py`, not `executor.py` — an unhandled
+  exception inside a tick, the exact BD-013 failure mode)
+
+There is NO SNS publish for "stuck run" or "pre-warm exhausted" — see §8's Custom
+metrics table for what actually exists (and does not) for those two conditions.
 
 **Re-wiring checklist:**
 1. Create topic `vip-plans-alerts` manually (CFN cannot do it under the boundary).
@@ -231,17 +243,33 @@ fields @timestamp, event, durationMs
 | stats pct(durationMs, 95) by bin(5m)
 ```
 
-**Custom metrics (PutMetricData):**
+**Custom metrics (PutMetricData) — verified against executor.py, 2026-08-21. The
+previous version of this table listed three metrics (`StuckRunDetected`,
+`PrewarmFailure`, `CampaignSkippedEmpty`) under namespace `VipConnect/Plans` that
+were never implemented anywhere in the codebase — `aws cloudwatch list-metrics
+--namespace VipConnect/Plans` returns zero results. What actually exists:**
 
-| Metric | Namespace | Dimensions | Purpose |
+| Metric | Namespace | Dimensions | Alarmed? |
 |---|---|---|---|
-| `StuckRunDetected` | `VipConnect/Plans` | `planId` | Alarmable; threshold 1 |
-| `PrewarmFailure` | `VipConnect/Plans` | `planId` | Alarmable |
-| `CampaignSkippedEmpty` | `VipConnect/Plans` | `state` | Informational |
+| `CampaignDispatchStalled` | `VIPPlans` | `campaignId` (+ aggregate, no dims) | Yes — `vip-plans-campaign-dispatch-stalled` |
+| `ScheduledRunFallback` | `VIPPlans` | `planId` (+ aggregate, no dims) | Yes — `vip-plans-scheduled-run-fallback` |
+| `NoActiveCampaign` | `VIPPlans` | none (aggregate) | Yes — `vip-plans-no-active-campaign` |
+| `StuckRun` | `VIPPlans` | none (aggregate) | **No** — the metric's own definition (time since run START, not since last progress) makes it unfit to alarm on directly; see `create-alarms.sh` comment. Not the same thing as "PrewarmFailure". |
+| `UnknownLocation` | `VipConnect/ProgressiveDialer` | — | No |
+
+**Pre-warm failures have zero telemetry.** `_prestart_after_campaign` /
+`_prestart_plan` only `logger.error(...)` on failure (executor.py, `_prestart_*`
+functions) — no metric, no SNS. A plan whose pre-warm keeps failing loses its
+warmup window silently every run, with no alarm and no page. This is a real
+monitoring gap, not a documentation error to paper over — if you're reading this
+because pre-warm looks broken, check CloudWatch Logs Insights for
+`_prestart_plan` errors filtered to the plan's ID; nothing else will surface it.
 
 **Re-wiring checklist:**
 1. CDK creates encrypted log groups; ensure CMK is in same region.
-2. Add CloudWatch Alarms on `StuckRunDetected >= 1` and `PrewarmFailure >= 1` → SNS `vip-plans-alerts`.
+2. Recreate the alarms listed above (`create-alarms.sh`), pointed at SNS `vip-admin-alerts`.
+3. If pre-warm monitoring is needed, it does not exist yet — add metric emission
+   to `_prestart_plan`'s except block before wiring an alarm to it.
 
 ---
 

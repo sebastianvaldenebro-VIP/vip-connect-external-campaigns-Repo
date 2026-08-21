@@ -58,6 +58,35 @@ alarm \
   --comparison-operator "GreaterThanOrEqualToThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# ── Kickstart (DynamoDB Streams on VipProgressiveCampaignQueue) ──────────────
+# Audit 2026-08-21: kickstart had ZERO alarm coverage of any kind. It failed
+# 100% of invocations for 30h+ (missing shared layer — import requests via
+# first_orion_client crashed every cold start) until the DynamoDB Streams
+# event source mapping's retries exhausted the 24h stream retention window and
+# permanently dropped the backlog of fast-agent-dispatch events. Layer fix is
+# separate; these two alarms are what should have caught it in the first 5
+# minutes instead of 30 hours.
+alarm \
+  --alarm-name "vip-progressive-dialer-kickstart-errors" \
+  --alarm-description "CRITICAL: kickstart Lambda errors — fast-dispatch-to-available-agent on new queue item is failing (BD-013-shaped: import/runtime crash means the DynamoDB Streams backlog silently ages toward the 24h retention limit)" \
+  --namespace "AWS/Lambda" --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=vip-admin-progressive-dialer-kickstart" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
+# 1h threshold: well below the stream's 24h retention (leaves ~23h to intervene
+# before events are permanently dropped), well above normal transient backlog
+# during a traffic spike (avoids paging on noise).
+alarm \
+  --alarm-name "vip-progressive-dialer-kickstart-iterator-age" \
+  --alarm-description "CRITICAL: kickstart is falling behind its DynamoDB Streams shard by 1h+ — the 24h stream retention window will start dropping events if this isn't fixed. Check for a crash-looping Lambda (import errors, missing layer) first." \
+  --namespace "AWS/Lambda" --metric-name "IteratorAge" \
+  --dimensions "Name=FunctionName,Value=vip-admin-progressive-dialer-kickstart" \
+  --statistic "Maximum" --period 300 --threshold 3600000 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 2 --datapoints-to-alarm 2
+
 # ── Branded campaign monitoring ───────────────────────────────────────────────
 # Metrics emitted by vip-admin-branded-metrics-collector (EventBridge rate(1 minute)).
 # Namespace: VipBrandedMonitor
@@ -97,4 +126,4 @@ alarm \
   --evaluation-periods 2 --datapoints-to-alarm 2
 
 echo ""
-echo "=== 8 progressive dialer + branded alarms created ==="
+echo "=== 10 progressive dialer + branded alarms created ==="

@@ -236,12 +236,17 @@ def update_plan(event: dict, path_params: dict) -> dict:
     had_time_trigger = existing.get("trigger", {}).get("type") == "time"
 
     new_trigger = body.get("trigger")
-    if new_trigger is not None:
-        if is_template:
-            # Templates never run on a cron — remove the rule if one exists
-            if had_time_trigger:
-                scheduler_manager.delete_schedule(plan_id)
-        elif new_trigger.get("type") == "time":
+    if is_template:
+        # Templates never run on a cron — remove the rule if one exists. Checked
+        # unconditionally (not gated on new_trigger being resent): isTemplate alone
+        # is enough to make the plan a template, and a PATCH that only sends
+        # {"isTemplate": true} without "trigger" must still clean up an existing
+        # vip-sched-* rule, or it orphans forever (audit follow-up, 2026-08-21 —
+        # confirmed live: plan c63d695c-b99e-4885-808a-8eca91d08e8e).
+        if had_time_trigger:
+            scheduler_manager.delete_schedule(plan_id)
+    elif new_trigger is not None:
+        if new_trigger.get("type") == "time":
             scheduler_manager.upsert_schedule(plan_id, new_trigger)
         elif had_time_trigger:
             # Trigger changed away from "time" — remove the EventBridge rule

@@ -32,8 +32,12 @@ def lambda_handler(event: dict, context) -> dict:
             })
             return {"ok": True, **result}
         except Exception as exc:
+            # Re-raise (don't swallow into {"ok": False}) so this Lambda's AWS/Lambda
+            # Errors metric fires — the standard alarm every other function in this
+            # repo relies on. Swallowing here left 14+ days of 100% export failures
+            # with zero signal, since nothing else watches this handler's return value.
             _logger.error("branded_export_error", error=str(exc))
-            return {"ok": False, "error": str(exc)}
+            raise
 
     if action == "sms_export":
         import sms_exporter
@@ -47,7 +51,7 @@ def lambda_handler(event: dict, context) -> dict:
             return {"ok": True, **result}
         except Exception as exc:
             _logger.error("sms_export_error", error=str(exc))
-            return {"ok": False, "error": str(exc)}
+            raise
 
     # Default: campaign_export
     _logger.info("campaign_export_started")
@@ -57,4 +61,4 @@ def lambda_handler(event: dict, context) -> dict:
         return {"ok": True, **result}
     except Exception as exc:
         _logger.error("campaign_export_error", error=str(exc))
-        return {"ok": False, "error": str(exc)}
+        raise

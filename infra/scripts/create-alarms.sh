@@ -12,6 +12,24 @@ alarm() {
   echo "OK: $1 ($2)"
 }
 
+# ── One-time cleanup of stale/decommissioned alarms ────────────────────────────
+# Safe to re-run: delete-alarms on a name that doesn't exist is a no-op.
+# - vip-feeder-*: the feeder Lambda was decommissioned before these alarms were
+#   created (audit 2026-08-21) — they've been watching a function that no longer
+#   exists, docs/runbook.md's troubleshooting section for it is likewise stale.
+# - vip-plans-stuck-run: removed from this script months ago (StuckRun's own
+#   definition — time since run START, not since last progress — makes it unfit
+#   to alarm on directly; a genuinely healthy 12h+ run trips it daily). The LIVE
+#   alarm was never actually deleted when the script changed — pure code/reality
+#   drift, caught by the 2026-08-21 audit. Deleting it now for real.
+aws cloudwatch delete-alarms $R --alarm-names \
+  "vip-feeder-errors" \
+  "vip-feeder-throttles" \
+  "vip-feeder-duration-p99" \
+  "vip-plans-stuck-run" \
+  2>/dev/null || true
+echo "Cleanup: removed vip-feeder-* and vip-plans-stuck-run if present"
+
 # ── api-plans ─────────────────────────────────────────────────────────────────
 alarm \
   --alarm-name "vip-plans-errors" \
@@ -40,6 +58,20 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# ── campaign-exporter ─────────────────────────────────────────────────────────
+# Audit 2026-08-21: this Lambda swallowed every exception into {"ok": false}
+# instead of raising, so its own AWS/Lambda Errors metric stayed at 0 for 14+
+# days of 100% export failures (wrong KMS key granted — fixed separately).
+# The code fix (raise instead of return) now lets this standard alarm catch it.
+alarm \
+  --alarm-name "vip-campaign-exporter-errors" \
+  --alarm-description "CRITICAL: campaign-exporter Lambda errors - daily Snowflake export (campaigns/branded/SMS) failed" \
+  --namespace "AWS/Lambda" --metric-name "Errors" \
+  --dimensions "Name=FunctionName,Value=vip-admin-ui-campaign-exporter" \
+  --statistic "Sum" --period 300 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
 # ── location-onboarding-guard ────────────────────────────────────────────────
 alarm \
   --alarm-name "vip-location-onboarding-guard-errors" \
@@ -47,34 +79,6 @@ alarm \
   --namespace "AWS/Lambda" --metric-name "Errors" \
   --dimensions "Name=FunctionName,Value=vip-location-onboarding-guard" \
   --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
-
-# ── feeder ────────────────────────────────────────────────────────────────────
-alarm \
-  --alarm-name "vip-feeder-errors" \
-  --alarm-description "CRITICAL: feeder Lambda errors - lead push to Connect failed" \
-  --namespace "AWS/Lambda" --metric-name "Errors" \
-  --dimensions "Name=FunctionName,Value=vip-external-campaigns-feeder" \
-  --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
-
-alarm \
-  --alarm-name "vip-feeder-throttles" \
-  --alarm-description "CRITICAL: feeder throttled - 1 reserved concurrency, no data flowing" \
-  --namespace "AWS/Lambda" --metric-name "Throttles" \
-  --dimensions "Name=FunctionName,Value=vip-external-campaigns-feeder" \
-  --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
-
-alarm \
-  --alarm-name "vip-feeder-duration-p99" \
-  --alarm-description "WARNING: feeder p99 duration > 4min (approaching 5min timeout)" \
-  --namespace "AWS/Lambda" --metric-name "Duration" \
-  --dimensions "Name=FunctionName,Value=vip-external-campaigns-feeder" \
-  --extended-statistic "p99" --period 300 --threshold 240000 \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
@@ -126,24 +130,101 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 3 --datapoints-to-alarm 3
 
-# ── DynamoDB VipAdminPlans ────────────────────────────────────────────────────
-alarm \
-  --alarm-name "vip-plans-table-system-errors" \
-  --alarm-description "CRITICAL: VipAdminPlans DynamoDB system errors - table availability issue" \
-  --namespace "AWS/DynamoDB" --metric-name "SystemErrors" \
-  --dimensions "Name=TableName,Value=VipAdminPlans" \
-  --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
+# ── DynamoDB — all VIP tables ──────────────────────────────────────────────────
+# AWS/DynamoDB SystemErrors/ThrottledRequests are published ONLY per {TableName,
+# Operation} — never {TableName} alone. A plain --dimensions Name=TableName
+# alarm subscribes to a series that structurally never receives a datapoint.
+# Audit 2026-08-21 confirmed this dropped a real error on 2026-08-07 for
+# VipAdminPlans, and that 11 of the 12 VIP tables had ZERO DynamoDB alarm
+# coverage at all.
+#
+# Fix: sum SystemErrors/ThrottledRequests across all 8 possible DynamoDB
+# data-plane operations via Metric Math (FILL(...,0) so an operation with zero
+# errors ever — and therefore no metric series yet — contributes 0 instead of
+# breaking the sum). A SEARCH()-based expression would be simpler but CloudWatch
+# rejects it for alarms outright ("SEARCH is not supported on Metric Alarms",
+# confirmed live 2026-08-21) — this explicit per-operation sum is the actual
+# supported way to alarm across every operation for a table.
+# (vip-connect-deny-list excluded: tagged Project=vip-connect but managed
+# manually by the separate connectcampaign_denylist_* Lambdas' team, not this
+# repo — out of scope here.)
+VIP_TABLES=(
+  "VipAdminPlans"
+  "VipActiveBrandedCampaigns"
+  "VipAdminSegmentFilterConfig"
+  "VipAgentSnapshot"
+  "VipBrandedCampaignMetrics"
+  "VipBrandedRunSummary"
+  "VipLocationMapping"
+  "VipProgressiveAgentLocks"
+  "VipProgressiveCampaignQueue"
+  "VipSmsCampaignQueue"
+  "VipSmsCampaignRuns"
+)
+DDB_OPERATIONS=(GetItem PutItem Query Scan UpdateItem DeleteItem BatchGetItem BatchWriteItem)
 
-alarm \
-  --alarm-name "vip-plans-table-throttles" \
-  --alarm-description "WARNING: VipAdminPlans DynamoDB throttled requests" \
-  --namespace "AWS/DynamoDB" --metric-name "ThrottledRequests" \
-  --dimensions "Name=TableName,Value=VipAdminPlans" \
-  --statistic "Sum" --period 60 --threshold 0 \
-  --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
+alarm_ddb_all_ops() {
+  local table="$1" metric="$2" alarm_name="$3" description="$4"
+  local metrics_file
+  metrics_file=$(mktemp)
+  DDB_TABLE="$table" DDB_METRIC="$metric" python3 - "$metrics_file" "${DDB_OPERATIONS[@]}" <<'PYEOF'
+import json, os, sys
+
+metrics_file = sys.argv[1]
+ops = sys.argv[2:]
+table = os.environ["DDB_TABLE"]
+metric = os.environ["DDB_METRIC"]
+
+entries = []
+ids = []
+for i, op in enumerate(ops, start=1):
+    mid = f"m{i}"
+    ids.append(mid)
+    entries.append({
+        "Id": mid,
+        "MetricStat": {
+            "Metric": {
+                "Namespace": "AWS/DynamoDB",
+                "MetricName": metric,
+                "Dimensions": [
+                    {"Name": "TableName", "Value": table},
+                    {"Name": "Operation", "Value": op},
+                ],
+            },
+            "Period": 300,
+            "Stat": "Sum",
+        },
+        "ReturnData": False,
+    })
+expr = "+".join(f"FILL({i},0)" for i in ids)
+entries.append({
+    "Id": "e1",
+    "Expression": expr,
+    "Label": f"{table} {metric} (all operations)",
+    "ReturnData": True,
+})
+with open(metrics_file, "w") as f:
+    json.dump(entries, f)
+PYEOF
+  aws cloudwatch put-metric-alarm $R \
+    --alarm-name "$alarm_name" \
+    --alarm-description "$description" \
+    --metrics "file://$metrics_file" \
+    --threshold 0 \
+    --comparison-operator "GreaterThanThreshold" \
+    --evaluation-periods 1 --datapoints-to-alarm 1 \
+    --alarm-actions "$TOPIC" --ok-actions "$TOPIC" \
+    --treat-missing-data "notBreaching"
+  rm -f "$metrics_file"
+  echo "OK: $alarm_name ($table $metric, all 8 operations)"
+}
+
+for table in "${VIP_TABLES[@]}"; do
+  alarm_ddb_all_ops "$table" "SystemErrors" "vip-ddb-${table}-system-errors" \
+    "CRITICAL: ${table} DynamoDB system errors (all operations) - table availability issue"
+  alarm_ddb_all_ops "$table" "ThrottledRequests" "vip-ddb-${table}-throttles" \
+    "WARNING: ${table} DynamoDB throttled requests (all operations)"
+done
 
 # ── EventBridge ───────────────────────────────────────────────────────────────
 alarm \
@@ -192,7 +273,9 @@ alarm \
 # Fixing this needs the metric itself redefined (e.g. time since the CURRENT
 # bucket's own startedAt, not the run's) — not done in this pass. The
 # aggregate emission added for BD-013 is left in code (harmless, useful for
-# manual CloudWatch Metrics inspection) but no alarm watches it.
+# manual CloudWatch Metrics inspection) but no alarm watches it. (The cleanup
+# block at the top of this script deletes the live vip-plans-stuck-run alarm
+# that drifted out of sync with this comment — audit 2026-08-21.)
 
 # Fires when a "running" bucket has gone _NO_ACTIVE_CAMPAIGN_MINUTES (5) with
 # zero campaigns in creating/warming/running status — the tick that should
@@ -210,6 +293,23 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
+# Fires when any pre-warm attempt fails (a stage-1 Connect campaign creation
+# failure, or the whole pre-warm call crashing). Previously documented in
+# RUNBOOKS.md/INTEGRATION_CONTRACTS.md as an existing, alarmable metric for
+# months while it was never implemented anywhere (audit 2026-08-21) — a failing
+# pre-warm just logged an ERROR and retried next tick, burning invocations with
+# zero operator visibility until the upstream campaign finished and the
+# downstream started cold. _emit_prewarm_failure() in executor.py now emits
+# this on all 4 failure sites. Metric emitted WITHOUT dimensions (aggregate) so
+# this CLI alarm can catch it; per-PlanId dimension also emitted for drill-down.
+alarm \
+  --alarm-name "vip-plans-prewarm-failure" \
+  --alarm-description "WARNING: a pre-warm attempt failed — a downstream plan may start cold instead of already-warmed. Check CloudWatch Logs Insights for 'prestart_plan_campaign_failed' or '_prestart_after_campaign' errors with this plan's id." \
+  --namespace "VIPPlans" --metric-name "PrewarmFailure" \
+  --statistic "Sum" --period 60 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 1 --datapoints-to-alarm 1
+
 # Per-plan vip-sched-* FailedInvocations alarms cannot be created here because rule names
 # are dynamic (created at runtime by upsert_schedule). Options:
 #   a) Console: Metric Math alarm with SEARCH('{AWS/Events,RuleName} vip-sched FailedInvocations')
@@ -221,8 +321,26 @@ alarm \
 #        --comparison-operator GreaterThanThreshold --evaluation-periods 1 \
 #        --alarm-actions $TOPIC $R
 
+# ── API Gateway — vip-admin-ui-api (ApiId me1idvufo6) ─────────────────────────
+# Audit 2026-08-21: api-campaigns/api-metrics (and every other HTTP handler in
+# this repo) deliberately convert application-level failures (ServiceQuotaExceeded,
+# validation errors, DynamoDB throttles) into well-formed 4xx/5xx HTTP responses —
+# that's correct behavior for an HTTP API, but it means AWS/Lambda's own Errors
+# metric can NEVER see them (Lambda's own invocation completed successfully from
+# its point of view). No alarm anywhere in this account was watching the actual
+# HTTP-level error rate. This is the correct backstop: it sees every status code
+# regardless of how gracefully the Lambda handled the underlying failure.
+alarm \
+  --alarm-name "vip-admin-ui-api-5xx" \
+  --alarm-description "WARNING: vip-admin-ui-api (api-campaigns/api-metrics/api-plans/api-segments/api-profiles) returning 5xx — catches application-level failures that AWS/Lambda Errors can't see because handlers convert them to well-formed error responses" \
+  --namespace "AWS/ApiGateway" --metric-name "5xx" \
+  --dimensions "Name=ApiId,Value=me1idvufo6" \
+  --statistic "Sum" --period 300 --threshold 0 \
+  --comparison-operator "GreaterThanThreshold" \
+  --evaluation-periods 2 --datapoints-to-alarm 2
+
 echo ""
-echo "=== 18 alarmas creadas ==="
+echo "=== alarmas creadas/actualizadas (ver conteo real con describe-alarms) ==="
 
 # ── Progressive Branded Dialer SNS topic (manual pre-req) ─────────────────────
 # The CDK stack imports this topic by ARN (SNS:GetTopicAttributes is outside the

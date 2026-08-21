@@ -2926,6 +2926,83 @@ def test_dispatch_cross_bucket_schedule_failure_no_claim():
     )
 
 
+# ── _schedule_tick atomicity (audit follow-up, 2026-08-21) ───────────────────
+# The 4 call sites above all assumed _schedule_tick either fully succeeds or
+# raises with NOTHING created. That was false for an add_permission-stage
+# failure specifically: put_rule/put_targets had already succeeded, leaving a
+# live-but-unreferenced EventBridge rule — the exact BD-013 orphan shape, just
+# triggered by a different failure than the ConcurrentWriteError already
+# fixed. _schedule_tick now rolls back its own partial work before
+# re-raising, so every caller's existing "log and move on" handling is safe
+# by construction instead of by accident.
+
+
+def test_schedule_tick_rolls_back_rule_on_add_permission_failure():
+    """A non-ResourceConflictException failure from add_permission must delete
+    the rule+target that put_rule/put_targets already created, before
+    re-raising — otherwise it's a permanent (or, now, up-to-24h) orphan."""
+    import executor
+    from unittest.mock import MagicMock
+    from botocore.exceptions import ClientError
+
+    events_client = MagicMock()
+    lambda_client = MagicMock()
+    lambda_client.get_policy.return_value = {"Policy": '{"Statement": []}'}
+    lambda_client.add_permission.side_effect = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+        "AddPermission",
+    )
+
+    sts_client = MagicMock()
+    sts_client.get_caller_identity.return_value = {"Account": "165505826690"}
+
+    def _client(service_name, *a, **kw):
+        return {"events": events_client, "lambda": lambda_client, "sts": sts_client}[service_name]
+
+    with (
+        patch("boto3.client", side_effect=_client),
+        patch("executor._delete_schedule_safe") as mock_delete,
+    ):
+        with pytest.raises(ClientError, match="ThrottlingException"):
+            executor._schedule_tick(plan_id="plan-1", run_id="run-1", bucket_index=0)
+
+    events_client.put_rule.assert_called_once()
+    events_client.put_targets.assert_called_once()
+    mock_delete.assert_called_once_with("vip-plan-plan-1-run-run-1-b0")
+
+
+def test_schedule_tick_does_not_roll_back_on_resource_conflict():
+    """ResourceConflictException means the permission already exists (a
+    concurrent caller won the race) — this is the expected idempotent case,
+    not a failure. Must NOT delete the rule the caller is relying on."""
+    import executor
+    from unittest.mock import MagicMock
+    from botocore.exceptions import ClientError
+
+    events_client = MagicMock()
+    lambda_client = MagicMock()
+    lambda_client.get_policy.return_value = {"Policy": '{"Statement": []}'}
+    lambda_client.add_permission.side_effect = ClientError(
+        {"Error": {"Code": "ResourceConflictException", "Message": "already exists"}},
+        "AddPermission",
+    )
+
+    sts_client = MagicMock()
+    sts_client.get_caller_identity.return_value = {"Account": "165505826690"}
+
+    def _client(service_name, *a, **kw):
+        return {"events": events_client, "lambda": lambda_client, "sts": sts_client}[service_name]
+
+    with (
+        patch("boto3.client", side_effect=_client),
+        patch("executor._delete_schedule_safe") as mock_delete,
+    ):
+        result = executor._schedule_tick(plan_id="plan-1", run_id="run-1", bucket_index=0)
+
+    assert result == "vip-plan-plan-1-run-run-1-b0"
+    mock_delete.assert_not_called()
+
+
 # B1-C: _force_finish_internal and abort_run always unlock
 
 
@@ -3297,6 +3374,212 @@ def test_prestart_does_not_flag_before_5_minutes():
     mock_boto.return_value.put_metric_data.assert_not_called()
 
 
+# ── Cross-bucket dependency waits are not "stuck" (audit follow-up, 2026-08-21) ──
+# Live incident, plan 6203a0b5-a82d-42c7-b523-6d1b1893ae30: bucket 11's only
+# non-terminal campaign depends on bucket 10's campaign, which was genuinely still
+# actively dialing in Connect (real schedule, hours from its own endTime) — not
+# crashed. The alarm paged every single minute for over an hour anyway, because
+# it only checked "is anything active IN THIS bucket", with no notion of a
+# same-run cross-bucket dependency that's still legitimately in flight elsewhere.
+
+
+def test_prestart_does_not_flag_bucket_blocked_on_live_cross_bucket_dependency():
+    import executor
+
+    plan = _make_plan(
+        [
+            _bucket_def("b0", [_campaign_def("c0")]),
+            _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+        ]
+    )
+    # c0 (bucket 0) is still actively running — c1 (bucket 1) correctly waits.
+    run = _make_run(
+        plan,
+        [
+            _bucket_state("b0", [_campaign_state("c0", "running")], status="running"),
+            _bucket_state("b1", [_campaign_state("c1", "queued")], status="running"),
+        ],
+    )
+    now_utc = datetime(2026, 5, 8, 10, 6, tzinfo=timezone.utc)  # 6 min after b1 startedAt
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == []
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
+def test_prestart_flags_bucket_whose_dependency_is_already_terminal():
+    """If the dependency is DONE (terminal) but the dependent campaign never
+    started, that's the real BD-013 shape again — dispatch should have already
+    happened and didn't. Must still alarm."""
+    import executor
+
+    plan = _make_plan(
+        [
+            _bucket_def("b0", [_campaign_def("c0")]),
+            _bucket_def("b1", [_campaign_def("c1", depends_on=["c0"])]),
+        ]
+    )
+    run = _make_run(
+        plan,
+        [
+            _bucket_state("b0", [_campaign_state("c0", "completed")], status="completed"),
+            _bucket_state("b1", [_campaign_state("c1", "queued")], status="running"),
+        ],
+    )
+    now_utc = datetime(2026, 5, 8, 10, 6, tzinfo=timezone.utc)
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == ["plan-1"]
+    mock_boto.return_value.put_metric_data.assert_called_once()
+
+
+def test_prestart_flags_bucket_with_no_dependency_still_queued():
+    """A queued campaign with NO dependsOn at all has nothing legitimate to wait
+    on — must still alarm (this is the original, unmodified BD-013 case)."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    run = _make_run(
+        plan, [_bucket_state("b0", [_campaign_state("c0", "queued")], status="running")]
+    )
+    now_utc = datetime(2026, 5, 8, 10, 6, tzinfo=timezone.utc)
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == ["plan-1"]
+    mock_boto.return_value.put_metric_data.assert_called_once()
+
+
+# ── PrewarmFailure metric (audit follow-up, 2026-08-21) ───────────────────────
+# RUNBOOKS.md/INTEGRATION_CONTRACTS.md documented an alarmable "PrewarmFailure"
+# metric for months; it was never implemented anywhere — every pre-warm failure
+# path only logged an ERROR and moved on, with zero telemetry. These tests lock
+# in the real emission across all four failure sites.
+
+
+def test_prestart_plan_emits_metric_when_a_campaign_fails_to_warm():
+    import executor
+
+    plan = {
+        "planId": "plan-target",
+        "buckets": [_bucket_def("b0", [_campaign_def("c0")])],
+    }
+
+    with (
+        patch("executor._create_campaign_only", side_effect=RuntimeError("Connect quota")),
+        patch("executor.get_plan", return_value=plan),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.update_plan_pending_warmup"),
+        patch("boto3.client") as mock_boto,
+    ):
+        executor._prestart_plan("plan-target")
+
+    calls = mock_boto.return_value.put_metric_data.call_args_list
+    assert len(calls) == 1
+    metric_data = calls[0].kwargs["MetricData"]
+    assert metric_data[0]["MetricName"] == "PrewarmFailure"
+    assert metric_data[0]["Value"] == 1
+    assert metric_data[0]["Dimensions"] == [{"Name": "PlanId", "Value": "plan-target"}]
+    assert metric_data[1]["Dimensions"] == []
+
+
+def test_prestart_plan_does_not_emit_metric_when_warmup_succeeds():
+    import executor
+
+    plan = {
+        "planId": "plan-target",
+        "buckets": [_bucket_def("b0", [_campaign_def("c0")])],
+    }
+
+    with (
+        patch(
+            "executor._create_campaign_only",
+            return_value=("conn-1", "seg-1", "arn:seg-1", True),
+        ),
+        patch("executor.get_plan", return_value=plan),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor.update_plan_pending_warmup"),
+        patch("boto3.client") as mock_boto,
+    ):
+        executor._prestart_plan("plan-target")
+
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
+def test_prestart_chained_runs_emits_metric_when_prestart_plan_crashes():
+    """on_plan_complete chain: _prestart_plan itself raising (not a per-campaign
+    failure it already swallows) must still surface via the metric."""
+    import executor
+
+    run = {"planId": "plan-1", "runId": "run-1"}
+    plan = {"planId": "plan-1", "loop": None}
+    downstream = {"planId": "plan-2"}
+
+    with (
+        patch("executor.find_plans_by_trigger_planid", return_value=[downstream]),
+        patch("executor._prestart_plan", side_effect=RuntimeError("boom")),
+        patch("boto3.client") as mock_boto,
+    ):
+        executor._prestart_chained_runs(run, plan, 0)
+
+    calls = mock_boto.return_value.put_metric_data.call_args_list
+    assert len(calls) == 1
+    metric_data = calls[0].kwargs["MetricData"]
+    assert metric_data[0]["MetricName"] == "PrewarmFailure"
+    assert metric_data[0]["Dimensions"] == [{"Name": "PlanId", "Value": "plan-2"}]
+
+
+def test_prestart_after_campaign_emits_metric_when_prestart_plan_crashes():
+    import executor
+
+    downstream = {
+        "planId": "plan-2",
+        "trigger": {"afterCampaign": "camp-1"},
+    }
+
+    with (
+        patch("executor.find_plans_by_trigger_planid", return_value=[downstream]),
+        patch("executor._prestart_plan", side_effect=RuntimeError("boom")),
+        patch("boto3.client") as mock_boto,
+    ):
+        executor._prestart_after_campaign("plan-1", "camp-1")
+
+    calls = mock_boto.return_value.put_metric_data.call_args_list
+    assert len(calls) == 1
+    metric_data = calls[0].kwargs["MetricData"]
+    assert metric_data[0]["MetricName"] == "PrewarmFailure"
+    assert metric_data[0]["Dimensions"] == [{"Name": "PlanId", "Value": "plan-2"}]
+
+
 def test_prestart_does_not_flag_bucket_with_an_active_campaign():
     """A bucket running 5+ minutes with at least one campaign actually
     creating/warming/running must NOT be flagged — this is healthy, not stalled.
@@ -3327,6 +3610,24 @@ def test_prestart_does_not_flag_bucket_with_an_active_campaign():
 # ── Janitor: daily orphan-schedule cleanup (BD-013 follow-up) ────────────────
 
 
+def _prefix_dispatch_list_rules(vip_plan_pages: list | None = None, vip_sched_pages: list | None = None):
+    """side_effect for events.list_rules dispatching by NamePrefix — the janitor
+    now sweeps vip-plan-* and vip-sched-* as two separate paginated calls through
+    the SAME boto3 client, so a single static return_value can't distinguish them."""
+    plan_iter = iter(vip_plan_pages or [{"Rules": []}])
+    sched_iter = iter(vip_sched_pages or [{"Rules": []}])
+
+    def _side_effect(**kwargs):
+        prefix = kwargs.get("NamePrefix")
+        if prefix == "vip-plan-":
+            return next(plan_iter)
+        if prefix == "vip-sched-":
+            return next(sched_iter)
+        raise AssertionError(f"unexpected NamePrefix: {prefix}")
+
+    return _side_effect
+
+
 def test_janitor_deletes_rule_not_referenced_by_any_running_run():
     """A vip-plan-* rule that no currently-running run's bucketState.scheduleName
     points to must be deleted — this is the actual orphan-detection gap
@@ -3347,9 +3648,11 @@ def test_janitor_deletes_rule_not_referenced_by_any_running_run():
         patch("executor._notify_sns") as mock_notify,
         patch("boto3.client") as mock_boto,
     ):
-        mock_boto.return_value.list_rules.return_value = {
-            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}, {"Name": "vip-plan-orphan-rule"}]
-        }
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_plan_pages=[
+                {"Rules": [{"Name": "vip-plan-p1-run-r1-b0"}, {"Name": "vip-plan-orphan-rule"}]}
+            ]
+        )
         result = executor.janitor_cleanup_orphan_schedules()
 
     assert result["deleted"] == ["vip-plan-orphan-rule"]
@@ -3376,9 +3679,9 @@ def test_janitor_preserves_the_current_running_bucket_schedule():
         patch("executor._notify_sns"),
         patch("boto3.client") as mock_boto,
     ):
-        mock_boto.return_value.list_rules.return_value = {
-            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
-        }
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_plan_pages=[{"Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]}]
+        )
         result = executor.janitor_cleanup_orphan_schedules()
 
     assert result["deleted"] == []
@@ -3406,9 +3709,9 @@ def test_janitor_treats_non_running_plans_schedules_as_fair_game():
         patch("executor._notify_sns") as mock_notify,
         patch("boto3.client") as mock_boto,
     ):
-        mock_boto.return_value.list_rules.return_value = {
-            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
-        }
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_plan_pages=[{"Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]}]
+        )
         result = executor.janitor_cleanup_orphan_schedules()
 
     assert result["deleted"] == ["vip-plan-p1-run-r1-b0"]
@@ -3428,10 +3731,12 @@ def test_janitor_paginates_through_all_rules():
         patch("executor._notify_sns"),
         patch("boto3.client") as mock_boto,
     ):
-        mock_boto.return_value.list_rules.side_effect = [
-            {"Rules": [{"Name": "vip-plan-a"}], "NextToken": "page2"},
-            {"Rules": [{"Name": "vip-plan-b"}]},
-        ]
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_plan_pages=[
+                {"Rules": [{"Name": "vip-plan-a"}], "NextToken": "page2"},
+                {"Rules": [{"Name": "vip-plan-b"}]},
+            ]
+        )
         result = executor.janitor_cleanup_orphan_schedules()
 
     assert sorted(result["deleted"]) == ["vip-plan-a", "vip-plan-b"]
@@ -3459,12 +3764,100 @@ def test_janitor_does_not_notify_when_nothing_was_orphaned():
         patch("executor._notify_sns") as mock_notify,
         patch("boto3.client") as mock_boto,
     ):
-        mock_boto.return_value.list_rules.return_value = {
-            "Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]
-        }
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_plan_pages=[{"Rules": [{"Name": "vip-plan-p1-run-r1-b0"}]}]
+        )
         executor.janitor_cleanup_orphan_schedules()
 
     mock_notify.assert_not_called()
+
+
+# ── janitor vip-sched-* sweep (audit follow-up, 2026-08-21) ───────────────────
+
+
+def test_janitor_deletes_vip_sched_rule_for_template_plan():
+    """A vip-sched-* rule whose owning plan is now isTemplate=true is an orphan
+    — update_plan's own cleanup only fires when the PATCH resends "trigger",
+    so this sweep is the backstop (confirmed live: plan
+    c63d695c-b99e-4885-808a-8eca91d08e8e)."""
+    import executor
+    from scheduler_manager import _rule_name
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["planId"] = "c63d695c-b99e-4885-808a-8eca91d08e8e"
+    plan["isTemplate"] = True
+    plan["trigger"] = {"type": "time", "time": "08:40"}
+    rule_name = _rule_name(plan["planId"])
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns"),
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_sched_pages=[{"Rules": [{"Name": rule_name}]}]
+        )
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == [rule_name]
+    mock_delete.assert_called_once_with(rule_name)
+
+
+def test_janitor_preserves_vip_sched_rule_for_live_time_triggered_plan():
+    """A non-template plan with an active time trigger must keep its rule."""
+    import executor
+    from scheduler_manager import _rule_name
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["planId"] = "plan-with-time-trigger"
+    plan["isTemplate"] = False
+    plan["trigger"] = {"type": "time", "time": "08:40"}
+    rule_name = _rule_name(plan["planId"])
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns"),
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_sched_pages=[{"Rules": [{"Name": rule_name}]}]
+        )
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == []
+    mock_delete.assert_not_called()
+
+
+def test_janitor_deletes_vip_sched_rule_for_manual_trigger_plan():
+    """A plan whose trigger changed away from "time" (e.g. to manual) but still
+    has a live rule — same orphan shape, different cause than isTemplate."""
+    import executor
+    from scheduler_manager import _rule_name
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    plan["planId"] = "plan-now-manual"
+    plan["isTemplate"] = False
+    plan["trigger"] = {"type": "manual"}
+    rule_name = _rule_name(plan["planId"])
+
+    with (
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=None),
+        patch("executor._delete_schedule_safe") as mock_delete,
+        patch("executor._notify_sns"),
+        patch("boto3.client") as mock_boto,
+    ):
+        mock_boto.return_value.list_rules.side_effect = _prefix_dispatch_list_rules(
+            vip_sched_pages=[{"Rules": [{"Name": rule_name}]}]
+        )
+        result = executor.janitor_cleanup_orphan_schedules()
+
+    assert result["deleted"] == [rule_name]
+    mock_delete.assert_called_once_with(rule_name)
 
 
 def test_prestart_prewarm_and_fallback_still_fire_on_allowed_day():
@@ -3637,6 +4030,56 @@ def test_force_start_clears_connect_campaign_id_in_phase1_save():
     )
     assert phase1_save["segmentArn"] is None
     assert phase1_save["segmentName"] is None
+
+
+# S10-F: force_start_campaign Phase-1 save rolls back a just-created schedule
+# on ConcurrentWriteError (audit follow-up, 2026-08-21) — otherwise the schedule's
+# name never persists anywhere and it orphans forever, same shape as BD-013.
+
+
+def test_force_start_phase1_save_rolls_back_new_schedule_on_concurrent_write():
+    import executor
+    from executor import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "queued")
+    bs = _bucket_state("b0", [cs], status="queued", schedule_name=None)
+    run = _make_run(plan, [bs])
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor.save_run", side_effect=ConcurrentWriteError("raced")),
+        patch("executor._schedule_tick", return_value="vip-plan-plan-1-run-run-1-b0"),
+        patch("executor._reset_cascade_cancelled_children"),
+        patch("executor._delete_schedule_safe") as mock_delete,
+    ):
+        with pytest.raises(ConcurrentWriteError):
+            executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    mock_delete.assert_called_once_with("vip-plan-plan-1-run-run-1-b0")
+
+
+def test_force_start_phase1_save_no_rollback_when_no_schedule_created():
+    import executor
+    from executor import ConcurrentWriteError
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "queued")
+    # Bucket already "running" — force_start_campaign does not call _schedule_tick
+    # for an already-running bucket, so nothing new exists to roll back.
+    bs = _bucket_state("b0", [cs], status="running", schedule_name="sched-existing")
+    run = _make_run(plan, [bs])
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor.save_run", side_effect=ConcurrentWriteError("raced")),
+        patch("executor._reset_cascade_cancelled_children"),
+        patch("executor._delete_schedule_safe") as mock_delete,
+    ):
+        with pytest.raises(ConcurrentWriteError):
+            executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    mock_delete.assert_not_called()
 
 
 # S10-E: force_start_campaign final-save retry loop

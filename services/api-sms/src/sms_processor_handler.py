@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -18,6 +18,15 @@ _QUEUE_TABLE = os.environ["SMS_CAMPAIGN_QUEUE_TABLE"]
 _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
 _CONFIG_SET = os.environ.get("SMS_CONFIG_SET_NAME", "")
 _OPT_OUT_LIST = os.environ.get("SMS_OPT_OUT_LIST_NAME", "")
+
+# 2x this Lambda's own 30s timeout (api-sms-stack.ts B5 comment), comfortably below
+# the queue's 180s VisibilityTimeout. A SENDING claim older than this cannot belong
+# to a still-running invocation (it would have already timed out) — it can only be
+# an orphan left behind by a crash/timeout, since nothing else ever moves an item
+# out of SENDING. Without this, a redelivered message for an orphaned claim hits the
+# ConditionalCheckFailedException below, is skipped as a "duplicate", and its SQS
+# message is deleted on the way out — permanently stranding it in SENDING forever.
+_STALE_SENDING_SECONDS = 60
 
 _ddb = boto3.resource("dynamodb")
 _sms = boto3.client("pinpoint-sms-voice-v2", region_name="us-east-1")
@@ -49,22 +58,31 @@ def _process(
     sent_at = datetime.now(timezone.utc).isoformat()
 
     # Claim this item PENDING → SENDING before sending (H-A1: idempotency guard).
-    # If another invocation already claimed it, this raises ConditionalCheckFailedException
-    # and we return early — preventing duplicate sends for the same SQS message.
+    # Also allows re-claiming a SENDING item whose claim has gone stale (see
+    # _STALE_SENDING_SECONDS) — recovering an orphan left by a crashed/timed-out
+    # invocation. If another invocation holds a fresh claim, this raises
+    # ConditionalCheckFailedException and we return early to avoid a duplicate send.
+    stale_before = (
+        datetime.now(timezone.utc) - timedelta(seconds=_STALE_SENDING_SECONDS)
+    ).isoformat()
     try:
         _ddb.Table(_QUEUE_TABLE).update_item(
             Key={"campaignId": campaign_id, "sk": sk},
             UpdateExpression="SET #s = :sending, updatedAt = :t",
-            ConditionExpression="#s = :pending",
+            ConditionExpression=(
+                "#s = :pending OR (#s = :sending AND updatedAt < :stale_before)"
+            ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":sending": "SENDING",
                 ":pending": "PENDING",
+                ":stale_before": stale_before,
                 ":t": sent_at,
             },
         )
     except _ddb.meta.client.exceptions.ConditionalCheckFailedException:
-        # Already claimed or processed by another invocation — skip to avoid duplicate send
+        # Already claimed by a still-live invocation, or already terminal — skip
+        # to avoid duplicate send.
         print(f"sms_processor: skipped duplicate campaign={campaign_id} sk={sk[:20]}")
         return
 

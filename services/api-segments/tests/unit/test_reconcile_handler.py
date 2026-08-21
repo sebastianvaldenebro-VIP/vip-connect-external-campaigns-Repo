@@ -226,3 +226,161 @@ def test_paginates_campaign_listing_when_retargeting():
     body = json.loads(response["body"])
     assert body["campaignsUpdated"] == ["page1", "page2"]
     assert oc.list_campaigns.call_count == 2
+
+
+# ── Rollback on mid-sequence failure (audit follow-up, 2026-08-21) ────────────
+# CP segment names are unique. Without rollback, a failure after the new segment
+# is created leaves {family}-v{N+1} permanently occupied — current_version is
+# only bumped by mark_rebuilt (which runs AFTER the failure point), so every
+# retry recomputes the exact same new_name and create_segment_definition rejects
+# it as a duplicate forever.
+
+
+def test_mark_rebuilt_failure_reverts_retargeted_campaigns_and_deletes_new_segment():
+    from handlers import reconcile
+
+    old_arn = "arn:old"
+    new_arn = "arn:new"
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn=old_arn
+    )
+    cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [{"id": "cust-a", "customerid": "cust-a", "available": "1"}]
+    )
+
+    oc = MagicMock()
+    oc.list_campaigns.return_value = {
+        "campaignSummaryList": [
+            {"id": "cmp-1", "source": {"customerProfilesSegmentArn": old_arn}},
+        ],
+        "nextToken": None,
+    }
+
+    config_store = _config_store_with(
+        [("available", "eq", ["1"])], combinator="ALL", version=3
+    )
+    config_store.mark_rebuilt.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_oc", return_value=oc),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch("handlers.reconcile.build_audit", return_value=MagicMock()),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=config_store,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="DDB throttled"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+    # Campaign reverted back to the OLD segment ARN — not left pointing at the
+    # new segment that's about to be deleted.
+    oc.update_campaign_source.assert_any_call(
+        "cmp-1", {"customerProfilesSegmentArn": new_arn}
+    )
+    oc.update_campaign_source.assert_called_with(
+        "cmp-1", {"customerProfilesSegmentArn": old_arn}
+    )
+    # New segment deleted so the name is free for the next retry.
+    cp.delete_segment_definition.assert_called_once_with("nj-available-leads-v4")
+    # Old segment must NOT be deleted — the rebuild never completed.
+    cp.delete_segment_definition.assert_called_once()
+
+
+def test_delete_old_segment_failure_still_rolls_back_new_segment_and_campaigns():
+    from handlers import reconcile
+
+    old_arn = "arn:old"
+    new_arn = "arn:new"
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn=old_arn
+    )
+    cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
+    # First delete_segment_definition call is the real step-5 delete of the OLD
+    # segment, which fails; the second is the rollback's delete of the NEW one.
+    cp.delete_segment_definition.side_effect = [RuntimeError("CP unavailable"), None]
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [{"id": "cust-a", "customerid": "cust-a", "available": "1"}]
+    )
+
+    oc = MagicMock()
+    oc.list_campaigns.return_value = {
+        "campaignSummaryList": [
+            {"id": "cmp-1", "source": {"customerProfilesSegmentArn": old_arn}},
+        ],
+        "nextToken": None,
+    }
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_oc", return_value=oc),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch("handlers.reconcile.build_audit", return_value=MagicMock()),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=_config_store_with(
+                [("available", "eq", ["1"])], combinator="ALL", version=3
+            ),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="CP unavailable"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+    oc.update_campaign_source.assert_called_with(
+        "cmp-1", {"customerProfilesSegmentArn": old_arn}
+    )
+    assert cp.delete_segment_definition.call_args_list == [
+        (("nj-v3",),),
+        (("nj-available-leads-v4",),),
+    ]
+
+
+def test_rollback_itself_failing_raises_annotated_error_not_silent():
+    """If the rollback's own compensating calls also fail, the caller must be
+    told the orphan wasn't cleaned up — not just see the original error."""
+    from handlers import reconcile
+
+    old_arn = "arn:old"
+    new_arn = "arn:new"
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn=old_arn
+    )
+    cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
+    cp.delete_segment_definition.side_effect = RuntimeError(
+        "cannot even delete new segment"
+    )
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [{"id": "cust-a", "customerid": "cust-a", "available": "1"}]
+    )
+
+    oc = MagicMock()
+    oc.list_campaigns.return_value = {"campaignSummaryList": [], "nextToken": None}
+
+    config_store = _config_store_with(
+        [("available", "eq", ["1"])], combinator="ALL", version=3
+    )
+    config_store.mark_rebuilt.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_oc", return_value=oc),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch("handlers.reconcile.build_audit", return_value=MagicMock()),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=config_store,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="rollback was incomplete"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})

@@ -112,12 +112,29 @@ We empirically tested 5 variants, all of which failed:
 | **Audit trail ≥ 6 years** | `AdminAuditLog` DynamoDB table with `ttl` ~189M seconds ahead. Deletion protection enabled. Every mutation goes through `record_audit()` in `services/shared/audit.py`. |
 | **Access controls** | IAM least-privilege per Lambda. All roles have the mandatory `EngineeringPermissionBoundary` attached. API Gateway JWT Authorizer validates Cognito tokens server-side. |
 | **Logging without PHI** | `StructuredLogger` in shared layer SHA-256-hashes any field matching a PHI regex (phone, first_name, last_name, email, SSN, address). |
-| **VPC posture** | `api-plans`, `api-segments`, and `feeder` are VPC-attached (require Redis/ElastiCache access). `api-campaigns`, `api-profiles`, `api-metrics` call only AWS public-endpoint APIs — no VPC needed. |
+| **VPC posture** | `api-plans` and `api-segments` are VPC-attached (require Redis/ElastiCache access). `api-campaigns`, `api-profiles`, `api-metrics` call only AWS public-endpoint APIs — no VPC needed. (`feeder` is gone — decommissioned; `aws lambda get-function` returns ResourceNotFoundException, verified live 2026-08-21.) |
 | **Dedicated account for PHI** | Account `165505826690` already holds the Customer Profiles domain. No cross-account data movement. |
-| **Breach readiness** | CloudTrail captures all API calls. GuardDuty assumed enabled at org level. 14 CloudWatch Alarms → SNS topic `vip-admin-alerts` provide automated operational alerting. |
-| **Operational alerting** | SNS topic `arn:aws:sns:us-east-1:165505826690:vip-admin-alerts` with email subscription. 14 alarms cover Lambda errors/throttles/duration for all 6 functions, DynamoDB system errors and throttles, and EventBridge failed invocations. Created via CLI (CFN exec role lacks SNS + cloudwatch:PutDashboard permissions). |
+| **Breach readiness** | CloudTrail captures all API calls. GuardDuty assumed enabled at org level. 58 CloudWatch Alarms (verified live 2026-08-21, up from the original 14 created 2026-05-13) → SNS topic `vip-admin-alerts` provide automated operational alerting. |
+| **Operational alerting** | SNS topic `arn:aws:sns:us-east-1:165505826690:vip-admin-alerts` with email subscription. 58 alarms as of 2026-08-21 — Lambda errors/throttles/duration across every function in this repo, DynamoDB system errors and throttles across all 11 in-repo VIP tables (see below), EventBridge failed invocations, API Gateway 5xx (backstop for handlers that convert application errors into well-formed HTTP responses, which AWS/Lambda's own Errors metric can't see), and app-level custom metrics (`VIPPlans` namespace). Created via CLI (CFN exec role lacks SNS + cloudwatch:PutDashboard permissions). |
 
-**Monitoring architecture note:** The MonitoringStack CDK construct (`infra/lib/stacks/monitoring-stack.ts`) exists as a reference implementation but is NOT instantiated in `app.ts`. The CFN execution role `VipAdminCdkCfnExecPolicy` lacks SNS and CloudWatch alarm/dashboard permissions. All monitoring resources (SNS topic, 14 alarms, dashboard) were created via AWS CLI and persist independently of CDK. Do not attempt to add them back to CDK without first updating the CFN exec role policy.
+**DynamoDB alarm coverage (verified live 2026-08-21):** every AWS/DynamoDB
+`SystemErrors`/`ThrottledRequests` alarm in this account was, until this date,
+dimensioned by `TableName` alone — a dimension combination DynamoDB never
+actually publishes data under (it's always `{TableName, Operation}`), so the
+two alarms that existed (both on `VipAdminPlans`) had never once received a
+datapoint and had already missed a real error on 2026-08-07. Fixed for all 11
+VIP tables owned by this repo (`VipAdminPlans`, `VipActiveBrandedCampaigns`,
+`VipAdminSegmentFilterConfig`, `VipAgentSnapshot`, `VipBrandedCampaignMetrics`,
+`VipBrandedRunSummary`, `VipLocationMapping`, `VipProgressiveAgentLocks`,
+`VipProgressiveCampaignQueue`, `VipSmsCampaignQueue`, `VipSmsCampaignRuns`) via
+a Metric Math sum across all 8 possible DynamoDB operations per table (CLI
+alarms cannot use `SEARCH()` — confirmed live, "SEARCH is not supported on
+Metric Alarms" — so each operation is an explicit `MetricStat` summed with
+`FILL(...,0)`). `vip-connect-deny-list` (12th `Vip*`-tagged table) is
+excluded: manually managed by a different team's Lambdas, out of this repo's
+scope.
+
+**Monitoring architecture note:** The MonitoringStack CDK construct (`infra/lib/stacks/monitoring-stack.ts`) exists as a reference implementation but is NOT instantiated in `app.ts`. The CFN execution role `VipAdminCdkCfnExecPolicy` lacks SNS and CloudWatch alarm/dashboard permissions. All monitoring resources (SNS topic, alarms, dashboard) were created via AWS CLI and persist independently of CDK — see `infra/scripts/create-alarms.sh` (58 alarms) and `infra/scripts/create-progressive-dialer-alarms.sh` (10 alarms, separate `vip-progressive-dialer-alerts` topic) for the exact current set. Do not attempt to add them back to CDK without first updating the CFN exec role policy.
 
 **Consequences:**
 - ✅ All HIPAA technical safeguards are met — reproducible deploys

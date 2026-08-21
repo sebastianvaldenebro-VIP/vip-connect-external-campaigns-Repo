@@ -68,16 +68,16 @@ AWS_PROFILE=production aws lambda wait function-updated \
 
 ### Deploy any other Lambda (code-only change)
 
-Replace `api-plans` with the target function name (`api-segments`, `api-campaigns`, `api-profiles`, `api-metrics`, `feeder`):
+Replace `api-plans` with the target function name (`api-segments`, `api-campaigns`, `api-profiles`, `api-metrics`):
 
 ```bash
-# feeder lives in a different source directory
 # api-plans: services/api-plans/src/
 # api-segments: services/api-segments/src/
 # api-campaigns: services/api-campaigns/src/
 # api-profiles: services/api-profiles/src/
 # api-metrics: services/api-metrics/src/
-# feeder: services/external-campaigns/src/
+# (feeder was decommissioned — the Lambda no longer exists. Verified live
+# 2026-08-21: aws lambda get-function returns ResourceNotFoundException.)
 
 cd /home/devaju/projects/vip-connect-external-campaigns/services/<service>/src
 zip -r /tmp/<service>.zip . -x "__pycache__/*" "*.pyc"
@@ -388,23 +388,6 @@ aws scheduler delete-schedule \
 
 ---
 
-### Plans — feeder Lambda errors
-
-**Symptom:** `vip-feeder-errors` alarm is firing; leads are not being pushed to Connect.
-
-```bash
-# Tail feeder logs
-AWS_PROFILE=production aws logs tail /aws/lambda/vip-external-campaigns-feeder \
-  --region us-east-1 --since 30m --format short
-
-# Check Redis connection (confirm host is reachable from Lambda)
-# The feeder is VPC-attached — check SG rules if networking changed
-```
-
-**Common cause:** Redis rebuild in progress. The feeder retries automatically on `_RedisRebuildingError`. If the error persists > 10 min, check ElastiCache Redis replication group status.
-
----
-
 ### Segment estimate never completes
 
 **Symptom:** UI shows "Computing..." indefinitely, polling `GetSegmentEstimate` returns `IN_PROGRESS` for > 5 min.
@@ -514,34 +497,43 @@ AWS_PROFILE=production aws apigatewayv2 get-api \
 URL: `https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=VipConnect-Admin-UI`
 
 Widgets:
-- Lambda Errors (all 6 functions)
-- Lambda Throttles (api-plans, feeder, api-segments, api-campaigns)
-- Lambda Invocations (all 6 functions)
-- Lambda Duration p99 (api-plans, feeder, api-segments)
-- DynamoDB VipAdminPlans RCU/WCU + Throttles/SystemErrors
+- Lambda Errors (api-plans, api-segments, api-campaigns, api-metrics, api-profiles, campaign-exporter, location-onboarding-guard)
+- Lambda Throttles (api-plans, api-segments, api-campaigns)
+- Lambda Invocations (all functions above)
+- Lambda Duration p99 (api-plans, api-segments)
+- DynamoDB RCU/WCU + Throttles/SystemErrors, all 11 in-repo VIP tables
 - EventBridge Invocations + Failed Invocations (prestart-check, campaign-events rules)
-- Alarm status panel (all 14 alarms)
+- API Gateway 5xx (vip-admin-ui-api)
+- Alarm status panel
 
-### CloudWatch Alarms (14 total)
+(`feeder` was decommissioned — removed from all widgets. Verified live
+2026-08-21: the Lambda no longer exists.)
+
+### CloudWatch Alarms (58 total as of 2026-08-21)
 
 All alarms send to SNS topic `arn:aws:sns:us-east-1:165505826690:vip-admin-alerts` (email: sebastian.valdenebro@medwork.io).
 
-| Alarm name | Threshold | Severity |
-|---|---|---|
-| `vip-plans-errors` | Lambda Errors > 0 (1/1 period=1min) | CRITICAL — plan tick or prestart_check failed |
-| `vip-plans-throttles` | Lambda Throttles > 0 (1/1 period=1min) | CRITICAL — 5 reserved concurrency exhausted |
-| `vip-plans-duration-p99` | Duration p99 > 240000ms (1/1 period=5min) | WARNING — approaching 5min timeout |
-| `vip-feeder-errors` | Lambda Errors > 0 (1/1 period=1min) | CRITICAL — lead push to Connect failed |
-| `vip-feeder-throttles` | Lambda Throttles > 0 (1/1 period=1min) | CRITICAL — 1 reserved concurrency, no data flowing |
-| `vip-feeder-duration-p99` | Duration p99 > 240000ms (1/1 period=5min) | WARNING |
-| `vip-segments-errors` | Lambda Errors > 0 (2/2 period=5min) | WARNING — segment rebuild failed |
-| `vip-segments-duration-p99` | Duration p99 > 240000ms (1/1 period=5min) | WARNING |
-| `vip-campaigns-errors` | Lambda Errors > 0 (2/2 period=5min) | WARNING — Connect campaign CRUD failed |
-| `vip-metrics-errors` | Lambda Errors > 3 (3/3 period=5min) | INFO — elevated error rate |
-| `vip-profiles-errors` | Lambda Errors > 3 (3/3 period=5min) | INFO — elevated error rate |
-| `vip-plans-table-system-errors` | DynamoDB SystemErrors > 0 (1/1 period=1min) | CRITICAL — table availability issue |
-| `vip-plans-table-throttles` | DynamoDB ThrottledRequests > 0 (1/1 period=1min) | WARNING |
-| `vip-prestart-check-failed-invocations` | EventBridge FailedInvocations > 0 (1/1 period=5min) | WARNING — prestart_check rule can't invoke Lambda |
+This table used to hand-list every alarm and had drifted badly out of date (it
+still listed 3 alarms for the decommissioned `feeder` Lambda, and named the
+DynamoDB alarms `vip-plans-table-*` after they'd been renamed/expanded to
+`vip-ddb-{TableName}-*` across all 11 VIP tables). Rather than re-create a
+list that will drift again, the source of truth is
+`infra/scripts/create-alarms.sh` (this topic) and
+`infra/scripts/create-progressive-dialer-alarms.sh` (`vip-progressive-dialer-alerts`
+topic, 10 alarms) — every alarm name, threshold, and description lives there
+as a comment next to the `aws cloudwatch put-metric-alarm` call that creates
+it. To see the live set: `aws cloudwatch describe-alarms --query
+"MetricAlarms[?contains(join(',',AlarmActions),'vip-admin-alerts')].AlarmName"`.
+
+Categories covered: Lambda Errors/Throttles/Duration for every function in
+this repo (including `campaign-exporter` and `location-onboarding-guard`),
+DynamoDB SystemErrors/ThrottledRequests for all 11 VIP tables (Metric Math sum
+across all 8 operations — a plain `TableName`-only dimension never receives
+data), EventBridge FailedInvocations, app-level `VIPPlans` custom metrics
+(`ScheduledRunFallback`, `CampaignDispatchStalled`, `NoActiveCampaign`), and
+API Gateway 5xx on `vip-admin-ui-api` (catches application-level failures
+that handlers convert into well-formed HTTP responses, which AWS/Lambda's own
+Errors metric structurally cannot see).
 
 ### Re-create monitoring infrastructure (if ever destroyed)
 

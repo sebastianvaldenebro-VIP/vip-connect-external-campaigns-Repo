@@ -177,6 +177,127 @@ def test_update_campaign_rejects_empty_body():
         campaigns.update_campaign(_event({}), {"id": "c-1"})
 
 
+# ── Audit write failure must not mask a successful Connect mutation ──────────
+# (audit follow-up, 2026-08-21). Previously an audit.record() failure after the
+# real mutation succeeded propagated as a 500 — the caller would retry and
+# create a duplicate Connect campaign, on top of missing the HIPAA audit row.
+
+
+def test_create_campaign_succeeds_even_if_audit_write_fails():
+    from handlers import campaigns
+
+    mock_oc = MagicMock()
+    mock_oc.create_campaign.return_value = {"id": "new-c", "arn": "arn:new"}
+    mock_audit = MagicMock()
+    mock_audit.record.side_effect = RuntimeError("DDB throttled")
+
+    body = {
+        "name": "test",
+        "segmentArn": "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/seg",
+        "queueId": "q",
+        "contactFlowId": "f",
+        "campaignFlowArn": "arn:aws:connect:us-east-1:123:instance/i/contact-flow/cf",
+        "sourcePhoneNumber": "+1",
+        "dialer": {
+            "type": "progressive",
+            "bandwidthAllocation": 1.0,
+            "dialingCapacity": 1.0,
+        },
+        "schedule": {
+            "startTime": "2026-04-23T14:00:00Z",
+            "endTime": "2026-04-23T22:00:00Z",
+        },
+    }
+
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
+    ):
+        # Must NOT raise — the Connect campaign was already created.
+        response = campaigns.create_campaign(_event(body), {})
+
+    assert response["statusCode"] == 201
+    body_out = json.loads(response["body"])
+    assert body_out["id"] == "new-c"
+
+
+def test_delete_campaign_succeeds_even_if_audit_write_fails():
+    from handlers import campaigns
+
+    mock_oc = MagicMock()
+    mock_oc.get_campaign_state.return_value = {"state": "Stopped"}
+    mock_audit = MagicMock()
+    mock_audit.record.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
+    ):
+        response = campaigns.delete_campaign(_event(), {"id": "c-1"})
+
+    assert response["statusCode"] == 204
+    mock_oc.delete_campaign.assert_called_once_with("c-1")
+
+
+def test_update_campaign_succeeds_even_if_audit_write_fails():
+    from handlers import campaigns
+
+    mock_oc = MagicMock()
+    mock_audit = MagicMock()
+    mock_audit.record.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
+    ):
+        response = campaigns.update_campaign(
+            _event({"name": "new-name"}), {"id": "c-1"}
+        )
+
+    assert response["statusCode"] == 200
+
+
+def test_lifecycle_action_succeeds_even_if_audit_write_fails():
+    from handlers import campaigns
+
+    mock_oc = MagicMock()
+    mock_oc.get_campaign_state.return_value = {"state": "Running"}
+    mock_audit = MagicMock()
+    mock_audit.record.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
+    ):
+        response = campaigns.start_campaign(_event(), {"id": "c-1"})
+
+    assert response["statusCode"] == 200
+    mock_oc.start_campaign.assert_called_once_with("c-1")
+
+
+def test_audit_write_failure_is_logged_distinctly():
+    from handlers import campaigns
+
+    mock_oc = MagicMock()
+    mock_oc.get_campaign_state.return_value = {"state": "Stopped"}
+    mock_audit = MagicMock()
+    mock_audit.record.side_effect = RuntimeError("DDB throttled")
+    mock_logger = MagicMock()
+
+    with (
+        patch("handlers.campaigns.build_oc", return_value=mock_oc),
+        patch("handlers.campaigns.build_audit", return_value=mock_audit),
+        patch.object(campaigns, "_logger", mock_logger),
+    ):
+        campaigns.delete_campaign(_event(), {"id": "c-1"})
+
+    mock_logger.error.assert_called_once()
+    log_call = mock_logger.error.call_args
+    assert log_call.args[0] == "audit_write_failed"
+    assert log_call.kwargs["entity_id"] == "c-1"
+    assert log_call.kwargs["action"] == "delete"
+
+
 def test_lifecycle_actions_call_right_method():
     from handlers import campaigns
 

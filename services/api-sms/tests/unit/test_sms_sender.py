@@ -160,6 +160,151 @@ def test_sender_sqs_flushes_every_10():
     assert mock_sqs.send_message_batch.call_count == 3
 
 
+# ── SQS send_message_batch partial failure (audit follow-up, 2026-08-21) ─────
+# send_message_batch does not raise on a partial failure — some entries in the
+# batch can fail while the call itself returns 200. Previously the response was
+# discarded entirely, so a failed entry's DDB row was still written as PENDING
+# with no message ever in the queue: permanently stuck, invisible, never retried.
+
+
+def test_sender_partial_sqs_failure_marks_item_failed_not_pending():
+    handler = _load_handler()
+
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp(phones=["+15125559999"])
+
+    # Capture the entry Id assigned to the single phone so the failure response
+    # can reference it back.
+    captured_entries = {}
+
+    def _send_batch(QueueUrl, Entries):
+        captured_entries["id"] = Entries[0]["Id"]
+        return {"Failed": [{"Id": Entries[0]["Id"], "Code": "ThrottlingException"}]}
+
+    mock_sqs.send_message_batch.side_effect = _send_batch
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+    ):
+        result = handler.lambda_handler(_base_event(), None)
+
+    assert result["enqueued"] == 0
+    assert result["failed"] == 1
+
+    put_calls = [
+        c.kwargs["Item"]
+        for c in mock_queue_table.batch_writer.return_value.__enter__.return_value.put_item.call_args_list
+    ]
+    assert len(put_calls) == 1
+    assert put_calls[0]["status"] == "SQS_SEND_FAILED"
+
+
+def test_sender_partial_sqs_failure_updates_run_summary_total_failed():
+    handler = _load_handler()
+
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp(phones=["+15125559999"])
+    mock_sqs.send_message_batch.side_effect = lambda QueueUrl, Entries: {
+        "Failed": [{"Id": Entries[0]["Id"], "Code": "ThrottlingException"}]
+    }
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+    ):
+        handler.lambda_handler(_base_event(), None)
+
+    runs_update_kwargs = mock_runs_table.update_item.call_args.kwargs
+    assert runs_update_kwargs["ExpressionAttributeValues"][":f"] == 1
+    assert runs_update_kwargs["ExpressionAttributeValues"][":n"] == 0
+
+
+def test_sender_mixed_success_and_failure_in_same_batch():
+    handler = _load_handler()
+
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp(
+        phone_ids=["p-0", "p-1"],
+        phones=["+15125550001", "+15125550002"],
+    )
+
+    def _send_batch(QueueUrl, Entries):
+        # Fail only the second entry.
+        return {"Failed": [{"Id": Entries[1]["Id"], "Code": "ThrottlingException"}]}
+
+    mock_sqs.send_message_batch.side_effect = _send_batch
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+    ):
+        result = handler.lambda_handler(_base_event(), None)
+
+    assert result["enqueued"] == 1
+    assert result["failed"] == 1
+
+    put_calls = [
+        c.kwargs["Item"]
+        for c in mock_queue_table.batch_writer.return_value.__enter__.return_value.put_item.call_args_list
+    ]
+    statuses = sorted(item["status"] for item in put_calls)
+    assert statuses == ["PENDING", "SQS_SEND_FAILED"]
+
+
+def test_sender_no_sqs_failures_all_written_pending():
+    handler = _load_handler()
+
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    mock_sqs = MagicMock()
+    mock_sqs.send_message_batch.return_value = {"Failed": []}
+    mock_cp = _make_mock_cp(phones=["+15125559999"])
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+    ):
+        result = handler.lambda_handler(_base_event(), None)
+
+    assert result["enqueued"] == 1
+    assert result["failed"] == 0
+
+
 def test_sender_runs_table_condition_expression_set():
     """put_item for runs table uses ConditionExpression to prevent duplicates."""
     handler = _load_handler()

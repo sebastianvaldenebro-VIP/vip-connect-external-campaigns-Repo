@@ -167,7 +167,7 @@ Lock down Connect console access. Add a CloudWatch alarm on `creation_failed` ra
 
 ```bash
 # Confirm prestart_check rule exists
-aws events list-rules --name-prefix vip-sched-prestart --profile production
+aws events list-rules --name-prefix vip-plans-prestart-check --profile production
 
 # Look for prestart logs
 aws logs filter-log-events \
@@ -185,18 +185,21 @@ aws dynamodb get-item \
 
 ### Resolution
 
-1. If rule is missing, recreate:
+1. If rule is missing, recreate (verified live rule name and target Input, 2026-08-21 —
+   the rule is `vip-plans-prestart-check`, NOT `vip-sched-prestart-check`; that
+   `vip-sched-*` prefix is used exclusively by per-plan daily time triggers,
+   see scheduler_manager.py):
    ```bash
-   aws events put-rule --name vip-sched-prestart-check \
+   aws events put-rule --name vip-plans-prestart-check \
      --schedule-expression "rate(1 minute)" \
      --profile production
-   aws events put-targets --rule vip-sched-prestart-check \
-     --targets 'Id=1,Arn=arn:aws:lambda:us-east-1:165505826690:function:vip-admin-ui-api-plans,Input="{\"detail-type\":\"prestart_check\"}"' \
+   aws events put-targets --rule vip-plans-prestart-check \
+     --targets 'Id=1,Arn=arn:aws:lambda:us-east-1:165505826690:function:vip-admin-ui-api-plans,Input="{\"action\":\"prestart_check\"}"' \
      --profile production
    aws lambda add-permission --function-name vip-admin-ui-api-plans \
-     --statement-id vip-sched-prestart-check \
+     --statement-id vip-plans-prestart-check \
      --action lambda:InvokeFunction --principal events.amazonaws.com \
-     --source-arn arn:aws:events:us-east-1:165505826690:rule/vip-sched-prestart-check \
+     --source-arn arn:aws:events:us-east-1:165505826690:rule/vip-plans-prestart-check \
      --profile production
    ```
 2. If `pendingWarmup` exists but is stale, clear it manually:
@@ -218,7 +221,7 @@ Platform engineer.
 
 ### Prevention
 
-Move `vip-sched-prestart-check` into CDK (when the boundary permits).
+Move `vip-plans-prestart-check` into CDK (when the boundary permits).
 
 ---
 
@@ -423,7 +426,11 @@ Next `prestart_check` log event shows fresh warmup.
 ## RB-010 — Lambda OOM / timeout on api-plans
 
 **Severity:** P2.
-**Trigger:** CloudWatch metric `Errors > 5` in 5 minutes; Lambda billed duration approaches 5 min.
+**Trigger:** `vip-plans-errors` alarm — `Errors > 0` in a single 1-minute period
+(verified live 2026-08-21; this doc previously said `Errors > 5` in 5 minutes,
+which was never the real threshold — the live alarm pages on the FIRST error,
+not after 5 accumulate). Also watch `vip-plans-duration-p99` — Duration p99 >
+240000ms (4min) over a 5-min period, i.e. approaching the 5min timeout.
 **Impact:** Some ticks fail silently; runs may stall.
 
 ### Diagnosis

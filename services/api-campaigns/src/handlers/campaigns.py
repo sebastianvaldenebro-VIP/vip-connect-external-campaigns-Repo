@@ -13,10 +13,35 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
     build as build_oc,
 )
+from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
 
 from builders import build_create_campaign_params
 
 INSTANCE_ID = os.environ.get("CONNECT_INSTANCE_ID", "")
+
+_logger = StructuredLogger(service="api-campaigns")
+
+
+def _record_audit_or_log(*, action: str, entity_id: str, **kwargs) -> None:
+    """Record the audit trail for an action whose Connect mutation already
+    succeeded. Never raises: the mutation already happened, so letting an audit
+    write failure propagate would return a 500 for an action that actually
+    succeeded — the caller would retry and create a duplicate Connect campaign.
+    Logs distinctly (audit_write_failed) so a metric-filter alarm can catch a
+    missing HIPAA audit record instead of it vanishing silently.
+    """
+    try:
+        build_audit().record(
+            entity_type="campaign", entity_id=entity_id, action=action, **kwargs
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.error(
+            "audit_write_failed",
+            action=action,
+            entity_type="campaign",
+            entity_id=entity_id,
+            error=str(exc),
+        )
 
 
 # ── CRUD ───────────────────────────────────────────────────────────────
@@ -71,8 +96,7 @@ def create_campaign(event: dict, _path_params: dict) -> dict:
     oc = build_oc()
     response = oc.create_campaign(**params)
 
-    build_audit().record(
-        entity_type="campaign",
+    _record_audit_or_log(
         entity_id=response["id"],
         action="create",
         actor_sub=caller.sub,
@@ -110,8 +134,7 @@ def delete_campaign(event: dict, path_params: dict) -> dict:
         oc.stop_campaign(campaign_id)
     oc.delete_campaign(campaign_id)
 
-    build_audit().record(
-        entity_type="campaign",
+    _record_audit_or_log(
         entity_id=campaign_id,
         action="delete",
         actor_sub=caller.sub,
@@ -151,8 +174,7 @@ def update_campaign(event: dict, path_params: dict) -> dict:
         oc.update_campaign_schedule(campaign_id, body["schedule"])
         applied["schedule"] = body["schedule"]
 
-    build_audit().record(
-        entity_type="campaign",
+    _record_audit_or_log(
         entity_id=campaign_id,
         action="update",
         actor_sub=caller.sub,
@@ -193,8 +215,7 @@ def _lifecycle_action(event: dict, path_params: dict, *, action: str) -> dict:
     method(campaign_id)
     state = oc.get_campaign_state(campaign_id).get("state")
 
-    build_audit().record(
-        entity_type="campaign",
+    _record_audit_or_log(
         entity_id=campaign_id,
         action=action,
         actor_sub=caller.sub,

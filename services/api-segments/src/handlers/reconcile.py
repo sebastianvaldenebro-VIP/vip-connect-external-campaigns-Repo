@@ -137,23 +137,52 @@ def reconcile_segment(event: dict, path_params: dict) -> dict:
         tags=new_tags,
     )
     new_arn = create_response["SegmentDefinitionArn"]
-
-    # 3. Retarget every active campaign that pointed at the old segment.
     old_arn = definition["SegmentDefinitionArn"]
-    campaigns_updated = _retarget_campaigns(old_arn=old_arn, new_arn=new_arn)
 
-    # 4. Bump the config version so future verify/reconcile calls line up with
-    # the new segment name. Only persist if we already had a config row
-    # (legacy segments stay legacy until recreated).
-    if config is not None:
-        config_store.mark_rebuilt(
-            family=family,
-            new_version=new_version,
-            rebuilt_by=caller.email or caller.sub,
+    # 3-5: retarget campaigns, bump the config version, delete the old segment.
+    # CP segment names are unique, so a failure anywhere in here that isn't rolled
+    # back leaves {family}-v{new_version} permanently occupied by an orphan — every
+    # future reconcile recomputes the exact same new_name (current_version is only
+    # bumped by mark_rebuilt below, which hasn't run yet) and create_segment_definition
+    # rejects it as a duplicate forever, with no code path that ever frees the name.
+    oc = build_oc()
+    campaigns_updated: list[str] = []
+    try:
+        _retarget_campaigns(
+            oc=oc, old_arn=old_arn, new_arn=new_arn, updated=campaigns_updated
         )
 
-    # 5. Delete the old segment (after retarget so campaigns don't break mid-flight).
-    cp.delete_segment_definition(name)
+        # 4. Bump the config version so future verify/reconcile calls line up with
+        # the new segment name. Only persist if we already had a config row
+        # (legacy segments stay legacy until recreated).
+        if config is not None:
+            config_store.mark_rebuilt(
+                family=family,
+                new_version=new_version,
+                rebuilt_by=caller.email or caller.sub,
+            )
+
+        # 5. Delete the old segment (after retarget so campaigns don't break mid-flight).
+        cp.delete_segment_definition(name)
+    except Exception as exc:
+        rollback_ok = True
+        for campaign_id in campaigns_updated:
+            try:
+                oc.update_campaign_source(
+                    campaign_id, {"customerProfilesSegmentArn": old_arn}
+                )
+            except Exception:  # noqa: BLE001
+                rollback_ok = False
+        try:
+            cp.delete_segment_definition(new_name)
+        except Exception:  # noqa: BLE001
+            rollback_ok = False
+        if rollback_ok:
+            raise
+        raise RuntimeError(
+            f"reconcile failed and rollback was incomplete — segment {new_name} "
+            f"and/or its retargeted campaigns may need manual cleanup: {exc}"
+        ) from exc
 
     build_audit().record(
         entity_type="segment",
@@ -204,10 +233,12 @@ def _collect_redis_ids(rules, combinator: str) -> set[str]:
     return matching
 
 
-def _retarget_campaigns(*, old_arn: str, new_arn: str) -> list[str]:
-    """Find campaigns using the old segment ARN and point them at the new one."""
-    oc = build_oc()
-    updated: list[str] = []
+def _retarget_campaigns(*, oc, old_arn: str, new_arn: str, updated: list[str]) -> None:
+    """Find campaigns using the old segment ARN and point them at the new one.
+
+    Appends each successfully retargeted campaign id to `updated` in place, so a
+    caller still sees partial progress (and can roll it back) if this raises partway.
+    """
     next_token: str | None = None
     while True:
         page = oc.list_campaigns(max_results=100, next_token=next_token)
@@ -221,7 +252,6 @@ def _retarget_campaigns(*, old_arn: str, new_arn: str) -> list[str]:
         next_token = page.get("nextToken")
         if not next_token:
             break
-    return updated
 
 
 def _merged_tags(

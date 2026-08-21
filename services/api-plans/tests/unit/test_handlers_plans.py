@@ -114,3 +114,134 @@ def test_resolve_campaign_flow_records_audit_entry(monkeypatch):
     assert call_kwargs["entity_type"] == "campaign_flow"
     assert call_kwargs["action"] == "resolve"
     assert call_kwargs["after"]["states"] == ["PA"]
+
+
+# ── update_plan vip-sched-* cleanup (audit follow-up, 2026-08-21) ─────────────
+# Previously the whole is_template/had_time_trigger cleanup block only ran when
+# the PATCH body resent "trigger" — a PATCH that only sent {"isTemplate": true}
+# left an existing vip-sched-* rule alive forever. Confirmed live: plan
+# c63d695c-b99e-4885-808a-8eca91d08e8e.
+
+
+def _existing_plan(*, is_template: bool, trigger: dict) -> dict:
+    return {
+        "planId": "plan-1",
+        "name": "Test Plan",
+        "isTemplate": is_template,
+        "trigger": trigger,
+        "buckets": [],
+    }
+
+
+def test_update_plan_deletes_schedule_when_template_set_without_trigger_resend(
+    monkeypatch,
+):
+    fake_sched = MagicMock()
+    monkeypatch.setattr(plans_handler, "scheduler_manager", fake_sched)
+    monkeypatch.setattr(
+        plans_handler.store,
+        "get_plan",
+        lambda plan_id: _existing_plan(
+            is_template=False, trigger={"type": "time", "time": "08:40"}
+        ),
+    )
+    monkeypatch.setattr(plans_handler.store, "put_plan", lambda p: p)
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: MagicMock())
+
+    event = {"body": json.dumps({"isTemplate": True})}
+    resp = plans_handler.update_plan(event, {"id": "plan-1"})
+
+    assert resp["statusCode"] == 200
+    fake_sched.delete_schedule.assert_called_once_with("plan-1")
+    fake_sched.upsert_schedule.assert_not_called()
+
+
+def test_update_plan_keeps_schedule_when_unrelated_field_updated(monkeypatch):
+    """An update that touches neither isTemplate nor trigger must not disturb
+    an existing, still-valid time-triggered schedule."""
+    fake_sched = MagicMock()
+    monkeypatch.setattr(plans_handler, "scheduler_manager", fake_sched)
+    monkeypatch.setattr(
+        plans_handler.store,
+        "get_plan",
+        lambda plan_id: _existing_plan(
+            is_template=False, trigger={"type": "time", "time": "08:40"}
+        ),
+    )
+    monkeypatch.setattr(plans_handler.store, "put_plan", lambda p: p)
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: MagicMock())
+
+    event = {"body": json.dumps({"name": "renamed"})}
+    resp = plans_handler.update_plan(event, {"id": "plan-1"})
+
+    assert resp["statusCode"] == 200
+    fake_sched.delete_schedule.assert_not_called()
+    fake_sched.upsert_schedule.assert_not_called()
+
+
+def test_update_plan_upserts_when_trigger_explicitly_set_to_time(monkeypatch):
+    fake_sched = MagicMock()
+    monkeypatch.setattr(plans_handler, "scheduler_manager", fake_sched)
+    monkeypatch.setattr(
+        plans_handler.store,
+        "get_plan",
+        lambda plan_id: _existing_plan(is_template=False, trigger={"type": "manual"}),
+    )
+    monkeypatch.setattr(plans_handler.store, "put_plan", lambda p: p)
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: MagicMock())
+
+    new_trigger = {"type": "time", "time": "09:00"}
+    event = {"body": json.dumps({"trigger": new_trigger})}
+    resp = plans_handler.update_plan(event, {"id": "plan-1"})
+
+    assert resp["statusCode"] == 200
+    fake_sched.upsert_schedule.assert_called_once_with("plan-1", new_trigger)
+    fake_sched.delete_schedule.assert_not_called()
+
+
+def test_update_plan_deletes_schedule_when_trigger_changes_away_from_time(monkeypatch):
+    fake_sched = MagicMock()
+    monkeypatch.setattr(plans_handler, "scheduler_manager", fake_sched)
+    monkeypatch.setattr(
+        plans_handler.store,
+        "get_plan",
+        lambda plan_id: _existing_plan(
+            is_template=False, trigger={"type": "time", "time": "08:40"}
+        ),
+    )
+    monkeypatch.setattr(plans_handler.store, "put_plan", lambda p: p)
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: MagicMock())
+
+    event = {"body": json.dumps({"trigger": {"type": "manual"}})}
+    resp = plans_handler.update_plan(event, {"id": "plan-1"})
+
+    assert resp["statusCode"] == 200
+    fake_sched.delete_schedule.assert_called_once_with("plan-1")
+    fake_sched.upsert_schedule.assert_not_called()
+
+
+def test_update_plan_template_takes_precedence_over_resent_time_trigger(monkeypatch):
+    """isTemplate=true must win even if the SAME PATCH also resends a "time"
+    trigger — templates never run on a cron, regardless of what else is sent."""
+    fake_sched = MagicMock()
+    monkeypatch.setattr(plans_handler, "scheduler_manager", fake_sched)
+    monkeypatch.setattr(
+        plans_handler.store,
+        "get_plan",
+        lambda plan_id: _existing_plan(
+            is_template=False, trigger={"type": "time", "time": "08:40"}
+        ),
+    )
+    monkeypatch.setattr(plans_handler.store, "put_plan", lambda p: p)
+    monkeypatch.setattr(plans_handler, "build_audit", lambda: MagicMock())
+
+    event = {
+        "body": json.dumps(
+            {"isTemplate": True, "trigger": {"type": "time", "time": "09:00"}}
+        )
+    }
+    resp = plans_handler.update_plan(event, {"id": "plan-1"})
+
+    assert resp["statusCode"] == 200
+    fake_sched.delete_schedule.assert_called_once_with("plan-1")
+    fake_sched.upsert_schedule.assert_not_called()

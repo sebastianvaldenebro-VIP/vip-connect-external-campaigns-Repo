@@ -218,6 +218,67 @@ def test_pending_to_sending_claim_is_first_queue_update():
     assert "ConditionExpression" in first_call_kwargs
 
 
+# ── Stale SENDING claim recovery (audit follow-up, 2026-08-21) ────────────────
+# Previously a crashed/timed-out invocation left an item stuck in SENDING forever:
+# the redelivered message would hit ConditionalCheckFailedException, get skipped
+# as a "duplicate", and its SQS message deleted — permanent silent loss with no
+# recovery path. The claim's ConditionExpression now also allows re-claiming a
+# SENDING item whose updatedAt is older than _STALE_SENDING_SECONDS.
+
+
+def test_claim_condition_allows_stale_sending_recovery():
+    """The claim's ConditionExpression must permit reclaiming an old SENDING item,
+    not just a PENDING one — otherwise an orphaned claim can never be recovered."""
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.send_text_message.return_value = {"MessageId": "msg-ok"}
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+    ):
+        handler.lambda_handler(_make_sqs_event(), None)
+
+    claim_kwargs = mock_queue_table.update_item.call_args_list[0].kwargs
+    assert "sending" in claim_kwargs["ConditionExpression"].lower()
+    assert "updatedAt <" in claim_kwargs["ConditionExpression"]
+    assert ":stale_before" in claim_kwargs["ExpressionAttributeValues"]
+
+
+def test_stale_before_threshold_is_stale_sending_seconds_in_the_past():
+    """:stale_before must be _STALE_SENDING_SECONDS before this invocation's own
+    sent_at timestamp, so a claim held longer than that is treated as an orphan."""
+    from datetime import datetime as _dt
+
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.send_text_message.return_value = {"MessageId": "msg-ok"}
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+    ):
+        handler.lambda_handler(_make_sqs_event(), None)
+
+    claim_kwargs = mock_queue_table.update_item.call_args_list[0].kwargs
+    sent_at = _dt.fromisoformat(claim_kwargs["ExpressionAttributeValues"][":t"])
+    stale_before = _dt.fromisoformat(
+        claim_kwargs["ExpressionAttributeValues"][":stale_before"]
+    )
+    delta = (sent_at - stale_before).total_seconds()
+    assert delta == pytest.approx(handler._STALE_SENDING_SECONDS, abs=1)
+
+
 # ── OPTED_OUT path ────────────────────────────────────────────────────────────
 
 

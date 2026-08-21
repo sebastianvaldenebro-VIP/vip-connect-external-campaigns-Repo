@@ -1059,6 +1059,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                                 cs["campaignId"],
                                 _exc,
                             )
+                            _emit_prewarm_failure(plan_id)
                     # Force-stop if Connect hasn't transitioned after duration elapsed
                     if _elapsed > _dur + 2:
                         logger.warning(
@@ -1507,6 +1508,11 @@ def force_start_campaign(
             f"Campaign is {cs['status']} — can only force-start queued, cancelled, or error campaigns"
         )
 
+    # Tracks a schedule created by THIS call so a lost Phase-1 save race (below) can
+    # roll it back — otherwise its name is never persisted and it orphans forever,
+    # same failure shape as the _schedule_tick atomicity bug (BD-013 follow-up).
+    _new_schedule_name: str | None = None
+
     # Completed bucket: allowed for cancelled or queued campaigns.
     # "queued" in a completed bucket is an inconsistent state that occurs when a
     # cascade-cancel save_run lost a ConcurrentWriteError race — the campaign stayed
@@ -1536,6 +1542,7 @@ def force_start_campaign(
                 plan_id=plan_id, run_id=run_id, bucket_index=bucket_index
             )
             bs["scheduleName"] = sched
+            _new_schedule_name = sched
         except Exception as exc:
             logger.error(
                 "force_start_campaign: failed to schedule tick for reactivated bucket %d: %s",
@@ -1577,6 +1584,7 @@ def force_start_campaign(
                 plan_id=plan_id, run_id=run_id, bucket_index=bucket_index
             )
             bs["scheduleName"] = sched
+            _new_schedule_name = sched
         except Exception as exc:
             logger.error(
                 "force_start_campaign: failed to schedule tick for bucket %d: %s",
@@ -1604,7 +1612,21 @@ def force_start_campaign(
     cs["segmentName"] = None
     cs["brandedCampaignId"] = None
     cs["queueArn"] = None
-    save_run(run)  # raises ConcurrentWriteError if another tick already updated
+    try:
+        save_run(run)
+    except ConcurrentWriteError:
+        # Another tick already updated the run first. The claim never persisted, so
+        # any schedule created above for this call would never have its name recorded
+        # anywhere — roll it back before propagating, or it orphans forever.
+        if _new_schedule_name:
+            logger.warning(
+                "force_start_campaign: rolling back schedule %s after lost Phase-1 "
+                "save race for bucket %d",
+                _new_schedule_name,
+                bucket_index,
+            )
+            _delete_schedule_safe(_new_schedule_name)
+        raise
 
     # Phase 2: clean up stale Connect campaign AFTER claim is persisted.
     if old_connect_id:
@@ -2343,6 +2365,41 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
 # ── Cross-plan warmup ────────────────────────────────────────────────────────
 
 
+def _emit_prewarm_failure(plan_id: str, count: int = 1) -> None:
+    """Emit PrewarmFailure so a missed/failed pre-warm has real visibility.
+
+    RUNBOOKS.md/INTEGRATION_CONTRACTS.md documented this as an existing,
+    alarmable metric for months while every pre-warm failure path only ever
+    logged an ERROR line and moved on — confirmed live 2026-08-21 (zero data
+    in namespace VipConnect/Plans, zero code references to "PrewarmFailure"
+    anywhere in the repo). Same emission shape as CampaignDispatchStalled/
+    ScheduledRunFallback/NoActiveCampaign: per-plan dimension for drill-down,
+    plus a no-dimension aggregate so a single CLI alarm can watch it.
+    """
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="VIPPlans",
+            MetricData=[
+                {
+                    "MetricName": "PrewarmFailure",
+                    "Value": count,
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "PlanId", "Value": plan_id}],
+                },
+                {
+                    "MetricName": "PrewarmFailure",
+                    "Value": count,
+                    "Unit": "Count",
+                    "Dimensions": [],
+                },
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "_emit_prewarm_failure: metric emission failed for %s: %s", plan_id, exc
+        )
+
+
 def _prestart_plan(target_plan_id: str) -> None:
     """Pre-create bucket-0 stage-1 Connect campaigns for a downstream plan.
 
@@ -2429,6 +2486,7 @@ def _prestart_plan(target_plan_id: str) -> None:
             # Will be retried on the next prestart_check tick (runs every minute)
 
     newly_warmed = len(warmed) - len(already_warmed)
+    failed = attempted - newly_warmed
     _slog.info(
         "prestart_plan_summary",
         plan_id=target_plan_id,
@@ -2436,9 +2494,11 @@ def _prestart_plan(target_plan_id: str) -> None:
         newly_warmed=newly_warmed,
         total_warmed=len(warmed),
         total_stage1=len(stage1_campaigns),
-        failed=attempted - newly_warmed,
+        failed=failed,
         all_covered=len(warmed) == len(stage1_campaigns),
     )
+    if failed > 0:
+        _emit_prewarm_failure(target_plan_id, failed)
     if warmed:
         update_plan_pending_warmup(
             target_plan_id,
@@ -2466,6 +2526,7 @@ def _prestart_chained_runs(run: dict, plan: dict, bucket_index: int) -> None:
                 downstream["planId"],
                 exc,
             )
+            _emit_prewarm_failure(downstream["planId"])
 
     # 2. Loop: same plan restarts if the loop window will still be open
     loop = plan.get("loop") or {}
@@ -2484,6 +2545,7 @@ def _prestart_chained_runs(run: dict, plan: dict, bucket_index: int) -> None:
                     plan_id,
                     exc,
                 )
+                _emit_prewarm_failure(plan_id)
 
 
 def _prestart_after_campaign(upstream_plan_id: str, campaign_id: str) -> None:
@@ -2505,6 +2567,7 @@ def _prestart_after_campaign(upstream_plan_id: str, campaign_id: str) -> None:
                 downstream["planId"],
                 exc,
             )
+            _emit_prewarm_failure(downstream["planId"])
 
 
 def _ensure_scheduled_run_permission(plan_id: str) -> None:
@@ -2801,6 +2864,8 @@ def prestart_check() -> dict:
                 continue
             campaign_states = bucket_state.get("campaignStates", [])
             if any(cs.get("status") in _ACTIVE_CAMPAIGN_STATUSES for cs in campaign_states):
+                continue
+            if _bucket_has_only_legitimate_waits(latest, plan, bucket_state):
                 continue
             run_id = latest.get("runId", "unknown")
             logger.warning(
@@ -3192,6 +3257,42 @@ def _find_campaign_state(run: dict, campaign_id: str) -> dict | None:
             if cs.get("campaignId") == campaign_id:
                 return cs
     return None
+
+
+def _bucket_has_only_legitimate_waits(
+    run: dict, plan: dict, bucket_state: dict
+) -> bool:
+    """True if every non-terminal campaign in this bucket is "queued" and blocked
+    on a dependency (same-bucket or cross-bucket) that has not reached a terminal
+    state yet — i.e. correctly waiting, not stalled by a crashed tick.
+
+    Used by prestart_check's no-active-campaign detector (audit follow-up,
+    2026-08-21) to avoid alarming on plan 6203a0b5's exact shape: a bucket whose
+    only campaign depends on another bucket's still-actively-dialing campaign.
+    Without this, a bucket that's correctly waiting on a legitimately long-running
+    upstream campaign pages every single minute for as long as that wait lasts.
+    """
+    plan = run.get("planSnapshot") or plan
+    bucket_def = next(
+        (b for b in plan.get("buckets", []) if b.get("id") == bucket_state.get("bucketId")),
+        None,
+    )
+    campaigns_by_id = {c["id"]: c for c in (bucket_def or {}).get("campaigns", [])}
+
+    for cs in bucket_state.get("campaignStates", []):
+        if cs.get("status") in _CAMPAIGN_TERMINAL_STATUSES:
+            continue
+        if cs.get("status") != "queued":
+            return False  # creating/warming/running would already be "active"; anything
+            # else here (e.g. an unexpected status) isn't a recognized legitimate wait
+        campaign_def = campaigns_by_id.get(cs.get("campaignId"))
+        depends_on = (campaign_def or {}).get("dependsOn") or []
+        if not depends_on:
+            return False  # nothing to wait on — should already have been dispatched
+        parent_states = [_find_campaign_state(run, cid) for cid in depends_on]
+        if all(s and s["status"] in _CAMPAIGN_TERMINAL_STATUSES for s in parent_states):
+            return False  # every dependency is done — this campaign should be running by now
+    return True
 
 
 def _all_campaigns_terminal(run: dict, bucket_index: int) -> bool:
@@ -4262,47 +4363,13 @@ def _cleanup_orphan_plan_permissions() -> None:
             logger.warning("Could not remove orphan permission %s: %s", sid, exc)
 
 
-def janitor_cleanup_orphan_schedules() -> dict:
-    """Daily sweep: delete every vip-plan-* EventBridge rule (and its Lambda
-    permission) that no currently-running run references anymore.
-
-    Fixes _cleanup_orphan_plan_permissions' blind spot (BD-013): that function
-    only catches a permission whose rule is ALREADY gone — it does nothing for
-    a rule that's still alive but nothing tracks anymore, which is exactly
-    what an incomplete ConcurrentWriteError recovery can produce. This is the
-    "daily janitor" this repo's own runbook (RUNBOOKS.md RB-001, "Prevention")
-    documented as the fix but that was never actually built.
-
-    Safety: does NOT decompose the truncated 8-char plan/run IDs embedded in
-    a rule's name (vip-plan-{planId[:8]}-run-{runId[:8]}-b{bucketIndex}) —
-    those truncations can collide and are not safe to reverse uniquely. It
-    instead collects the exact, full scheduleName strings currently recorded
-    on every plan's LATEST run (only a run that's actually "running" needs
-    its schedule to survive — a completed/aborted run's schedule is stale by
-    definition, whether or not the janitor ever "sees" it), and deletes any
-    vip-plan-* rule whose full name isn't in that set. Exact-string
-    membership, no ambiguity.
-    """
-    protected: set[str] = set()
-    for plan in list_plans():
-        plan_id = plan.get("planId")
-        if not plan_id:
-            continue
-        try:
-            latest = get_latest_run(plan_id)
-        except Exception:
-            continue
-        if not latest or latest.get("status") != "running":
-            continue
-        for bucket_state in latest.get("bucketStates", []):
-            sched = bucket_state.get("scheduleName")
-            if sched:
-                protected.add(sched)
-
-    events = boto3.client("events")
+def _sweep_orphan_rules(
+    events, prefix: str, protected: set[str]
+) -> tuple[list[str], list[str]]:
+    """Delete every EventBridge rule under `prefix` not in `protected`."""
     deleted: list[str] = []
     failed: list[str] = []
-    kwargs: dict = {"NamePrefix": "vip-plan-"}
+    kwargs: dict = {"NamePrefix": prefix}
     while True:
         resp = events.list_rules(**kwargs)
         for rule in resp.get("Rules", []):
@@ -4319,17 +4386,79 @@ def janitor_cleanup_orphan_schedules() -> dict:
         if not token:
             break
         kwargs["NextToken"] = token
+    return deleted, failed
+
+
+def janitor_cleanup_orphan_schedules() -> dict:
+    """Daily sweep: delete every vip-plan-*/vip-sched-* EventBridge rule (and its
+    Lambda permission) that nothing currently references anymore.
+
+    Fixes _cleanup_orphan_plan_permissions' blind spot (BD-013): that function
+    only catches a permission whose rule is ALREADY gone — it does nothing for
+    a rule that's still alive but nothing tracks anymore, which is exactly
+    what an incomplete ConcurrentWriteError recovery can produce. This is the
+    "daily janitor" this repo's own runbook (RUNBOOKS.md RB-001, "Prevention")
+    documented as the fix but that was never actually built.
+
+    vip-plan-* safety: does NOT decompose the truncated 8-char plan/run IDs
+    embedded in a rule's name (vip-plan-{planId[:8]}-run-{runId[:8]}-b{bucketIndex})
+    — those truncations can collide and are not safe to reverse uniquely. It
+    instead collects the exact, full scheduleName strings currently recorded
+    on every plan's LATEST run (only a run that's actually "running" needs
+    its schedule to survive — a completed/aborted run's schedule is stale by
+    definition, whether or not the janitor ever "sees" it), and deletes any
+    vip-plan-* rule whose full name isn't in that set. Exact-string
+    membership, no ambiguity.
+
+    vip-sched-* (audit follow-up, 2026-08-21): update_plan's own cleanup only
+    ran when a PATCH resent "trigger" in the request body — a PATCH that only
+    set isTemplate=true left the rule alive forever with nothing else that
+    ever revisits it (confirmed live: plan c63d695c-b99e-4885-808a-8eca91d08e8e).
+    That call site is now fixed too, but this sweep is the backstop for
+    anything that orphaned before the fix, or any future gap of the same
+    shape. A vip-sched-* rule is protected if its owning plan is a
+    non-template with a "time" trigger — computed via the exact same
+    scheduler_manager._rule_name() the rule was created with, not by parsing
+    the rule's name back into a plan_id.
+    """
+    from scheduler_manager import _rule_name
+
+    protected_plan: set[str] = set()
+    protected_sched: set[str] = set()
+    for plan in list_plans():
+        plan_id = plan.get("planId")
+        if not plan_id:
+            continue
+        if not plan.get("isTemplate") and plan.get("trigger", {}).get("type") == "time":
+            protected_sched.add(_rule_name(plan_id))
+        try:
+            latest = get_latest_run(plan_id)
+        except Exception:
+            continue
+        if not latest or latest.get("status") != "running":
+            continue
+        for bucket_state in latest.get("bucketStates", []):
+            sched = bucket_state.get("scheduleName")
+            if sched:
+                protected_plan.add(sched)
+
+    events = boto3.client("events")
+    deleted_plan, failed_plan = _sweep_orphan_rules(events, "vip-plan-", protected_plan)
+    deleted_sched, failed_sched = _sweep_orphan_rules(
+        events, "vip-sched-", protected_sched
+    )
+    deleted = deleted_plan + deleted_sched
+    failed = failed_plan + failed_sched
 
     if deleted:
-        logger.warning(
-            "janitor: deleted %d orphan vip-plan-* rule(s): %s", len(deleted), deleted
-        )
+        logger.warning("janitor: deleted %d orphan rule(s): %s", len(deleted), deleted)
         _notify_sns(
             subject=f"[VIP Plans] Janitor cleaned up {len(deleted)} orphaned schedule(s)",
             detail=(
-                f"Deleted {len(deleted)} vip-plan-* EventBridge rule(s) (and their "
-                f"Lambda permissions) that no currently-running run referenced "
-                f"anymore:\n{deleted}\n\n"
+                f"Deleted {len(deleted)} EventBridge rule(s) (and their Lambda "
+                f"permissions) that nothing currently references anymore — "
+                f"{len(deleted_plan)} vip-plan-* (tick), {len(deleted_sched)} "
+                f"vip-sched-* (time trigger):\n{deleted}\n\n"
                 f"This is routine cleanup, not necessarily a problem — but if this "
                 f"count is consistently large or growing, something is still "
                 f"creating untracked schedules (see BD-013)."
@@ -4393,6 +4522,16 @@ def _schedule_tick(*, plan_id: str, run_id: str, bucket_index: int) -> str:
         )
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceConflictException":
+            # put_rule/put_targets above already succeeded — a live rule now
+            # exists. Every caller of this function used to swallow this
+            # exact exception (log-and-continue) without ever deleting the
+            # rule it just created, since the caller has no way to know its
+            # name on the exception path. Roll it back HERE instead, so
+            # _schedule_tick is atomic: it either fully succeeds, or leaves
+            # nothing behind. Fixes the orphan mechanism found at 4 call
+            # sites (force_start_campaign x2, _advance_bucket's rescue path,
+            # _dispatch_cross_bucket_ready) without touching each of them.
+            _delete_schedule_safe(rule_name)
             raise
     return rule_name
 
