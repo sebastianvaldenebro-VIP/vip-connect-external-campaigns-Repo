@@ -2678,6 +2678,14 @@ def prestart_check() -> dict:
     cw = boto3.client("cloudwatch")
 
     for plan in all_plans:
+        # Templates never run on a cron (same invariant as update_plan's own
+        # vip-sched-* cleanup) — skip both branches below entirely. Without this,
+        # _ensure_scheduled_run_permission recreated a template's vip-sched-* rule
+        # every day at its old trigger.time regardless of isTemplate, undoing the
+        # janitor's cleanup daily (confirmed live 2026-08-24: plan
+        # c63d695c-b99e-4885-808a-8eca91d08e8e's rule kept coming back).
+        if plan.get("isTemplate") or plan.get("is_template"):
+            continue
         trigger = plan.get("trigger") or {}
         if trigger.get("type") != "time":
             continue
@@ -2708,8 +2716,6 @@ def prestart_check() -> dict:
             elif delta == -1:
                 # Fallback trigger: the EventBridge cron should have fired ~80 seconds ago.
                 # If no run was started in the last 3 minutes, the cron invocation failed.
-                if plan.get("isTemplate") or plan.get("is_template"):
-                    continue  # templates never start runs; fallback metric would be a false alarm
                 if not _is_working_day(plan):
                     continue  # plan doesn't run today; absence of a run is expected, not a missed cron
                 latest = get_latest_run(plan["planId"])

@@ -293,22 +293,25 @@ alarm \
   --comparison-operator "GreaterThanThreshold" \
   --evaluation-periods 1 --datapoints-to-alarm 1
 
-# Fires when any pre-warm attempt fails (a stage-1 Connect campaign creation
-# failure, or the whole pre-warm call crashing). Previously documented in
-# RUNBOOKS.md/INTEGRATION_CONTRACTS.md as an existing, alarmable metric for
-# months while it was never implemented anywhere (audit 2026-08-21) — a failing
-# pre-warm just logged an ERROR and retried next tick, burning invocations with
-# zero operator visibility until the upstream campaign finished and the
-# downstream started cold. _emit_prewarm_failure() in executor.py now emits
-# this on all 4 failure sites. Metric emitted WITHOUT dimensions (aggregate) so
-# this CLI alarm can catch it; per-PlanId dimension also emitted for drill-down.
+# Fires when pre-warm attempts keep failing for 5 CONSECUTIVE minutes — same
+# debounce, same reasoning as CampaignDispatchStalled above. A single failed
+# attempt is routine, not a page: _prestart_plan's own retry-merge logic
+# already retries missing campaigns on every subsequent tick within the 4-6
+# min pre-warm window, and the most common cause (_RedisRebuildingError) is
+# a brief, expected blip that normally clears within 1 tick. Confirmed live
+# 2026-08-25: a real _RedisRebuildingError on 2 campaigns paged immediately
+# under the original evaluation-periods=1, then fully self-healed one minute
+# later on the very next tick (failed: 2 -> failed: 0) — a false-positive page
+# for a non-incident. _emit_prewarm_failure() in executor.py emits this on all
+# 4 failure sites. Metric emitted WITHOUT dimensions (aggregate) so this CLI
+# alarm can catch it; per-PlanId dimension also emitted for drill-down.
 alarm \
   --alarm-name "vip-plans-prewarm-failure" \
-  --alarm-description "WARNING: a pre-warm attempt failed — a downstream plan may start cold instead of already-warmed. Check CloudWatch Logs Insights for 'prestart_plan_campaign_failed' or '_prestart_after_campaign' errors with this plan's id." \
+  --alarm-description "WARNING: pre-warm has failed for 5+ consecutive minutes — a downstream plan may start cold instead of already-warmed. Check CloudWatch Logs Insights for 'prestart_plan_campaign_failed' or '_prestart_after_campaign' errors with this plan's id. If the error is _RedisRebuildingError, check ElastiCache Redis replication group status." \
   --namespace "VIPPlans" --metric-name "PrewarmFailure" \
   --statistic "Sum" --period 60 --threshold 0 \
   --comparison-operator "GreaterThanThreshold" \
-  --evaluation-periods 1 --datapoints-to-alarm 1
+  --evaluation-periods 5 --datapoints-to-alarm 5
 
 # Per-plan vip-sched-* FailedInvocations alarms cannot be created here because rule names
 # are dynamic (created at runtime by upsert_schedule). Options:

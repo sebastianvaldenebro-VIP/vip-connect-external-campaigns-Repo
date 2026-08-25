@@ -3306,6 +3306,42 @@ def test_prestart_prewarm_skips_plans_outside_working_hours():
     assert result["warmed"] == []
 
 
+def test_prestart_prewarm_skips_template_plans():
+    """Templates never run on a cron — _ensure_scheduled_run_permission must not
+    recreate a template's vip-sched-* rule just because it's 4-6 min from its old
+    trigger.time. Live incident, 2026-08-25: plan c63d695c-b99e-4885-808a-
+    8eca91d08e8e (isTemplate=true, trigger.time=08:40) had its vip-sched-* rule
+    recreated by this exact path every day, undoing the janitor's cleanup daily.
+    """
+    import executor
+
+    now_cot = datetime(2025, 1, 1, 8, 35, tzinfo=None)  # delta=5 for 08:40
+
+    plan = _make_plan([])
+    plan["planId"] = "plan-template"
+    plan["isTemplate"] = True
+    plan["trigger"] = {"type": "time", "time": "08:40"}
+
+    with (
+        patch(
+            "executor.datetime",
+            **{
+                "now.return_value": now_cot,
+                "fromisoformat.side_effect": datetime.fromisoformat,
+            },
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor._ensure_scheduled_run_permission") as mock_ensure_perm,
+        patch("executor._prestart_plan") as mock_prestart_plan,
+        patch("boto3.client"),
+    ):
+        result = executor.prestart_check()
+
+    mock_ensure_perm.assert_not_called()
+    mock_prestart_plan.assert_not_called()
+    assert result["warmed"] == []
+
+
 # ── No-active-campaign detection (BD-013 follow-up) ───────────────────────────
 
 
