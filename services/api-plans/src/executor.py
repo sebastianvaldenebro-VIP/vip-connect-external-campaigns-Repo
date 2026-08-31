@@ -2182,7 +2182,7 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
             camp_name = campaign.get("name") or campaign.get("id", "?")
             if cs["status"] == "queued":
                 try:
-                    connect_id, seg_name, seg_arn, warmup_started = (
+                    connect_id, seg_name, seg_arn, warmup_started, expected, actual = (
                         _create_campaign_only(next_bucket, campaign, run)
                     )
                     cs["status"] = "warming"
@@ -2190,6 +2190,12 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     cs["segmentName"] = seg_name
                     cs["segmentArn"] = seg_arn
                     cs["warmupStarted"] = warmup_started
+                    if expected is not None:
+                        cs["reconcile"] = {
+                            "expected": expected,
+                            "actual": actual,
+                            "retries": 0,
+                        }
                     _slog.info(
                         "prestart_next_bucket_campaign_ok",
                         plan_id=run["planId"],
@@ -2582,7 +2588,7 @@ def _prestart_plan(target_plan_id: str) -> None:
         attempted += 1
         camp_name = campaign.get("name") or camp_id or "?"
         try:
-            connect_id, seg_name, seg_arn, warmup_started = _create_campaign_only(
+            connect_id, seg_name, seg_arn, warmup_started, _, _ = _create_campaign_only(
                 bucket, campaign, {}
             )
             warmed.append(
@@ -4099,10 +4105,11 @@ def _create_campaign_only(
     bucket: dict,
     campaign: dict,
     run: dict,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, bool, int | None, int | None]:
     """Create Connect campaign without starting it (for pre-start warming).
 
-    Returns (connectCampaignId, segmentName, segmentArn).
+    Returns (connectCampaignId, segmentName, segmentArn, warmupStarted, expected, actual).
+    `expected`/`actual` are None when a pinned segment is used (no `_create_segment` call).
     """
     from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
         build as build_oc,
@@ -4110,11 +4117,12 @@ def _create_campaign_only(
 
     now = _now_utc()
     pinned_arn = campaign.get("pinnedSegmentArn")
+    expected = actual = None
     if pinned_arn:
         segment_arn = pinned_arn
         segment_name = pinned_arn.rsplit("/", 1)[-1]
     else:
-        segment_name, segment_arn = _create_segment(bucket, campaign)
+        segment_name, segment_arn, expected, actual = _create_segment(bucket, campaign)
 
     start_dt = now + timedelta(minutes=6)
     start_time = start_dt.isoformat()
@@ -4202,7 +4210,7 @@ def _create_campaign_only(
             exc,
         )
 
-    return campaign_id, segment_name, segment_arn, warmup_started
+    return campaign_id, segment_name, segment_arn, warmup_started, expected, actual
 
 
 def _poll_campaign_state(cs: dict) -> None:

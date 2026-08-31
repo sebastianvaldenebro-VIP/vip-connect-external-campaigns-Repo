@@ -1048,7 +1048,7 @@ def test_prestart_sets_next_bucket_to_warming():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn:seg-w", True),
+            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None),
         ),
         patch("executor.save_run"),
     ):
@@ -1084,7 +1084,7 @@ def test_prestart_only_creates_stage1_campaigns():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn-w", True),
+            return_value=("conn-w", "seg-w", "arn-w", True, None, None),
         ) as create,
         patch("executor.save_run"),
     ):
@@ -1149,7 +1149,7 @@ def test_prestart_claim_save_persists_warming_before_campaigns():
 
     def track_create(*_args, **_kwargs):
         call_order.append(("create",))
-        return ("conn-w", "seg-w", "arn-w", True)
+        return ("conn-w", "seg-w", "arn-w", True, None, None)
 
     with (
         patch("executor.save_run", side_effect=track_save),
@@ -1195,7 +1195,7 @@ def test_prestart_mid_flight_save_persists_connect_id():
         patch("executor.save_run", side_effect=track_save),
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-warm", "seg-w", "arn-w", True),
+            return_value=("conn-warm", "seg-w", "arn-w", True, None, None),
         ),
     ):
         executor._prestart_next_bucket(run, plan, 0)
@@ -3896,7 +3896,7 @@ def test_prestart_plan_does_not_emit_metric_when_warmup_succeeds():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-1", "seg-1", "arn:seg-1", True),
+            return_value=("conn-1", "seg-1", "arn:seg-1", True, None, None),
         ),
         patch("executor.get_plan", return_value=plan),
         patch("executor.get_latest_run", return_value=None),
@@ -4993,7 +4993,10 @@ def test_create_campaign_only_guard_raises_when_start_gte_end():
     try:
         with (
             patch("executor._now_utc", return_value=now_utc),
-            patch("executor._create_segment", return_value=("seg-name", "arn:seg")),
+            patch(
+                "executor._create_segment",
+                return_value=("seg-name", "arn:seg", None, None),
+            ),
             patch("executor._campaign_end_time", return_value=stale_end_time),
         ):
             with pytest.raises(
@@ -5502,7 +5505,7 @@ class TestPrestartSkipsBranded:
 
         create = mocker.patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn:seg-w", True),
+            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None),
         )
         mocker.patch("executor.save_run")
 
@@ -5536,7 +5539,7 @@ class TestPrestartSkipsBranded:
 
         create = mocker.patch(
             "executor._create_campaign_only",
-            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False),
+            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False, None, None),
         )
         mocker.patch("executor.get_plan", return_value=plan)
         mocker.patch("executor.get_latest_run", return_value=None)
@@ -7336,3 +7339,177 @@ class TestTelephonyNativeReconcile:
 
         assert cs["status"] == "running"
         assert "reconcile" not in cs
+
+
+# ── Task 2 (reconcile-normalization plan): _create_campaign_only pre-warm     ──
+# path now also returns expected/actual from _create_segment (Task 1's 4-tuple).
+#
+# No existing test in this file exercises _create_campaign_only's real body all
+# the way through to build_oc()/create_campaign() — the only test that reaches
+# into its body (test_create_campaign_only_guard_raises_when_start_gte_end)
+# raises _CutoffTooCloseError before ever importing build_oc. build_oc is never
+# a module-level name in executor.py (every call site does a function-local
+# `from vip_shared...outbound_campaigns_client import build as build_oc`), so
+# `patch("executor.build_oc")` has no effect — the local import inside the
+# function shadows it. These tests instead stub the vip_shared module chain in
+# sys.modules (same technique as the guard test) so build_oc resolves to a
+# MagicMock we control, and pin _now_utc to a safe daytime value so the daily-
+# cutoff guard never fires (avoiding a ~0.4%/run flaky window near 7PM COT).
+class TestCreateCampaignOnlyReconcileCounts:
+    def _stub_vip_shared(self, mock_oc):
+        import sys
+        from unittest.mock import MagicMock
+
+        vip_stub = MagicMock()
+        vip_stub.build.return_value = mock_oc
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+        return originals, modules_to_stub
+
+    def _unstub_vip_shared(self, originals):
+        import sys
+
+        for m, orig in originals.items():
+            if orig is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = orig
+
+    def test_returns_expected_and_actual_from_create_segment(self):
+        from unittest.mock import MagicMock
+
+        import executor
+
+        bucket = {
+            "id": "B1",
+            "name": "B1",
+            "campaigns": [],
+            "segmentFilters": {"state": ["TX"]},
+        }
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "groups": [],
+            "dependsOn": [],
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        now_utc = datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)  # 7am COT
+
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-1"}
+        originals, _ = self._stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=now_utc),
+                patch(
+                    "executor._create_segment",
+                    return_value=("seg1", "arn:cp:seg1", 60, 55),
+                ),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                connect_id, seg_name, seg_arn, _warmup_started, expected, actual = (
+                    executor._create_campaign_only(bucket, campaign, run)
+                )
+        finally:
+            self._unstub_vip_shared(originals)
+
+        assert connect_id == "connect-1"
+        assert seg_name == "seg1"
+        assert seg_arn == "arn:cp:seg1"
+        assert expected == 60
+        assert actual == 55
+
+    def test_pinned_segment_returns_none_expected_actual(self):
+        from unittest.mock import MagicMock
+
+        import executor
+
+        bucket = {
+            "id": "B1",
+            "name": "B1",
+            "campaigns": [],
+            "segmentFilters": {"state": ["TX"]},
+        }
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "groups": [],
+            "dependsOn": [],
+            "pinnedSegmentArn": "arn:cp:pinned/seg-pinned",
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        now_utc = datetime(2026, 5, 19, 12, 0, 0, tzinfo=timezone.utc)  # 7am COT
+
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-1"}
+        originals, _ = self._stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=now_utc),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                _connect_id, seg_name, seg_arn, _warmup_started, expected, actual = (
+                    executor._create_campaign_only(bucket, campaign, run)
+                )
+        finally:
+            self._unstub_vip_shared(originals)
+
+        assert seg_arn == "arn:cp:pinned/seg-pinned"
+        assert seg_name == "seg-pinned"
+        assert expected is None
+        assert actual is None
+
+
+class TestPrestartNextBucketReconcile:
+    """Step 5/6 (Task 2): _prestart_next_bucket's pre-warm call site sets
+    cs['reconcile'] from _create_campaign_only's new expected/actual values."""
+
+    def test_warming_success_sets_reconcile(self):
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def(
+                    "b0", [_campaign_def("c0")], run_mode="time_based", duration=20
+                ),
+                _bucket_def("b1", [_campaign_def("c1")]),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+            ],
+        )
+
+        with (
+            patch(
+                "executor._create_campaign_only",
+                return_value=("connect-1", "seg", "arn", True, 20, 18),
+            ),
+            patch("executor.save_run"),
+        ):
+            executor._prestart_next_bucket(run, plan, 0)
+
+        cs = run["bucketStates"][1]["campaignStates"][0]
+        assert cs["reconcile"] == {"expected": 20, "actual": 18, "retries": 0}
