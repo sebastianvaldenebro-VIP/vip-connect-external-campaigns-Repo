@@ -11,6 +11,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
+sys.modules.setdefault("vip_shared", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -6378,3 +6383,49 @@ class TestMaxLeadAgeRule:
             15, datetime(2026, 8, 27, 14, 30, 0, 0, tzinfo=timezone.utc)
         )
         assert "2026-08-27T14:15:00.000Z" >= cutoff
+
+
+class TestRecordPlanEvent:
+    """_record_plan_event: best-effort audit write for automatic executor transitions."""
+
+    def test_writes_expected_audit_record(self):
+        import executor
+
+        mock_audit = MagicMock()
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "bucket_started", {"bucketIndex": 2})
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 2},
+        )
+
+    def test_extra_defaults_to_none(self):
+        import executor
+
+        mock_audit = MagicMock()
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "window_closed")
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra=None,
+        )
+
+    def test_swallows_write_failure_without_raising(self):
+        import executor
+
+        mock_audit = MagicMock()
+        mock_audit.record.side_effect = RuntimeError("dynamodb throttled")
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "bucket_completed", {"bucketIndex": 0})
+        # No exception raised — the call above completing is the assertion.

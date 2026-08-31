@@ -48,6 +48,7 @@ from typing import Any, Final
 
 import boto3
 from botocore.exceptions import ClientError
+from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
 
 from builders import (
     _JOURNEY_FLOW_NAME,
@@ -4881,6 +4882,27 @@ def _emit_queue_collision_metric(queue_id: str) -> None:
         logger.warning(
             "_emit_queue_collision_metric failed queue=%s error=%s",
             queue_id, type(exc).__name__,
+        )
+
+
+def _record_plan_event(run: dict, action: str, extra: dict | None = None) -> None:
+    """Best-effort write to the day-activity-feed audit trail (AdminAuditLog).
+
+    Telemetry only — a write failure here must never abort plan execution,
+    so every exception is caught and logged, not raised.
+    """
+    try:
+        build_audit().record(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action=action,
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra=extra,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_record_plan_event(%s) failed: %s", action, type(exc).__name__
         )
 
 
