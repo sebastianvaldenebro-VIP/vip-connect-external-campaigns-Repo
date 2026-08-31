@@ -2316,6 +2316,13 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
         bucket_state["status"] = "completed"
         bucket_state["completedAt"] = now
 
+        # Duplicate audit row possible if this function re-executes after a
+        # ConcurrentWriteError below (see comment above on stale_tick re-tryability)
+        # — accepted, a cosmetic duplicate in the activity feed, not worth a new lock.
+        _record_plan_event(
+            run, "bucket_completed", {"bucketIndex": bucket_index, "bucketName": bucket.get("name"), "reason": reason}
+        )
+
         # Fire any plans waiting for this specific bucket to complete
         try:
             _fire_bucket_chains(run["planId"], bucket_index)

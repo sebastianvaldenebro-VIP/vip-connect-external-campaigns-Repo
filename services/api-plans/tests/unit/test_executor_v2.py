@@ -6486,3 +6486,34 @@ class TestBucketStartedAuditEvent:
             actor_email="system@api-plans-executor",
             extra={"bucketIndex": 1, "bucketName": "3rd attempt"},
         )
+
+
+class TestBucketCompletedAuditEvent:
+    def test_advance_bucket_records_bucket_completed(self):
+        import executor
+
+        run = {
+            "planId": "plan-3",
+            "runId": "run-3",
+            "bucketStates": [{"campaignStates": [], "status": "running"}],
+        }
+        plan = {"buckets": [{"name": "Cancellation/No Show", "cleanup": False}]}
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor.save_run"),
+            patch("executor._delete_bucket_schedule_safe"),
+            patch("executor._fire_bucket_chains"),
+            patch("executor.unlock_plan_run"),
+            patch("executor._maybe_loop"),
+            patch("executor.start_run_chained"),
+        ):
+            executor._advance_bucket(run, plan, 0, reason="time_expired")
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-3/run-3",
+            action="bucket_completed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "Cancellation/No Show", "reason": "time_expired"},
+        )
