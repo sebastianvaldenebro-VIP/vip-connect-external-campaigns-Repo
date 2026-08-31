@@ -2083,6 +2083,15 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
                     cs["exitReason"] = REASON_CREATION_FAILED
                     cs["errorDetail"] = str(exc)
                     cs["completedAt"] = now_iso
+                    _record_plan_event(
+                        run,
+                        "creation_failed",
+                        {
+                            "bucketIndex": bucket_index,
+                            "campaignIndex": ci,
+                            "error": str(exc),
+                        },
+                    )
 
     # Dispatch any newly unblocked campaigns — saves internally per wave (B1-A)
     changed = True
@@ -2267,6 +2276,15 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     cs["exitReason"] = REASON_CREATION_FAILED
                     cs["errorDetail"] = str(exc)
                     cs["completedAt"] = _now_iso()
+                    _record_plan_event(
+                        run,
+                        "creation_failed",
+                        {
+                            "bucketIndex": next_index,
+                            "campaignIndex": ci,
+                            "error": str(exc),
+                        },
+                    )
 
 
 def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
@@ -3710,6 +3728,15 @@ def _start_one_campaign(
                 cs["exitReason"] = REASON_CREATION_FAILED
                 cs["errorDetail"] = str(exc)
                 cs["completedAt"] = now_iso
+                _record_plan_event(
+                    run,
+                    "creation_failed",
+                    {
+                        "bucketIndex": bucket_index,
+                        "campaignIndex": campaign_index,
+                        "error": str(exc),
+                    },
+                )
                 return
 
     # Fresh start: create segment → create Connect campaign → start
@@ -3757,6 +3784,16 @@ def _start_one_campaign(
                 if empty_retries < reconcile_retry_limit:
                     cs["status"] = "queued"
                     cs["reconcileRetries"] = empty_retries + 1
+                    _record_plan_event(
+                        run,
+                        "reconcile_retry",
+                        {
+                            "bucketIndex": bucket_index,
+                            "campaignIndex": campaign_index,
+                            "retry": empty_retries + 1,
+                            "retryLimit": reconcile_retry_limit,
+                        },
+                    )
                     _slog.warn(
                         "start_one_campaign_empty_segment_retry",
                         plan_id=run["planId"],
@@ -3948,6 +3985,15 @@ def _start_one_campaign(
             cs["exitReason"] = REASON_CREATION_FAILED
             cs["errorDetail"] = f"Campaign creation failed: {exc}"
             cs["completedAt"] = now_iso
+            _record_plan_event(
+                run,
+                "creation_failed",
+                {
+                    "bucketIndex": bucket_index,
+                    "campaignIndex": campaign_index,
+                    "error": str(exc),
+                },
+            )
             _notify_sns(
                 subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
                 detail=(
@@ -3972,6 +4018,15 @@ def _start_one_campaign(
         cs["exitReason"] = REASON_CREATION_FAILED
         cs["errorDetail"] = f"Campaign creation failed: {exc}"
         cs["completedAt"] = now_iso
+        _record_plan_event(
+            run,
+            "creation_failed",
+            {
+                "bucketIndex": bucket_index,
+                "campaignIndex": campaign_index,
+                "error": str(exc),
+            },
+        )
         _notify_sns(
             subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
             detail=(
