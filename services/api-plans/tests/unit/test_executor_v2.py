@@ -16,6 +16,33 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
+# _create_segment (executor.py) does function-local imports of these two clients —
+# stub them the same way so TestCreateSegmentReconcileCounts can exercise the real
+# function body (patching build_from_env on each) instead of mocking _create_segment
+# wholesale like every other test in this file does.
+sys.modules.setdefault(
+    "vip_shared.infrastructure.persistence.redis_lead_source", MagicMock()
+)
+sys.modules.setdefault(
+    "vip_shared.infrastructure.persistence.customer_profiles_client", MagicMock()
+)
+
+# _create_segment also does function-local imports of these pure domain-layer
+# filter helpers. No real vip_shared source is on this test's sys.path (see stubs
+# above), so stub them too. matches_group is set to always match — these tests
+# verify expected/actual counting (truncation, phone-normalization exclusion), not
+# vip_shared's own filter-matching semantics.
+sys.modules.setdefault("vip_shared.domain", MagicMock())
+sys.modules.setdefault("vip_shared.domain.entities", MagicMock())
+sys.modules.setdefault("vip_shared.domain.entities.filter_rule", MagicMock())
+sys.modules.setdefault("vip_shared.domain.services", MagicMock())
+sys.modules.setdefault(
+    "vip_shared.domain.services.segment_groups_translator", MagicMock()
+)
+sys.modules[
+    "vip_shared.domain.services.segment_groups_translator"
+].matches_group.return_value = True
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2071,6 +2098,8 @@ def test_start_one_campaign_retries_generic_exception_before_succeeding():
         return (
             "seg-name",
             "arn:aws:profiles:us-east-1:123:domains/d/segment-definitions/s",
+            1,
+            1,
         )
 
     with (
@@ -2202,7 +2231,7 @@ def test_start_one_campaign_quota_exceeded_reverts_to_queued():
         "CreateCampaign",
     )
     with (
-        patch("executor._create_segment", return_value=("seg", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
         patch("executor._create_and_start_campaign", side_effect=quota_exc),
         patch("executor._notify_sns"),
     ):
@@ -2226,7 +2255,7 @@ def test_start_one_campaign_throttle_reverts_to_queued():
         "CreateCampaign",
     )
     with (
-        patch("executor._create_segment", return_value=("seg", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
         patch("executor._create_and_start_campaign", side_effect=throttle_exc),
         patch("executor._notify_sns"),
     ):
@@ -2258,7 +2287,7 @@ def test_start_one_campaign_throttle_resets_reconcile_retries():
         "CreateCampaign",
     )
     with (
-        patch("executor._create_segment", return_value=("seg", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
         patch("executor._create_and_start_campaign", side_effect=throttle_exc),
         patch("executor._notify_sns"),
     ):
@@ -2287,7 +2316,7 @@ def test_start_one_campaign_succeeds_when_segment_already_existed():
     with (
         patch(
             "executor._create_segment",
-            return_value=("11-5-26-NY-NL-2-1953", existing_arn),
+            return_value=("11-5-26-NY-NL-2-1953", existing_arn, 1, 1),
         ),
         patch(
             "executor._create_and_start_campaign", return_value=("conn-1", "camp-name")
@@ -2324,7 +2353,7 @@ def test_start_one_campaign_native_alerts_when_branded_active_on_same_queue():
     }
 
     with (
-        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1", 1, 1)),
         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
         patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
         patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
@@ -2356,7 +2385,7 @@ def test_start_one_campaign_native_no_alert_when_no_branded_active():
     mock_ddb.query.return_value = {"Items": []}
 
     with (
-        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1", 1, 1)),
         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
         patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
         patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
@@ -2380,7 +2409,7 @@ def test_start_one_campaign_native_skips_collision_check_when_table_not_configur
     mock_ddb = MagicMock()
 
     with (
-        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1", 1, 1)),
         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
         patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", ""),
         patch("executor._get_ddb_client", return_value=mock_ddb),
@@ -2404,7 +2433,7 @@ def test_start_one_campaign_native_collision_check_query_error_never_blocks_star
     mock_ddb.query.side_effect = RuntimeError("ProvisionedThroughputExceeded")
 
     with (
-        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1", 1, 1)),
         patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
         patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
         patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
@@ -4794,7 +4823,7 @@ def test_start_one_campaign_mid_flight_save_retries_on_concurrent_write():
         patch(
             "executor._create_and_start_campaign", return_value=("conn-new", "seg-name")
         ),
-        patch("executor._create_segment", return_value=("seg-name", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg-name", "arn:seg", 1, 1)),
         patch("executor.save_run", side_effect=mock_save),
         patch("executor.get_run", return_value=fresh_run),
     ):
@@ -4832,7 +4861,7 @@ def test_start_one_campaign_mid_flight_save_exhausts_retries_logs_warning():
         patch(
             "executor._create_and_start_campaign", return_value=("conn-new", "seg-name")
         ),
-        patch("executor._create_segment", return_value=("seg-name", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg-name", "arn:seg", 1, 1)),
         patch("executor.save_run", side_effect=ConcurrentWriteError("always fails")),
         patch("executor.get_run", return_value=fresh_run),
     ):
@@ -5039,7 +5068,7 @@ def test_start_one_campaign_cutoff_too_close_marks_expired():
     cs["status"] = "creating"
 
     with (
-        patch("executor._create_segment", return_value=("seg", "arn:seg")),
+        patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
         patch(
             "executor._create_and_start_campaign",
             side_effect=executor._CutoffTooCloseError(
@@ -5206,7 +5235,9 @@ class TestStartBrandedCampaign:
         from unittest.mock import MagicMock
 
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 5}).encode())
@@ -5229,7 +5260,9 @@ class TestStartBrandedCampaign:
         from unittest.mock import MagicMock
 
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 3}).encode())
@@ -5250,7 +5283,9 @@ class TestStartBrandedCampaign:
         from unittest.mock import MagicMock
 
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 2}).encode())
@@ -5271,7 +5306,9 @@ class TestStartBrandedCampaign:
         from unittest.mock import MagicMock
 
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 0}).encode())
@@ -5289,7 +5326,9 @@ class TestStartBrandedCampaign:
 
     def test_seeder_error_sets_error_status(self, mocker):
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.side_effect = Exception("Lambda timeout")
         ddb = mocker.patch("executor._get_ddb_client").return_value
@@ -5308,7 +5347,9 @@ class TestStartBrandedCampaign:
         from unittest.mock import MagicMock
 
         run, plan = self._make_run_with_branded()
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
             "Payload": MagicMock(read=lambda: json.dumps({"seeded": 1}).encode())
@@ -5883,7 +5924,9 @@ class TestInvokeSeederFunctionError:
             "bucketStates": [{"status": "running", "campaignStates": [cs]}],
         }
 
-        mocker.patch("executor._create_segment", return_value=("seg-name", "seg-arn"))
+        mocker.patch(
+            "executor._create_segment", return_value=("seg-name", "seg-arn", 1, 1)
+        )
 
         lam = mocker.patch("executor._get_lambda_client").return_value
         lam.invoke.return_value = {
@@ -6017,7 +6060,7 @@ class TestBL1ExpireOnSeederException:
 
         mocker.patch(
             "executor._create_segment",
-            return_value=("seg-bl1", "arn:seg-bl1"),
+            return_value=("seg-bl1", "arn:seg-bl1", 1, 1),
         )
         mocker.patch(
             "executor._invoke_seeder",
@@ -6052,7 +6095,7 @@ class TestH1ExpireOnDdbWriteFailure:
 
         mocker.patch(
             "executor._create_segment",
-            return_value=("seg-h1", "arn:seg-h1"),
+            return_value=("seg-h1", "arn:seg-h1", 1, 1),
         )
         invoke_seeder = mocker.patch("executor._invoke_seeder")
         ddb = mocker.patch("executor._get_ddb_client").return_value
@@ -6174,7 +6217,7 @@ class TestH4PutItemConditionalCheck:
 
         mocker.patch(
             "executor._create_segment",
-            return_value=("seg-h4", "arn:seg-h4"),
+            return_value=("seg-h4", "arn:seg-h4", 1, 1),
         )
         mocker.patch("executor._invoke_seeder", return_value=3)
 
@@ -6892,7 +6935,7 @@ class TestReconcileRetryAndCreationFailedAuditEvents:
             "CreateCampaign",
         )
         with (
-            patch("executor._create_segment", return_value=("seg", "arn:seg")),
+            patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
             patch("executor._create_and_start_campaign", side_effect=access_denied_exc),
             patch("executor._notify_sns"),
             patch("executor._safe_delete_segment"),
@@ -6927,7 +6970,7 @@ class TestReconcileRetryAndCreationFailedAuditEvents:
         mock_audit = MagicMock()
 
         with (
-            patch("executor._create_segment", return_value=("seg", "arn:seg")),
+            patch("executor._create_segment", return_value=("seg", "arn:seg", 1, 1)),
             patch(
                 "executor._create_and_start_campaign",
                 side_effect=RuntimeError("Connect boom"),
@@ -6948,3 +6991,348 @@ class TestReconcileRetryAndCreationFailedAuditEvents:
             actor_email="system@api-plans-executor",
             extra={"bucketIndex": 0, "campaignIndex": 0, "error": "Connect boom"},
         )
+
+
+# ── Task 1 (reconcile-normalization plan): _create_segment returns             ──
+# ── expected/actual counts; branded/SMS/telephony-native call sites wire them ──
+#
+# _create_segment's signature changed from (name, arn) to
+# (name, arn, expected, actual). TestCreateSegmentReconcileCounts is the only
+# class in this file exercising _create_segment's real body (every other test
+# mocks the function wholesale) — necessary to verify the counting logic itself
+# (total_matched vs len(phones_e164) after truncation and phone-normalization
+# exclusion). The Branded/Sms/TelephonyNative classes below verify the 3
+# _start_one_campaign call sites correctly unpack and wire cs["reconcile"].
+
+
+class TestCreateSegmentReconcileCounts:
+    """expected/actual derivation inside the real _create_segment body."""
+
+    def test_returns_expected_and_actual_when_no_truncation(self):
+        """expected == actual when every matched lead has a valid phone and none are truncated."""
+        import executor
+
+        redis_source = MagicMock()
+        redis_source.is_ready.return_value = True
+        redis_source.iter_records.return_value = [
+            {"customerid": "c1", "phone": "5551234567", "location": "NY"},
+            {"customerid": "c2", "phone": "5551234568", "location": "NY"},
+        ]
+        cp = MagicMock()
+        cp.create_segment_definition.return_value = {
+            "SegmentDefinitionArn": "arn:cp:seg1"
+        }
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=redis_source,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=[]),
+        ):
+            _, _, expected, actual = executor._create_segment(
+                {"segmentFilters": {}}, campaign={}
+            )
+        assert expected == 2
+        assert actual == 2
+
+    def test_actual_excludes_unnormalizable_phones(self):
+        """A lead with an empty/invalid phone counts toward `expected` but not `actual`."""
+        import executor
+
+        redis_source = MagicMock()
+        redis_source.is_ready.return_value = True
+        redis_source.iter_records.return_value = [
+            {"customerid": "c1", "phone": "5551234567", "location": "NY"},
+            {"customerid": "c2", "phone": "", "location": "NY"},
+        ]
+        cp = MagicMock()
+        cp.create_segment_definition.return_value = {
+            "SegmentDefinitionArn": "arn:cp:seg1"
+        }
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=redis_source,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=[]),
+        ):
+            _, _, expected, actual = executor._create_segment(
+                {"segmentFilters": {}}, campaign={}
+            )
+        assert expected == 2
+        assert actual == 1
+
+    def test_actual_reflects_truncation_to_max_segment_members(self):
+        """expected > _MAX_SEGMENT_MEMBERS truncates actual to the cap."""
+        import executor
+
+        redis_source = MagicMock()
+        redis_source.is_ready.return_value = True
+        redis_source.iter_records.return_value = [
+            {"customerid": f"c{i}", "phone": f"555123{i:04d}", "location": "NY"}
+            for i in range(executor._MAX_SEGMENT_MEMBERS + 5)
+        ]
+        cp = MagicMock()
+        cp.create_segment_definition.return_value = {
+            "SegmentDefinitionArn": "arn:cp:seg1"
+        }
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=redis_source,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=[]),
+        ):
+            _, _, expected, actual = executor._create_segment(
+                {"segmentFilters": {}}, campaign={}
+            )
+        assert expected == executor._MAX_SEGMENT_MEMBERS + 5
+        assert actual == executor._MAX_SEGMENT_MEMBERS
+
+
+class TestBrandedReconcile:
+    """Branded call site (Step 5/6): success wires cs['reconcile']; pinned segment does not."""
+
+    @pytest.fixture(autouse=True)
+    def _branded_env(self, mocker):
+        mocker.patch(
+            "executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"
+        )
+        mocker.patch(
+            "executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue"
+        )
+
+    def _branded_campaign(
+        self, campaign_id: str = "bc-rc-1", pinned_segment_arn: str | None = None
+    ) -> dict:
+        campaign = {
+            "id": campaign_id,
+            "name": "Branded Reconcile Test",
+            "deliveryType": "branded",
+            "campaignConfig": {
+                "dialerType": "progressive",
+                "queueArn": "arn:aws:connect:::queue/q1",
+                "contactFlowId": "flow-abc",
+                "sourcePhone": "+12125550199",
+            },
+        }
+        if pinned_segment_arn:
+            campaign["pinnedSegmentArn"] = pinned_segment_arn
+        return campaign
+
+    def _make_run_with_branded(
+        self, campaign_id: str = "bc-rc-1", pinned_segment_arn: str | None = None
+    ):
+        bucket = _bucket_def(
+            "b-branded",
+            campaigns=[self._branded_campaign(campaign_id, pinned_segment_arn)],
+        )
+        plan = {"planId": "p-1", "buckets": [bucket]}
+        cs = _campaign_state(campaign_id, status="queued")
+        run = {
+            "planId": "p-1",
+            "runId": "r-1",
+            "bucketStates": [{"status": "running", "campaignStates": [cs]}],
+        }
+        return run, plan, cs
+
+    def test_branded_success_sets_reconcile(self, mocker):
+        import json
+
+        run, plan, cs = self._make_run_with_branded()
+        mocker.patch(
+            "executor._create_segment", return_value=("seg", "arn:seg", 50, 47)
+        )
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 47}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["reconcile"] == {"expected": 50, "actual": 47, "retries": 0}
+
+    def test_branded_pinned_segment_sets_no_reconcile(self, mocker):
+        import json
+
+        pinned_arn = (
+            "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/pinned-seg"
+        )
+        run, plan, cs = self._make_run_with_branded(pinned_segment_arn=pinned_arn)
+        lam = mocker.patch("executor._get_lambda_client").return_value
+        lam.invoke.return_value = {
+            "Payload": MagicMock(read=lambda: json.dumps({"seeded": 10}).encode())
+        }
+        mocker.patch("executor._get_ddb_client").return_value.put_item.return_value = {}
+
+        from executor import _start_one_campaign
+
+        _start_one_campaign(run, plan, 0, 0)
+
+        assert cs["status"] == "running"
+        assert "reconcile" not in cs
+
+
+class TestSmsReconcile:
+    """SMS call site (Step 7/8): success wires cs['reconcile']."""
+
+    def _sms_campaign(
+        self, campaign_id: str = "sms-rc-1", pinned_segment_arn: str | None = None
+    ) -> dict:
+        campaign = {
+            "id": campaign_id,
+            "name": "SMS Reconcile Test",
+            "deliveryType": "sms",
+            "campaignConfig": {
+                "smsMessageTemplate": "Hello {{firstName}}",
+                "smsOriginationNumberArn": "arn:aws:sms-voice:us-east-1:123:phone-number-id/abc",
+                "smsOriginationNumber": "+18885550100",
+            },
+        }
+        if pinned_segment_arn:
+            campaign["pinnedSegmentArn"] = pinned_segment_arn
+        return campaign
+
+    def test_sms_success_sets_reconcile(self):
+        import executor
+
+        bucket = _bucket_def("b-sms", campaigns=[self._sms_campaign()])
+        plan = _make_plan([bucket])
+        cs = _campaign_state("sms-rc-1", status="queued")
+        run = _make_run(plan, [_bucket_state("b-sms", [cs])])
+
+        with (
+            patch("executor._create_segment", return_value=("seg", "arn:seg", 30, 28)),
+            patch("executor._invoke_sms_sender"),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["reconcile"] == {"expected": 30, "actual": 28, "retries": 0}
+
+    def test_sms_pinned_segment_sets_no_reconcile(self):
+        """Pinned segment skips _create_segment entirely — no reconcile key at all."""
+        import executor
+
+        pinned_arn = (
+            "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/pinned-seg"
+        )
+        bucket = _bucket_def(
+            "b-sms", campaigns=[self._sms_campaign(pinned_segment_arn=pinned_arn)]
+        )
+        plan = _make_plan([bucket])
+        cs = _campaign_state("sms-rc-1", status="queued")
+        run = _make_run(plan, [_bucket_state("b-sms", [cs])])
+
+        with patch("executor._invoke_sms_sender"):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "running"
+        assert "reconcile" not in cs
+
+
+class TestTelephonyNativeReconcile:
+    """Telephony-native fresh-start call site (Step 9/10): retry loop + success continuation."""
+
+    def test_fresh_start_success_sets_reconcile(self):
+        """First-attempt success wires cs['reconcile'] with retries == 0."""
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+        with (
+            patch(
+                "executor._create_segment", return_value=("seg-1", "arn:seg-1", 100, 95)
+            ),
+            patch(
+                "executor._create_and_start_campaign",
+                return_value=("conn-1", "camp-name"),
+            ),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["reconcile"] == {"expected": 100, "actual": 95, "retries": 0}
+
+    def test_success_after_retries_records_retry_count(self):
+        """Two empty-segment retries (across ticks), then success, records retries == 2."""
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+        # Tick 1: empty segment -> queued, reconcileRetries=1
+        with patch(
+            "executor._create_segment",
+            side_effect=executor._EmptySegmentError("No leads"),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+        assert cs["status"] == "queued"
+        assert cs["reconcileRetries"] == 1
+
+        # Tick 2: empty segment again -> queued, reconcileRetries=2
+        with patch(
+            "executor._create_segment",
+            side_effect=executor._EmptySegmentError("No leads"),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+        assert cs["status"] == "queued"
+        assert cs["reconcileRetries"] == 2
+
+        # Tick 3: succeeds
+        with (
+            patch(
+                "executor._create_segment",
+                return_value=("seg-3", "arn:seg-3", 40, 38),
+            ),
+            patch(
+                "executor._create_and_start_campaign",
+                return_value=("conn-1", "camp-name"),
+            ),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "running"
+        assert cs["reconcile"] == {"expected": 40, "actual": 38, "retries": 2}
+
+    def test_pinned_segment_sets_no_reconcile(self):
+        """campaign['pinnedSegmentArn'] set — _create_segment never called, no reconcile key."""
+        import executor
+
+        campaign = _campaign_def("c0")
+        campaign["pinnedSegmentArn"] = (
+            "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/pinned-seg"
+        )
+        bucket = _bucket_def("b0", [campaign])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+        with patch(
+            "executor._create_and_start_campaign", return_value=("conn-1", "camp-name")
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "running"
+        assert "reconcile" not in cs

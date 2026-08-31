@@ -3606,10 +3606,11 @@ def _start_one_campaign(
         # _stop_branded_campaign cleans up both the record and the queue.
         try:
             pinned_arn = campaign.get("pinnedSegmentArn")
+            expected = actual = None
             if pinned_arn:
                 seg_name = pinned_arn.rsplit("/", 1)[-1]
             else:
-                seg_name, _ = _create_segment(bucket, campaign)
+                seg_name, _, expected, actual = _create_segment(bucket, campaign)
             seeded = _invoke_seeder(
                 campaign_id=campaign_id,
                 segment_name=seg_name,
@@ -3649,6 +3650,12 @@ def _start_one_campaign(
             seg_arn=pinned_arn or "",
             seeded=seeded,
         )
+        if expected is not None:
+            cs["reconcile"] = {
+                "expected": expected,
+                "actual": actual,
+                "retries": cs.get("reconcileRetries", 0),
+            }
         # brandedCampaignId and queueArn already set early (before try/except)
         cs["connectCampaignId"] = None
         cs["status"] = "running"
@@ -3674,13 +3681,20 @@ def _start_one_campaign(
         cs["startedAt"] = now_iso
         try:
             pinned_arn = campaign.get("pinnedSegmentArn")
+            expected = actual = None
             if pinned_arn:
                 seg_name = pinned_arn.rsplit("/", 1)[-1]
                 seg_arn = pinned_arn
             else:
-                seg_name, seg_arn = _create_segment(bucket, campaign)
+                seg_name, seg_arn, expected, actual = _create_segment(bucket, campaign)
             cs["segmentName"] = seg_name
             cs["segmentArn"] = seg_arn
+            if expected is not None:
+                cs["reconcile"] = {
+                    "expected": expected,
+                    "actual": actual,
+                    "retries": cs.get("reconcileRetries", 0),
+                }
             _invoke_sms_sender(
                 campaignId=sms_campaign_id,
                 planId=run["planId"],
@@ -3773,6 +3787,7 @@ def _start_one_campaign(
 
     # Fresh start: create segment → create Connect campaign → start
     pinned_segment_arn = campaign.get("pinnedSegmentArn")
+    expected = actual = None
 
     if pinned_segment_arn:
         # Operator-pinned segment: skip Redis lookup and segment auto-creation entirely.
@@ -3793,7 +3808,9 @@ def _start_one_campaign(
         last_exc: Exception | None = None
         for attempt in range(reconcile_retry_limit + 1):
             try:
-                segment_name, segment_arn = _create_segment(bucket, campaign)
+                segment_name, segment_arn, expected, actual = _create_segment(
+                    bucket, campaign
+                )
                 last_exc = None
                 break
             except _RedisRebuildingError as exc:
@@ -3899,6 +3916,12 @@ def _start_one_campaign(
 
     cs["segmentName"] = segment_name
     cs["segmentArn"] = segment_arn
+    if expected is not None:
+        cs["reconcile"] = {
+            "expected": expected,
+            "actual": actual,
+            "retries": cs.get("reconcileRetries", 0),
+        }
 
     # Phase 2: create + start Connect campaign
     try:
@@ -4303,7 +4326,9 @@ def _max_age_cutoff(max_age_minutes: Any, now: datetime | None = None) -> str | 
     )
 
 
-def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
+def _create_segment(
+    bucket: dict, campaign: dict | None = None
+) -> tuple[str, str, int, int]:
     from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
     from vip_shared.domain.services.segment_groups_translator import (
         SegmentGroupsTranslator,
@@ -4484,7 +4509,12 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
             description="Auto-created by Daily Plans",
             tags={"VipPlanBucket": "true", "VipSyncMode": "manual"},
         )
-        return segment_name, resp["SegmentDefinitionArn"]
+        return (
+            segment_name,
+            resp["SegmentDefinitionArn"],
+            total_matched,
+            len(phones_e164),
+        )
     except ClientError as exc:
         if "already exists" in str(exc):
             # Segment was created by a previous Lambda invocation that crashed before
@@ -4492,7 +4522,12 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
             # identical (same name encodes same state/attempt/minute/campaign id).
             logger.warning("_create_segment: %s already exists — reusing", segment_name)
             existing = cp.get_segment_definition(segment_name)
-            return segment_name, existing["SegmentDefinitionArn"]
+            return (
+                segment_name,
+                existing["SegmentDefinitionArn"],
+                total_matched,
+                len(phones_e164),
+            )
         raise
 
 
