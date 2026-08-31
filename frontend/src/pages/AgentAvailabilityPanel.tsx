@@ -65,7 +65,9 @@ export function AgentAvailabilityPanel({ className }: { className?: string }): R
   return (
     <div className={className}>
       <h3 className="text-sm font-semibold text-gray-700 mb-2">Agent availability</h3>
-      {query.isPending ? (
+      {query.isError ? (
+        <p className="text-xs text-red-500">Failed to load agent roster.</p>
+      ) : query.isPending ? (
         <p className="text-xs text-gray-400">Loading…</p>
       ) : rows.length === 0 ? (
         <p className="text-xs text-gray-400">No agents online.</p>
