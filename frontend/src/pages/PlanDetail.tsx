@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { Button, Spinner } from '@/components/ui';
+import { StatusChip } from '@/components/ui/StatusChip';
 import {
   api,
   type BrandedCampaignCounts,
@@ -20,6 +21,7 @@ import {
   type SmsCampaignRunRecord,
 } from '@/lib/api';
 import { buildChainMap } from '@/lib/chainMap';
+import { formatReconcile, reconcileTone } from './reconcile';
 
 // ── Time helpers (Colombia timezone, UTC-5, no DST) ──────────────────────────
 
@@ -405,6 +407,9 @@ function CampaignCard({
         <div className="text-xs text-red-500 truncate" title={cs.errorDetail}>
           {cs.errorDetail}
         </div>
+      )}
+      {cs.reconcile && (
+        <StatusChip tone={reconcileTone(cs.reconcile)} label={formatReconcile(cs.reconcile)} mono />
       )}
       <TimingMeta items={timingItems} />
     </div>
