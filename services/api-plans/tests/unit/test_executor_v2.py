@@ -6429,3 +6429,60 @@ class TestRecordPlanEvent:
         with patch("executor.build_audit", return_value=mock_audit):
             executor._record_plan_event(run, "bucket_completed", {"bucketIndex": 0})
         # No exception raised — the call above completing is the assertion.
+
+
+class TestBucketStartedAuditEvent:
+    def test_start_bucket_records_bucket_started(self):
+        import executor
+
+        run = {
+            "planId": "plan-1",
+            "runId": "run-1",
+            "planSnapshot": {"buckets": [{"name": "1st attempt"}]},
+            "bucketStates": [{"campaignStates": []}],
+        }
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._schedule_tick", return_value="sched-1"),
+            patch("executor.save_run"),
+            patch("executor._dispatch_ready_campaigns", return_value=False),
+        ):
+            executor._start_bucket(run, 0)
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "1st attempt"},
+        )
+
+    def test_activate_warming_bucket_records_bucket_started(self):
+        import executor
+
+        run = {
+            "planId": "plan-2",
+            "runId": "run-2",
+            "bucketStates": [
+                {"campaignStates": []},
+                {"campaignStates": [], "status": "warming"},
+            ],
+        }
+        plan = {"buckets": [{}, {"name": "3rd attempt"}]}
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._schedule_tick", return_value="sched-2"),
+            patch("executor.save_run"),
+            patch("executor._dispatch_ready_campaigns", return_value=False),
+        ):
+            executor._activate_warming_bucket(run, plan, 1)
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-2/run-2",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 1, "bucketName": "3rd attempt"},
+        )

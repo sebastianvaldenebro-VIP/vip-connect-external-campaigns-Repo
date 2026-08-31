@@ -1917,6 +1917,11 @@ def _start_bucket(run: dict, index: int) -> None:
     bucket_state = run["bucketStates"][index]
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    _record_plan_event(
+        run,
+        "bucket_started",
+        {"bucketIndex": index, "bucketName": plan["buckets"][index].get("name")},
+    )
 
     # Schedule FIRST — if this fails, don't create Connect campaigns without a poller
     try:
@@ -1976,6 +1981,14 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
 
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    _record_plan_event(
+        run,
+        "bucket_started",
+        {
+            "bucketIndex": bucket_index,
+            "bucketName": plan["buckets"][bucket_index].get("name"),
+        },
+    )
 
     # Schedule FIRST — if this fails, don't start Connect campaigns without a poller
     try:
