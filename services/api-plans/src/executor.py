@@ -44,7 +44,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Final
+from typing import Any, Final
 
 import boto3
 from botocore.exceptions import ClientError
@@ -610,7 +610,7 @@ def _write_branded_run_summary(plan_id: str, run_id: str, cs: dict) -> None:
     exit_reason = cs.get("exitReason", "")
     if exit_reason == "queue_drained":
         final_status = "COMPLETED"
-    elif exit_reason in ("aborted", "manually_stopped", "poll_failure"):
+    elif exit_reason in ("aborted", "manually_stopped", "poll_failure", REASON_EXPIRED):
         final_status = "ABORTED"
     else:
         final_status = "ERROR"
@@ -1071,7 +1071,13 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                         _safe_stop_campaign(cs["connectCampaignId"])
 
         elif cs.get("brandedCampaignId") and cs["status"] == "running":
-            # Branded campaign: poll VipProgressiveCampaignQueue instead of Connect
+            # Poll VipProgressiveCampaignQueue instead of Connect. Poll BEFORE
+            # evaluating run_duration_minutes below (root-caused 2026-08-27,
+            # adversarial code review) — checking elapsed time first could mark
+            # a campaign whose queue already drained this same tick as
+            # expired/ABORTED instead of completed, even though it genuinely
+            # finished. The telephony branch above has the same ordering:
+            # poll first, only evaluate duration if still running afterward.
             try:
                 count = _count_branded_queue(cs["brandedCampaignId"])
             except Exception as _poll_exc:
@@ -1112,6 +1118,41 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _write_branded_run_summary(plan_id, run_id, cs)
                 _stop_branded_campaign(cs)
                 _emit_branded_metric("BrandedCampaignCompleted")
+                continue
+
+            # Branded campaign: same run_duration_minutes force-stop as the telephony
+            # branch above — branded never gets a connectCampaignId, so without this
+            # check it ran indefinitely (root-caused 2026-08-27: a 45-min branded
+            # campaign ran 107 min until a human force-finished it, abandoning 994 of
+            # 1085 seeded contacts as EXPIRED). Only reached when count > 0 (still
+            # has pending work) — a naturally-drained campaign is handled above.
+            _campaign_def = next(
+                (c for c in bucket.get("campaigns", []) if c["id"] == cs["campaignId"]),
+                {},
+            )
+            _dur = int(
+                _campaign_def.get("run_duration_minutes")
+                or _campaign_def.get("duration_minutes")
+                or 0
+            )
+            _cs_started = cs.get("startedAt") or bucket_state.get("startedAt")
+            if _dur > 0 and _cs_started:
+                _elapsed = (
+                    _now_utc() - datetime.fromisoformat(_cs_started)
+                ).total_seconds() / 60
+                if _elapsed > _dur + 2:
+                    logger.warning(
+                        "tick: branded campaign %s still running after %.1f min (limit=%d) — force stopping",
+                        cs["brandedCampaignId"],
+                        _elapsed,
+                        _dur,
+                    )
+                    cs["status"] = "expired"
+                    cs["exitReason"] = REASON_EXPIRED
+                    cs["completedAt"] = _now_iso()
+                    _write_branded_run_summary(plan_id, run_id, cs)
+                    _stop_branded_campaign(cs)
+                    _emit_branded_metric("BrandedCampaignExpired")
 
         elif cs.get("smsCampaignId") and cs["status"] == "running":
             # SMS campaign: poll VipSmsCampaignQueue PENDING count
@@ -1575,6 +1616,12 @@ def force_start_campaign(
                             "connectCampaignId": None,
                             "segmentName": None,
                             "segmentArn": None,
+                            # See BD-020 — reconcileRetries is sticky and must
+                            # not survive an unrelated queued revert (this
+                            # sibling-cleanup path was missed by BD-020;
+                            # root-caused 2026-08-27, second adversarial
+                            # review round).
+                            "reconcileRetries": 0,
                         }
                     )
         bs["status"] = "running"
@@ -1612,6 +1659,7 @@ def force_start_campaign(
     cs["segmentName"] = None
     cs["brandedCampaignId"] = None
     cs["queueArn"] = None
+    cs["reconcileRetries"] = 0
     try:
         save_run(run)
     except ConcurrentWriteError:
@@ -1711,6 +1759,13 @@ def _reset_cascade_cancelled_children(run: dict, plan: dict, campaign_id: str) -
                 cs["status"] = "queued"
                 cs["exitReason"] = None
                 cs["completedAt"] = None
+                # reconcileRetries is a sticky signal meaning "mid empty-segment
+                # retry" (see _bucket_has_only_legitimate_waits) — clear it here
+                # since this queued state has nothing to do with that retry cycle
+                # (root-caused 2026-08-27, adversarial code review: a stale value
+                # left over from before cascade-cancel could mask a genuinely
+                # stuck campaign as "legitimately waiting").
+                cs["reconcileRetries"] = 0
                 _reset_cascade_cancelled_children(run, plan, campaign["id"])
 
 
@@ -1913,6 +1968,10 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
             cs.pop("exitReason", None)
             cs.pop("errorDetail", None)
             cs.pop("completedAt", None)
+            # See _reset_cascade_cancelled_children — reconcileRetries is sticky
+            # and must not survive an unrelated queued revert (root-caused
+            # 2026-08-27, adversarial code review).
+            cs["reconcileRetries"] = 0
 
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
@@ -3059,6 +3118,14 @@ def _dispatch_cross_bucket_ready(
 
             parent_states = [_find_campaign_state(run, cid) for cid in depends_on]
 
+            # Deliberately stricter than _dispatch_ready_campaigns' terminal-status
+            # check (BD-014 investigation, 2026-08-27): this function activates an
+            # entire future bucket ahead of its natural turn (new schedule, running
+            # status) on the strength of the parent alone. Only jump the gun on a
+            # clean finish. A cancelled/errored/expired parent still unblocks the
+            # dependent — just via the normal path once the bucket's turn comes,
+            # where _dispatch_ready_campaigns' permissive check applies. No deadlock,
+            # only timing — see docs/BUGLOG.md.
             if all(
                 s and (s["status"] == "completed" or s.get("exitReason") == "skipped")
                 for s in parent_states
@@ -3143,6 +3210,7 @@ def _dispatch_ready_campaigns(
                         cs["segmentArn"] = None
                         cs["segmentName"] = None
                         cs["status"] = "queued"
+                        cs["reconcileRetries"] = 0
                     else:
                         cs["status"] = "running"
                         logger.info(
@@ -3160,6 +3228,7 @@ def _dispatch_ready_campaigns(
                     cs["segmentArn"] = None
                     cs["segmentName"] = None
                     cs["status"] = "queued"
+                    cs["reconcileRetries"] = 0
             else:
                 # No conn_id: the claim was made but Connect was never called.
                 # Only reset if the claim is stale (> 5 min) — a fresh claim means a
@@ -3173,6 +3242,7 @@ def _dispatch_ready_campaigns(
                 )
                 if _age_seconds > 300:
                     cs["status"] = "queued"
+                    cs["reconcileRetries"] = 0
                 else:
                     logger.info(
                         "_dispatch_ready_campaigns: skipping fresh creating claim for %s "
@@ -3277,6 +3347,37 @@ def _bucket_has_only_legitimate_waits(
     only campaign depends on another bucket's still-actively-dialing campaign.
     Without this, a bucket that's correctly waiting on a legitimately long-running
     upstream campaign pages every single minute for as long as that wait lasts.
+
+    Also covers a second legitimate-wait shape (root-caused 2026-08-27, from
+    vip-plans-no-active-campaign-sustained false positives on plan
+    1a29f025's frequent re-triggers): a campaign mid-retry in
+    _start_one_campaign's _EmptySegmentError handler, which reverts status to
+    "queued" and defers to a later tick (see reconcileRetries in
+    _reconcile_bucket). That's normal segment-not-populated-yet retry, not a
+    crashed tick — the two are indistinguishable by status alone, so this uses
+    reconcileRetries > 0 as the signal. Bounded by reconcile_retry_limit
+    (default 5) before the campaign is cancelled to a terminal status, and by
+    StuckRun (4h) as the ultimate backstop either way.
+
+    reconcileRetries is otherwise sticky (only the empty-segment retry cycle
+    itself increments or clears it on success/exhaustion) — every OTHER path
+    that reverts a campaign to "queued"/"error" for unrelated reasons
+    explicitly resets it to 0 as part of that revert, specifically so a stale
+    value from a PRIOR, already-finished retry cycle can never masquerade as
+    "currently mid-retry" here (root-caused 2026-08-27, adversarial code
+    review — this field's presence used to be treated as sufficient on its
+    own, which it is not unless every revert-to-queued path is disciplined
+    about clearing it). As of the second adversarial review round
+    (2026-08-27) the known reset sites are: _activate_warming_bucket's
+    pre-warm-failure recovery; force_start_campaign's own claim (Phase 1) and
+    its warming-bucket sibling cleanup; _reset_cascade_cancelled_children;
+    _start_one_campaign's ClientError throttle/quota-exceeded revert; and all
+    3 reset statements across _dispatch_ready_campaigns' Phase-1 "creating"
+    recovery (Connect-terminal-state, exception-while-polling, and
+    stale->300s claim). Treat this list as best-effort, not a guarantee — the
+    first round of this same fix already missed 2 of these sites, so a
+    revert-to-queued path found elsewhere in the future should be assumed
+    unreset until verified.
     """
     plan = run.get("planSnapshot") or plan
     bucket_def = next(
@@ -3291,6 +3392,8 @@ def _bucket_has_only_legitimate_waits(
         if cs.get("status") != "queued":
             return False  # creating/warming/running would already be "active"; anything
             # else here (e.g. an unexpected status) isn't a recognized legitimate wait
+        if cs.get("reconcileRetries"):
+            continue  # mid-retry on an empty/not-yet-populated segment — legitimate
         campaign_def = campaigns_by_id.get(cs.get("campaignId"))
         depends_on = (campaign_def or {}).get("dependsOn") or []
         if not depends_on:
@@ -3529,6 +3632,8 @@ def _start_one_campaign(
         return
     # ── End SMS path ──────────────────────────────────────────────────────────
 
+    _check_native_queue_collision(bucket, campaign, run["planId"], run["runId"])
+
     if cs.get("connectCampaignId"):
         if cs.get("warmupStarted"):
             # StartCampaign already called during warmup — campaign is Running in Connect.
@@ -3611,11 +3716,13 @@ def _start_one_campaign(
             except _RedisRebuildingError as exc:
                 # Redis is mid-rebuild — transient. Revert to queued so the next tick retries.
                 cs["status"] = "queued"
-                logger.warning(
-                    "_start_one_campaign[%d/%d]: Redis rebuilding, will retry next tick: %s",
-                    bucket_index,
-                    campaign_index,
-                    exc,
+                _slog.warn(
+                    "start_one_campaign_redis_rebuilding",
+                    plan_id=run["planId"],
+                    run_id=run["runId"],
+                    bucket_index=bucket_index,
+                    campaign_index=campaign_index,
+                    error=str(exc),
                 )
                 return
             except _EmptySegmentError as exc:
@@ -3626,34 +3733,40 @@ def _start_one_campaign(
                 if empty_retries < reconcile_retry_limit:
                     cs["status"] = "queued"
                     cs["reconcileRetries"] = empty_retries + 1
-                    logger.warning(
-                        "_start_one_campaign[%d/%d]: empty segment (retry %d/%d), will retry next tick: %s",
-                        bucket_index,
-                        campaign_index,
-                        empty_retries + 1,
-                        reconcile_retry_limit,
-                        exc,
+                    _slog.warn(
+                        "start_one_campaign_empty_segment_retry",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=bucket_index,
+                        campaign_index=campaign_index,
+                        retry=empty_retries + 1,
+                        retry_limit=reconcile_retry_limit,
+                        error=str(exc),
                     )
                     return
                 last_exc = exc
-                logger.info(
-                    "_start_one_campaign[%d/%d]: empty segment after %d retries — cancelling: %s",
-                    bucket_index,
-                    campaign_index,
-                    empty_retries,
-                    exc,
+                _slog.info(
+                    "start_one_campaign_empty_segment_cancelled",
+                    plan_id=run["planId"],
+                    run_id=run["runId"],
+                    bucket_index=bucket_index,
+                    campaign_index=campaign_index,
+                    retries_exhausted=empty_retries,
+                    error=str(exc),
                 )
                 break
             except Exception as exc:
                 last_exc = exc
                 if attempt < reconcile_retry_limit:
-                    logger.warning(
-                        "_start_one_campaign[%d/%d]: segment attempt %d/%d failed (%s), retrying",
-                        bucket_index,
-                        campaign_index,
-                        attempt + 1,
-                        reconcile_retry_limit + 1,
-                        exc,
+                    _slog.warn(
+                        "start_one_campaign_segment_attempt_failed",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=bucket_index,
+                        campaign_index=campaign_index,
+                        attempt=attempt + 1,
+                        max_attempts=reconcile_retry_limit + 1,
+                        error=str(exc),
                     )
 
         if last_exc is not None:
@@ -3664,12 +3777,13 @@ def _start_one_campaign(
                 if not _check_redis_ready():
                     cs["status"] = "queued"
                     cs["reconcileRetries"] = 0
-                    logger.warning(
-                        "_start_one_campaign[%d/%d]: Redis not ready on final check after %d retries"
-                        " — resetting for rebuild, will retry next tick",
-                        bucket_index,
-                        campaign_index,
-                        reconcile_retry_limit,
+                    _slog.warn(
+                        "start_one_campaign_redis_not_ready_reset",
+                        plan_id=run["planId"],
+                        run_id=run["runId"],
+                        bucket_index=bucket_index,
+                        campaign_index=campaign_index,
+                        retries_exhausted=reconcile_retry_limit,
                     )
                     return
                 cs["status"] = "cancelled"
@@ -3780,6 +3894,10 @@ def _start_one_campaign(
             )
             cs["status"] = "queued"
             cs.pop("connectCampaignId", None)
+            # See BD-020 — reconcileRetries is sticky and must not survive an
+            # unrelated queued revert (this throttle/quota path was missed by
+            # BD-020; root-caused 2026-08-27, second adversarial review round).
+            cs["reconcileRetries"] = 0
             _notify_sns(
                 subject=f"[VIP Plans] Campaign throttled/quota exceeded: {cs.get('name', cs['campaignId'])}",
                 detail=(
@@ -4050,6 +4168,30 @@ def _normalize_phone_e164(raw: str) -> str | None:
     return None
 
 
+def _max_age_cutoff(max_age_minutes: Any, now: datetime | None = None) -> str | None:
+    """Build the createdAt >= cutoff for the maxLeadAgeMinutes filter.
+
+    Casts to int: campaigns read from run["planSnapshot"] come back from
+    DynamoDB as decimal.Decimal (boto3 Table resource deserializes all Number
+    attributes that way; only the plan-read path normalizes Decimal->int, the
+    run-read path does not), and timedelta() raises TypeError on Decimal.
+    A non-positive value (e.g. a negative minutes value slipping past upstream
+    validation) is treated as "no filter" rather than producing a cutoff in
+    the future, which would silently match zero leads.
+    """
+    if not max_age_minutes:
+        return None
+    minutes = int(max_age_minutes)
+    if minutes <= 0:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return (
+        (now - timedelta(minutes=minutes))
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, str]:
     from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
     from vip_shared.domain.services.segment_groups_translator import (
@@ -4094,6 +4236,17 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
             FilterRule(
                 field="groups", operator=FilterOperator.IN, values=tuple(all_groups)
             )
+        )
+
+    # Only include leads created within the last N minutes (10-35, step 5;
+    # None = no age filter). createdAt is an ISO-8601 UTC string with
+    # millisecond precision (e.g. "2026-08-28T14:30:00.123Z") straight from
+    # the Redis producer — plain string comparison sorts identically to
+    # chronological order as long as both sides use this exact format.
+    cutoff = _max_age_cutoff(filters.get("maxLeadAgeMinutes"))
+    if cutoff:
+        rules.append(
+            FilterRule(field="createdAt", operator=FilterOperator.GTE, values=(cutoff,))
         )
 
     redis_source = build_redis()
@@ -4225,7 +4378,7 @@ def _create_segment(bucket: dict, campaign: dict | None = None) -> tuple[str, st
         if "already exists" in str(exc):
             # Segment was created by a previous Lambda invocation that crashed before
             # persisting connectCampaignId. Reuse the existing definition — filters are
-            # identical (same name encodes same state/attempt/minute).
+            # identical (same name encodes same state/attempt/minute/campaign id).
             logger.warning("_create_segment: %s already exists — reusing", segment_name)
             existing = cp.get_segment_definition(segment_name)
             return segment_name, existing["SegmentDefinitionArn"]
@@ -4637,6 +4790,98 @@ def _now_utc() -> datetime:
 
 def _now_iso() -> str:
     return _now_utc().isoformat()
+
+
+def _check_native_queue_collision(
+    bucket: dict, campaign: dict | None, plan_id: str, run_id: str
+) -> None:
+    """Alert-only: a native campaign starting on a queue where a branded campaign
+    is already active competes for the same agent capacity — the two dialing
+    engines have no awareness of each other. Never blocks or alters the start.
+
+    One-directional by design: cheap here because VipActiveBrandedCampaigns is
+    keyed by queue ARN. The reverse (branded checking for an already-active
+    native campaign) has no equivalent index — native campaign state isn't
+    tracked by queue anywhere — and would require an expensive full-table scan
+    or a new tracking table. Out of scope for this alert (root-caused 2026-08-27).
+    """
+    if not _ACTIVE_BRANDED_CAMPAIGNS_TABLE or not CONNECT_INSTANCE_ID:
+        return
+    cfg = dict(bucket.get("campaignConfig", {}))
+    if campaign:
+        cfg.update(campaign.get("campaignConfig", {}))
+    queue_id = cfg.get("queueId", "")
+    if not queue_id:
+        return
+    queue_arn = (
+        f"arn:aws:connect:us-east-1:{_account_id()}:instance/"
+        f"{CONNECT_INSTANCE_ID}/queue/{queue_id}"
+    )
+    try:
+        resp = _get_ddb_client().query(
+            TableName=_ACTIVE_BRANDED_CAMPAIGNS_TABLE,
+            KeyConditionExpression="pk = :pk",
+            ExpressionAttributeValues={":pk": {"S": f"QUEUE#{queue_arn}"}},
+            Limit=1,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_check_native_queue_collision: query failed queue=%s error=%s",
+            queue_id, type(exc).__name__,
+        )
+        return
+    items = resp.get("Items", [])
+    if not items:
+        return
+    branded_campaign_id = items[0].get("campaignId", {}).get("S", "")
+    logger.warning(
+        "_check_native_queue_collision: native campaign starting on queue=%s "
+        "while branded campaign %s is active — dial-rate contention risk",
+        queue_id, branded_campaign_id,
+    )
+    _notify_sns(
+        subject="Branded+Native queue collision detected",
+        detail=(
+            f"Native campaign starting for plan={plan_id} run={run_id} on "
+            f"queue={queue_id} while branded campaign {branded_campaign_id} is "
+            "already active on the same queue. Both dialing engines compete for "
+            "the same agent capacity — no automatic action taken."
+        ),
+        attributes={
+            "PlanId": plan_id,
+            "RunId": run_id,
+            "QueueId": queue_id,
+            "BrandedCampaignId": branded_campaign_id,
+        },
+    )
+    _emit_queue_collision_metric(queue_id)
+
+
+def _emit_queue_collision_metric(queue_id: str) -> None:
+    """Emit BrandedNativeQueueCollision to VIPPlans. Fire-and-forget, never raises."""
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="VIPPlans",
+            MetricData=[
+                {
+                    "MetricName": "BrandedNativeQueueCollision",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [{"Name": "QueueId", "Value": queue_id}],
+                },
+                {
+                    "MetricName": "BrandedNativeQueueCollision",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [],
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.warning(
+            "_emit_queue_collision_metric failed queue=%s error=%s",
+            queue_id, type(exc).__name__,
+        )
 
 
 def _notify_sns(subject: str, detail: str, attributes: dict | None = None) -> None:

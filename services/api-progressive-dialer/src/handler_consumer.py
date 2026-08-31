@@ -17,6 +17,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 
@@ -110,11 +111,25 @@ def _emit_metric(metric_name: str, value: float = 1.0) -> None:
         logger.warning("Failed to emit metric %s: %s", metric_name, type(exc).__name__)
 
 
+# In-memory overlay of dispatches recorded by THIS warm container, keyed by
+# campaign_id. VipActiveBrandedCampaigns is read via a GSI, which DynamoDB
+# never serves with strongly-consistent reads — a later Kinesis record in the
+# same batch (same lambda_handler invocation) can otherwise still see the
+# pre-write value and re-pick the campaign that just won, reproducing the
+# FIFO starvation BD-018 fixed (root-caused 2026-08-27, adversarial code review).
+_recent_dispatches: dict[str, str] = {}
+
+
 def _get_active_campaigns(queue_arn: str) -> list[dict]:
     """Query VipActiveBrandedCampaigns GSI for all active campaigns on this queue.
 
     Paginates through all pages so queues with many campaigns are fully retrieved.
-    Returns items sorted by priority ASC then createdAt ASC (oldest high-priority first).
+    Returns items sorted by priority ASC, then by least-recently-dispatched first
+    (lastDispatchedAt ASC, falling back to createdAt for a campaign never yet
+    dispatched to). Fairness fix (root-caused 2026-08-27): every campaign has
+    priority=0 in practice, so a plain createdAt sort is pure FIFO — the oldest
+    campaign on a shared queue would win every single dispatch event for as long
+    as it had any pending contact, fully starving newer campaigns on that queue.
     """
     items: list[dict] = []
     kwargs = dict(
@@ -130,10 +145,53 @@ def _get_active_campaigns(queue_arn: str) -> list[dict]:
         if not lek:
             break
         kwargs["ExclusiveStartKey"] = lek
+
+    def _last_dispatched(item: dict) -> str:
+        campaign_id = item.get("campaignId", {}).get("S", "")
+        created_at = item["createdAt"]["S"]
+        gsi_value = item.get("lastDispatchedAt", {}).get("S") or ""
+        local_value = _recent_dispatches.get(campaign_id, "")
+        if local_value and local_value < created_at:
+            # Stale — belongs to a PRIOR generation of this campaignId.
+            # brandedCampaignId is deterministic per (planId, runId,
+            # bucket_index, campaign_index), so a stop/force-restart within
+            # the same run reuses it verbatim with a fresh createdAt. A real
+            # dispatch can never predate the generation it belongs to
+            # (root-caused 2026-08-27, second adversarial review round).
+            local_value = ""
+        return max(gsi_value, local_value) or created_at
+
     return sorted(
         items,
-        key=lambda x: (int(x["priority"]["N"]), x["createdAt"]["S"]),
+        key=lambda x: (int(x["priority"]["N"]), _last_dispatched(x)),
     )
+
+
+def _record_dispatch(queue_arn: str, campaign_id: str) -> None:
+    """Persist lastDispatchedAt on the winning campaign so the next dispatch event
+    on this queue rotates to a different campaign instead of re-picking this one.
+
+    Best-effort — a failure here must not fail the dispatch that already succeeded.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _recent_dispatches[campaign_id] = now_iso
+    try:
+        _get_ddb().update_item(
+            TableName=_ACTIVE_CAMPAIGNS_TABLE,
+            Key={
+                "pk": {"S": f"QUEUE#{queue_arn}"},
+                "sk": {"S": f"CAMPAIGN#{campaign_id}"},
+            },
+            UpdateExpression="SET lastDispatchedAt = :now",
+            ExpressionAttributeValues={":now": {"S": now_iso}},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record lastDispatchedAt for campaign_id=%s: %s",
+            campaign_id,
+            type(exc).__name__,
+        )
+        _emit_metric("LastDispatchedAtWriteFailed")
 
 
 def _process_record(record: dict) -> None:
@@ -246,6 +304,7 @@ def _process_record(record: dict) -> None:
             correlation_id,
             campaign_id,
         )
+        _record_dispatch(matched_queue_arn, campaign_id)
     except Exception:
         lock.release(agent_arn)
         raise

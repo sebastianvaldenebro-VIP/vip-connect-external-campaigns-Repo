@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import os
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -2132,6 +2132,35 @@ def test_start_one_campaign_redis_rebuilding_leaves_queued():
     )
 
 
+# Bug: _start_one_campaign's segment-retry path logs via stdlib `logger`, discarded
+# silently per S14-A (root-caused 2026-08-27, CT campaign investigation) — the sibling
+# _prestart_next_bucket already migrated the identical retry logic to _slog.
+
+
+def test_start_one_campaign_empty_segment_retry_uses_slog_not_stdlib_logger():
+    """The empty-segment retry path must log via _slog so it survives to CloudWatch —
+    stdlib `logger` calls here are discarded per the known S14-A root-logger filter,
+    which is exactly why today's CT investigation had no log trail and needed
+    DynamoDB archaeology instead."""
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    with (
+        patch(
+            "executor._create_segment",
+            side_effect=executor._EmptySegmentError("No leads"),
+        ),
+        patch("executor._slog") as mock_slog,
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    mock_slog.warn.assert_called_once()
+    assert mock_slog.warn.call_args.args[0] == "start_one_campaign_empty_segment_retry"
+
+
 def test_start_one_campaign_quota_exceeded_reverts_to_queued():
     """ServiceQuotaExceededException from Connect must revert to 'queued', not 'error'.
 
@@ -2182,6 +2211,39 @@ def test_start_one_campaign_throttle_reverts_to_queued():
     assert cs["status"] == "queued", "Throttle must revert to queued for retry"
 
 
+# Bug: a 4th revert-to-queued path (ClientError throttle/quota, above) never
+# reset reconcileRetries — same sticky-field masking risk as BD-020, just a
+# path BD-020 missed (root-caused 2026-08-27, second adversarial review round).
+
+
+def test_start_one_campaign_throttle_resets_reconcile_retries():
+    """A throttle/quota revert to queued must clear reconcileRetries too —
+    otherwise a stale value from an earlier, unrelated empty-segment retry
+    cycle survives into this revert and can mask a genuinely stuck campaign
+    as legitimately waiting."""
+    import executor
+    from botocore.exceptions import ClientError
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    cs["reconcileRetries"] = 3  # stale, from an earlier finished retry cycle
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    throttle_exc = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "throttled"}},
+        "CreateCampaign",
+    )
+    with (
+        patch("executor._create_segment", return_value=("seg", "arn:seg")),
+        patch("executor._create_and_start_campaign", side_effect=throttle_exc),
+        patch("executor._notify_sns"),
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "queued"
+    assert cs["reconcileRetries"] == 0
+
+
 def test_start_one_campaign_succeeds_when_segment_already_existed():
     """Campaign must start successfully when the segment was orphaned by a prior crashed Lambda.
 
@@ -2214,6 +2276,124 @@ def test_start_one_campaign_succeeds_when_segment_already_existed():
     )
     assert cs["segmentName"] == "11-5-26-NY-NL-2-1953"
     assert cs["connectCampaignId"] == "conn-1"
+
+
+# ── native/branded queue collision alert ───────────────────────────────────────
+#
+# Alert-only, one-directional by design: a native campaign starting checks
+# VipActiveBrandedCampaigns (indexed by queue ARN) for an already-active branded
+# campaign on the same Connect queue. The reverse (branded checking for an
+# already-active native campaign) has no equivalent cheap/indexed lookup and is
+# out of scope — see docs/BUGLOG.md. Never blocks or alters the campaign start.
+
+
+def test_start_one_campaign_native_alerts_when_branded_active_on_same_queue():
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    mock_ddb = MagicMock()
+    mock_ddb.query.return_value = {
+        "Items": [{"campaignId": {"S": "bc-1"}}]
+    }
+
+    with (
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
+        patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
+        patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
+        patch("executor._account_id", return_value="123456789012"),
+        patch("executor._get_ddb_client", return_value=mock_ddb),
+        patch("executor._notify_sns") as mock_notify,
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "running", "Collision alert must never block the native start"
+    mock_ddb.query.assert_called_once()
+    call_kwargs = mock_ddb.query.call_args.kwargs
+    assert call_kwargs["ExpressionAttributeValues"][":pk"] == {
+        "S": "QUEUE#arn:aws:connect:us-east-1:123456789012:instance/instance-1/queue/q-1"
+    }
+    mock_notify.assert_called_once()
+    _, notify_kwargs = mock_notify.call_args
+    assert "bc-1" in notify_kwargs.get("detail", notify_kwargs.get("attributes", {}).get("BrandedCampaignId", ""))
+
+
+def test_start_one_campaign_native_no_alert_when_no_branded_active():
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    mock_ddb = MagicMock()
+    mock_ddb.query.return_value = {"Items": []}
+
+    with (
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
+        patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
+        patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
+        patch("executor._account_id", return_value="123456789012"),
+        patch("executor._get_ddb_client", return_value=mock_ddb),
+        patch("executor._notify_sns") as mock_notify,
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "running"
+    mock_notify.assert_not_called()
+
+
+def test_start_one_campaign_native_skips_collision_check_when_table_not_configured():
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    mock_ddb = MagicMock()
+
+    with (
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
+        patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", ""),
+        patch("executor._get_ddb_client", return_value=mock_ddb),
+        patch("executor._notify_sns") as mock_notify,
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "running"
+    mock_ddb.query.assert_not_called()
+    mock_notify.assert_not_called()
+
+
+def test_start_one_campaign_native_collision_check_query_error_never_blocks_start():
+    import executor
+
+    bucket = _bucket_def("b0", [_campaign_def("c0")])
+    cs = _campaign_state("c0", "queued")
+    run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+    mock_ddb = MagicMock()
+    mock_ddb.query.side_effect = RuntimeError("ProvisionedThroughputExceeded")
+
+    with (
+        patch("executor._create_segment", return_value=("seg-1", "seg-arn-1")),
+        patch("executor._create_and_start_campaign", return_value=("conn-1", "camp-name")),
+        patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
+        patch("executor.CONNECT_INSTANCE_ID", "instance-1"),
+        patch("executor._account_id", return_value="123456789012"),
+        patch("executor._get_ddb_client", return_value=mock_ddb),
+        patch("executor._notify_sns") as mock_notify,
+    ):
+        executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+    assert cs["status"] == "running", (
+        "A failed collision check must never prevent the native campaign from starting"
+    )
+    mock_notify.assert_not_called()
 
 
 # ── skip_campaign ─────────────────────────────────────────────────────────────
@@ -2812,6 +2992,71 @@ def test_activate_warming_bucket_cleans_orphan_on_concurrent_write():
 
     mock_sched.assert_called_once()
     mock_delete.assert_called_once_with("sched-orphan")
+
+
+# Bug: reconcileRetries is a sticky signal meaning "mid empty-segment retry"
+# (see _bucket_has_only_legitimate_waits) but several unrelated queued-revert
+# paths left it untouched, so a stale value from an earlier, already-finished
+# retry cycle could mask a genuinely crashed/stuck campaign as "legitimately
+# waiting" (root-caused 2026-08-27, adversarial code review).
+
+
+def test_activate_warming_bucket_resets_reconcile_retries_on_error_recovery():
+    """The error->queued pre-warm-failure recovery must clear reconcileRetries."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "error")
+    cs["reconcileRetries"] = 3  # stale, from an earlier finished retry cycle
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="warming")])
+
+    with (
+        patch("executor.save_run"),
+        patch("executor._schedule_tick", return_value="sched-1"),
+        patch("executor._dispatch_ready_campaigns", return_value=False),
+    ):
+        executor._activate_warming_bucket(run, plan, 0)
+
+    assert cs["status"] == "queued"
+    assert cs["reconcileRetries"] == 0
+
+
+def test_reset_cascade_cancelled_children_resets_reconcile_retries():
+    """A parent_cancelled child reset to queued must have reconcileRetries
+    cleared too."""
+    import executor
+
+    child_def = _campaign_def("child", depends_on=["parent"])
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("parent"), child_def])])
+    child_cs = _campaign_state("child", "cancelled", exit_reason="parent_cancelled")
+    child_cs["reconcileRetries"] = 2
+    parent_cs = _campaign_state("parent", "cancelled")
+    run = _make_run(plan, [_bucket_state("b0", [parent_cs, child_cs])])
+
+    executor._reset_cascade_cancelled_children(run, plan, "parent")
+
+    assert child_cs["status"] == "queued"
+    assert child_cs["reconcileRetries"] == 0
+
+
+def test_dispatch_ready_campaigns_phase1_stale_claim_resets_reconcile_retries():
+    """A stale 'creating' claim (no connectCampaignId, >5min old) reverted to
+    queued must have reconcileRetries cleared too."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0", depends_on=["never"])])])
+    cs = _campaign_state("c0", "creating")
+    cs["creatingAt"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat()
+    cs["reconcileRetries"] = 4
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    with patch("executor.save_run"), patch("executor._start_one_campaign"):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert cs["status"] == "queued"
+    assert cs["reconcileRetries"] == 0
 
 
 # ── New tests for 26-issue bug sweep ─────────────────────────────────────────
@@ -3515,6 +3760,45 @@ def test_prestart_flags_bucket_with_no_dependency_still_queued():
     mock_boto.return_value.put_metric_data.assert_called_once()
 
 
+# ── Empty-segment retry is not "stuck" either (root-caused 2026-08-27) ────────
+# vip-plans-no-active-campaign-sustained false-paged on plan 1a29f025's frequent
+# re-triggers: each new run's first campaign normally takes 5-13 min to find a
+# non-empty Redis segment (_EmptySegmentError retry in _start_one_campaign,
+# reconcileRetries incremented each time), which is the exact BD-013 shape by
+# status alone ("queued", no dependsOn) but isn't a crashed tick — it's a live,
+# bounded retry. Confirmed against a real incident (2026-08-25, plan 6203a0b5):
+# a campaign sat "queued" for 70 min on this exact path before a matching lead
+# appeared and it started normally.
+
+
+def test_prestart_does_not_flag_bucket_mid_empty_segment_retry():
+    """A queued campaign with reconcileRetries set (mid _EmptySegmentError retry,
+    no dependsOn) must NOT alarm — it's actively retrying, not crashed."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    retrying_campaign = _campaign_state("c0", "queued")
+    retrying_campaign["reconcileRetries"] = 5
+    run = _make_run(
+        plan, [_bucket_state("b0", [retrying_campaign], status="running")]
+    )
+    now_utc = datetime(2026, 5, 8, 11, 20, tzinfo=timezone.utc)  # 80 min after bucket startedAt
+
+    with (
+        patch(
+            "executor.datetime",
+            **{"now.return_value": now_utc, "fromisoformat.side_effect": datetime.fromisoformat},
+        ),
+        patch("executor.list_plans", return_value=[plan]),
+        patch("executor.get_latest_run", return_value=run),
+        patch("boto3.client") as mock_boto,
+    ):
+        result = executor.prestart_check()
+
+    assert result["no_active_campaign"] == []
+    mock_boto.return_value.put_metric_data.assert_not_called()
+
+
 # ── PrewarmFailure metric (audit follow-up, 2026-08-21) ───────────────────────
 # RUNBOOKS.md/INTEGRATION_CONTRACTS.md documented an alarmable "PrewarmFailure"
 # metric for months; it was never implemented anywhere — every pre-warm failure
@@ -4020,6 +4304,38 @@ def test_force_start_resets_started_at():
     assert bs["status"] == "running"
 
 
+# Bug: a 5th revert-to-queued path (the warming-bucket sibling cleanup below)
+# never reset reconcileRetries — same sticky-field masking risk as BD-020,
+# just a path BD-020 missed (root-caused 2026-08-27, second adversarial
+# review round).
+
+
+def test_force_start_campaign_resets_sibling_reconcile_retries_in_warming_cleanup():
+    """The warming-bucket sibling cleanup in force_start_campaign must also
+    clear reconcileRetries on the siblings it reverts to queued."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0"), _campaign_def("c1")])])
+    target_cs = _campaign_state("c0", "queued")
+    sibling_cs = _campaign_state("c1", "warming")
+    sibling_cs["reconcileRetries"] = 2  # stale, from an earlier finished retry cycle
+    run = _make_run(
+        plan, [_bucket_state("b0", [target_cs, sibling_cs], status="warming")]
+    )
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor.save_run"),
+        patch("executor._schedule_tick", return_value="sched-1"),
+        patch("executor._start_one_campaign"),
+        patch("executor._reset_cascade_cancelled_children"),
+    ):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    assert sibling_cs["status"] == "queued"
+    assert sibling_cs["reconcileRetries"] == 0
+
+
 # Bug: force_start Phase 1 must clear connectCampaignId to prevent duplicate Connect campaigns
 
 
@@ -4066,6 +4382,51 @@ def test_force_start_clears_connect_campaign_id_in_phase1_save():
     )
     assert phase1_save["segmentArn"] is None
     assert phase1_save["segmentName"] is None
+
+
+# Bug: force_start Phase 1 must reset reconcileRetries — otherwise manual force-starts
+# consume the same limited empty-segment retry budget as automatic ticks, and once a
+# prior run of attempts exhausts it, every subsequent force-start is an instant
+# skipped_empty no-op with zero real retries left (root-caused 2026-08-27, CT campaign).
+
+
+def test_force_start_resets_reconcile_retries_in_phase1_save():
+    """Phase 1 claim save must reset reconcileRetries to 0.
+
+    A manual force-start is a deliberate fresh attempt — it must not inherit a
+    retry count left over from earlier automatic or manual attempts, or it can
+    exhaust reconcile_retry_limit and cancel with skipped_empty before ever
+    checking whether the segment is populated on this attempt.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "cancelled", exit_reason="skipped_empty")
+    cs["reconcileRetries"] = 5
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    saved_states: list[dict] = []
+
+    def capture_save(r):
+        import copy
+
+        saved_states.append(copy.deepcopy(r["bucketStates"][0]["campaignStates"][0]))
+
+    with (
+        patch("executor.get_run", return_value=run),
+        patch("executor.save_run", side_effect=capture_save),
+        patch("executor._safe_stop_campaign"),
+        patch("executor._safe_delete_campaign"),
+        patch("executor._start_one_campaign"),
+        patch("executor._reset_cascade_cancelled_children"),
+    ):
+        executor.force_start_campaign("plan-1", "run-1", 0, 0)
+
+    phase1_save = saved_states[0]
+    assert phase1_save["reconcileRetries"] == 0, (
+        "Phase 1 must reset reconcileRetries so a manual force-start gets a fresh "
+        "empty-segment retry budget instead of inheriting a previously exhausted one"
+    )
 
 
 # S10-F: force_start_campaign Phase-1 save rolls back a just-created schedule
@@ -5140,7 +5501,7 @@ class TestTickBrandedPoll:
         }])
         run = {"planId": "p-1", "runId": "r-1", "status": "running",
                "bucketStates": [{"status": "running", "campaignStates": [cs],
-                                  "startedAt": datetime.utcnow().isoformat()}]}
+                                  "startedAt": datetime.now(timezone.utc).isoformat()}]}
         plan = {"planId": "p-1", "buckets": [bucket]}
         return run, plan, cs
 
@@ -5187,6 +5548,83 @@ class TestTickBrandedPoll:
         tick("p-1", "r-1", 0)  # must not raise
 
         assert cs["status"] == "running"  # unchanged on poll error
+
+    # Bug: branded campaigns ignore run_duration_minutes entirely (root-caused
+    # 2026-08-27) — the telephony branch force-stops on elapsed > duration+2 min
+    # (see tick's connectCampaignId branch), but the branded elif never checked
+    # elapsed time at all, only queue-drain. A branded campaign configured for
+    # 45 min ran 107 min today until a human force-finished it, abandoning 994
+    # of 1085 seeded contacts as EXPIRED.
+
+    def test_force_stops_branded_when_duration_exceeded(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
+        cs["startedAt"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=50)
+        ).isoformat()
+        mocker.patch("executor._count_branded_queue", return_value=12)  # still has pending
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor._advance_bucket")
+        mocker.patch("executor._fire_campaign_chains")
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "expired"
+        assert cs["exitReason"] == "expired"
+        assert cs.get("completedAt") is not None
+        stop.assert_called_once_with(cs)
+
+    def test_branded_within_duration_does_not_force_stop(self, mocker):
+        run, plan, cs = self._run_with_running_branded()
+        plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
+        cs["startedAt"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        ).isoformat()
+        mocker.patch("executor._count_branded_queue", return_value=12)
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "running"
+        stop.assert_not_called()
+
+    # Bug: duration was checked BEFORE polling the queue, so a campaign that
+    # genuinely finished (queue drained) in the same tick its duration was
+    # exceeded got marked expired/ABORTED instead of completed (root-caused
+    # 2026-08-27, adversarial code review).
+
+    def test_branded_queue_drained_same_tick_duration_exceeded_completes_not_expires(
+        self, mocker
+    ):
+        """count==0 must win over an exceeded duration — the campaign finished
+        on its own; it must not be misreported as force-stopped/ABORTED."""
+        run, plan, cs = self._run_with_running_branded()
+        plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
+        cs["startedAt"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=50)
+        ).isoformat()
+        mocker.patch("executor._count_branded_queue", return_value=0)  # drained
+        stop = mocker.patch("executor._stop_branded_campaign")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.get_run", return_value=run)
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor._advance_bucket")
+        mocker.patch("executor._fire_campaign_chains")
+
+        from executor import tick
+        tick("p-1", "r-1", 0)
+
+        assert cs["status"] == "completed"
+        assert cs["exitReason"] == "queue_drained"
+        stop.assert_called_once_with(cs)
 
 
 class TestAbortStopCallsStopBranded:
@@ -5872,3 +6310,71 @@ class TestNormalizePhoneE164:
         """
         from executor import _normalize_phone_e164
         assert _normalize_phone_e164("11347555123") is None
+
+
+# ── _create_segment — maxLeadAgeMinutes → createdAt GTE rule (2026-08-27) ────
+#
+# Calls the real executor._max_age_cutoff directly (not a local mirror) — it's
+# a pure module-level function with zero vip_shared dependency, so importing
+# it doesn't collide with other test modules' vip_shared MagicMock stubs.
+#
+# Regression (adversarial review, 2026-08-27): campaigns read back from a
+# run's DynamoDB planSnapshot come back as decimal.Decimal (store._run_from_item
+# never normalizes planSnapshot the way _plan_from_item normalizes buckets),
+# and timedelta() raises TypeError on Decimal. This broke every real dispatch
+# path except the first campaign of a freshly-started run. The Decimal case
+# below is the regression test that would have caught it.
+
+
+class TestMaxLeadAgeRule:
+    def test_no_cutoff_when_none(self):
+        from executor import _max_age_cutoff
+        assert _max_age_cutoff(None, datetime.now(timezone.utc)) is None
+
+    def test_no_cutoff_when_zero(self):
+        from executor import _max_age_cutoff
+        assert _max_age_cutoff(0, datetime.now(timezone.utc)) is None
+
+    def test_no_cutoff_when_negative(self):
+        """A negative value must not produce a cutoff in the future — that
+        would silently match zero leads (empty_segment) instead of erroring.
+        """
+        from executor import _max_age_cutoff
+        assert _max_age_cutoff(-5, datetime.now(timezone.utc)) is None
+
+    def test_decimal_from_dynamodb_does_not_raise(self):
+        """Regression: boto3's Table resource deserializes DynamoDB Number
+        attributes as decimal.Decimal, not int. timedelta() rejects Decimal
+        with TypeError — this must be cast, not passed through raw.
+        """
+        from decimal import Decimal
+
+        from executor import _max_age_cutoff
+        now = datetime(2026, 8, 27, 14, 30, 0, 123000, tzinfo=timezone.utc)
+        assert _max_age_cutoff(Decimal(15), now) == "2026-08-27T14:15:00.123Z"
+
+    def test_cutoff_format_matches_redis_created_at(self):
+        from executor import _max_age_cutoff
+        now = datetime(2026, 8, 27, 14, 30, 0, 123000, tzinfo=timezone.utc)
+        assert _max_age_cutoff(15, now) == "2026-08-27T14:15:00.123Z"
+
+    def test_lead_created_within_window_is_gte_cutoff(self):
+        from executor import _max_age_cutoff
+        cutoff = _max_age_cutoff(
+            15, datetime(2026, 8, 27, 14, 30, 0, 0, tzinfo=timezone.utc)
+        )
+        assert "2026-08-27T14:20:00.000Z" >= cutoff
+
+    def test_lead_older_than_window_is_not_gte_cutoff(self):
+        from executor import _max_age_cutoff
+        cutoff = _max_age_cutoff(
+            15, datetime(2026, 8, 27, 14, 30, 0, 0, tzinfo=timezone.utc)
+        )
+        assert not ("2026-08-27T14:00:00.000Z" >= cutoff)
+
+    def test_lead_exactly_at_cutoff_is_gte_cutoff(self):
+        from executor import _max_age_cutoff
+        cutoff = _max_age_cutoff(
+            15, datetime(2026, 8, 27, 14, 30, 0, 0, tzinfo=timezone.utc)
+        )
+        assert "2026-08-27T14:15:00.000Z" >= cutoff

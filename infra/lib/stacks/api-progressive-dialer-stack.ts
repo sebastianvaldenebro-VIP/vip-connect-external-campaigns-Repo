@@ -7,6 +7,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as events from 'aws-cdk-lib/aws-events';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
 
@@ -303,6 +304,35 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       });
     }
 
+    // ── EventBridge: Kickstart sweep (timer backstop) ────────────────────
+    // Fixes the "no re-arm" gap: dispatch is otherwise 100% event-driven (stream
+    // INSERT + Kinesis STATE_CHANGE). A campaign whose calls mostly land on
+    // voicemail never cycles an agent through a state change, so no event ever
+    // re-triggers dispatch even with PENDING contacts and free agents on hand.
+    // This rule invokes the SAME kickstart Lambda on a schedule; lambda_handler
+    // branches on event.source === 'aws.events' to run the sweep path (scans all
+    // active campaigns) instead of the stream-record path (one campaign).
+    //
+    // imported — confirmed by a failed deploy attempt (2026-08-27): cfn-exec-role
+    // lacks events:DescribeRule, so CloudFormation cannot create/manage an
+    // AWS::Events::Rule here (same permission-boundary class as the other
+    // imported roles/functions/log groups in this stack). Rule pre-created via CLI:
+    //   aws events put-rule --name vip-progressive-dialer-kickstart-sweep \
+    //     --schedule-expression "rate(2 minutes)" --state ENABLED \
+    //     --region us-east-1 --profile production
+    //   aws lambda add-permission --function-name vip-admin-progressive-dialer-kickstart \
+    //     --statement-id AllowEventBridgeSweep --action lambda:InvokeFunction \
+    //     --principal events.amazonaws.com \
+    //     --source-arn arn:aws:events:us-east-1:165505826690:rule/vip-progressive-dialer-kickstart-sweep \
+    //     --region us-east-1 --profile production
+    //   aws events put-targets --rule vip-progressive-dialer-kickstart-sweep \
+    //     --targets "Id=1,Arn=arn:aws:lambda:us-east-1:165505826690:function:vip-admin-progressive-dialer-kickstart" \
+    //     --region us-east-1 --profile production
+    const sweepRule = events.Rule.fromEventRuleArn(
+      this, 'KickstartSweepRule',
+      `arn:aws:events:${this.region}:${this.account}:rule/vip-progressive-dialer-kickstart-sweep`,
+    );
+
     // ── Alarms (created via CLI — cfn-exec-role lacks cloudwatch:PutMetricAlarm) ──
     // Run infra/scripts/create-progressive-dialer-alarms.sh after stack deploys.
 
@@ -319,5 +349,6 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'CallerFunctionArn', { value: callerFn.functionArn });
     new cdk.CfnOutput(this, 'SeederFunctionArn', { value: this.seederFunction.functionArn });
     new cdk.CfnOutput(this, 'KickstartFunctionArn', { value: kickstartFn.functionArn });
+    new cdk.CfnOutput(this, 'KickstartSweepRuleArn', { value: sweepRule.ruleArn });
   }
 }

@@ -17,6 +17,7 @@ from builders import (  # noqa: E402
     build_segment_groups,
     build_segment_name,
     build_campaign_params,
+    campaign_to_segment_filters,
     get_all_location_groups,
     locations_for_state_codes,
     resolve_campaign_flow_arn,
@@ -226,6 +227,85 @@ def test_segment_name_contains_state_code():
     assert "NY" in name
 
 
+# Regression (2026-08-27, adversarial review round 2): two campaigns sharing
+# state+groups but differing only in maxLeadAgeMinutes used to collide on an
+# identical segment name, and _create_segment's "already exists" recovery
+# path silently reused whichever campaign's segment won the create race —
+# dialing the wrong lead set with no error.
+
+
+def test_segment_name_differs_for_campaigns_with_different_max_lead_age():
+    bucket = {"name": "b1"}
+    campaign_a = {
+        "id": "c-a", "states": ["NY"], "groups": ["New Lead / New Lead"],
+        "maxLeadAgeMinutes": 10,
+    }
+    campaign_b = {
+        "id": "c-b", "states": ["NY"], "groups": ["New Lead / New Lead"],
+        "maxLeadAgeMinutes": None,
+    }
+    name_a = build_segment_name(bucket, campaign_a)
+    name_b = build_segment_name(bucket, campaign_b)
+    assert name_a != name_b
+
+
+def test_segment_name_stable_for_legacy_bucket_without_campaign():
+    """Legacy (v1) buckets have no per-campaign id — behavior must be unchanged."""
+    name = build_segment_name(_bucket(state=("NY",), groups=["New Lead / 1st Attempt"]))
+    assert "None" not in name
+
+
+# Regression (2026-08-27, adversarial review round 3): the round-2 campaign-id
+# disambiguator added up to 13 chars with no length budget, pushing realistic
+# multi-state/multi-attempt campaigns past AWS Customer Profiles'
+# SegmentDefinitionName hard limit (verified against botocore's service
+# model: max=64) — segment creation would fail for campaigns that worked
+# before that patch.
+
+
+def test_segment_name_never_exceeds_aws_64_char_limit():
+    campaign = {
+        "id": "campaign-id-with-a-very-long-descriptive-name-1234567890",
+        "states": ["SCA", "NCA", "CT", "MD", "NJ", "NY", "LI", "TX"],
+        "groups": [
+            "New Lead / 1st Attempt",
+            "No Show / 2nd Attempt",
+            "Cancellation / 3rd Attempt",
+            "Reschedule / 4th Attempt",
+        ],
+        "maxLeadAgeMinutes": 15,
+    }
+    name = build_segment_name({"name": "b1"}, campaign)
+    assert len(name) <= 64
+
+
+def test_segment_name_disambiguator_survives_truncation():
+    """The campaign-id disambiguator (its first 12 sanitized chars) must never
+    be the part that gets cut — losing it would silently reopen the collision
+    it exists to prevent. Uses ids that differ within the first 12 chars, and
+    enough states/groups (4 groups, not 2) to actually push the body past the
+    budget on any calendar date — verified: this fixture's body is 47 chars
+    against a ~37-38 char budget, so it genuinely exercises the truncation
+    branch, unlike a 2-group fixture which never reaches it.
+    """
+    shared_extra = {
+        "states": ["SCA", "NCA", "CT", "MD", "NJ", "NY", "LI", "TX"],
+        "groups": [
+            "New Lead / 1st Attempt",
+            "No Show / 2nd Attempt",
+            "Cancellation / 3rd Attempt",
+            "Reschedule / 4th Attempt",
+        ],
+    }
+    campaign_a = {"id": "campaign-a-" + "x" * 100, **shared_extra}
+    campaign_b = {"id": "campaign-b-" + "x" * 100, **shared_extra}
+    name_a = build_segment_name({"name": "b1"}, campaign_a)
+    name_b = build_segment_name({"name": "b1"}, campaign_b)
+    assert name_a != name_b
+    assert len(name_a) <= 64
+    assert len(name_b) <= 64
+
+
 # ── build_campaign_params ─────────────────────────────────────────────────────
 
 
@@ -428,3 +508,18 @@ def test_resolve_campaign_flow_arn_returns_none_when_create_and_retry_both_fail(
     with patch("builders.boto3.client", return_value=fake_client):
         arn = resolve_campaign_flow_arn(["PA"], "instance-id")
     assert arn is None
+
+
+# ── campaign_to_segment_filters — maxLeadAgeMinutes passthrough (2026-08-28) ───
+
+
+def test_campaign_to_segment_filters_passes_through_max_lead_age_minutes():
+    campaign = {"states": ["NY"], "groups": ["New Lead / New Lead"], "maxLeadAgeMinutes": 15}
+    filters = campaign_to_segment_filters(campaign)
+    assert filters["maxLeadAgeMinutes"] == 15
+
+
+def test_campaign_to_segment_filters_max_lead_age_minutes_none_by_default():
+    campaign = {"states": ["NY"], "groups": ["New Lead / New Lead"]}
+    filters = campaign_to_segment_filters(campaign)
+    assert filters["maxLeadAgeMinutes"] is None

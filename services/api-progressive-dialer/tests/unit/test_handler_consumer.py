@@ -1,4 +1,5 @@
 import base64, json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -217,6 +218,198 @@ class TestGsiCampaignLookup:
 
         calls = [c.args[0] for c in queue.dequeue.call_args_list]
         assert calls == ["camp-high", "camp-low"]  # priority 0 first
+
+    # Bug: same-priority campaigns on a shared queue were pure FIFO-by-createdAt
+    # (root-caused 2026-08-27) — in production every campaign has priority=0, so
+    # the oldest campaign always won every single dispatch event for as long as
+    # it had any pending contact, fully starving newer campaigns on that queue.
+
+    def test_prefers_least_recently_dispatched_campaign_at_same_priority(self, mocker):
+        """Among same-priority campaigns, the one that waited longest since its last
+        successful dispatch goes first — not simply the oldest by createdAt."""
+        recently_served = self._make_campaign_item(
+            "camp-recent", priority=0, created_at="2026-06-18T09:00:00"
+        )
+        recently_served["lastDispatchedAt"] = {"S": "2026-08-27T15:59:00+00:00"}
+        never_served = self._make_campaign_item(
+            "camp-waiting", priority=0, created_at="2026-06-18T10:00:00"
+        )
+        # camp-waiting is newer by createdAt but has never been dispatched to —
+        # old FIFO-by-createdAt logic would try camp-recent first; fairness must not.
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {
+            "Items": [recently_served, never_served]
+        }
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={
+                "agent_arn": "arn::agent/a1",
+                "queue_arn": "arn::queue/q1",
+            },
+        )
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.return_value = None  # both empty — just verify order
+
+        import handler_consumer
+        import base64
+        import json
+
+        record = {
+            "kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}
+        }
+        handler_consumer._process_record(record)
+
+        calls = [c.args[0] for c in queue.dequeue.call_args_list]
+        assert calls == ["camp-waiting", "camp-recent"]
+
+    def test_records_last_dispatched_at_on_the_winning_campaign(self, mocker):
+        """After a successful dispatch, the winning campaign's active-campaign
+        record must be updated with lastDispatchedAt so the next event on this
+        queue rotates to a different campaign instead of re-picking this one."""
+        from campaign_queue import Contact
+
+        campaign_item = self._make_campaign_item("camp-1")
+        ddb = mocker.patch("handler_consumer._get_ddb").return_value
+        ddb.query.return_value = {"Items": [campaign_item]}
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={
+                "agent_arn": "arn::agent/a1",
+                "queue_arn": "arn::queue/q1",
+            },
+        )
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.return_value = Contact(
+            campaign_id="camp-1",
+            contact_uuid="uuid-1",
+            sk="ts1#uuid-1",
+            phone="+15551234567",
+        )
+        mock_fo = mocker.MagicMock()
+        mock_fo.push.return_value = True
+        mocker.patch(
+            "handler_consumer.FirstOrionClient"
+        ).build_from_secret.return_value = mock_fo
+        mocker.patch("handler_consumer.boto3.client", return_value=mocker.MagicMock())
+
+        import handler_consumer
+        import base64
+        import json
+
+        record = {
+            "kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}
+        }
+        handler_consumer._process_record(record)
+
+        ddb.update_item.assert_called_once()
+        kwargs = ddb.update_item.call_args.kwargs
+        assert kwargs["Key"] == {
+            "pk": {"S": "QUEUE#arn::queue/q1"},
+            "sk": {"S": "CAMPAIGN#camp-1"},
+        }
+        assert "lastDispatchedAt" in kwargs["UpdateExpression"]
+
+    # Bug: _get_active_campaigns queries a GSI (always eventually-consistent in
+    # DynamoDB) immediately after _record_dispatch wrote lastDispatchedAt to the
+    # base table — within the SAME Lambda invocation processing several Kinesis
+    # records sequentially, a later record's query can still see the pre-write
+    # (stale) value and re-pick the campaign that just won, reproducing the
+    # exact FIFO starvation BD-018 fixed (root-caused 2026-08-27, adversarial
+    # code review).
+
+    def test_get_active_campaigns_uses_locally_recorded_dispatch_despite_gsi_lag(
+        self, mocker
+    ):
+        """After _record_dispatch() writes locally, a later _get_active_campaigns()
+        call in the SAME warm invocation must treat that campaign as just-served
+        even if the GSI read hasn't caught up yet."""
+        stale_camp1 = self._make_campaign_item(
+            "camp-1", created_at="2026-06-18T09:00:00"
+        )
+        camp2 = self._make_campaign_item("camp-2", created_at="2026-06-18T09:30:00")
+        camp2["lastDispatchedAt"] = {"S": "2026-08-27T15:00:00+00:00"}
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {
+            "Items": [stale_camp1, camp2]
+        }
+
+        import handler_consumer
+
+        # Fixed, controlled clock — round-2 fix: the test previously relied on
+        # the real wall clock being later than camp2's hardcoded lastDispatchedAt,
+        # a time-bomb that only passed because this sandbox's date happens to be
+        # 2026-08-27 (root-caused 2026-08-27, second adversarial review round).
+        fixed_now = datetime(2026, 8, 27, 15, 5, tzinfo=timezone.utc)
+        mocker.patch("handler_consumer.datetime").now.return_value = fixed_now
+
+        handler_consumer._record_dispatch("arn::queue/q1", "camp-1")
+
+        result = handler_consumer._get_active_campaigns("arn::queue/q1")
+        assert [c["campaignId"]["S"] for c in result] == ["camp-2", "camp-1"]
+
+    # Bug: _recent_dispatches is keyed only by campaign_id, with no TTL/eviction
+    # and no awareness of the record's own generation. brandedCampaignId is
+    # deterministic per (planId, runId, bucket_index, campaign_index) and is
+    # REUSED verbatim across a stop/force-restart within the same run — a warm
+    # container's stale pre-stop timestamp could otherwise be resurrected via
+    # max(gsi_value, local_value) against the restarted campaign's fresh
+    # DynamoDB item, inverting the fairness ordering BD-018 built (root-caused
+    # 2026-08-27, second adversarial review round).
+
+    def test_local_cache_ignored_when_older_than_campaigns_own_created_at(self, mocker):
+        """A local dispatch timestamp from BEFORE a stop/restart must not be
+        trusted for the restarted (same campaignId, fresh createdAt) record —
+        it belongs to a prior generation of that campaign. A stale value that
+        old would otherwise make the restarted campaign look like it has been
+        waiting even longer than it really has, skewing the ordering against
+        a genuinely-longer-waiting sibling."""
+        restarted_camp = self._make_campaign_item(
+            "camp-1", created_at="2026-08-27T16:00:00+00:00"
+        )
+        never_served_camp = self._make_campaign_item(
+            "camp-2", created_at="2026-08-27T15:00:00+00:00"
+        )
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {
+            "Items": [restarted_camp, never_served_camp]
+        }
+
+        import handler_consumer
+
+        # Stale — from the prior generation, well before camp-1's restart.
+        handler_consumer._recent_dispatches["camp-1"] = "2026-08-27T14:00:00+00:00"
+
+        result = handler_consumer._get_active_campaigns("arn::queue/q1")
+
+        # camp-2 has been waiting since 15:00 (never served) — genuinely
+        # longer than camp-1's true wait since its 16:00 restart — so camp-2
+        # must go first. The stale 14:00 cache entry must not let camp-1
+        # jump ahead of it.
+        assert [c["campaignId"]["S"] for c in result] == ["camp-2", "camp-1"]
+
+    def test_record_dispatch_emits_metric_when_update_fails(self, mocker):
+        """A failed lastDispatchedAt write must be visible via a metric, not
+        just a warning log — otherwise a lost IAM permission silently degrades
+        the fairness fix back to pure FIFO with no operational signal."""
+        mock_ddb = mocker.patch("handler_consumer._get_ddb").return_value
+        mock_ddb.update_item.side_effect = RuntimeError("AccessDeniedException")
+        mock_cw = mocker.patch("handler_consumer._get_cw").return_value
+
+        import handler_consumer
+
+        handler_consumer._record_dispatch("arn::queue/q1", "camp-1")
+
+        mock_cw.put_metric_data.assert_called_once()
+        metric_names = {
+            m["MetricName"]
+            for m in mock_cw.put_metric_data.call_args.kwargs["MetricData"]
+        }
+        assert "LastDispatchedAtWriteFailed" in metric_names
 
     def test_no_active_campaigns_skips_dispatch(self, mocker):
         mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {"Items": []}

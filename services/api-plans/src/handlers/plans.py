@@ -334,6 +334,15 @@ def clone_from_template(event: dict, path_params: dict) -> dict:
         "isTemplate": False,
         "isDefault": False,
     }
+
+    branded_errors = _validate_plan_body(new_plan)
+    if branded_errors:
+        return json_response(
+            400,
+            {"error": {"code": "VALIDATION_ERROR", "messages": branded_errors}},
+        )
+    _validate_dag(new_plan["buckets"])
+
     plan = store.put_plan(new_plan)
 
     build_audit().record(
@@ -377,13 +386,54 @@ def _validate_dag(buckets: list[dict]) -> None:
                     f"Bucket {bi} duration_minutes={duration} is too short — "
                     f"must be >= {_MIN_TIME_BASED_DURATION} to allow pre-start warming"
                 )
-    # Build a flat map of campaign_id → bucket_index
+    # Build a flat map of campaign_id → bucket_index. Ids must be unique across
+    # the whole plan — build_segment_name uses a campaign's id as a
+    # disambiguator to prevent same-bucket campaigns from colliding on an
+    # identical segment name (and silently reusing each other's lead set); a
+    # duplicate id defeats that guarantee (e.g. via _regenerate_bucket_ids
+    # collapsing two source campaigns onto the same new id when cloning).
     campaign_bucket: dict[str, int] = {}
     for bi, bucket in enumerate(buckets):
         for campaign in bucket.get("campaigns", []):
             cid = campaign.get("id")
-            if cid:
-                campaign_bucket[cid] = bi
+            if not cid:
+                continue
+            if cid in campaign_bucket:
+                raise ValueError(
+                    f"Duplicate campaign id '{cid}' found in bucket "
+                    f"{campaign_bucket[cid]} and bucket {bi} — campaign ids "
+                    f"must be unique across the whole plan"
+                )
+            campaign_bucket[cid] = bi
+
+    # Separately: build_segment_name's disambiguator is a LOSSY projection of
+    # id/name (sanitized, truncated to 12 chars) — two campaigns with distinct
+    # raw ids can still collapse onto the same projection (or, if neither has
+    # an id nor a name, onto no disambiguator at all), reopening the exact
+    # segment-name collision the duplicate-id check above cannot catch by
+    # itself. Validate the same token build_segment_name actually consumes,
+    # so the two can never drift apart again.
+    seen_tokens: dict[str, tuple[int, str]] = {}
+    for bi, bucket in enumerate(buckets):
+        for campaign in bucket.get("campaigns", []):
+            token = builders.campaign_name_token(campaign)
+            label = campaign.get("id") or campaign.get("name") or "(unnamed)"
+            if not token:
+                raise ValueError(
+                    f"Campaign '{label}' in bucket {bi} has neither an id nor "
+                    f"a name — at least one is required to build a unique "
+                    f"segment name"
+                )
+            if token in seen_tokens:
+                prev_bi, prev_label = seen_tokens[token]
+                raise ValueError(
+                    f"Campaign '{label}' in bucket {bi} and campaign "
+                    f"'{prev_label}' in bucket {prev_bi} produce the same "
+                    f"segment-name disambiguator (first 12 sanitized chars of "
+                    f"id/name) — campaign ids/names must be distinct within "
+                    f"that prefix"
+                )
+            seen_tokens[token] = (bi, label)
 
     all_ids = set(campaign_bucket)
 
@@ -502,6 +552,39 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
     return errors
 
 
+_ALLOWED_MAX_LEAD_AGE_MINUTES = {None, 10, 15, 20, 25, 30, 35}
+
+
+def _validate_max_lead_age(campaign: dict, bucket: dict, bucket_name: str, ci: int) -> list[str]:
+    """Return validation errors for the maxLeadAgeMinutes lead-age filter.
+
+    Mirrors executor._create_segment's filter-source selection exactly: a
+    legacy-bucket campaign (campaign["_legacyBucket"] truthy) reads
+    maxLeadAgeMinutes from bucket["segmentFilters"], not from the campaign
+    dict — validating only the campaign-level field would let a
+    client-supplied "_legacyBucket": true flag bypass this check entirely.
+
+    The frontend <select> only emits None/10/15/20/25/30/35, but that's a
+    client-side constraint, not a trust boundary — a direct API call or a
+    stale/duplicated plan record could carry any value.
+    """
+    if campaign.get("_legacyBucket"):
+        val = bucket.get("segmentFilters", {}).get("maxLeadAgeMinutes")
+    else:
+        val = campaign.get("maxLeadAgeMinutes")
+    try:
+        is_allowed = val in _ALLOWED_MAX_LEAD_AGE_MINUTES
+    except TypeError:
+        # Unhashable JSON type (list/dict) — parse_body enforces no schema,
+        # so this is reachable from a raw request body, not just internal data.
+        is_allowed = False
+    if not is_allowed:
+        prefix = f"bucket '{bucket_name}' campaign[{ci}]"
+        msg = f"{prefix}: maxLeadAgeMinutes must be omitted/null or one of 10,15,20,25,30,35 (got {val!r})"
+        return [msg]
+    return []
+
+
 def _validate_plan_body(plan_body: dict) -> list[str]:
     """Validate plan body; return a list of error strings (empty means valid)."""
     errors: list[str] = []
@@ -516,6 +599,7 @@ def _validate_plan_body(plan_body: dict) -> list[str]:
                 errors.extend(
                     _validate_sms_campaign(campaign, bucket_name, ci)
                 )
+            errors.extend(_validate_max_lead_age(campaign, bucket, bucket_name, ci))
     return errors
 
 

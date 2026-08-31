@@ -713,6 +713,31 @@ function CampaignCard({
               )}
             </div>
 
+            {/* Max lead age — only include leads created within this many minutes */}
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">Max lead age</label>
+              <select
+                value={campaign.maxLeadAgeMinutes ?? ''}
+                onChange={(e) =>
+                  onChange({
+                    ...campaign,
+                    maxLeadAgeMinutes: e.target.value ? Number(e.target.value) : undefined,
+                  })
+                }
+                className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+              >
+                <option value="">None</option>
+                {[10, 15, 20, 25, 30, 35].map((minutes) => (
+                  <option key={minutes} value={minutes}>
+                    {minutes} min
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-gray-400">
+                Only include leads created within the selected window (Redis <code>createdAt</code>).
+              </p>
+            </div>
+
             {/* Pinned segment */}
             <div>
               <label className="block text-xs font-semibold text-gray-700 mb-1">Pinned segment</label>

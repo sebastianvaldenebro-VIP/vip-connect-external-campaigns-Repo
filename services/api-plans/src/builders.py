@@ -141,17 +141,47 @@ def campaign_to_segment_filters(campaign: dict) -> dict:
         "groups": groups,
         "attempts": [],
         "available": campaign.get("available") or "True",
+        "maxLeadAgeMinutes": campaign.get("maxLeadAgeMinutes"),
     }
 
 
 # ── Segment name building (mirrors buildAutoName in SegmentNew.tsx) ───────────
 
 
+# AWS Customer Profiles CreateSegmentDefinition's SegmentDefinitionName shape
+# is hard-capped at 64 chars (verified against botocore's service model:
+# max=64, pattern=^[a-zA-Z0-9_-]+$). Truncating post-hoc would risk cutting
+# off the campaign-id disambiguator itself, silently reopening the collision
+# it exists to prevent — so the variable-length state/attempts portion is
+# what gets trimmed, never the disambiguator or the HHMM suffix.
+_MAX_SEGMENT_NAME_LEN = 64
+
+
+def campaign_name_token(campaign: dict) -> str:
+    """The exact disambiguator token build_segment_name derives from a campaign.
+
+    Exposed so validation (handlers/plans.py._validate_dag) can enforce
+    uniqueness on the projection the segment name actually encodes — not just
+    the raw id — since two distinct ids can still collapse to the same
+    12-char sanitized token, and a campaign with neither id nor name yields
+    an empty (non-disambiguating) token.
+    """
+    raw = str(campaign.get("id") or campaign.get("name") or "")
+    return _sanitize_segment_name(raw)[:12] if raw else ""
+
+
 def build_segment_name(bucket: dict, campaign: dict | None = None) -> str:
-    """Build a unique segment name.
+    """Build a unique segment name, capped at AWS's 64-char hard limit.
 
     When called with a v2 campaign dict, derives state/attempts from the campaign.
     When called with a legacy bucket dict (no campaign), falls back to bucket.segmentFilters.
+
+    Includes the campaign's own id/name as a disambiguator: two campaigns in the
+    same bucket can share state+groups while differing in another per-campaign
+    filter (e.g. maxLeadAgeMinutes), and _create_segment's "already exists"
+    recovery path trusts the name to mean "same filters" — without this, two
+    such campaigns starting in the same clock minute would collide on an
+    identical name and silently reuse each other's lead set.
     """
     now = datetime.now(timezone.utc)
     d = str(now.day)
@@ -161,8 +191,10 @@ def build_segment_name(bucket: dict, campaign: dict | None = None) -> str:
 
     if campaign is not None:
         filters = campaign_to_segment_filters(campaign)
+        campaign_token = campaign_name_token(campaign)
     else:
         filters = bucket.get("segmentFilters", {})
+        campaign_token = ""
 
     state_codes = filters.get("state", [])
     states_part = "_".join(state_codes) if state_codes else "all"
@@ -173,8 +205,21 @@ def build_segment_name(bucket: dict, campaign: dict | None = None) -> str:
 
     hh = str(now.hour).zfill(2)
     mn = str(now.minute).zfill(2)
-    raw = f"{date_part}-{states_part}-{attempts_part}-{hh}{mn}"
-    return _sanitize_segment_name(raw)
+    suffix_parts = []
+    if campaign_token:
+        suffix_parts.append(campaign_token)
+    suffix_parts.append(f"{hh}{mn}")
+    suffix = "-".join(suffix_parts)
+
+    # Budget: date_part + "-" + body + "-" + suffix, where body is the only
+    # unbounded-length piece (states_part/attempts_part scale with how many
+    # states/groups a campaign targets).
+    reserved = len(date_part) + 1 + 1 + len(suffix)
+    budget = max(_MAX_SEGMENT_NAME_LEN - reserved, 1)
+    body = f"{states_part}-{attempts_part}"[:budget]
+
+    raw = f"{date_part}-{body}-{suffix}"
+    return _sanitize_segment_name(raw)[:_MAX_SEGMENT_NAME_LEN]
 
 
 def build_attempts_part(attempts: list[str]) -> str:
