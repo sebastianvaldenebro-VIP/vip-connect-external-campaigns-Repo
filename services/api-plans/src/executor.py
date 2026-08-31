@@ -990,6 +990,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _wh_end,
                 run_id,
             )
+            _record_plan_event(run, "window_closed", {"reason": "working_hours_cutoff"})
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "working_hours_cutoff"}
 
@@ -1003,12 +1004,14 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _loop_end,
                 run_id,
             )
+            _record_plan_event(run, "window_closed", {"reason": "loop_cutoff"})
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "loop_cutoff"}
 
     # Fallback hard-stop for non-looping plans stuck past midnight
     if _past_daily_cutoff(_now_utc()):
         logger.info("tick: past daily cutoff, force-finishing run %s", run_id)
+        _record_plan_event(run, "window_closed", {"reason": "daily_cutoff"})
         _force_finish_internal(run, plan)
         return {"ok": True, "reason": "daily_cutoff"}
 

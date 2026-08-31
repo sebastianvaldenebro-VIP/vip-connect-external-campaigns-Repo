@@ -6517,3 +6517,102 @@ class TestBucketCompletedAuditEvent:
             actor_email="system@api-plans-executor",
             extra={"bucketIndex": 0, "bucketName": "Cancellation/No Show", "reason": "time_expired"},
         )
+
+
+class TestWindowClosedAuditEvent:
+    """tick()'s 3 operating-window cutoffs each record a window_closed audit event
+    right before force-finishing the run. Instrumented in tick() itself (not inside
+    _force_finish_internal, which is shared with the operator-manual force_finish_run
+    path that already writes its own "force_finish" audit record)."""
+
+    def test_working_hours_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        plan["workingHours"] = {
+            "days": ["MON", "TUE", "WED", "THU", "FRI"],
+            "startTime": "08:00",
+            "endTime": "17:00",
+        }
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._now_cot_hhmm", return_value=17 * 60),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=False),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "working_hours_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "working_hours_cutoff"},
+        )
+
+    def test_loop_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        plan["loop"] = {"endTime": "17:00"}
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._now_cot_hhmm", return_value=17 * 60),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=False),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "loop_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "loop_cutoff"},
+        )
+
+    def test_daily_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=True),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "daily_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "daily_cutoff"},
+        )
