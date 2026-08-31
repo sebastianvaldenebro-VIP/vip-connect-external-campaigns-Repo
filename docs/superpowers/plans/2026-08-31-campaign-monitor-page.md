@@ -25,6 +25,7 @@ The page's "Main content" section becomes a 2-column grid on wide screens (bucke
 - Do not touch `services/` (backend) at all in this plan — everything needed already shipped in Plans B1/B2.
 - Do not restructure `CampaignCard`/`BucketSection`/`RunStatusBar` beyond what each task explicitly describes — these are large, already-working functions; add to them surgically.
 - Run `cd frontend && npx vitest run && npm run typecheck && npm run build` before and after each task. Baseline: whatever `main` currently reports (verify fresh — this plan doesn't know the exact count going in, unlike the backend plans, since frontend test count drifts with every merged plan this session).
+- **`@/components/ui` import-path collision (found during Task 1):** `frontend/src/components/ui.tsx` (old primitives: `Button`/`Card`/`Badge`/`Spinner`/etc.) and `frontend/src/components/ui/` (Plan A's new barrel: `StatusChip`/`ProgressBar`/`StepStrip`/`StatTile`/`Avatar`/`ActivityFeed`/`status`) both exist; TypeScript's module resolution silently picks the `.tsx` file over the directory for the bare `@/components/ui` path. Every task in this plan that needs a Plan A primitive imports it from its specific file (`@/components/ui/StatusChip`, `@/components/ui/StatTile`, `@/components/ui/ActivityFeed`, `@/components/ui/status`) — never from the bare `@/components/ui` path. Pre-existing imports of `Button`/`Spinner`/etc. from the bare path are correct as-is and must not be changed. This collision is a pre-existing repo issue (introduced when Plan A added `components/ui/` alongside the already-existing `components/ui.tsx`) — fixing the collision itself (e.g. merging or renaming) is out of this plan's scope.
 
 ---
 
@@ -140,7 +141,7 @@ Create `frontend/src/pages/reconcile.ts`:
 
 ```ts
 import type { CampaignState } from '@/lib/api';
-import type { StatusTone } from '@/components/ui';
+import type { StatusTone } from '@/components/ui/status';
 
 type Reconcile = CampaignState['reconcile'];
 
@@ -185,16 +186,18 @@ git commit -m "feat(frontend): type cs.reconcile and audit extra shapes, add rec
 - Modify: `frontend/src/pages/PlanDetail.tsx` (`CampaignCard`, currently lines 153-412)
 
 **Interfaces:**
-- Consumes: `reconcileTone`, `formatReconcile` from `./reconcile` (Task 1); `StatusChip` from `@/components/ui` (Plan A, already merged).
+- Consumes: `reconcileTone`, `formatReconcile` from `./reconcile` (Task 1); `StatusChip` from `@/components/ui/StatusChip` (Plan A, already merged).
+
+**Import path warning (found during Task 1):** `@/components/ui` is ambiguous in this repo — both `frontend/src/components/ui.tsx` (a file, the old primitives: `Button`/`Card`/`Badge`/etc.) and `frontend/src/components/ui/` (a directory, Plan A's new barrel: `StatusChip`/`ProgressBar`/`StepStrip`/`StatTile`/`Avatar`/`ActivityFeed`/`status`) exist side by side, and TypeScript's module resolution picks the `.tsx` file over the directory's `index.ts`, silently. `import { StatusChip } from '@/components/ui'` will fail to compile (`StatusChip` isn't exported from `ui.tsx`). Import Plan A's primitives from their specific file instead: `@/components/ui/StatusChip`, `@/components/ui/StatTile`, `@/components/ui/ActivityFeed`, `@/components/ui/status`, etc. Keep `Button`/`Spinner`/other pre-existing primitives imported from the bare `@/components/ui` exactly as before — that part still resolves correctly to `ui.tsx`, don't change those import lines.
 
 **Read this first:** `CampaignCard`'s current body, specifically where `TimingMeta` renders (currently the last line before the closing `</div>`, line 409) — the reconcile badge belongs right above it, after any delivery-type-specific block (branded/SMS), so it reads as "the last fact about this campaign before timing."
 
 - [ ] **Step 1: Add the import**
 
-In `frontend/src/pages/PlanDetail.tsx`, add to the existing `@/components/ui` import (currently `import { Button, Spinner } from '@/components/ui';`, line 5):
+In `frontend/src/pages/PlanDetail.tsx`, keep the existing `Button`/`Spinner` import from `@/components/ui` unchanged (line 5), and add a separate new import line for `StatusChip` from its specific file:
 
 ```tsx
-import { Button, Spinner, StatusChip } from '@/components/ui';
+import { StatusChip } from '@/components/ui/StatusChip';
 ```
 
 And add a new import line after the `buildChainMap` import (line 22):
@@ -328,7 +331,7 @@ Create `frontend/src/pages/AgentAvailabilityPanel.tsx`:
 import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
-import { StatTile } from '@/components/ui';
+import { StatTile } from '@/components/ui/StatTile';
 import { api, type AgentRosterEntry } from '@/lib/api';
 
 export type RoutingProfileAvailability = {
@@ -538,7 +541,7 @@ Create `frontend/src/pages/DayActivityFeed.tsx`:
 import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
-import { ActivityFeed, type ActivityFeedItem } from '@/components/ui';
+import { ActivityFeed, type ActivityFeedItem } from '@/components/ui/ActivityFeed';
 import { api, type AuditEntry } from '@/lib/api';
 
 import { fmtTime } from '@/lib/utils';
