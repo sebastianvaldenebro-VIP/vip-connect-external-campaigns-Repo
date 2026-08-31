@@ -2194,7 +2194,16 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                         cs["reconcile"] = {
                             "expected": expected,
                             "actual": actual,
-                            "retries": 0,
+                            # This function has its own cross-tick empty-segment retry
+                            # cycle (see cs["reconcileRetries"] increment below, in the
+                            # _EmptySegmentError handler) — reuse whatever count that
+                            # cycle already recorded rather than hardcoding 0, or a
+                            # pre-warmed campaign that needed retries would silently
+                            # report "0 retries" forever (root-caused 2026-08-31,
+                            # whole-branch review; _activate_warming_bucket never
+                            # re-touches cs["reconcile"] afterward, so this value is
+                            # permanent for the campaign's lifetime).
+                            "retries": cs.get("reconcileRetries", 0),
                         }
                     _slog.info(
                         "prestart_next_bucket_campaign_ok",

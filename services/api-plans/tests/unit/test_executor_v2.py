@@ -7513,3 +7513,42 @@ class TestPrestartNextBucketReconcile:
 
         cs = run["bucketStates"][1]["campaignStates"][0]
         assert cs["reconcile"] == {"expected": 20, "actual": 18, "retries": 0}
+
+    def test_warming_success_after_retry_sets_real_retry_count(self):
+        """Bug fix (whole-branch review, 2026-08-31): if this campaign already went
+        through 1+ rounds of this function's own empty-segment retry cycle (see
+        cs["reconcileRetries"] increment in the _EmptySegmentError handler) before
+        _create_campaign_only finally succeeds, the reconcile write must report the
+        real retry count — not hardcode 0 and silently discard it."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def(
+                    "b0", [_campaign_def("c0")], run_mode="time_based", duration=20
+                ),
+                _bucket_def("b1", [_campaign_def("c1")]),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+            ],
+        )
+        # Simulate a campaign that already retried twice (mid empty-segment retry
+        # cycle) before this attempt succeeds.
+        run["bucketStates"][1]["campaignStates"][0]["reconcileRetries"] = 2
+
+        with (
+            patch(
+                "executor._create_campaign_only",
+                return_value=("connect-1", "seg", "arn", True, 20, 18),
+            ),
+            patch("executor.save_run"),
+        ):
+            executor._prestart_next_bucket(run, plan, 0)
+
+        cs = run["bucketStates"][1]["campaignStates"][0]
+        assert cs["reconcile"] == {"expected": 20, "actual": 18, "retries": 2}
