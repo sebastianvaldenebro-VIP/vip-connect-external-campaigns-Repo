@@ -21,19 +21,8 @@ import {
   type SmsCampaignRunRecord,
 } from '@/lib/api';
 import { buildChainMap } from '@/lib/chainMap';
+import { fmtTime } from '@/lib/utils';
 import { formatReconcile, reconcileTone } from './reconcile';
-
-// ── Time helpers (Colombia timezone, UTC-5, no DST) ──────────────────────────
-
-const COL_OFFSET_MS = -5 * 60 * 60 * 1000;
-
-function fmtTime(d: Date | string | null | undefined): string {
-  if (!d) return '—';
-  const dt = typeof d === 'string' ? new Date(d) : d;
-  if (isNaN(dt.getTime())) return '—';
-  const col = new Date(dt.getTime() + COL_OFFSET_MS);
-  return `${col.getUTCHours().toString().padStart(2, '0')}:${col.getUTCMinutes().toString().padStart(2, '0')}`;
-}
 
 function fmtDate(d: Date | string): string {
   const dt = typeof d === 'string' ? new Date(d) : d;

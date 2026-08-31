@@ -12,6 +12,19 @@ export function formatDateTime(iso: string | undefined | null): string {
   return d.toLocaleString();
 }
 
+// ── Time helpers (Colombia timezone, UTC-5, no DST) ──────────────────────────
+
+const COL_OFFSET_MS = -5 * 60 * 60 * 1000;
+
+/** Formats a UTC timestamp as "HH:MM" in Colombia time (UTC-5, no DST). */
+export function fmtTime(d: Date | string | null | undefined): string {
+  if (!d) return '—';
+  const dt = typeof d === 'string' ? new Date(d) : d;
+  if (isNaN(dt.getTime())) return '—';
+  const col = new Date(dt.getTime() + COL_OFFSET_MS);
+  return `${col.getUTCHours().toString().padStart(2, '0')}:${col.getUTCMinutes().toString().padStart(2, '0')}`;
+}
+
 /**
  * Return the current instant as an ISO 8601 UTC string.
  */
