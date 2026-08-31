@@ -1524,7 +1524,9 @@ def force_stop_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
     if bs["status"] not in ("running", "warming"):
         raise ValueError(f"Bucket {bucket_index} is not active (status={bs['status']})")
     plan = run.get("planSnapshot") or get_plan(plan_id) or {}
-    _expire_bucket(run, plan, bucket_index)
+    # reason="force_stopped" so the resulting bucket_completed audit event doesn't
+    # falsely claim time_expired for an operator-initiated stop (see _expire_bucket docstring).
+    _expire_bucket(run, plan, bucket_index, reason="force_stopped")
     return run
 
 
@@ -1920,6 +1922,15 @@ def _start_bucket(run: dict, index: int) -> None:
     bucket_state = run["bucketStates"][index]
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    # This fires here on every automatic start AND as a side effect of the operator-manual
+    # force_start_bucket action (which already writes its own "force_start_bucket" audit
+    # row for the same click) — expected dual-emission, not a bug, not suppressed.
+    #
+    # Also: this write happens BEFORE _schedule_tick()/save_run() below, which can fail
+    # and raise without persisting the "running" transition. A caller retry could then
+    # re-execute this function and re-emit a second bucket_started row — architecturally
+    # identical to the accepted duplicate-emission race documented on bucket_completed in
+    # _advance_bucket. Accepted as a cosmetic risk, not worth a new lock.
     _record_plan_event(
         run,
         "bucket_started",
@@ -1984,6 +1995,11 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
 
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    # This write happens BEFORE _schedule_tick()/save_run() below, which can fail and
+    # raise without persisting the "running" transition. A caller retry could then
+    # re-execute this function and re-emit a second bucket_started row — architecturally
+    # identical to the accepted duplicate-emission race documented on bucket_completed in
+    # _advance_bucket. Accepted as a cosmetic risk, not worth a new lock.
     _record_plan_event(
         run,
         "bucket_started",
@@ -2287,7 +2303,17 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     )
 
 
-def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
+def _expire_bucket(
+    run: dict, plan: dict, bucket_index: int, reason: str = "time_expired"
+) -> None:
+    """Tear down a bucket's campaigns and advance it.
+
+    `reason` flows straight into `_advance_bucket`'s `bucket_completed` audit event —
+    it must reflect why THIS call happened. Defaults to the automatic time-based-expiry
+    wording (tick()'s call site) since that's the original/most common caller.
+    force_stop_bucket (operator-manual) passes its own reason so the audit trail
+    doesn't misreport a manual stop as a genuine time expiry.
+    """
     now = _now_iso()
     bucket_state = run["bucketStates"][bucket_index]
 
@@ -2305,7 +2331,7 @@ def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
             cs["exitReason"] = REASON_BUCKET_EXPIRED
             cs["completedAt"] = now
 
-    _advance_bucket(run, plan, bucket_index, reason="time_expired")
+    _advance_bucket(run, plan, bucket_index, reason=reason)
 
 
 def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> None:
@@ -3473,7 +3499,13 @@ def _next_bucket_warming(run: dict, current_index: int) -> bool:
 def _start_one_campaign(
     run: dict, plan: dict, bucket_index: int, campaign_index: int
 ) -> None:
-    """Start a single campaign (creating segment + Connect campaign if not already warmed)."""
+    """Start a single campaign (creating segment + Connect campaign if not already warmed).
+
+    Also reachable via the operator-manual force_start_campaign action. If creation
+    fails here, the resulting "creation_failed" event dual-emits alongside
+    force_start_campaign's own "force_start_campaign" audit row for the same click —
+    expected, not a bug, not suppressed.
+    """
     bucket = plan["buckets"][bucket_index]
     campaigns = bucket.get("campaigns", [])
     campaign = campaigns[campaign_index]

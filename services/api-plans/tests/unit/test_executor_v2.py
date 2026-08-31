@@ -1244,6 +1244,25 @@ def test_expire_bucket_stops_running_and_cancels_queued():
     advance.assert_called_once_with(run, plan, 0, reason="time_expired")
 
 
+def test_expire_bucket_forwards_custom_reason_to_advance_bucket():
+    """_expire_bucket's `reason` param (default "time_expired") flows straight through
+    to _advance_bucket — this is what lets force_stop_bucket correct the previously
+    hardcoded "time_expired" string for a manual stop (Finding 1 fix)."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    run = _make_run(plan, [_bucket_state("b0", [c0])])
+
+    with (
+        patch("executor._safe_stop_campaign"),
+        patch("executor._advance_bucket") as advance,
+    ):
+        executor._expire_bucket(run, plan, 0, reason="force_stopped")
+
+    advance.assert_called_once_with(run, plan, 0, reason="force_stopped")
+
+
 # ── _advance_bucket ───────────────────────────────────────────────────────────
 
 
@@ -6516,6 +6535,43 @@ class TestBucketCompletedAuditEvent:
             actor_sub="system",
             actor_email="system@api-plans-executor",
             extra={"bucketIndex": 0, "bucketName": "Cancellation/No Show", "reason": "time_expired"},
+        )
+
+
+class TestForceStopBucketAuditReason:
+    """Finding 1 (whole-branch review, 2026-08-31): force_stop_bucket → _expire_bucket
+    → _advance_bucket must report reason="force_stopped" in the bucket_completed audit
+    event for a manual stop, NOT the automatic time_expired reason — the two call sites
+    share _expire_bucket and were previously indistinguishable in the audit trail."""
+
+    def test_force_stop_bucket_records_force_stopped_not_time_expired(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")], cleanup=False)])
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+
+        mock_audit = MagicMock()
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._safe_stop_campaign"),
+            patch("executor.save_run"),
+            patch("executor._delete_bucket_schedule_safe"),
+            patch("executor._fire_bucket_chains"),
+            patch("executor.unlock_plan_run"),
+            patch("executor._maybe_loop"),
+            patch("executor.start_run_chained"),
+        ):
+            executor.force_stop_bucket("plan-1", "run-1", 0)
+
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_completed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "b0", "reason": "force_stopped"},
         )
 
 
