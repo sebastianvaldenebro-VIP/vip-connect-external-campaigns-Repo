@@ -28,6 +28,19 @@ export default {
           DEFAULT: 'hsl(var(--destructive))',
           foreground: 'hsl(var(--destructive-foreground))',
         },
+        status: {
+          success: { bg: 'var(--success-bg)', fg: 'var(--success-fg)', bar: 'var(--success-bar)' },
+          info: { bg: 'var(--info-bg)', fg: 'var(--info-fg)', bar: 'var(--info-bar)' },
+          warning: { bg: 'var(--warning-bg)', fg: 'var(--warning-fg)', bar: 'var(--warning-bar)' },
+          danger: { bg: 'var(--danger-bg)', fg: 'var(--danger-fg)', bar: 'var(--danger-bar)' },
+          neutral: { bg: 'var(--neutral-bg)', fg: 'var(--neutral-fg)', bar: 'var(--neutral-bar)' },
+          acw: { bg: 'var(--acw-bg)', fg: 'var(--acw-fg)', bar: 'var(--acw-bar)' },
+        },
+        track: {
+          1: 'var(--track1-accent)',
+          '1-active': 'var(--track1-accent-active)',
+          2: 'var(--track2-accent)',
+        },
       },
       borderRadius: {
         lg: 'var(--radius)',

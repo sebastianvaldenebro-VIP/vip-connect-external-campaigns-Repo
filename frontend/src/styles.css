@@ -17,6 +17,36 @@
     --destructive-foreground: 0 0% 98%;
     --ring:               217 91% 60%;
     --radius:             0.5rem;
+
+    /* ---------- Status tones (3-layer: bg tint / fg text / bar fill) ---------- */
+    --success-bg:  #dcfce7;
+    --success-fg:  #15803d;
+    --success-bar: #16a34a;
+
+    --info-bg:  #dbeafe;
+    --info-fg:  #1d4ed8;
+    --info-bar: #2563eb;
+
+    --warning-bg:  #fef3c7;
+    --warning-fg:  #b45309;
+    --warning-bar: #d97706;
+
+    --danger-bg:  #fee2e2;
+    --danger-fg:  #b91c1c;
+    --danger-bar: #b91c1c;
+
+    --neutral-bg:  #f1f5f9;
+    --neutral-fg:  #64748b;
+    --neutral-bar: #cbd5e1;
+
+    --acw-bg:  #ede9fe;
+    --acw-fg:  #6d28d9;
+    --acw-bar: #8b5cf6;
+
+    /* ---------- Track accents (Campaign Monitor timeline/step-strip) ---------- */
+    --track1-accent:        #0d9488;
+    --track1-accent-active: #14b8a6;
+    --track2-accent:        #7c3aed;
   }
 
   .dark {
