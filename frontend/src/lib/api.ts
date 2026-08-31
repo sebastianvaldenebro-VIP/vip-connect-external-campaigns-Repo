@@ -440,6 +440,13 @@ export type CampaignDef = {
   pinnedSegmentArn?: string;
   /** Controls the Connect campaign type. Defaults to "campaign" (MANAGED). */
   deliveryType?: 'campaign' | 'journey' | 'branded' | 'sms';
+  /**
+   * Only include leads whose Redis `createdAt` is within this many minutes of
+   * now (10-35, step 5). Undefined/null = no age filter. Evaluated directly
+   * against Redis by the executor — does not apply to pinned or standalone
+   * (Customer Profiles-native) segments.
+   */
+  maxLeadAgeMinutes?: number;
 };
 
 export type BucketDefV2 = {

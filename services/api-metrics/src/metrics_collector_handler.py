@@ -12,6 +12,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -25,6 +26,8 @@ _CONNECT_INSTANCE_ID = os.environ.get("CONNECT_INSTANCE_ID", "")
 _connect = boto3.client("connect")
 _ddb = boto3.resource("dynamodb")
 _cw = boto3.client("cloudwatch")
+
+_STALL_LOOKBACK_MINUTES = 10
 
 
 def lambda_handler(event, context):
@@ -55,11 +58,48 @@ def lambda_handler(event, context):
             continue
 
         _resolve_outcomes(campaign_id)
-        placed, answered, voicemail, busy, no_answer = _count_outcomes(campaign_id)
+        outcomes = _count_outcomes(campaign_id)
+        if outcomes is None:
+            logger.warning(
+                "metrics_collector: skipping campaign=%s this cycle — outcomes query failed",
+                campaign_id,
+            )
+            # A sustained failure here (lost IAM permission, sustained
+            # throttling) would otherwise produce zero CloudWatch signal —
+            # same blind spot BD-021 item 7 closed for _check_and_emit_stall's
+            # own query, one level up (root-caused 2026-08-27, second
+            # adversarial review round).
+            try:
+                _cw.put_metric_data(
+                    Namespace="VipBrandedMonitor",
+                    MetricData=[
+                        {
+                            "MetricName": "BrandedOutcomesQueryFailed",
+                            "Value": 1,
+                            "Unit": "Count",
+                            "Dimensions": [
+                                {"Name": "PlanId", "Value": plan_id},
+                                {"Name": "CampaignId", "Value": campaign_id},
+                            ],
+                        }
+                    ],
+                )
+            except Exception:
+                pass  # metric emission must never abort the collector loop
+            continue
+        placed, answered, voicemail, busy, no_answer = outcomes
 
         if queue_id not in seen_queues:
             seen_queues[queue_id] = _queue_metrics(queue_id, queue_arn)
         qm = seen_queues[queue_id]
+
+        _check_and_emit_stall(
+            campaign_id=campaign_id,
+            plan_id=plan_id,
+            placed=placed,
+            agents_available=qm.get("AGENTS_AVAILABLE", 0),
+            now_utc=now,
+        )
 
         ttl = int((now + timedelta(days=90)).timestamp())
         _ddb.Table(_METRICS_TABLE).put_item(Item={
@@ -203,10 +243,16 @@ def _resolve_outcomes(campaign_id: str) -> None:
             )
 
 
-def _count_outcomes(campaign_id: str) -> tuple[int, int, int, int, int]:
+def _count_outcomes(campaign_id: str) -> tuple[int, int, int, int, int] | None:
     """Count DIALED items by outcome.
 
-    Returns: (placed, answered, voicemail, busy, no_answer)
+    Returns: (placed, answered, voicemail, busy, no_answer), or None if the
+    query itself failed. None is NOT the same as a real (0,0,0,0,0) — a
+    fabricated zero on a transient DynamoDB error would both persist a
+    contaminated VipBrandedCampaignMetrics snapshot and falsely trigger
+    _check_and_emit_stall's "zero progress" comparison (root-caused
+    2026-08-27, adversarial code review). Callers must skip this cycle
+    entirely on None, not treat it as genuine zero progress.
     placed = total DIALED regardless of outcome (includes in-progress calls)
     """
     try:
@@ -226,7 +272,7 @@ def _count_outcomes(campaign_id: str) -> tuple[int, int, int, int, int]:
         return placed, answered, voicemail, busy, no_answer
     except Exception as exc:
         logger.error("_count_outcomes: campaign=%s error=%s", campaign_id, type(exc).__name__)
-        return 0, 0, 0, 0, 0
+        return None
 
 
 
@@ -278,6 +324,126 @@ def _emit_business_hours_metric(count: int, now_utc: datetime) -> None:
         )
     except Exception as exc:
         logger.error("metrics_collector: failed to emit ActiveBrandedCampaigns metric: %s", exc)
+
+
+def _check_and_emit_stall(
+    campaign_id: str,
+    plan_id: str,
+    placed: int,
+    agents_available: int,
+    now_utc: datetime,
+) -> None:
+    """Emit BrandedCampaignStalled if this campaign made zero dialing progress in
+    the last _STALL_LOOKBACK_MINUTES while agents are available right now.
+
+    Neither StuckRun (4h threshold, whole-run level) nor NoActiveCampaign (checks
+    campaign *status*, not throughput) catches a campaign that stays "running"
+    indefinitely with near-zero dispatch despite free agent capacity — root-caused
+    2026-08-27 with Plan 1.2/2.2 before the sweep-timer fix (BD-014).
+    """
+    if agents_available <= 0:
+        return  # no available capacity right now — genuinely busy/understaffed, not stalled
+    cutoff_iso = (now_utc - timedelta(minutes=_STALL_LOOKBACK_MINUTES)).isoformat()
+    try:
+        resp = _ddb.Table(_METRICS_TABLE).query(
+            KeyConditionExpression=(
+                Key("brandedCampaignId").eq(campaign_id)
+                & Key("snapshotAt").lte(cutoff_iso)
+            ),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+    except Exception as exc:
+        logger.warning(
+            "metrics_collector: stall check query failed for %s: %s",
+            campaign_id,
+            type(exc).__name__,
+        )
+        try:
+            _cw.put_metric_data(
+                Namespace="VipBrandedMonitor",
+                MetricData=[
+                    {
+                        "MetricName": "BrandedStallCheckError",
+                        "Value": 1,
+                        "Unit": "Count",
+                        "Dimensions": [
+                            {"Name": "PlanId", "Value": plan_id},
+                            {"Name": "CampaignId", "Value": campaign_id},
+                        ],
+                    }
+                ],
+            )
+        except Exception:
+            pass  # the stall check itself failing must never raise
+        return
+
+    items = resp.get("Items", [])
+    if not items:
+        return  # campaign younger than the lookback window — not enough history yet
+
+    # brandedCampaignId is deterministic per (planId, runId, bucket_index,
+    # campaign_index) and survives a stop/force-restart within the same run.
+    # Without this bound, the first post-restart cycle would compare against
+    # an hours-old pre-restart snapshot and could emit a false stall right
+    # after a legitimate restart (root-caused 2026-08-27, adversarial code
+    # review).
+    prior_snapshot_at = items[0].get("snapshotAt", "")
+    try:
+        prior_age_minutes = (
+            now_utc - datetime.fromisoformat(prior_snapshot_at)
+        ).total_seconds() / 60
+    except (ValueError, TypeError):
+        prior_age_minutes = float("inf")
+    # The query itself already requires the found snapshot to be
+    # >=_STALL_LOOKBACK_MINUTES old (Key("snapshotAt").lte(now-lookback)), so
+    # the old `* 2` bound (20 min) left a false-positive window for restart
+    # gaps between _STALL_LOOKBACK_MINUTES and 2x that (10-20 min) — only a
+    # couple of minutes of slack for collector-cycle jitter is needed here,
+    # not a full extra lookback window (root-caused 2026-08-27, second
+    # adversarial review round).
+    if prior_age_minutes > _STALL_LOOKBACK_MINUTES + 2:
+        return  # gap too large — not enough continuous history to compare
+
+    prior_placed = int(items[0].get("contactsPlaced", 0))
+    if placed > prior_placed:
+        return  # made progress since then — not stalled
+
+    logger.warning(
+        "metrics_collector: campaign %s stalled — placed=%d unchanged since %s "
+        "(agents_available=%d)",
+        campaign_id,
+        placed,
+        items[0].get("snapshotAt"),
+        agents_available,
+    )
+    try:
+        _cw.put_metric_data(
+            Namespace="VipBrandedMonitor",
+            MetricData=[
+                {
+                    "MetricName": "BrandedCampaignStalled",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [
+                        {"Name": "PlanId", "Value": plan_id},
+                        {"Name": "CampaignId", "Value": campaign_id},
+                    ],
+                },
+                {
+                    "MetricName": "BrandedCampaignStalled",
+                    "Value": 1,
+                    "Unit": "Count",
+                    "Dimensions": [],
+                },
+            ],
+        )
+    except Exception as exc:
+        logger.error(
+            "metrics_collector: stall metric emit failed for %s: %s",
+            campaign_id,
+            type(exc).__name__,
+        )
 
 
 def _emit_stuck_campaigns_metric(active: list[dict], now_utc: datetime) -> None:

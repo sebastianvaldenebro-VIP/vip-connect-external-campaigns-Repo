@@ -9,7 +9,7 @@ import {
   type BrandedTodaySummary,
   type RoutingProfileSummary,
 } from '@/lib/api';
-import { TEAM_ROUTING_PROFILES, TEAM_LABELS, BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
+import { TEAM_LABELS, BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
@@ -978,7 +978,7 @@ function AgentsView(): ReactNode {
   const routingProfiles: RoutingProfileSummary[] = agentQuery.data?.routingProfiles ?? [];
   const lastUpdated = agentQuery.data?.lastUpdated;
 
-  // Pre-filter to only Patient Success + Appointment Services — the two teams that use the branded dialer
+  // Pre-filter to only Patient Access + Appointment Services — the two teams that use the branded dialer
   const brandedAgents = agents.filter(
     a => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(a.routingProfileName) ?? '')
   );
@@ -1089,7 +1089,7 @@ function AgentsView(): ReactNode {
                 const t = teamForProfile(rp.name);
                 return t !== null && (BRANDED_MONITOR_TEAMS as readonly string[]).includes(t);
               })
-            : routingProfiles.filter(rp => (TEAM_ROUTING_PROFILES[teamFilter] ?? []).includes(rp.name));
+            : routingProfiles.filter(rp => teamForProfile(rp.name) === teamFilter);
 
           return (
             <>

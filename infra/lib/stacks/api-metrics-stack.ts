@@ -181,6 +181,18 @@ export class ApiMetricsStack extends cdk.Stack {
       props.activeBrandedCampaignsTable.grantReadData(collectorRole);
       props.brandedCampaignMetricsTable.grantWriteData(collectorRole);
       props.agentSnapshotTable.grantWriteData(collectorRole);
+      // dynamodb:Query on VipBrandedCampaignMetrics (BD-017 stall-detection check
+      // reads its own prior snapshots) granted via CLI, NOT grantReadData here —
+      // cfn-exec-role lacks iam:PutRolePolicy on this role (EngineeringPermissionBoundary),
+      // confirmed by a failed deploy 2026-08-27 that also left the stack in
+      // UPDATE_ROLLBACK_FAILED (recovered via continue-update-rollback --resources-to-skip).
+      // Granted directly:
+      //   aws iam put-role-policy --role-name <CollectorRole physical name> \
+      //     --policy-name BrandedMetricsHistoryRead --policy-document '{"Version":"2012-10-17",
+      //     "Statement":[{"Sid":"BrandedMetricsHistoryRead","Effect":"Allow","Action":"dynamodb:Query",
+      //     "Resource":"arn:aws:dynamodb:us-east-1:165505826690:table/VipBrandedCampaignMetrics"}]}'
+      // Do NOT add grantReadData/grantReadWriteData for this table here — CDK will retry
+      // reconciling its own managed policy on every future deploy and hit the same denial.
 
       collectorRole.addToPolicy(
         new iam.PolicyStatement({
