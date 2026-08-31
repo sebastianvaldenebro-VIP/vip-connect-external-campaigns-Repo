@@ -22,6 +22,9 @@ import {
 } from '@/lib/api';
 import { buildChainMap } from '@/lib/chainMap';
 import { fmtTime } from '@/lib/utils';
+import { AgentAvailabilityPanel } from './AgentAvailabilityPanel';
+import { DayActivityFeed } from './DayActivityFeed';
+import { DayHeaderTimeline } from './DayHeaderTimeline';
 import { formatReconcile, reconcileTone } from './reconcile';
 
 function fmtDate(d: Date | string): string {
@@ -964,6 +967,12 @@ export function PlanDetail(): ReactNode {
             )}
           </div>
         </div>
+
+        {displayRun && (
+          <div className="mt-3">
+            <DayHeaderTimeline plan={plan} run={displayRun} />
+          </div>
+        )}
       </div>
 
       {/* ── Error banners ────────────────────────────────────────────────────── */}
@@ -980,221 +989,232 @@ export function PlanDetail(): ReactNode {
       )}
 
       {/* ── Main content ─────────────────────────────────────────────────────── */}
-      <div className="px-8 py-6 space-y-8">
-
-        {/* Active / selected run — bucket sections */}
-        {displayRun ? (
+      <div className="px-8 py-6">
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-6">
-            {/* Run meta strip */}
-            <div className="flex items-center gap-3 text-xs text-gray-400">
-              <span>Run {displayRun.runId.slice(0, 16)}</span>
-              <span>·</span>
-              <span>started {fmtTime(displayRun.startedAt)}</span>
-              {displayRun.triggeredBy && displayRun.triggeredBy !== 'manual' && (
-                <>
-                  <span>·</span>
-                  <span>via {displayRun.triggeredBy}</span>
-                </>
-              )}
-              {displayRun.completedAt && (
-                <>
-                  <span>·</span>
-                  <span>finished {fmtTime(displayRun.completedAt)}</span>
-                  <span>·</span>
-                  <span>{fmtElapsed(displayRun.startedAt, displayRun.completedAt)} total</span>
-                </>
-              )}
-              {selectedRunId && selectedRunId !== latestRun?.runId && (
-                <button
-                  type="button"
-                  className="ml-2 text-blue-500 hover:underline"
-                  onClick={() => setSelectedRunId(null)}
-                >
-                  ← Back to latest
-                </button>
-              )}
-            </div>
 
-            {/* Bucket sections */}
-            <div className="space-y-6">
-              {displayRun.bucketStates.map((bs, bi) => {
-                const bucketDef = planForDisplay.buckets[bi] ?? null;
-                const canControl = isRunning && displayRun.runId === latestRun?.runId;
-                // Bug 1 + 3 fix: only pass brandedProgress when the user is viewing the
-                // active latestRun AND it is currently running. This prevents:
-                //   - Bug 1: latestRun counts bleeding into historical run cards
-                //   - Bug 3: stale counts persisting in React Query cache after run completes
-                const isCurrentRunDisplayed = isRunActive && displayRun.runId === latestRun?.runId;
-                return (
-                  <BucketSection
-                    key={bs.bucketId}
-                    bs={bs}
-                    bucketDef={bucketDef}
-                    index={bi}
-                    plan={planForDisplay}
-                    run={displayRun}
-                    onForceStart={canControl && (bs.status === 'queued' || bs.status === 'warming')
-                      ? () => bucketActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, action: 'start' })
-                      : undefined}
-                    onForceStop={canControl && (bs.status === 'running' || bs.status === 'warming')
-                      ? () => bucketActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, action: 'stop' })
-                      : undefined}
-                    onForceStartCampaign={canControl
-                      ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'start' })
-                      : undefined}
-                    onForceStopCampaign={canControl
-                      ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'stop' })
-                      : undefined}
-                    onSkipCampaign={canControl
-                      ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'skip' })
-                      : undefined}
-                    brandedProgress={isCurrentRunDisplayed ? brandedProgressQuery.data?.progress : undefined}
-                    brandedQueue={isCurrentRunDisplayed ? brandedQueueQuery.data?.items : undefined}
-                    smsRunsMap={hasSmsCampaigns ? smsRunsMap : undefined}
-                  />
-                );
-              })}
-            </div>
-          </div>
-        ) : (
-          <div className="rounded-2xl border-2 border-dashed border-gray-200 py-16 text-center text-gray-400 text-sm">
-            No runs yet.{' '}
-            {!plan.isTemplate && (
-              <button
-                type="button"
-                className="text-blue-500 hover:underline"
-                onClick={() => triggerMutation.mutate(undefined)}
-              >
-                Start the first run
-              </button>
+            {/* Active / selected run — bucket sections */}
+            {displayRun ? (
+              <div className="space-y-6">
+                {/* Run meta strip */}
+                <div className="flex items-center gap-3 text-xs text-gray-400">
+                  <span>Run {displayRun.runId.slice(0, 16)}</span>
+                  <span>·</span>
+                  <span>started {fmtTime(displayRun.startedAt)}</span>
+                  {displayRun.triggeredBy && displayRun.triggeredBy !== 'manual' && (
+                    <>
+                      <span>·</span>
+                      <span>via {displayRun.triggeredBy}</span>
+                    </>
+                  )}
+                  {displayRun.completedAt && (
+                    <>
+                      <span>·</span>
+                      <span>finished {fmtTime(displayRun.completedAt)}</span>
+                      <span>·</span>
+                      <span>{fmtElapsed(displayRun.startedAt, displayRun.completedAt)} total</span>
+                    </>
+                  )}
+                  {selectedRunId && selectedRunId !== latestRun?.runId && (
+                    <button
+                      type="button"
+                      className="ml-2 text-blue-500 hover:underline"
+                      onClick={() => setSelectedRunId(null)}
+                    >
+                      ← Back to latest
+                    </button>
+                  )}
+                </div>
+
+                {/* Bucket sections */}
+                <div className="space-y-6">
+                  {displayRun.bucketStates.map((bs, bi) => {
+                    const bucketDef = planForDisplay.buckets[bi] ?? null;
+                    const canControl = isRunning && displayRun.runId === latestRun?.runId;
+                    // Bug 1 + 3 fix: only pass brandedProgress when the user is viewing the
+                    // active latestRun AND it is currently running. This prevents:
+                    //   - Bug 1: latestRun counts bleeding into historical run cards
+                    //   - Bug 3: stale counts persisting in React Query cache after run completes
+                    const isCurrentRunDisplayed = isRunActive && displayRun.runId === latestRun?.runId;
+                    return (
+                      <BucketSection
+                        key={bs.bucketId}
+                        bs={bs}
+                        bucketDef={bucketDef}
+                        index={bi}
+                        plan={planForDisplay}
+                        run={displayRun}
+                        onForceStart={canControl && (bs.status === 'queued' || bs.status === 'warming')
+                          ? () => bucketActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, action: 'start' })
+                          : undefined}
+                        onForceStop={canControl && (bs.status === 'running' || bs.status === 'warming')
+                          ? () => bucketActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, action: 'stop' })
+                          : undefined}
+                        onForceStartCampaign={canControl
+                          ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'start' })
+                          : undefined}
+                        onForceStopCampaign={canControl
+                          ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'stop' })
+                          : undefined}
+                        onSkipCampaign={canControl
+                          ? (ci) => campaignActionMutation.mutate({ runId: displayRun.runId, bucketIndex: bi, campaignIndex: ci, action: 'skip' })
+                          : undefined}
+                        brandedProgress={isCurrentRunDisplayed ? brandedProgressQuery.data?.progress : undefined}
+                        brandedQueue={isCurrentRunDisplayed ? brandedQueueQuery.data?.items : undefined}
+                        smsRunsMap={hasSmsCampaigns ? smsRunsMap : undefined}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-2xl border-2 border-dashed border-gray-200 py-16 text-center text-gray-400 text-sm">
+                No runs yet.{' '}
+                {!plan.isTemplate && (
+                  <button
+                    type="button"
+                    className="text-blue-500 hover:underline"
+                    onClick={() => triggerMutation.mutate(undefined)}
+                  >
+                    Start the first run
+                  </button>
+                )}
+              </div>
             )}
+
+            {/* ── Run history ────────────────────────────────────────────────────── */}
+            {runs.length > 0 && (
+              <details className="group" open>
+                <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 select-none list-none flex items-center gap-2">
+                  <span className="group-open:rotate-90 transition-transform inline-block text-gray-400">▶</span>
+                  Run history ({runs.length})
+                </summary>
+                <div className="mt-3 bg-white rounded-xl border border-gray-200 overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>
+                        {['Run ID', 'Status', 'Triggered by', 'Date', 'Started', 'Duration'].map((h) => (
+                          <th
+                            key={h}
+                            className="px-4 py-2.5 text-left text-[11px] font-semibold tracking-wider text-gray-400 uppercase"
+                          >
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {runs.map((r) => {
+                        const startDt = r.startedAt ? new Date(r.startedAt) : null;
+                        const dateStr = startDt
+                          ? startDt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+                          : '—';
+                        return (
+                          <tr
+                            key={r.runId}
+                            className={`cursor-pointer hover:bg-gray-50 transition-colors ${
+                              r.runId === displayRun?.runId ? 'bg-blue-50' : ''
+                            }`}
+                            onClick={() =>
+                              setSelectedRunId((prev) => (prev === r.runId ? null : r.runId))
+                            }
+                          >
+                            <td className="px-4 py-2.5 text-xs font-mono text-gray-500">
+                              {r.runId.slice(0, 16)}
+                            </td>
+                            <td className="px-4 py-2.5">
+                              <StatusBadge status={r.status} />
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">
+                              {r.triggeredBy ?? 'manual'}
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">
+                              {dateStr}
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">
+                              {fmtTime(r.startedAt)}
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">
+                              {fmtElapsed(r.startedAt, r.completedAt)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
+
+            {/* ── Branded campaign history ─────────────────────────────────────────── */}
+            {hasBrandedCampaigns && (brandedHistoryQuery.data?.history?.length ?? 0) > 0 && (
+              <details className="group" open>
+                <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 select-none list-none flex items-center gap-2">
+                  <span className="group-open:rotate-90 transition-transform inline-block text-gray-400">▶</span>
+                  Branded dialer history ({brandedHistoryQuery.data!.history.length})
+                </summary>
+                <div className="mt-3 bg-white rounded-xl border border-gray-200 overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-100">
+                      <tr>
+                        {['Run', 'Campaign', 'Dialed', 'Total', '%', 'Resultado', 'Duración'].map((h) => (
+                          <th key={h} className="px-4 py-2.5 text-left text-[11px] font-semibold tracking-wider text-gray-400 uppercase">
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {brandedHistoryQuery.data!.history.map((r: BrandedRunSummary) => {
+                        const pct = r.totalSeeded > 0
+                          ? Math.min(100, Math.round((r.totalDialed / r.totalSeeded) * 100))
+                          : 0;
+                        return (
+                          <tr key={`${r.runId}#${r.campaignId}`} className="hover:bg-gray-50">
+                            <td className="px-4 py-2.5 font-mono text-xs text-gray-400">{r.runId.slice(0, 13)}</td>
+                            <td className="px-4 py-2.5 text-xs text-gray-700">{r.campaignId}</td>
+                            <td className="px-4 py-2.5 text-xs font-medium text-green-600">{r.totalDialed}</td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded}</td>
+                            <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded > 0 ? `${pct}%` : '—'}</td>
+                            <td className="px-4 py-2.5">
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                                r.exitReason === 'queue_drained'
+                                  ? 'bg-green-100 text-green-700'
+                                  : r.exitReason === 'manually_stopped'
+                                    ? 'bg-amber-100 text-amber-700'
+                                    : 'bg-gray-100 text-gray-500'
+                              }`}>
+                                {r.exitReason || '—'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-gray-400">{fmtElapsed(r.startedAt, r.completedAt)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
+
+            {/* ── Plan definition ─────────────────────────────────────────────────── */}
+            <details>
+              <summary className="cursor-pointer text-xs text-gray-400 hover:text-gray-600 select-none list-none flex items-center gap-1">
+                <span className="text-gray-300">▶</span> Plan definition (JSON)
+              </summary>
+              <pre className="mt-2 text-xs bg-white border border-gray-100 rounded-xl p-4 overflow-x-auto max-h-96 text-gray-600">
+                {JSON.stringify(plan, null, 2)}
+              </pre>
+            </details>
           </div>
-        )}
 
-        {/* ── Run history ────────────────────────────────────────────────────── */}
-        {runs.length > 0 && (
-          <details className="group" open>
-            <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 select-none list-none flex items-center gap-2">
-              <span className="group-open:rotate-90 transition-transform inline-block text-gray-400">▶</span>
-              Run history ({runs.length})
-            </summary>
-            <div className="mt-3 bg-white rounded-xl border border-gray-200 overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 border-b border-gray-100">
-                  <tr>
-                    {['Run ID', 'Status', 'Triggered by', 'Date', 'Started', 'Duration'].map((h) => (
-                      <th
-                        key={h}
-                        className="px-4 py-2.5 text-left text-[11px] font-semibold tracking-wider text-gray-400 uppercase"
-                      >
-                        {h}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {runs.map((r) => {
-                    const startDt = r.startedAt ? new Date(r.startedAt) : null;
-                    const dateStr = startDt
-                      ? startDt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-                      : '—';
-                    return (
-                      <tr
-                        key={r.runId}
-                        className={`cursor-pointer hover:bg-gray-50 transition-colors ${
-                          r.runId === displayRun?.runId ? 'bg-blue-50' : ''
-                        }`}
-                        onClick={() =>
-                          setSelectedRunId((prev) => (prev === r.runId ? null : r.runId))
-                        }
-                      >
-                        <td className="px-4 py-2.5 text-xs font-mono text-gray-500">
-                          {r.runId.slice(0, 16)}
-                        </td>
-                        <td className="px-4 py-2.5">
-                          <StatusBadge status={r.status} />
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">
-                          {r.triggeredBy ?? 'manual'}
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">
-                          {dateStr}
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">
-                          {fmtTime(r.startedAt)}
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">
-                          {fmtElapsed(r.startedAt, r.completedAt)}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+          {displayRun && (
+            <div className="space-y-6">
+              <AgentAvailabilityPanel />
+              <DayActivityFeed planId={id!} runId={displayRun.runId} />
             </div>
-          </details>
-        )}
-
-        {/* ── Branded campaign history ─────────────────────────────────────────── */}
-        {hasBrandedCampaigns && (brandedHistoryQuery.data?.history?.length ?? 0) > 0 && (
-          <details className="group" open>
-            <summary className="cursor-pointer text-sm font-medium text-gray-600 hover:text-gray-800 select-none list-none flex items-center gap-2">
-              <span className="group-open:rotate-90 transition-transform inline-block text-gray-400">▶</span>
-              Branded dialer history ({brandedHistoryQuery.data!.history.length})
-            </summary>
-            <div className="mt-3 bg-white rounded-xl border border-gray-200 overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="bg-gray-50 border-b border-gray-100">
-                  <tr>
-                    {['Run', 'Campaign', 'Dialed', 'Total', '%', 'Resultado', 'Duración'].map((h) => (
-                      <th key={h} className="px-4 py-2.5 text-left text-[11px] font-semibold tracking-wider text-gray-400 uppercase">
-                        {h}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {brandedHistoryQuery.data!.history.map((r: BrandedRunSummary) => {
-                    const pct = r.totalSeeded > 0
-                      ? Math.min(100, Math.round((r.totalDialed / r.totalSeeded) * 100))
-                      : 0;
-                    return (
-                      <tr key={`${r.runId}#${r.campaignId}`} className="hover:bg-gray-50">
-                        <td className="px-4 py-2.5 font-mono text-xs text-gray-400">{r.runId.slice(0, 13)}</td>
-                        <td className="px-4 py-2.5 text-xs text-gray-700">{r.campaignId}</td>
-                        <td className="px-4 py-2.5 text-xs font-medium text-green-600">{r.totalDialed}</td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded}</td>
-                        <td className="px-4 py-2.5 text-xs text-gray-500">{r.totalSeeded > 0 ? `${pct}%` : '—'}</td>
-                        <td className="px-4 py-2.5">
-                          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
-                            r.exitReason === 'queue_drained'
-                              ? 'bg-green-100 text-green-700'
-                              : r.exitReason === 'manually_stopped'
-                                ? 'bg-amber-100 text-amber-700'
-                                : 'bg-gray-100 text-gray-500'
-                          }`}>
-                            {r.exitReason || '—'}
-                          </span>
-                        </td>
-                        <td className="px-4 py-2.5 text-xs text-gray-400">{fmtElapsed(r.startedAt, r.completedAt)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </details>
-        )}
-
-        {/* ── Plan definition ─────────────────────────────────────────────────── */}
-        <details>
-          <summary className="cursor-pointer text-xs text-gray-400 hover:text-gray-600 select-none list-none flex items-center gap-1">
-            <span className="text-gray-300">▶</span> Plan definition (JSON)
-          </summary>
-          <pre className="mt-2 text-xs bg-white border border-gray-100 rounded-xl p-4 overflow-x-auto max-h-96 text-gray-600">
-            {JSON.stringify(plan, null, 2)}
-          </pre>
-        </details>
+          )}
+        </div>
       </div>
     </div>
   );
