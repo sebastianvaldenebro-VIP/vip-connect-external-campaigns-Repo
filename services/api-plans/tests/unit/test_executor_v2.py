@@ -11,6 +11,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
+sys.modules.setdefault("vip_shared", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
+sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1237,6 +1242,25 @@ def test_expire_bucket_stops_running_and_cancels_queued():
     assert c1["status"] == "cancelled"
     assert c1["exitReason"] == "bucket_expired"
     advance.assert_called_once_with(run, plan, 0, reason="time_expired")
+
+
+def test_expire_bucket_forwards_custom_reason_to_advance_bucket():
+    """_expire_bucket's `reason` param (default "time_expired") flows straight through
+    to _advance_bucket — this is what lets force_stop_bucket correct the previously
+    hardcoded "time_expired" string for a manual stop (Finding 1 fix)."""
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    c0 = _campaign_state("c0", "running", connect_id="conn-0")
+    run = _make_run(plan, [_bucket_state("b0", [c0])])
+
+    with (
+        patch("executor._safe_stop_campaign"),
+        patch("executor._advance_bucket") as advance,
+    ):
+        executor._expire_bucket(run, plan, 0, reason="force_stopped")
+
+    advance.assert_called_once_with(run, plan, 0, reason="force_stopped")
 
 
 # ── _advance_bucket ───────────────────────────────────────────────────────────
@@ -6378,3 +6402,549 @@ class TestMaxLeadAgeRule:
             15, datetime(2026, 8, 27, 14, 30, 0, 0, tzinfo=timezone.utc)
         )
         assert "2026-08-27T14:15:00.000Z" >= cutoff
+
+
+class TestRecordPlanEvent:
+    """_record_plan_event: best-effort audit write for automatic executor transitions."""
+
+    def test_writes_expected_audit_record(self):
+        import executor
+
+        mock_audit = MagicMock()
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "bucket_started", {"bucketIndex": 2})
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 2},
+        )
+
+    def test_extra_defaults_to_none(self):
+        import executor
+
+        mock_audit = MagicMock()
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "window_closed")
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra=None,
+        )
+
+    def test_swallows_write_failure_without_raising(self):
+        import executor
+
+        mock_audit = MagicMock()
+        mock_audit.record.side_effect = RuntimeError("dynamodb throttled")
+        run = {"planId": "plan-1", "runId": "run-1"}
+        with patch("executor.build_audit", return_value=mock_audit):
+            executor._record_plan_event(run, "bucket_completed", {"bucketIndex": 0})
+        # No exception raised — the call above completing is the assertion.
+
+
+class TestBucketStartedAuditEvent:
+    def test_start_bucket_records_bucket_started(self):
+        import executor
+
+        run = {
+            "planId": "plan-1",
+            "runId": "run-1",
+            "planSnapshot": {"buckets": [{"name": "1st attempt"}]},
+            "bucketStates": [{"campaignStates": []}],
+        }
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._schedule_tick", return_value="sched-1"),
+            patch("executor.save_run"),
+            patch("executor._dispatch_ready_campaigns", return_value=False),
+        ):
+            executor._start_bucket(run, 0)
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "1st attempt"},
+        )
+
+    def test_activate_warming_bucket_records_bucket_started(self):
+        import executor
+
+        run = {
+            "planId": "plan-2",
+            "runId": "run-2",
+            "bucketStates": [
+                {"campaignStates": []},
+                {"campaignStates": [], "status": "warming"},
+            ],
+        }
+        plan = {"buckets": [{}, {"name": "3rd attempt"}]}
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._schedule_tick", return_value="sched-2"),
+            patch("executor.save_run"),
+            patch("executor._dispatch_ready_campaigns", return_value=False),
+        ):
+            executor._activate_warming_bucket(run, plan, 1)
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-2/run-2",
+            action="bucket_started",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 1, "bucketName": "3rd attempt"},
+        )
+
+
+class TestBucketCompletedAuditEvent:
+    def test_advance_bucket_records_bucket_completed(self):
+        import executor
+
+        run = {
+            "planId": "plan-3",
+            "runId": "run-3",
+            "bucketStates": [{"campaignStates": [], "status": "running"}],
+        }
+        plan = {"buckets": [{"name": "Cancellation/No Show", "cleanup": False}]}
+        mock_audit = MagicMock()
+        with (
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor.save_run"),
+            patch("executor._delete_bucket_schedule_safe"),
+            patch("executor._fire_bucket_chains"),
+            patch("executor.unlock_plan_run"),
+            patch("executor._maybe_loop"),
+            patch("executor.start_run_chained"),
+        ):
+            executor._advance_bucket(run, plan, 0, reason="time_expired")
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-3/run-3",
+            action="bucket_completed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "Cancellation/No Show", "reason": "time_expired"},
+        )
+
+
+class TestForceStopBucketAuditReason:
+    """Finding 1 (whole-branch review, 2026-08-31): force_stop_bucket → _expire_bucket
+    → _advance_bucket must report reason="force_stopped" in the bucket_completed audit
+    event for a manual stop, NOT the automatic time_expired reason — the two call sites
+    share _expire_bucket and were previously indistinguishable in the audit trail."""
+
+    def test_force_stop_bucket_records_force_stopped_not_time_expired(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")], cleanup=False)])
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+
+        mock_audit = MagicMock()
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.build_audit", return_value=mock_audit),
+            patch("executor._safe_stop_campaign"),
+            patch("executor.save_run"),
+            patch("executor._delete_bucket_schedule_safe"),
+            patch("executor._fire_bucket_chains"),
+            patch("executor.unlock_plan_run"),
+            patch("executor._maybe_loop"),
+            patch("executor.start_run_chained"),
+        ):
+            executor.force_stop_bucket("plan-1", "run-1", 0)
+
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="bucket_completed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "bucketName": "b0", "reason": "force_stopped"},
+        )
+
+
+class TestWindowClosedAuditEvent:
+    """tick()'s 3 operating-window cutoffs each record a window_closed audit event
+    right before force-finishing the run. Instrumented in tick() itself (not inside
+    _force_finish_internal, which is shared with the operator-manual force_finish_run
+    path that already writes its own "force_finish" audit record)."""
+
+    def test_working_hours_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        plan["workingHours"] = {
+            "days": ["MON", "TUE", "WED", "THU", "FRI"],
+            "startTime": "08:00",
+            "endTime": "17:00",
+        }
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._now_cot_hhmm", return_value=17 * 60),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=False),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "working_hours_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "working_hours_cutoff"},
+        )
+
+    def test_loop_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        plan["loop"] = {"endTime": "17:00"}
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._now_cot_hhmm", return_value=17 * 60),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=False),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "loop_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "loop_cutoff"},
+        )
+
+    def test_daily_cutoff_records_window_closed(self):
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+        cs = _campaign_state("c0", "running", connect_id="conn-0")
+        run = _make_run(plan, [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor.get_plan", return_value=plan),
+            patch("executor._force_finish_internal") as mock_finish,
+            patch("executor._past_daily_cutoff", return_value=True),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            result = executor.tick("plan-1", "run-1", 0)
+
+        mock_finish.assert_called_once()
+        assert result.get("reason") == "daily_cutoff"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id="plan-1/run-1",
+            action="window_closed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"reason": "daily_cutoff"},
+        )
+
+
+class TestReconcileRetryAndCreationFailedAuditEvents:
+    """Task 5: reconcile_retry (empty-segment retry) and creation_failed (5 sites)
+    audit events. Each test is a variant of an existing, already-passing test for
+    the same branch, plus a build_audit patch and a new mock_audit.record assertion."""
+
+    def test_empty_segment_retry_records_reconcile_retry(self):
+        """Modeled on test_start_one_campaign_retries_empty_segment_before_cancelling's
+        first-attempt arrange/act (same _EmptySegmentError side_effect on _create_segment)."""
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch(
+                "executor._create_segment",
+                side_effect=executor._EmptySegmentError("No leads"),
+            ),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "queued"
+        assert cs.get("reconcileRetries") == 1
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="reconcile_retry",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "campaignIndex": 0, "retry": 1, "retryLimit": 5},
+        )
+
+    def test_activate_warming_bucket_campaign_failure_records_creation_failed(self):
+        """Modeled on test_activate_warming_bucket_cleans_orphan_on_concurrent_write's
+        fixture (warming campaign with a connectCampaignId) + the sys.modules stub for
+        outbound_campaigns_client used by test_get_campaign_state_returns_deleted_on_404,
+        but here start_campaign raises so the cold-start except block at :2070 fires.
+        _activate_warming_bucket also unconditionally records bucket_started first, so
+        assert_any_call (not assert_called_once_with) on the creation_failed record."""
+        import sys
+
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        plan = _make_plan([bucket])
+        cs = _campaign_state("c0", "warming", connect_id="conn-w")
+        run = _make_run(plan, [_bucket_state("b0", [cs], status="warming")])
+
+        oc_mock = MagicMock()
+        oc_mock.start_campaign.side_effect = RuntimeError("Connect start failed")
+
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        vip_stub = MagicMock()
+        vip_stub.build = MagicMock(return_value=oc_mock)
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+
+        mock_audit = MagicMock()
+        try:
+            with (
+                patch("executor.build_audit", return_value=mock_audit),
+                patch("executor._schedule_tick", return_value="sched-1"),
+                patch("executor.save_run"),
+                patch("executor._dispatch_ready_campaigns", return_value=False),
+            ):
+                executor._activate_warming_bucket(run, plan, 0)
+        finally:
+            for m, orig in originals.items():
+                if orig is None:
+                    sys.modules.pop(m, None)
+                else:
+                    sys.modules[m] = orig
+
+        assert cs["status"] == "error"
+        assert cs["exitReason"] == "creation_failed"
+        mock_audit.record.assert_any_call(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="creation_failed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={
+                "bucketIndex": 0,
+                "campaignIndex": 0,
+                "error": "Connect start failed",
+            },
+        )
+
+    def test_prestart_next_bucket_campaign_failure_records_creation_failed(self):
+        """Modeled on test_prestart_sets_next_bucket_to_warming's run/plan fixture plus
+        test_prestart_plan_emits_metric_when_a_campaign_fails_to_warm's side_effect
+        pattern for _create_campaign_only, applied directly to _prestart_next_bucket
+        instead of _prestart_plan so it lands in the bare except at :2255."""
+        import executor
+
+        plan = _make_plan(
+            [
+                _bucket_def(
+                    "b0", [_campaign_def("c0")], run_mode="time_based", duration=20
+                ),
+                _bucket_def("b1", [_campaign_def("c1")]),
+            ]
+        )
+        run = _make_run(
+            plan,
+            [
+                _bucket_state("b0", [_campaign_state("c0", "running")]),
+                _bucket_state("b1", [_campaign_state("c1", "queued")], status="queued"),
+            ],
+        )
+        mock_audit = MagicMock()
+
+        with (
+            patch(
+                "executor._create_campaign_only",
+                side_effect=RuntimeError("Connect quota"),
+            ),
+            patch("executor.save_run"),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            executor._prestart_next_bucket(run, plan, 0)
+
+        cs = run["bucketStates"][1]["campaignStates"][0]
+        assert cs["status"] == "error"
+        assert cs["exitReason"] == "creation_failed"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="creation_failed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 1, "campaignIndex": 0, "error": "Connect quota"},
+        )
+
+    def test_start_warmed_campaign_failure_records_creation_failed(self):
+        """Covers executor.py's "start warmed campaign failed" else branch — a campaign
+        with a pre-existing connectCampaignId (pre-warmed) whose start_campaign call
+        raises with a message that does NOT match the "already passed" recreate path.
+        Uses the same sys.modules stub for outbound_campaigns_client as the
+        _activate_warming_bucket creation_failed test above."""
+        import sys
+
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "warming", connect_id="conn-w")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+
+        oc_mock = MagicMock()
+        oc_mock.start_campaign.side_effect = RuntimeError("Connect internal error")
+
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        vip_stub = MagicMock()
+        vip_stub.build = MagicMock(return_value=oc_mock)
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+
+        mock_audit = MagicMock()
+        try:
+            with patch("executor.build_audit", return_value=mock_audit):
+                executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+        finally:
+            for m, orig in originals.items():
+                if orig is None:
+                    sys.modules.pop(m, None)
+                else:
+                    sys.modules[m] = orig
+
+        assert cs["status"] == "error"
+        assert cs["exitReason"] == "creation_failed"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="creation_failed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={
+                "bucketIndex": 0,
+                "campaignIndex": 0,
+                "error": "Connect internal error",
+            },
+        )
+
+    def test_campaign_creation_client_error_records_creation_failed(self):
+        """Modeled on test_start_one_campaign_quota_exceeded_reverts_to_queued's fixture
+        (same _create_segment/_create_and_start_campaign patch shape), but with a
+        ClientError code NOT in the throttle/quota allowlist, so it lands in the
+        ClientError non-throttle "else" branch (creation_failed) instead of the
+        revert-to-queued branch."""
+        from botocore.exceptions import ClientError
+
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        access_denied_exc = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no permission"}},
+            "CreateCampaign",
+        )
+        with (
+            patch("executor._create_segment", return_value=("seg", "arn:seg")),
+            patch("executor._create_and_start_campaign", side_effect=access_denied_exc),
+            patch("executor._notify_sns"),
+            patch("executor._safe_delete_segment"),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "error"
+        assert cs["exitReason"] == "creation_failed"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="creation_failed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={
+                "bucketIndex": 0,
+                "campaignIndex": 0,
+                "error": str(access_denied_exc),
+            },
+        )
+
+    def test_campaign_creation_generic_exception_records_creation_failed(self):
+        """Modeled on test_start_one_campaign_quota_exceeded_reverts_to_queued's fixture,
+        with a plain (non-ClientError) exception from _create_and_start_campaign, so it
+        lands in the bare `except Exception as exc:` branch (creation_failed)."""
+        import executor
+
+        bucket = _bucket_def("b0", [_campaign_def("c0")])
+        cs = _campaign_state("c0", "queued")
+        run = _make_run(_make_plan([bucket]), [_bucket_state("b0", [cs])])
+        mock_audit = MagicMock()
+
+        with (
+            patch("executor._create_segment", return_value=("seg", "arn:seg")),
+            patch(
+                "executor._create_and_start_campaign",
+                side_effect=RuntimeError("Connect boom"),
+            ),
+            patch("executor._notify_sns"),
+            patch("executor._safe_delete_segment"),
+            patch("executor.build_audit", return_value=mock_audit),
+        ):
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        assert cs["status"] == "error"
+        assert cs["exitReason"] == "creation_failed"
+        mock_audit.record.assert_called_once_with(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action="creation_failed",
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra={"bucketIndex": 0, "campaignIndex": 0, "error": "Connect boom"},
+        )

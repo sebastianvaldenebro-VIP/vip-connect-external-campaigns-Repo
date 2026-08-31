@@ -23,9 +23,14 @@ const ACTIONS = [
   'stop',
   'pause',
   'resume',
+  'bucket_started',
+  'bucket_completed',
+  'window_closed',
+  'reconcile_retry',
+  'creation_failed',
 ];
 
-const ENTITY_TYPES = ['segment', 'campaign'];
+const ENTITY_TYPES = ['segment', 'campaign', 'plan_run'];
 
 export function Audit(): ReactNode {
   const [filters, setFilters] = useState<Filters>(EMPTY);
@@ -276,18 +281,23 @@ function EntryDetail({ entry }: { entry: AuditEntry }): ReactNode {
   );
 }
 
-function actionTone(action: string): 'success' | 'warning' | 'danger' | 'default' {
+export function actionTone(action: string): 'success' | 'warning' | 'danger' | 'default' {
   switch (action) {
     case 'create':
     case 'start':
     case 'resume':
+    case 'bucket_started':
+    case 'bucket_completed':
       return 'success';
     case 'pause':
     case 'estimate':
     case 'snapshot':
+    case 'window_closed':
+    case 'reconcile_retry':
       return 'warning';
     case 'delete':
     case 'stop':
+    case 'creation_failed':
       return 'danger';
     default:
       return 'default';

@@ -48,6 +48,7 @@ from typing import Any, Final
 
 import boto3
 from botocore.exceptions import ClientError
+from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
 
 from builders import (
     _JOURNEY_FLOW_NAME,
@@ -989,6 +990,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _wh_end,
                 run_id,
             )
+            _record_plan_event(run, "window_closed", {"reason": "working_hours_cutoff"})
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "working_hours_cutoff"}
 
@@ -1002,12 +1004,14 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                 _loop_end,
                 run_id,
             )
+            _record_plan_event(run, "window_closed", {"reason": "loop_cutoff"})
             _force_finish_internal(run, plan)
             return {"ok": True, "reason": "loop_cutoff"}
 
     # Fallback hard-stop for non-looping plans stuck past midnight
     if _past_daily_cutoff(_now_utc()):
         logger.info("tick: past daily cutoff, force-finishing run %s", run_id)
+        _record_plan_event(run, "window_closed", {"reason": "daily_cutoff"})
         _force_finish_internal(run, plan)
         return {"ok": True, "reason": "daily_cutoff"}
 
@@ -1520,7 +1524,9 @@ def force_stop_bucket(plan_id: str, run_id: str, bucket_index: int) -> dict:
     if bs["status"] not in ("running", "warming"):
         raise ValueError(f"Bucket {bucket_index} is not active (status={bs['status']})")
     plan = run.get("planSnapshot") or get_plan(plan_id) or {}
-    _expire_bucket(run, plan, bucket_index)
+    # reason="force_stopped" so the resulting bucket_completed audit event doesn't
+    # falsely claim time_expired for an operator-initiated stop (see _expire_bucket docstring).
+    _expire_bucket(run, plan, bucket_index, reason="force_stopped")
     return run
 
 
@@ -1916,6 +1922,20 @@ def _start_bucket(run: dict, index: int) -> None:
     bucket_state = run["bucketStates"][index]
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    # This fires here on every automatic start AND as a side effect of the operator-manual
+    # force_start_bucket action (which already writes its own "force_start_bucket" audit
+    # row for the same click) — expected dual-emission, not a bug, not suppressed.
+    #
+    # Also: this write happens BEFORE _schedule_tick()/save_run() below, which can fail
+    # and raise without persisting the "running" transition. A caller retry could then
+    # re-execute this function and re-emit a second bucket_started row — architecturally
+    # identical to the accepted duplicate-emission race documented on bucket_completed in
+    # _advance_bucket. Accepted as a cosmetic risk, not worth a new lock.
+    _record_plan_event(
+        run,
+        "bucket_started",
+        {"bucketIndex": index, "bucketName": plan["buckets"][index].get("name")},
+    )
 
     # Schedule FIRST — if this fails, don't create Connect campaigns without a poller
     try:
@@ -1975,6 +1995,19 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
 
     bucket_state["status"] = "running"
     bucket_state["startedAt"] = now_iso
+    # This write happens BEFORE _schedule_tick()/save_run() below, which can fail and
+    # raise without persisting the "running" transition. A caller retry could then
+    # re-execute this function and re-emit a second bucket_started row — architecturally
+    # identical to the accepted duplicate-emission race documented on bucket_completed in
+    # _advance_bucket. Accepted as a cosmetic risk, not worth a new lock.
+    _record_plan_event(
+        run,
+        "bucket_started",
+        {
+            "bucketIndex": bucket_index,
+            "bucketName": plan["buckets"][bucket_index].get("name"),
+        },
+    )
 
     # Schedule FIRST — if this fails, don't start Connect campaigns without a poller
     try:
@@ -2066,6 +2099,15 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
                     cs["exitReason"] = REASON_CREATION_FAILED
                     cs["errorDetail"] = str(exc)
                     cs["completedAt"] = now_iso
+                    _record_plan_event(
+                        run,
+                        "creation_failed",
+                        {
+                            "bucketIndex": bucket_index,
+                            "campaignIndex": ci,
+                            "error": str(exc),
+                        },
+                    )
 
     # Dispatch any newly unblocked campaigns — saves internally per wave (B1-A)
     changed = True
@@ -2250,9 +2292,28 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
                     cs["exitReason"] = REASON_CREATION_FAILED
                     cs["errorDetail"] = str(exc)
                     cs["completedAt"] = _now_iso()
+                    _record_plan_event(
+                        run,
+                        "creation_failed",
+                        {
+                            "bucketIndex": next_index,
+                            "campaignIndex": ci,
+                            "error": str(exc),
+                        },
+                    )
 
 
-def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
+def _expire_bucket(
+    run: dict, plan: dict, bucket_index: int, reason: str = "time_expired"
+) -> None:
+    """Tear down a bucket's campaigns and advance it.
+
+    `reason` flows straight into `_advance_bucket`'s `bucket_completed` audit event —
+    it must reflect why THIS call happened. Defaults to the automatic time-based-expiry
+    wording (tick()'s call site) since that's the original/most common caller.
+    force_stop_bucket (operator-manual) passes its own reason so the audit trail
+    doesn't misreport a manual stop as a genuine time expiry.
+    """
     now = _now_iso()
     bucket_state = run["bucketStates"][bucket_index]
 
@@ -2270,7 +2331,7 @@ def _expire_bucket(run: dict, plan: dict, bucket_index: int) -> None:
             cs["exitReason"] = REASON_BUCKET_EXPIRED
             cs["completedAt"] = now
 
-    _advance_bucket(run, plan, bucket_index, reason="time_expired")
+    _advance_bucket(run, plan, bucket_index, reason=reason)
 
 
 def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> None:
@@ -2301,6 +2362,13 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
 
         bucket_state["status"] = "completed"
         bucket_state["completedAt"] = now
+
+        # Duplicate audit row possible if this function re-executes after a
+        # ConcurrentWriteError below (see comment above on stale_tick re-tryability)
+        # — accepted, a cosmetic duplicate in the activity feed, not worth a new lock.
+        _record_plan_event(
+            run, "bucket_completed", {"bucketIndex": bucket_index, "bucketName": bucket.get("name"), "reason": reason}
+        )
 
         # Fire any plans waiting for this specific bucket to complete
         try:
@@ -3431,7 +3499,13 @@ def _next_bucket_warming(run: dict, current_index: int) -> bool:
 def _start_one_campaign(
     run: dict, plan: dict, bucket_index: int, campaign_index: int
 ) -> None:
-    """Start a single campaign (creating segment + Connect campaign if not already warmed)."""
+    """Start a single campaign (creating segment + Connect campaign if not already warmed).
+
+    Also reachable via the operator-manual force_start_campaign action. If creation
+    fails here, the resulting "creation_failed" event dual-emits alongside
+    force_start_campaign's own "force_start_campaign" audit row for the same click —
+    expected, not a bug, not suppressed.
+    """
     bucket = plan["buckets"][bucket_index]
     campaigns = bucket.get("campaigns", [])
     campaign = campaigns[campaign_index]
@@ -3686,6 +3760,15 @@ def _start_one_campaign(
                 cs["exitReason"] = REASON_CREATION_FAILED
                 cs["errorDetail"] = str(exc)
                 cs["completedAt"] = now_iso
+                _record_plan_event(
+                    run,
+                    "creation_failed",
+                    {
+                        "bucketIndex": bucket_index,
+                        "campaignIndex": campaign_index,
+                        "error": str(exc),
+                    },
+                )
                 return
 
     # Fresh start: create segment → create Connect campaign → start
@@ -3733,6 +3816,16 @@ def _start_one_campaign(
                 if empty_retries < reconcile_retry_limit:
                     cs["status"] = "queued"
                     cs["reconcileRetries"] = empty_retries + 1
+                    _record_plan_event(
+                        run,
+                        "reconcile_retry",
+                        {
+                            "bucketIndex": bucket_index,
+                            "campaignIndex": campaign_index,
+                            "retry": empty_retries + 1,
+                            "retryLimit": reconcile_retry_limit,
+                        },
+                    )
                     _slog.warn(
                         "start_one_campaign_empty_segment_retry",
                         plan_id=run["planId"],
@@ -3924,6 +4017,15 @@ def _start_one_campaign(
             cs["exitReason"] = REASON_CREATION_FAILED
             cs["errorDetail"] = f"Campaign creation failed: {exc}"
             cs["completedAt"] = now_iso
+            _record_plan_event(
+                run,
+                "creation_failed",
+                {
+                    "bucketIndex": bucket_index,
+                    "campaignIndex": campaign_index,
+                    "error": str(exc),
+                },
+            )
             _notify_sns(
                 subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
                 detail=(
@@ -3948,6 +4050,15 @@ def _start_one_campaign(
         cs["exitReason"] = REASON_CREATION_FAILED
         cs["errorDetail"] = f"Campaign creation failed: {exc}"
         cs["completedAt"] = now_iso
+        _record_plan_event(
+            run,
+            "creation_failed",
+            {
+                "bucketIndex": bucket_index,
+                "campaignIndex": campaign_index,
+                "error": str(exc),
+            },
+        )
         _notify_sns(
             subject=f"[VIP Plans] Campaign creation FAILED: {cs.get('name', cs['campaignId'])}",
             detail=(
@@ -4881,6 +4992,27 @@ def _emit_queue_collision_metric(queue_id: str) -> None:
         logger.warning(
             "_emit_queue_collision_metric failed queue=%s error=%s",
             queue_id, type(exc).__name__,
+        )
+
+
+def _record_plan_event(run: dict, action: str, extra: dict | None = None) -> None:
+    """Best-effort write to the day-activity-feed audit trail (AdminAuditLog).
+
+    Telemetry only — a write failure here must never abort plan execution,
+    so every exception is caught and logged, not raised.
+    """
+    try:
+        build_audit().record(
+            entity_type="plan_run",
+            entity_id=f"{run['planId']}/{run['runId']}",
+            action=action,
+            actor_sub="system",
+            actor_email="system@api-plans-executor",
+            extra=extra,
+        )
+    except Exception as exc:
+        logger.warning(
+            "_record_plan_event(%s) failed: %s", action, type(exc).__name__
         )
 
 
