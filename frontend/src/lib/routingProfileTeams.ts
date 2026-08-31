@@ -40,8 +40,9 @@ export const TEAM_ROUTING_PROFILES: Record<string, string[]> = {
     'RCM - Repricing (repricing)',
     'RCM - (name redacted)',
   ],
-  // patient-success includes both the PC-* (Patient Care → renamed Patient Success)
-  // and PS-* (Patient Success coordinators/management) routing profiles.
+  // patient-success (displayed as "Patient Access") is PC-* only — PS-*
+  // (Patient Success coordinators/management) are a different team and must
+  // not be included here, even though the names look related.
   'patient-success': [
     'PC - Existing Patient',
     'PC - Existing Patient Spanish',
@@ -54,9 +55,6 @@ export const TEAM_ROUTING_PROFILES: Record<string, string[]> = {
     'PC - New Leads Spanish',
     'PC - New Leads Temporary Profile',
     'PC - TL',
-    'PS - Management',
-    'PS - Success Coordinator',
-    'PS - Success Specialist',
   ],
   'insurance-verification': [
     'IV - Agent',
@@ -85,11 +83,20 @@ export const TEAM_ROUTING_PROFILES: Record<string, string[]> = {
   ],
 };
 
+/** Prefix-matched teams — for naming conventions stable enough that any current
+ * or future routing profile matching the prefix belongs to the team, without
+ * needing this file edited every time Connect gets a new one added/renamed.
+ * Checked after TEAM_ROUTING_PROFILES' exact matches in teamForProfile().
+ */
+export const TEAM_ROUTING_PROFILE_PREFIXES: Record<string, string[]> = {
+  'patient-success': ['PC - '],
+};
+
 export const TEAM_LABELS: Record<string, string> = {
   'front-desk':            'Front Desk',
   'appointment-services':  'Appointment Svcs',
   'rcm':                   'RCM',
-  'patient-success':       'Patient Success',
+  'patient-success':       'Patient Access',
   'insurance-verification':'Insurance Verification',
   'referrals-medical':     'Referrals',
   'specialty':             'Specialty',
@@ -103,6 +110,9 @@ export const BRANDED_MONITOR_TEAMS = ['patient-success', 'appointment-services']
 export function teamForProfile(profileName: string): string | null {
   for (const [team, names] of Object.entries(TEAM_ROUTING_PROFILES)) {
     if (names.includes(profileName)) return team;
+  }
+  for (const [team, prefixes] of Object.entries(TEAM_ROUTING_PROFILE_PREFIXES)) {
+    if (prefixes.some((prefix) => profileName.startsWith(prefix))) return team;
   }
   return null;
 }
