@@ -244,8 +244,15 @@ export type AuditEntry = {
   after?: unknown;
   ipAddress?: string;
   userAgent?: string;
-  extra?: unknown;
+  extra?: AuditEventExtra | Record<string, unknown> | null;
 };
+
+export type AuditEventExtra =
+  | { bucketIndex: number; bucketName?: string | null }
+  | { bucketIndex: number; bucketName?: string | null; reason: string }
+  | { reason: string }
+  | { bucketIndex: number; campaignIndex: number; retry: number; retryLimit: number }
+  | { bucketIndex: number; campaignIndex: number; error: string };
 
 export type Profile = {
   profileId: string;
@@ -587,6 +594,7 @@ export type CampaignState = {
   completedAt?: string;
   exitReason?: string;
   errorDetail?: string;
+  reconcile?: { expected: number; actual: number; retries: number };
 };
 
 export type BucketStateV2 = {
