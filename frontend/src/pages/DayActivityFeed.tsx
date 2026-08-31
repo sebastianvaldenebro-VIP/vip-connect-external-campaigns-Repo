@@ -44,16 +44,18 @@ const BADGE_TONE_TO_STATUS_TONE: Record<ReturnType<typeof actionTone>, StatusTon
 export function DayActivityFeed({
   planId,
   runId,
+  active,
   className,
 }: {
   planId: string;
   runId: string;
+  active: boolean;
   className?: string;
 }): ReactNode {
   const query = useQuery({
     queryKey: ['day-activity', planId, runId],
     queryFn: () => api.audit.entityHistory(`plan_run/${planId}/${runId}`),
-    refetchInterval: 15_000,
+    refetchInterval: active ? 15_000 : false,
   });
 
   const items: ActivityFeedItem[] = (query.data?.entries ?? []).map((entry) => ({
@@ -66,7 +68,11 @@ export function DayActivityFeed({
   return (
     <div className={className}>
       <h3 className="text-sm font-semibold text-gray-700 mb-2">Day activity</h3>
-      <ActivityFeed items={items} emptyLabel={query.isPending ? 'Loading…' : 'No activity yet.'} />
+      {query.isError ? (
+        <p className="text-xs text-red-500">Failed to load activity.</p>
+      ) : (
+        <ActivityFeed items={items} emptyLabel={query.isPending ? 'Loading…' : 'No activity yet.'} />
+      )}
     </div>
   );
 }

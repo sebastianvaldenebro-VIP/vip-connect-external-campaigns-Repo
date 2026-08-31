@@ -53,11 +53,17 @@ export function aggregateByRoutingProfile(agents: AgentRosterEntry[]): RoutingPr
   return [...byProfile.values()].sort((a, b) => a.available - b.available);
 }
 
-export function AgentAvailabilityPanel({ className }: { className?: string }): ReactNode {
+export function AgentAvailabilityPanel({
+  active,
+  className,
+}: {
+  active: boolean;
+  className?: string;
+}): ReactNode {
   const query = useQuery({
     queryKey: ['agent-roster', 'all'],
     queryFn: () => api.brandedMonitor.getAgentRoster(),
-    refetchInterval: 20_000,
+    refetchInterval: active ? 20_000 : false,
   });
 
   const rows = aggregateByRoutingProfile(query.data?.agents ?? []);

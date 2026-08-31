@@ -824,6 +824,10 @@ export function PlanDetail(): ReactNode {
   // Use planSnapshot from run when available (immutable at trigger time)
   const planForDisplay = (displayRun?.planSnapshot as PlanSummaryV2 | undefined) ?? plan;
 
+  // Gates polling for the right-column monitoring panels: only the currently active
+  // run's own display should poll — viewing a completed/aborted historical run shouldn't.
+  const isDisplayedRunActive = isRunActive && displayRun?.runId === latestRun?.runId;
+
   const isRunning = latestRun?.status === 'running';
 
   // True when the live plan definition has diverged from the active run's snapshot
@@ -970,7 +974,7 @@ export function PlanDetail(): ReactNode {
 
         {displayRun && (
           <div className="mt-3">
-            <DayHeaderTimeline plan={plan} run={displayRun} />
+            <DayHeaderTimeline plan={planForDisplay} run={displayRun} />
           </div>
         )}
       </div>
@@ -1210,8 +1214,8 @@ export function PlanDetail(): ReactNode {
 
           {displayRun && (
             <div className="space-y-6">
-              <AgentAvailabilityPanel />
-              <DayActivityFeed planId={id!} runId={displayRun.runId} />
+              <AgentAvailabilityPanel active={isDisplayedRunActive} />
+              <DayActivityFeed planId={id!} runId={displayRun.runId} active={isDisplayedRunActive} />
             </div>
           )}
         </div>

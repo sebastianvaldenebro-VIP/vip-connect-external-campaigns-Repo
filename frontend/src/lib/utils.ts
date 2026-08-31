@@ -14,7 +14,7 @@ export function formatDateTime(iso: string | undefined | null): string {
 
 // ── Time helpers (Colombia timezone, UTC-5, no DST) ──────────────────────────
 
-const COL_OFFSET_MS = -5 * 60 * 60 * 1000;
+export const COL_OFFSET_MS = -5 * 60 * 60 * 1000;
 
 /** Formats a UTC timestamp as "HH:MM" in Colombia time (UTC-5, no DST). */
 export function fmtTime(d: Date | string | null | undefined): string {
