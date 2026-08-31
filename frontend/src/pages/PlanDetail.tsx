@@ -990,7 +990,7 @@ export function PlanDetail(): ReactNode {
 
       {/* ── Main content ─────────────────────────────────────────────────────── */}
       <div className="px-8 py-6">
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <div className={`grid grid-cols-1 gap-6 ${displayRun ? 'lg:grid-cols-[minmax(0,1fr)_320px]' : ''}`}>
           <div className="space-y-6">
 
             {/* Active / selected run — bucket sections */}
