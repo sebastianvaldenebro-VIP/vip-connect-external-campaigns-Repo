@@ -239,6 +239,9 @@ def get_agent_roster(event: dict, context: object) -> dict:
 
                 if active:
                     effective = "On Call"
+                    # Use the contact's StateStartTimestamp so elapsed time reflects
+                    # how long the agent has been on this specific call, not how long
+                    # they've been in their Connect status (which doesn't reset per call).
                     effective_ts = active.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
                 elif acw:
                     effective = "ACW"
