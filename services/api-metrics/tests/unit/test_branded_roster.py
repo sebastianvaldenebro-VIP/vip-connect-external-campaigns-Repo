@@ -381,6 +381,54 @@ class TestRoutingProfileBatching:
         body = json.loads(resp["body"])
         assert {a["agentId"] for a in body["agents"]} == {"u-1", "u-2"}
 
+    def test_multi_batch_with_multi_page_first_batch_does_not_leak_next_token(self):
+        """Batch 1 (100 profiles) spans 2 pages via its own NextToken; batch 2
+        (50 profiles) must start fresh with no NextToken, not inherit batch
+        1's leftover token from its last page.
+        """
+        from handlers import branded
+
+        page1_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100)]
+        page2_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100, 150)]
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"RoutingProfileSummaryList": page1_profiles},
+            {"RoutingProfileSummaryList": page2_profiles},
+        ]
+        mock.get_paginator.return_value = paginator
+        mock.list_agent_statuses.return_value = {
+            "AgentStatusSummaryList": [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}],
+        }
+        mock.describe_user.return_value = {
+            "User": {"IdentityInfo": {"FirstName": "A", "LastName": "B"}, "Username": "ab"},
+        }
+
+        # Batch 1 (100 profiles) spans 2 pages via its own NextToken.
+        batch1_page1 = {
+            "UserDataList": [_user_data(user_id="u-1", rp_id="rp-0", status_arn="arn:.../agent-status/s-avail")],
+            "NextToken": "batch1-tok-2",
+        }
+        batch1_page2 = {
+            "UserDataList": [_user_data(user_id="u-2", rp_id="rp-0", status_arn="arn:.../agent-status/s-avail")],
+        }
+        # Batch 2 (50 profiles) is a single page.
+        batch2_page1 = {
+            "UserDataList": [_user_data(user_id="u-3", rp_id="rp-149", status_arn="arn:.../agent-status/s-avail")],
+        }
+        mock.get_current_user_data.side_effect = [batch1_page1, batch1_page2, batch2_page1]
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        body = json.loads(resp["body"])
+        assert {a["agentId"] for a in body["agents"]} == {"u-1", "u-2", "u-3"}
+        assert mock.get_current_user_data.call_count == 3
+        # The 3rd call (batch 2's first/only page) must NOT carry a NextToken —
+        # proving batch 2 didn't inherit batch 1's leftover token.
+        third_call_kwargs = mock.get_current_user_data.call_args_list[2].kwargs
+        assert "NextToken" not in third_call_kwargs
+
 
 class TestEmptyRosterResponseShape:
     """The empty-roster early-return must carry the same 4 keys the TS type
