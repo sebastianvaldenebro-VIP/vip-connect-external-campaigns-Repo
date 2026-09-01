@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Avatar } from '@/components/ui/Avatar';
 import { StatTile } from '@/components/ui/StatTile';
 import { StatusChip } from '@/components/ui/StatusChip';
-import { api, type AgentRosterEntry } from '@/lib/api';
+import { api, type AgentRosterEntry, type RoutingProfileSummary } from '@/lib/api';
 import {
   aggregateByRoutingProfile,
   agentAlert,
@@ -54,6 +54,7 @@ export function AgentRoster(): ReactNode {
     (a) => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(a.routingProfileName) ?? ''),
   );
   const lastUpdated = query.data?.lastUpdated;
+  const routingProfiles: RoutingProfileSummary[] = query.data?.routingProfiles ?? [];
 
   function toggleStatus(status: AgentRosterEntry['effectiveStatus']) {
     setStatusFilters((prev) => {
@@ -63,17 +64,18 @@ export function AgentRoster(): ReactNode {
     });
   }
 
-  // NOTE: the brief's Step 1 also specified a `toggleRp(id)` helper mirroring
-  // `toggleStatus` above, for setting `rpFilters` via a routing-profile filter
-  // button row. Omitted here: it has no caller anywhere in this 7-task plan
-  // (grepped the master plan doc — no task ever renders team/routing-profile
-  // filter buttons, despite this task's own Context note promising a
-  // "row-of-buttons" pattern for them) and this repo's `noUnusedLocals: true`
-  // makes an uncalled local function declaration a hard build error, not a
-  // lint warning. `rpFilters`/`setRpFilters` state is kept exactly as
-  // specified — `rpFilters` is read by the `filteredAgents` predicate below.
-  // If a future task adds team/routing-profile filter buttons, add this
-  // helper back then (identical to `toggleStatus`, targeting `setRpFilters`).
+  function selectTeam(team: string | null) {
+    setTeamFilter(team);
+    setRpFilters(new Set());
+  }
+
+  function toggleRp(id: string) {
+    setRpFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
 
   function clearFilters() {
     setSearch('');
@@ -104,6 +106,24 @@ export function AgentRoster(): ReactNode {
 
   const hasActiveFilters = search !== '' || statusFilters.size > 0 || teamFilter !== null || rpFilters.size > 0 || alertFilter !== 'all';
   const flaggedInScope = agents.filter((a) => agentAlert(a, DEFAULT_ALERT_THRESHOLDS, nowMs) !== null);
+
+  const activeTeams = (BRANDED_MONITOR_TEAMS as readonly string[]).filter((team) =>
+    agents.some((a) => teamForProfile(a.routingProfileName) === team),
+  );
+  const visibleRps = teamFilter === null
+    ? routingProfiles.filter((rp) => {
+        const t = teamForProfile(rp.name);
+        return t !== null && (BRANDED_MONITOR_TEAMS as readonly string[]).includes(t);
+      })
+    : routingProfiles.filter((rp) => teamForProfile(rp.name) === teamFilter);
+  const teamCounts = activeTeams.reduce<Record<string, number>>((acc, team) => {
+    acc[team] = agents.filter((a) => teamForProfile(a.routingProfileName) === team).length;
+    return acc;
+  }, {});
+  const rpCounts = visibleRps.reduce<Record<string, number>>((acc, rp) => {
+    acc[rp.id] = agents.filter((a) => a.routingProfileId === rp.id).length;
+    return acc;
+  }, {});
 
   return (
     <div className="space-y-4">
@@ -139,6 +159,15 @@ export function AgentRoster(): ReactNode {
             totalCount={agents.length}
             hasActiveFilters={hasActiveFilters}
             onClearFilters={clearFilters}
+            activeTeams={activeTeams}
+            teamFilter={teamFilter}
+            onSelectTeam={selectTeam}
+            teamCounts={teamCounts}
+            visibleRps={visibleRps}
+            rpFilters={rpFilters}
+            onToggleRp={toggleRp}
+            onClearRp={() => setRpFilters(new Set())}
+            rpCounts={rpCounts}
           />
           <NeedsAttentionPanel agents={flaggedInScope} nowMs={nowMs} onAlertKeyClick={setAlertFilter} />
           <CapacityTable agents={agents} />
@@ -287,6 +316,8 @@ function ControlBar({
   alertFilter, onAlertFilter, flaggedCount,
   groupByProfile, onToggleGroup,
   filteredCount, totalCount, hasActiveFilters, onClearFilters,
+  activeTeams, teamFilter, onSelectTeam, teamCounts,
+  visibleRps, rpFilters, onToggleRp, onClearRp, rpCounts,
 }: {
   search: string; onSearch: (v: string) => void;
   statusFilters: Set<AgentRosterEntry['effectiveStatus']>; onToggleStatus: (s: AgentRosterEntry['effectiveStatus']) => void;
@@ -294,6 +325,8 @@ function ControlBar({
   alertFilter: AlertFilter; onAlertFilter: (f: AlertFilter) => void; flaggedCount: number;
   groupByProfile: boolean; onToggleGroup: () => void;
   filteredCount: number; totalCount: number; hasActiveFilters: boolean; onClearFilters: () => void;
+  activeTeams: string[]; teamFilter: string | null; onSelectTeam: (team: string | null) => void; teamCounts: Record<string, number>;
+  visibleRps: RoutingProfileSummary[]; rpFilters: Set<string>; onToggleRp: (id: string) => void; onClearRp: () => void; rpCounts: Record<string, number>;
 }): ReactNode {
   return (
     <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-3">
@@ -315,6 +348,28 @@ function ControlBar({
           </FilterBtn>
         ))}
       </div>
+      {activeTeams.length > 0 && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Team</span>
+          <FilterBtn active={teamFilter === null} onClick={() => onSelectTeam(null)}>All</FilterBtn>
+          {activeTeams.map((team) => (
+            <FilterBtn key={team} active={teamFilter === team} onClick={() => onSelectTeam(team)}>
+              {TEAM_LABELS[team] ?? team} <span className="opacity-60">{teamCounts[team] ?? 0}</span>
+            </FilterBtn>
+          ))}
+        </div>
+      )}
+      {visibleRps.length > 0 && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Profile</span>
+          <FilterBtn active={rpFilters.size === 0} onClick={onClearRp}>All</FilterBtn>
+          {visibleRps.map((rp) => (
+            <FilterBtn key={rp.id} active={rpFilters.has(rp.id)} onClick={() => onToggleRp(rp.id)}>
+              {rp.name} <span className="opacity-60">{rpCounts[rp.id] ?? 0}</span>
+            </FilterBtn>
+          ))}
+        </div>
+      )}
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Alerts</span>
         <FilterBtn active={alertFilter === 'all'} onClick={() => onAlertFilter('all')}>All agents</FilterBtn>
