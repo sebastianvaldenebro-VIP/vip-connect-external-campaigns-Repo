@@ -230,9 +230,9 @@ export function PlansGuide(): ReactNode {
             <li><strong>Abort</strong> — stops all campaigns and marks the run aborted. Chained plans do NOT fire. Loop does NOT restart.</li>
             <li><strong>Force Finish</strong> — stops all campaigns and marks the run completed. Chained plans WILL fire. Loop WILL restart.</li>
             <li><strong>▶ Start now</strong> (bucket header) — activates a queued or warming bucket immediately, bypassing timing and dependency checks.</li>
-            <li><strong>⏹ Stop bucket</strong> (bucket header) — expires the current bucket now and advances to the next one.</li>
+            <li><strong>■ Stop bucket</strong> (bucket header) — expires the current bucket now and advances to the next one.</li>
             <li><strong>▶</strong> (campaign card) — force-starts a single queued or cancelled campaign, bypassing its dependencies. Useful when a campaign got stuck or was incorrectly cancelled.</li>
-            <li><strong>⏹</strong> (campaign card) — force-stops a single running campaign immediately. If it was the last running campaign in the bucket, the bucket advances automatically.</li>
+            <li><strong>■</strong> (campaign card) — force-stops a single running campaign immediately. If it was the last running campaign in the bucket, the bucket advances automatically.</li>
           </ul>
           <p className="mt-1">
             <strong>When a run completes normally:</strong> all chained plans fire (any plan with trigger

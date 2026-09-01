@@ -521,7 +521,7 @@ function HowToUseTab(): ReactNode {
           <li><strong>Abort</strong> — stops all campaigns immediately and marks the run aborted. Does not trigger chained plans.</li>
           <li><strong>Force Finish</strong> — stops all campaigns and marks the run completed. Chained plans will fire.</li>
           <li><strong>▶ Start now</strong> (on a bucket) — manually activates a queued or warming bucket, bypassing timing and dependency checks.</li>
-          <li><strong>⏹ Stop bucket</strong> (on a bucket) — expires the current bucket immediately and advances to the next one.</li>
+          <li><strong>■ Stop bucket</strong> (on a bucket) — expires the current bucket immediately and advances to the next one.</li>
           <li><strong>▶</strong> (on a campaign card) — force-starts a single queued or cancelled campaign, bypassing its dependencies. Useful when a campaign got stuck or was cancelled by mistake.</li>
         </ul>
       </GuideSection>

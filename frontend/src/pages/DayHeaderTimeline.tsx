@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 
 import { clampPercent } from '@/components/ui/status';
 import type { BucketStateV2, PlanRunV2, PlanSummaryV2 } from '@/lib/api';
-import { COL_OFFSET_MS } from '@/lib/utils';
+import { COL_OFFSET_MS, fmtTime } from '@/lib/utils';
 
 export type TimelineSegment = {
   bucketIndex: number;
@@ -67,6 +67,13 @@ const SEGMENT_COLOR: Record<BucketStateV2['status'], string> = {
   completed: 'bg-green-500',
 };
 
+const LEGEND: { status: BucketStateV2['status']; label: string }[] = [
+  { status: 'queued', label: 'Queued' },
+  { status: 'warming', label: 'Warming' },
+  { status: 'running', label: 'Running' },
+  { status: 'completed', label: 'Completed' },
+];
+
 // Parses an "HH:MM" (COT) string and applies it to `base`'s COT calendar date.
 // Operates entirely via UTC-getters/Date.UTC (the same trick `fmtTime` in lib/utils
 // uses) rather than Date.prototype.setHours, which would apply the browser's local
@@ -96,15 +103,33 @@ export function DayHeaderTimeline({ plan, run }: { plan: PlanSummaryV2; run: Pla
   const nowPct = Math.min(100, Math.max(0, ((now.getTime() - windowStart.getTime()) / (windowEnd.getTime() - windowStart.getTime())) * 100));
 
   return (
-    <div className="relative h-6 w-full rounded-full bg-gray-100 overflow-hidden">
-      {segments.map((seg) => (
-        <div
-          key={seg.bucketIndex}
-          className={`absolute top-0 h-full ${SEGMENT_COLOR[seg.status]}`}
-          style={{ left: `${seg.startPct}%`, width: `${Math.max(0.5, seg.endPct - seg.startPct)}%` }}
-        />
-      ))}
-      <div className="absolute top-0 h-full w-0.5 bg-gray-900" style={{ left: `${nowPct}%` }} />
+    <div>
+      <div
+        className="relative h-6 w-full rounded-full bg-gray-100 overflow-hidden"
+        role="img"
+        aria-label={`Bucket timeline from ${fmtTime(windowStart)} to ${fmtTime(windowEnd)}, now at ${fmtTime(now)}`}
+      >
+        {segments.map((seg) => (
+          <div
+            key={seg.bucketIndex}
+            className={`absolute top-0 h-full ${SEGMENT_COLOR[seg.status]}`}
+            style={{ left: `${seg.startPct}%`, width: `${Math.max(0.5, seg.endPct - seg.startPct)}%` }}
+          />
+        ))}
+        <div className="absolute top-0 h-full w-0.5 bg-gray-900" style={{ left: `${nowPct}%` }} />
+      </div>
+      <div className="mt-1.5 flex items-center gap-3 text-[11px] text-gray-500">
+        {LEGEND.map(({ status, label }) => (
+          <span key={status} className="inline-flex items-center gap-1">
+            <span className={`inline-block h-2 w-2 rounded-full ${SEGMENT_COLOR[status]}`} />
+            {label}
+          </span>
+        ))}
+        <span className="inline-flex items-center gap-1">
+          <span className="inline-block h-2 w-0.5 bg-gray-900" />
+          Now
+        </span>
+      </div>
     </div>
   );
 }

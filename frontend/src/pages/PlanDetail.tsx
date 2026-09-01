@@ -261,7 +261,7 @@ function CampaignCard({
               className="text-[10px] text-orange-600 border border-orange-300 rounded px-1.5 py-0.5 hover:bg-orange-50 leading-none"
               title="Stop this campaign now"
             >
-              ⏹
+              ■
             </button>
           )}
           {onSkip && (cs.status === 'queued' || cs.status === 'warming' || cs.status === 'running') && (
@@ -271,7 +271,7 @@ function CampaignCard({
               className="text-[10px] text-gray-500 border border-gray-300 rounded px-1.5 py-0.5 hover:bg-gray-100 leading-none"
               title="Skip this campaign — children will not be cascade-cancelled"
             >
-              ⏭
+              »
             </button>
           )}
         </div>
@@ -519,7 +519,7 @@ function BucketSection({
             onClick={onForceStop}
             className="shrink-0 text-xs text-orange-600 border border-orange-300 rounded px-2 py-0.5 hover:bg-orange-50"
           >
-            ⏹ Stop bucket
+            ■ Stop bucket
           </button>
         )}
       </div>
