@@ -16,10 +16,53 @@ import {
   type AgentAlertKey,
   type RoutingProfileAvailability,
 } from '@/lib/agentRoster';
-import { elapsedMinutes, formatElapsed } from '@/lib/utils';
+import { elapsedMinutes, elapsedSeconds, formatElapsed, formatRuntime } from '@/lib/utils';
 import { BRANDED_MONITOR_TEAMS, TEAM_LABELS, teamForProfile } from '@/lib/routingProfileTeams';
 
 type AlertFilter = 'all' | 'any' | AgentAlertKey;
+
+export function sortAgentsForDisplay(agents: AgentRosterEntry[], nowMs: number = Date.now()): AgentRosterEntry[] {
+  return [...agents].sort((a, b) => {
+    const aFlagged = agentAlert(a, DEFAULT_ALERT_THRESHOLDS, nowMs) !== null;
+    const bFlagged = agentAlert(b, DEFAULT_ALERT_THRESHOLDS, nowMs) !== null;
+    if (aFlagged !== bFlagged) return aFlagged ? -1 : 1;
+    return elapsedMinutes(b.statusStartTimestamp, nowMs) - elapsedMinutes(a.statusStartTimestamp, nowMs);
+  });
+}
+
+export type AgentRosterGroup = {
+  routingProfileId: string;
+  routingProfileName: string;
+  agents: AgentRosterEntry[];
+  flaggedCount: number;
+  staffing: ReturnType<typeof classifyStaffing>;
+};
+
+export function groupAgentsByProfile(agents: AgentRosterEntry[], nowMs: number = Date.now()): AgentRosterGroup[] {
+  const byProfile = new Map<string, AgentRosterEntry[]>();
+  for (const agent of agents) {
+    const list = byProfile.get(agent.routingProfileId) ?? [];
+    list.push(agent);
+    byProfile.set(agent.routingProfileId, list);
+  }
+  const groups: AgentRosterGroup[] = [...byProfile.entries()].map(([routingProfileId, list]) => {
+    const available = list.filter((a) => a.effectiveStatus === 'Available').length;
+    const flaggedCount = list.filter((a) => agentAlert(a, DEFAULT_ALERT_THRESHOLDS, nowMs) !== null).length;
+    return {
+      routingProfileId,
+      routingProfileName: list[0]!.routingProfileName,
+      agents: sortAgentsForDisplay(list, nowMs),
+      flaggedCount,
+      staffing: classifyStaffing(available, minAvailableFor(list[0]!.routingProfileName)),
+    };
+  });
+  return groups.sort((a, b) => {
+    if ((a.flaggedCount > 0) !== (b.flaggedCount > 0)) return a.flaggedCount > 0 ? -1 : 1;
+    const riskDiff = STAFFING_RISK_ORDER[a.staffing.risk] - STAFFING_RISK_ORDER[b.staffing.risk];
+    if (riskDiff !== 0) return riskDiff;
+    return b.agents.length - a.agents.length;
+  });
+}
 
 /** Ticks every second so elapsed-time displays (M:SS timers, alert thresholds)
  * update live without waiting for the next data refetch. */
@@ -170,6 +213,7 @@ export function AgentRoster(): ReactNode {
             rpCounts={rpCounts}
           />
           <NeedsAttentionPanel agents={flaggedInScope} nowMs={nowMs} onAlertKeyClick={setAlertFilter} />
+          <AgentList agents={filteredAgents} groupByProfile={groupByProfile} nowMs={nowMs} isLoading={query.isLoading} />
           <CapacityTable agents={agents} />
         </>
       )}
@@ -430,6 +474,79 @@ function NeedsAttentionPanel({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function AgentRow({ agent, nowMs }: { agent: AgentRosterEntry; nowMs: number }): ReactNode {
+  const alert = agentAlert(agent, DEFAULT_ALERT_THRESHOLDS, nowMs);
+  const rowTint = alert?.sev === 'error' ? 'bg-red-50/50' : alert?.sev === 'warn' ? 'bg-amber-50/50' : '';
+  return (
+    <div className={`flex items-center gap-3 px-4 py-2.5 ${rowTint}`}>
+      <Avatar name={agent.agentName || agent.agentId} tone={agentStatusTone(agent.effectiveStatus)} />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-gray-800 truncate">{agent.agentName || agent.agentId}</div>
+        <div className="text-[11px] text-gray-400 truncate">
+          {alert ? `${alert.why} · ${agent.routingProfileName}` : agent.routingProfileName}
+        </div>
+      </div>
+      <StatusChip tone={agentStatusTone(agent.effectiveStatus)} label={agent.effectiveStatus === 'Unavailable' ? 'Away' : agent.effectiveStatus} />
+      <span className="w-14 text-right font-mono text-sm tabular-nums text-gray-600 shrink-0">
+        {formatRuntime(elapsedSeconds(agent.statusStartTimestamp, nowMs))}
+      </span>
+    </div>
+  );
+}
+
+function AgentList({
+  agents, groupByProfile, nowMs, isLoading,
+}: {
+  agents: AgentRosterEntry[]; groupByProfile: boolean; nowMs: number; isLoading: boolean;
+}): ReactNode {
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
+      <div className="px-4 py-2.5 border-b border-gray-100 flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-gray-800">
+          Agents <span className="text-gray-400 font-normal">({agents.length})</span>
+        </h2>
+        <span className="text-[11px] text-gray-400">Time in current status · flagged agents first</span>
+      </div>
+
+      {isLoading && <div className="px-4 py-10 text-center text-sm text-gray-400">Loading agents…</div>}
+
+      {!isLoading && agents.length === 0 && (
+        <div className="px-4 py-10 text-center">
+          <div className="text-sm text-gray-500">No agents match</div>
+          <div className="text-xs text-gray-400 mt-1">Try clearing a filter or the search.</div>
+        </div>
+      )}
+
+      {!isLoading && agents.length > 0 && !groupByProfile && (
+        <div className="divide-y divide-gray-100">
+          {sortAgentsForDisplay(agents, nowMs).map((a) => <AgentRow key={a.agentId} agent={a} nowMs={nowMs} />)}
+        </div>
+      )}
+
+      {!isLoading && agents.length > 0 && groupByProfile && (
+        <div className="divide-y divide-gray-100">
+          {groupAgentsByProfile(agents, nowMs).map((group) => (
+            <div key={group.routingProfileId}>
+              <div className="px-4 py-2 bg-gray-50 flex items-center gap-2 text-xs">
+                <span className="font-medium text-gray-700">{group.routingProfileName}</span>
+                <span className="text-gray-400">
+                  {group.agents.length} · {group.agents.filter((a) => a.effectiveStatus === 'Available').length} available
+                </span>
+                {group.flaggedCount > 0 && (
+                  <span className="text-amber-600">{group.flaggedCount} flagged</span>
+                )}
+              </div>
+              <div className="divide-y divide-gray-100">
+                {group.agents.map((a) => <AgentRow key={a.agentId} agent={a} nowMs={nowMs} />)}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
