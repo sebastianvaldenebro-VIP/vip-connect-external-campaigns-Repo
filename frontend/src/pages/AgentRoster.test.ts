@@ -32,8 +32,8 @@ describe('sortAgentsForDisplay', () => {
   });
 
   it('within the same flagged state, sorts by longest time in status first', () => {
-    const longer  = agent({ agentId: 'longer',  statusStartTimestamp: new Date(T0 - 30 * 60_000).toISOString() });
-    const shorter = agent({ agentId: 'shorter', statusStartTimestamp: new Date(T0 - 5 * 60_000).toISOString() });
+    const longer  = agent({ agentId: 'longer',  effectiveStatus: 'Offline', statusStartTimestamp: new Date(T0 - 30 * 60_000).toISOString() });
+    const shorter = agent({ agentId: 'shorter', effectiveStatus: 'Offline', statusStartTimestamp: new Date(T0 - 5 * 60_000).toISOString() });
     const result = sortAgentsForDisplay([shorter, longer], T0);
     expect(result.map((a) => a.agentId)).toEqual(['longer', 'shorter']);
   });
