@@ -156,6 +156,12 @@ def get_campaign_metrics(event: dict, context: object) -> dict:
     return _ok({"campaignId": campaign_id, "metrics": resp["Items"]})
 
 
+def _chunk(items: list, size: int):
+    """Yield successive `size`-length slices of `items`."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def _routing_profile_ids() -> list[str]:
     """Return all routing profile IDs and populate the name cache as a side-effect."""
     paginator = _connect.get_paginator("list_routing_profiles")
@@ -165,7 +171,7 @@ def _routing_profile_ids() -> list[str]:
             pid = p["Id"]
             ids.append(pid)
             _rp_name_cache[pid] = p.get("Name", pid)
-    return ids[:100]  # GetCurrentUserData accepts max 100
+    return ids
 
 
 def _status_type_for_arn(status_arn: str) -> str:
@@ -199,82 +205,89 @@ def get_agent_roster(event: dict, context: object) -> dict:
     # When a specific queue is requested, scope to that queue.
     # Otherwise, scope to all routing profiles (covers every agent in the instance).
     if queue_id:
-        filters: dict = {"Queues": [queue_id]}
+        filter_batches: list[dict] = [{"Queues": [queue_id]}]
     else:
         profile_ids = _routing_profile_ids()
         if not profile_ids:
-            return _ok({"agents": [], "queueId": queue_id})
-        filters = {"RoutingProfiles": profile_ids}
+            return _ok({
+                "agents": [], "queueId": queue_id, "routingProfiles": [],
+                "lastUpdated": datetime.now(timezone.utc).isoformat(),
+            })
+        filter_batches = [{"RoutingProfiles": batch} for batch in _chunk(profile_ids, 100)]
 
     agents: list[dict] = []
+    _MAX_PAGES_PER_BATCH = 50  # generous safety bound: 50 * 100 = 5,000 agents per filter batch
     try:
         _CONNECTED = {"CONNECTED", "CONNECTED_ONHOLD", "INCOMING", "CONNECTING"}
         _ACW = {"ENDED"}
         now = _now()
 
-        next_token: str | None = None
-        while True:
-            kwargs: dict = {
-                "InstanceId": _CONNECT_INSTANCE_ID,
-                "Filters": filters,
-                "MaxResults": 100,
-            }
-            if next_token:
-                kwargs["NextToken"] = next_token
-            resp = _connect.get_current_user_data(**kwargs)
+        for filters in filter_batches:
+            next_token: str | None = None
+            for _page in range(_MAX_PAGES_PER_BATCH):
+                kwargs: dict = {
+                    "InstanceId": _CONNECT_INSTANCE_ID,
+                    "Filters": filters,
+                    "MaxResults": 100,
+                }
+                if next_token:
+                    kwargs["NextToken"] = next_token
+                resp = _connect.get_current_user_data(**kwargs)
 
-            for ud in resp.get("UserDataList", []):
-                status = ud.get("Status", {})
-                contacts = ud.get("Contacts", [])
-                status_name = status.get("StatusName", "")
-                status_type = _status_type_for_arn(status.get("StatusArn", ""))
+                for ud in resp.get("UserDataList", []):
+                    status = ud.get("Status", {})
+                    contacts = ud.get("Contacts", [])
+                    status_name = status.get("StatusName", "")
+                    status_type = _status_type_for_arn(status.get("StatusArn", ""))
 
-                active = next((c for c in contacts if c.get("AgentContactState") in _CONNECTED), None)
-                acw_candidate = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
-                acw = None
-                if acw_candidate:
-                    started = _parse_ts(acw_candidate.get("StateStartTimestamp"))
-                    if started and (now - started).total_seconds() <= _ACW_MAX_AGE_SECONDS:
-                        acw = acw_candidate
+                    active = next((c for c in contacts if c.get("AgentContactState") in _CONNECTED), None)
+                    acw_candidate = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
+                    acw = None
+                    if acw_candidate:
+                        started = _parse_ts(acw_candidate.get("StateStartTimestamp"))
+                        if started and (now - started).total_seconds() <= _ACW_MAX_AGE_SECONDS:
+                            acw = acw_candidate
 
-                if active:
-                    effective = "On Call"
-                    # Use the contact's StateStartTimestamp so elapsed time reflects
-                    # how long the agent has been on this specific call, not how long
-                    # they've been in their Connect status (which doesn't reset per call).
-                    effective_ts = active.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
-                elif acw:
-                    effective = "ACW"
-                    effective_ts = acw.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
-                elif status_type == "ROUTABLE":
-                    effective = "Available"
-                    effective_ts = status.get("StatusStartTimestamp", "")
-                elif status_type == "OFFLINE":
-                    effective = "Offline"
-                    effective_ts = status.get("StatusStartTimestamp", "")
-                else:
-                    effective = "Unavailable"
-                    effective_ts = status.get("StatusStartTimestamp", "")
+                    if active:
+                        effective = "On Call"
+                        # Use the contact's StateStartTimestamp so elapsed time reflects
+                        # how long the agent has been on this specific call, not how long
+                        # they've been in their Connect status (which doesn't reset per call).
+                        effective_ts = active.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
+                    elif acw:
+                        effective = "ACW"
+                        effective_ts = acw.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
+                    elif status_type == "ROUTABLE":
+                        effective = "Available"
+                        effective_ts = status.get("StatusStartTimestamp", "")
+                    elif status_type == "OFFLINE":
+                        effective = "Offline"
+                        effective_ts = status.get("StatusStartTimestamp", "")
+                    else:
+                        effective = "Unavailable"
+                        effective_ts = status.get("StatusStartTimestamp", "")
 
-                user_id = ud.get("User", {}).get("Id", "")
-                rp_id = ud.get("RoutingProfile", {}).get("Id", "")
-                agents.append({
-                    "agentId": user_id,
-                    "agentName": _agent_display_name(user_id),
-                    "status": status_name,
-                    "statusType": status_type,
-                    "effectiveStatus": effective,
-                    "statusStartTimestamp": str(effective_ts) if effective_ts else "",
-                    "isIntentionalAbsence": status_name in _INTENTIONAL_ABSENCE_STATUSES,
-                    "routingProfileId": rp_id,
-                    "routingProfileName": _rp_name_cache.get(rp_id, rp_id),
-                    "contactsCount": len(contacts),
-                    "activeContactState": (active or acw or {}).get("AgentContactState", ""),
-                })
+                    user_id = ud.get("User", {}).get("Id", "")
+                    rp_id = ud.get("RoutingProfile", {}).get("Id", "")
+                    agents.append({
+                        "agentId": user_id,
+                        "agentName": _agent_display_name(user_id),
+                        "status": status_name,
+                        "statusType": status_type,
+                        "effectiveStatus": effective,
+                        "statusStartTimestamp": str(effective_ts) if effective_ts else "",
+                        "isIntentionalAbsence": status_name in _INTENTIONAL_ABSENCE_STATUSES,
+                        "routingProfileId": rp_id,
+                        "routingProfileName": _rp_name_cache.get(rp_id, rp_id),
+                        "contactsCount": len(contacts),
+                        "activeContactState": (active or acw or {}).get("AgentContactState", ""),
+                    })
 
-            next_token = resp.get("NextToken")
-            if not next_token:
-                break
+                next_token = resp.get("NextToken")
+                if not next_token:
+                    break
+            else:
+                logger.warning("get_agent_roster: hit %s-page safety bound for one filter batch", _MAX_PAGES_PER_BATCH)
     except Exception as exc:
         logger.error("get_agent_roster: %s", type(exc).__name__)
         return _err(502, "Failed to fetch agent roster from Connect")

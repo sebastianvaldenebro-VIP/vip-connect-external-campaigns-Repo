@@ -262,3 +262,143 @@ class TestPagination:
 
         body = json.loads(resp["body"])
         assert len(body["agents"]) == 1
+
+
+class TestRoutingProfileIdsNotTruncated:
+    """_routing_profile_ids() must return every profile the paginator yields,
+    not just the first 100 — GetCurrentUserData's 100-entry filter limit is
+    the caller's problem to batch around, not this function's to hide data.
+    """
+
+    def test_returns_all_ids_beyond_100(self):
+        from handlers import branded
+
+        page1_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100)]
+        page2_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100, 150)]
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"RoutingProfileSummaryList": page1_profiles},
+            {"RoutingProfileSummaryList": page2_profiles},
+        ]
+        mock.get_paginator.return_value = paginator
+
+        with patch("handlers.branded._connect", mock):
+            ids = branded._routing_profile_ids()
+
+        assert len(ids) == 150
+
+
+class TestRoutingProfileBatching:
+    """GetCurrentUserData's RoutingProfiles filter accepts max 100 entries —
+    an instance with more than 100 routing profiles must be queried in
+    multiple batches, not silently truncated to the first 100.
+    """
+
+    def test_more_than_100_profiles_are_batched_not_truncated(self):
+        from handlers import branded
+
+        page1_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100)]
+        page2_profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(100, 150)]
+
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"RoutingProfileSummaryList": page1_profiles},
+            {"RoutingProfileSummaryList": page2_profiles},
+        ]
+        mock.get_paginator.return_value = paginator
+        mock.list_agent_statuses.return_value = {
+            "AgentStatusSummaryList": [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}],
+        }
+        mock.describe_user.return_value = {
+            "User": {"IdentityInfo": {"FirstName": "A", "LastName": "B"}, "Username": "ab"},
+        }
+
+        batch1_response = {
+            "UserDataList": [_user_data(user_id="u-1", rp_id="rp-0", status_arn="arn:.../agent-status/s-avail")],
+        }
+        batch2_response = {
+            "UserDataList": [_user_data(user_id="u-2", rp_id="rp-149", status_arn="arn:.../agent-status/s-avail")],
+        }
+        mock.get_current_user_data.side_effect = [batch1_response, batch2_response]
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        body = json.loads(resp["body"])
+        assert {a["agentId"] for a in body["agents"]} == {"u-1", "u-2"}
+        assert mock.get_current_user_data.call_count == 2
+        first_filters = mock.get_current_user_data.call_args_list[0].kwargs["Filters"]
+        second_filters = mock.get_current_user_data.call_args_list[1].kwargs["Filters"]
+        assert len(first_filters["RoutingProfiles"]) == 100
+        assert len(second_filters["RoutingProfiles"]) == 50
+
+    def test_100_or_fewer_profiles_use_a_single_batch(self):
+        from handlers import branded
+
+        profiles = [{"Id": f"rp-{i}", "Name": f"RP {i}"} for i in range(50)]
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"RoutingProfileSummaryList": profiles}]
+        mock.get_paginator.return_value = paginator
+        mock.list_agent_statuses.return_value = {
+            "AgentStatusSummaryList": [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}],
+        }
+        mock.get_current_user_data.return_value = {"UserDataList": []}
+
+        with patch("handlers.branded._connect", mock):
+            branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        assert mock.get_current_user_data.call_count == 1
+
+    def test_each_batch_still_paginates_via_next_token(self):
+        """A single routing-profile batch that itself has >100 agents must
+        still follow NextToken within that batch (regression guard: the
+        earlier agent-level pagination fix must keep working now that it's
+        nested inside per-batch iteration)."""
+        from handlers import branded
+
+        profiles = [{"Id": "rp-1", "Name": "RP 1"}]
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"RoutingProfileSummaryList": profiles}]
+        mock.get_paginator.return_value = paginator
+        mock.list_agent_statuses.return_value = {
+            "AgentStatusSummaryList": [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}],
+        }
+
+        page1 = {
+            "UserDataList": [_user_data(user_id="u-1", rp_id="rp-1", status_arn="arn:.../agent-status/s-avail")],
+            "NextToken": "tok-2",
+        }
+        page2 = {"UserDataList": [_user_data(user_id="u-2", rp_id="rp-1", status_arn="arn:.../agent-status/s-avail")]}
+        mock.get_current_user_data.side_effect = [page1, page2]
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        body = json.loads(resp["body"])
+        assert {a["agentId"] for a in body["agents"]} == {"u-1", "u-2"}
+
+
+class TestEmptyRosterResponseShape:
+    """The empty-roster early-return must carry the same 4 keys the TS type
+    declares non-optional (routingProfiles, lastUpdated) — a prior version
+    omitted them, which type-disagreed with the frontend contract."""
+
+    def test_empty_roster_still_returns_routing_profiles_and_last_updated(self):
+        from handlers import branded
+
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"RoutingProfileSummaryList": []}]
+        mock.get_paginator.return_value = paginator
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        body = json.loads(resp["body"])
+        assert body["agents"] == []
+        assert body["routingProfiles"] == []
+        assert "lastUpdated" in body and body["lastUpdated"]
