@@ -53,7 +53,7 @@ export function groupAgentsByProfile(agents: AgentRosterEntry[], nowMs: number =
       routingProfileName: list[0]!.routingProfileName,
       agents: sortAgentsForDisplay(list, nowMs),
       flaggedCount,
-      staffing: classifyStaffing(available, minAvailableFor(list[0]!.routingProfileName)),
+      staffing: classifyStaffing(available, minAvailableFor(list[0]!.routingProfileName), nowMs),
     };
   });
   return groups.sort((a, b) => {
@@ -214,7 +214,7 @@ export function AgentRoster(): ReactNode {
           />
           <NeedsAttentionPanel agents={flaggedInScope} nowMs={nowMs} onAlertKeyClick={setAlertFilter} />
           <AgentList agents={filteredAgents} groupByProfile={groupByProfile} nowMs={nowMs} isLoading={query.isLoading} />
-          <CapacityTable agents={agents} />
+          <CapacityTable agents={agents} nowMs={nowMs} />
         </>
       )}
 
@@ -257,10 +257,10 @@ function WorkforceSummary({ agents, nowMs }: { agents: AgentRosterEntry[]; nowMs
   );
 }
 
-function CapacityTable({ agents }: { agents: AgentRosterEntry[] }): ReactNode {
+function CapacityTable({ agents, nowMs }: { agents: AgentRosterEntry[]; nowMs: number }): ReactNode {
   const rows: RoutingProfileAvailability[] = aggregateByRoutingProfile(agents);
   const withStaffing = rows
-    .map((row) => ({ row, staffing: classifyStaffing(row.available, minAvailableFor(row.routingProfileName)) }))
+    .map((row) => ({ row, staffing: classifyStaffing(row.available, minAvailableFor(row.routingProfileName), nowMs) }))
     .sort((a, b) => STAFFING_RISK_ORDER[a.staffing.risk] - STAFFING_RISK_ORDER[b.staffing.risk]);
 
   if (withStaffing.length === 0) {

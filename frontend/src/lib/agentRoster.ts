@@ -102,7 +102,7 @@ export function agentAlert(
 
 // ── Staffing risk ────────────────────────────────────────────────────────────
 
-export type StaffingRisk = 'no-coverage' | 'understaffed' | 'at-minimum' | 'healthy';
+export type StaffingRisk = 'off-hours' | 'no-coverage' | 'understaffed' | 'at-minimum' | 'healthy';
 
 export type StaffingStatus = {
   risk: StaffingRisk;
@@ -115,9 +115,27 @@ export const STAFFING_RISK_ORDER: Record<StaffingRisk, number> = {
   understaffed: 1,
   'at-minimum': 2,
   healthy: 3,
+  'off-hours': 4,
 };
 
-export function classifyStaffing(available: number, min: number): StaffingStatus {
+/**
+ * 7am-7pm Colombia time (COT, UTC-5, no DST) = 12:00-23:59 UTC. Matches
+ * services/api-metrics/src/metrics_collector_handler.py's
+ * _emit_business_hours_metric — the one other place this window is defined.
+ * Kept in sync manually since the two live in different languages/services.
+ */
+export function isBusinessHours(nowMs: number = Date.now()): boolean {
+  const utcHour = new Date(nowMs).getUTCHours();
+  return utcHour >= 12 && utcHour <= 23;
+}
+
+/**
+ * Outside business hours, low/zero availability is expected, not a risk —
+ * without this gate, any min > 0 would report "No coverage" on every
+ * profile every night and weekend.
+ */
+export function classifyStaffing(available: number, min: number, nowMs: number = Date.now()): StaffingStatus {
+  if (!isBusinessHours(nowMs)) return { risk: 'off-hours', label: 'Off hours', tone: 'neutral' };
   if (available === 0) return { risk: 'no-coverage', label: 'No coverage', tone: 'danger' };
   if (available < min) return { risk: 'understaffed', label: 'Understaffed', tone: 'danger' };
   if (available === min) return { risk: 'at-minimum', label: 'At minimum', tone: 'warning' };

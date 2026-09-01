@@ -7,6 +7,7 @@ import {
   agentStatusTone,
   classifyStaffing,
   DEFAULT_ALERT_THRESHOLDS,
+  isBusinessHours,
   minAvailableFor,
 } from './agentRoster';
 
@@ -28,6 +29,8 @@ function agent(overrides: Partial<AgentRosterEntry>): AgentRosterEntry {
 }
 
 const T0 = new Date('2026-09-01T12:00:00.000Z').getTime();
+const BUSINESS_HOURS_MS = new Date('2026-09-01T15:00:00.000Z').getTime(); // 10am COT — within 12:00-23:59 UTC
+const OFF_HOURS_MS = new Date('2026-09-01T05:00:00.000Z').getTime(); // midnight COT — outside 12:00-23:59 UTC
 
 describe('aggregateByRoutingProfile', () => {
   it('groups agents by routing profile and counts each effectiveStatus bucket', () => {
@@ -121,19 +124,42 @@ describe('agentAlert', () => {
 
 describe('classifyStaffing', () => {
   it('is "no-coverage"/danger when 0 are available, regardless of min', () => {
-    expect(classifyStaffing(0, 3)).toEqual({ risk: 'no-coverage', label: 'No coverage', tone: 'danger' });
+    expect(classifyStaffing(0, 3, BUSINESS_HOURS_MS)).toEqual({ risk: 'no-coverage', label: 'No coverage', tone: 'danger' });
   });
 
   it('is "understaffed"/danger when available is below min', () => {
-    expect(classifyStaffing(1, 3)).toEqual({ risk: 'understaffed', label: 'Understaffed', tone: 'danger' });
+    expect(classifyStaffing(1, 3, BUSINESS_HOURS_MS)).toEqual({ risk: 'understaffed', label: 'Understaffed', tone: 'danger' });
   });
 
   it('is "at-minimum"/warning when available equals min exactly', () => {
-    expect(classifyStaffing(2, 2)).toEqual({ risk: 'at-minimum', label: 'At minimum', tone: 'warning' });
+    expect(classifyStaffing(2, 2, BUSINESS_HOURS_MS)).toEqual({ risk: 'at-minimum', label: 'At minimum', tone: 'warning' });
   });
 
   it('is "healthy"/success when available exceeds min', () => {
-    expect(classifyStaffing(5, 2)).toEqual({ risk: 'healthy', label: 'Healthy', tone: 'success' });
+    expect(classifyStaffing(5, 2, BUSINESS_HOURS_MS)).toEqual({ risk: 'healthy', label: 'Healthy', tone: 'success' });
+  });
+});
+
+describe('isBusinessHours', () => {
+  it('is true within 7am-7pm COT (12:00-23:59 UTC)', () => {
+    expect(isBusinessHours(new Date('2026-09-01T12:00:00.000Z').getTime())).toBe(true);
+    expect(isBusinessHours(new Date('2026-09-01T23:59:00.000Z').getTime())).toBe(true);
+  });
+
+  it('is false outside 7am-7pm COT', () => {
+    expect(isBusinessHours(new Date('2026-09-01T11:59:00.000Z').getTime())).toBe(false);
+    expect(isBusinessHours(new Date('2026-09-01T00:00:00.000Z').getTime())).toBe(false);
+  });
+});
+
+describe('classifyStaffing — off hours', () => {
+  it('returns off-hours/neutral outside business hours, regardless of available/min', () => {
+    expect(classifyStaffing(0, 3, OFF_HOURS_MS)).toEqual({ risk: 'off-hours', label: 'Off hours', tone: 'neutral' });
+    expect(classifyStaffing(10, 3, OFF_HOURS_MS)).toEqual({ risk: 'off-hours', label: 'Off hours', tone: 'neutral' });
+  });
+
+  it('still classifies normally at the exact business-hours boundary', () => {
+    expect(classifyStaffing(0, 3, new Date('2026-09-01T12:00:00.000Z').getTime())).toEqual({ risk: 'no-coverage', label: 'No coverage', tone: 'danger' });
   });
 });
 
