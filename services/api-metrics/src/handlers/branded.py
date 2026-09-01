@@ -208,62 +208,70 @@ def get_agent_roster(event: dict, context: object) -> dict:
 
     agents: list[dict] = []
     try:
-        resp = _connect.get_current_user_data(
-            InstanceId=_CONNECT_INSTANCE_ID,
-            Filters=filters,
-            MaxResults=100,
-        )
         _CONNECTED = {"CONNECTED", "CONNECTED_ONHOLD", "INCOMING", "CONNECTING"}
         _ACW = {"ENDED"}
         now = _now()
-        for ud in resp.get("UserDataList", []):
-            status = ud.get("Status", {})
-            contacts = ud.get("Contacts", [])
-            status_name = status.get("StatusName", "")
-            status_type = _status_type_for_arn(status.get("StatusArn", ""))
 
-            active = next((c for c in contacts if c.get("AgentContactState") in _CONNECTED), None)
-            acw_candidate = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
-            acw = None
-            if acw_candidate:
-                started = _parse_ts(acw_candidate.get("StateStartTimestamp"))
-                if started and (now - started).total_seconds() <= _ACW_MAX_AGE_SECONDS:
-                    acw = acw_candidate
+        next_token: str | None = None
+        while True:
+            kwargs: dict = {
+                "InstanceId": _CONNECT_INSTANCE_ID,
+                "Filters": filters,
+                "MaxResults": 100,
+            }
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = _connect.get_current_user_data(**kwargs)
 
-            if active:
-                effective = "On Call"
-                # Use the contact's StateStartTimestamp so elapsed time reflects
-                # how long the agent has been on this specific call, not how long
-                # they've been in their Connect status (which doesn't reset per call).
-                effective_ts = active.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
-            elif acw:
-                effective = "ACW"
-                effective_ts = acw.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
-            elif status_type == "ROUTABLE":
-                effective = "Available"
-                effective_ts = status.get("StatusStartTimestamp", "")
-            elif status_type == "OFFLINE":
-                effective = "Offline"
-                effective_ts = status.get("StatusStartTimestamp", "")
-            else:
-                effective = "Unavailable"
-                effective_ts = status.get("StatusStartTimestamp", "")
+            for ud in resp.get("UserDataList", []):
+                status = ud.get("Status", {})
+                contacts = ud.get("Contacts", [])
+                status_name = status.get("StatusName", "")
+                status_type = _status_type_for_arn(status.get("StatusArn", ""))
 
-            user_id = ud.get("User", {}).get("Id", "")
-            rp_id = ud.get("RoutingProfile", {}).get("Id", "")
-            agents.append({
-                "agentId": user_id,
-                "agentName": _agent_display_name(user_id),
-                "status": status_name,
-                "statusType": status_type,
-                "effectiveStatus": effective,
-                "statusStartTimestamp": str(effective_ts) if effective_ts else "",
-                "isIntentionalAbsence": status_name in _INTENTIONAL_ABSENCE_STATUSES,
-                "routingProfileId": rp_id,
-                "routingProfileName": _rp_name_cache.get(rp_id, rp_id),
-                "contactsCount": len(contacts),
-                "activeContactState": (active or acw or {}).get("AgentContactState", ""),
-            })
+                active = next((c for c in contacts if c.get("AgentContactState") in _CONNECTED), None)
+                acw_candidate = next((c for c in contacts if c.get("AgentContactState") in _ACW), None)
+                acw = None
+                if acw_candidate:
+                    started = _parse_ts(acw_candidate.get("StateStartTimestamp"))
+                    if started and (now - started).total_seconds() <= _ACW_MAX_AGE_SECONDS:
+                        acw = acw_candidate
+
+                if active:
+                    effective = "On Call"
+                    effective_ts = active.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
+                elif acw:
+                    effective = "ACW"
+                    effective_ts = acw.get("StateStartTimestamp", status.get("StatusStartTimestamp", ""))
+                elif status_type == "ROUTABLE":
+                    effective = "Available"
+                    effective_ts = status.get("StatusStartTimestamp", "")
+                elif status_type == "OFFLINE":
+                    effective = "Offline"
+                    effective_ts = status.get("StatusStartTimestamp", "")
+                else:
+                    effective = "Unavailable"
+                    effective_ts = status.get("StatusStartTimestamp", "")
+
+                user_id = ud.get("User", {}).get("Id", "")
+                rp_id = ud.get("RoutingProfile", {}).get("Id", "")
+                agents.append({
+                    "agentId": user_id,
+                    "agentName": _agent_display_name(user_id),
+                    "status": status_name,
+                    "statusType": status_type,
+                    "effectiveStatus": effective,
+                    "statusStartTimestamp": str(effective_ts) if effective_ts else "",
+                    "isIntentionalAbsence": status_name in _INTENTIONAL_ABSENCE_STATUSES,
+                    "routingProfileId": rp_id,
+                    "routingProfileName": _rp_name_cache.get(rp_id, rp_id),
+                    "contactsCount": len(contacts),
+                    "activeContactState": (active or acw or {}).get("AgentContactState", ""),
+                })
+
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
     except Exception as exc:
         logger.error("get_agent_roster: %s", type(exc).__name__)
         return _err(502, "Failed to fetch agent roster from Connect")

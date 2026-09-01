@@ -203,3 +203,62 @@ class TestIntentionalAbsenceFlag:
 
         body = json.loads(resp["body"])
         assert body["agents"][0]["isIntentionalAbsence"] is False
+
+
+class TestPagination:
+    """GetCurrentUserData paginates via NextToken — a single unpaginated call
+    silently drops agents past the first page.
+    """
+
+    def test_follows_next_token_across_pages(self):
+        from handlers import branded
+
+        page1 = {
+            "UserDataList": [_user_data(user_id="u-1", status_arn="arn:.../agent-status/s-avail")],
+            "NextToken": "token-2",
+        }
+        page2 = {
+            "UserDataList": [_user_data(user_id="u-2", status_arn="arn:.../agent-status/s-avail")],
+        }
+        statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+
+        mock = _mock_connect([], statuses)
+        mock.get_current_user_data.side_effect = [page1, page2]
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+        body = json.loads(resp["body"])
+        assert {a["agentId"] for a in body["agents"]} == {"u-1", "u-2"}
+        assert mock.get_current_user_data.call_count == 2
+
+    def test_second_call_passes_the_next_token(self):
+        from handlers import branded
+
+        page1 = {"UserDataList": [], "NextToken": "token-2"}
+        page2 = {"UserDataList": []}
+        statuses: list = []
+
+        mock = _mock_connect([], statuses)
+        mock.get_current_user_data.side_effect = [page1, page2]
+
+        with patch("handlers.branded._connect", mock):
+            branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+        second_call_kwargs = mock.get_current_user_data.call_args_list[1].kwargs
+        assert second_call_kwargs["NextToken"] == "token-2"
+
+    def test_single_page_response_still_works(self):
+        """No NextToken in the response — the existing single-page behavior
+        (every other test in this file) must not regress.
+        """
+        from handlers import branded
+
+        ud = [_user_data(status_arn="arn:.../agent-status/s-avail")]
+        statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+
+        with patch("handlers.branded._connect", _mock_connect(ud, statuses)):
+            resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+        body = json.loads(resp["body"])
+        assert len(body["agents"]) == 1
