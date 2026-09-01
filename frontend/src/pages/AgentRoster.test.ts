@@ -25,10 +25,10 @@ const T0 = new Date('2026-09-01T12:00:00.000Z').getTime();
 
 describe('sortAgentsForDisplay', () => {
   it('puts flagged agents before unflagged ones', () => {
-    const idle = agent({ agentId: 'idle', effectiveStatus: 'Available', statusStartTimestamp: new Date(T0 - 15 * 60_000).toISOString() });
-    const fresh = agent({ agentId: 'fresh', effectiveStatus: 'Available', statusStartTimestamp: new Date(T0 - 1 * 60_000).toISOString() });
-    const result = sortAgentsForDisplay([fresh, idle], T0);
-    expect(result.map((a) => a.agentId)).toEqual(['idle', 'fresh']);
+    const flagged   = agent({ agentId: 'flagged',   effectiveStatus: 'ACW',     statusStartTimestamp: new Date(T0 - 5 * 60_000).toISOString() });
+    const unflagged = agent({ agentId: 'unflagged', effectiveStatus: 'Offline', statusStartTimestamp: new Date(T0 - 60 * 60_000).toISOString() });
+    const result = sortAgentsForDisplay([unflagged, flagged], T0);
+    expect(result.map((a) => a.agentId)).toEqual(['flagged', 'unflagged']);
   });
 
   it('within the same flagged state, sorts by longest time in status first', () => {

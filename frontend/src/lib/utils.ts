@@ -39,7 +39,9 @@ export function startTimeIso(): string {
 
 /** Seconds elapsed since `iso`, relative to `nowMs` (defaults to the real clock). */
 export function elapsedSeconds(iso: string, nowMs: number = Date.now()): number {
-  return Math.max(0, Math.floor((nowMs - new Date(iso).getTime()) / 1000));
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return 0;
+  return Math.max(0, Math.floor((nowMs - t) / 1000));
 }
 
 /** Whole minutes elapsed since `iso`, relative to `nowMs` (defaults to the real clock). */
