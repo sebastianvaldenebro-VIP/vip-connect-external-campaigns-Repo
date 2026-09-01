@@ -37,6 +37,33 @@ export function startTimeIso(): string {
   return new Date(Date.now() + 6 * 60 * 1000).toISOString();
 }
 
+/** Seconds elapsed since `iso`, relative to `nowMs` (defaults to the real clock). */
+export function elapsedSeconds(iso: string, nowMs: number = Date.now()): number {
+  return Math.max(0, Math.floor((nowMs - new Date(iso).getTime()) / 1000));
+}
+
+/** Whole minutes elapsed since `iso`, relative to `nowMs` (defaults to the real clock). */
+export function elapsedMinutes(iso: string, nowMs: number = Date.now()): number {
+  return Math.floor(elapsedSeconds(iso, nowMs) / 60);
+}
+
+/** `seconds` as "M:SS", or "H:MM:SS" once past an hour. */
+export function formatRuntime(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/** `minutes` as "Nm", or "Hh" / "Hh Mm" once past an hour. */
+export function formatElapsed(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
+
 /**
  * Return today at 21:00 America/New_York as an ISO 8601 UTC string.
  *

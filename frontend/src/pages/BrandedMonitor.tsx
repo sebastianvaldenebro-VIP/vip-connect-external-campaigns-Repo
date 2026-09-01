@@ -10,38 +10,12 @@ import {
   type RoutingProfileSummary,
 } from '@/lib/api';
 import { TEAM_LABELS, BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
+import { elapsedSeconds, elapsedMinutes, formatRuntime, formatElapsed, fmtTime } from '@/lib/utils';
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
-}
-
-function elapsedSeconds(iso: string): number {
-  return Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
-}
-
-function elapsedMinutes(iso: string): number {
-  return Math.floor(elapsedSeconds(iso) / 60);
-}
-
-function formatRuntime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString('es-CO', { hour: '2-digit', minute: '2-digit' });
-}
-
-function formatElapsed(minutes: number): string {
-  if (minutes < 60) return `${minutes}m`;
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
 }
 
 function queueLabel(queueArn: string): string {
@@ -416,7 +390,7 @@ function PlanGroupCard({
               {completedCount > 0 && <span className="text-green-600">{completedCount} done</span>}
               {failedCount > 0    && <span className="text-red-600">{failedCount} failed</span>}
               <span className="text-gray-300">·</span>
-              <span>started {formatTime(group.startedAt)}</span>
+              <span>started {fmtTime(group.startedAt)}</span>
               {isRunning   && <span>{formatRuntime(runtimeSec)} elapsed</span>}
             </div>
           </div>
@@ -530,7 +504,7 @@ function PlanDetailView({
         <div className="min-w-0">
           <div className="font-semibold text-gray-900 truncate">{group.planName}</div>
           <div className="text-xs text-gray-500">
-            {group.campaigns.length} campaigns · started {formatTime(group.startedAt)} · run {group.runId.slice(0, 8)}
+            {group.campaigns.length} campaigns · started {fmtTime(group.startedAt)} · run {group.runId.slice(0, 8)}
           </div>
         </div>
         <div className="ml-auto shrink-0"><StatusBadge status={group.status} /></div>
@@ -1241,7 +1215,7 @@ function HistoryView({ date, onDateChange, onNavigateLive }: {
               >
                 <td className="px-4 py-2.5 font-medium text-gray-900 hover:text-amber-700">{c.planName || c.campaignId}</td>
                 <td className="px-4 py-2.5 text-gray-500 max-w-[200px] truncate">{c.segmentName}</td>
-                <td className="px-4 py-2.5 tabular-nums text-gray-700">{formatTime(c.startedAt)}</td>
+                <td className="px-4 py-2.5 tabular-nums text-gray-700">{fmtTime(c.startedAt)}</td>
                 <td className="px-4 py-2.5 tabular-nums text-gray-700">{c.durationSeconds != null ? `${Math.round(c.durationSeconds / 60)}m` : '—'}</td>
                 <td className="px-4 py-2.5 tabular-nums text-gray-700">{c.totalSeeded ?? '—'}</td>
                 <td className="px-4 py-2.5 tabular-nums text-gray-700">{c.totalDialed ?? '—'}</td>

@@ -2,56 +2,8 @@ import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import { StatTile } from '@/components/ui/StatTile';
-import { api, type AgentRosterEntry } from '@/lib/api';
-
-export type RoutingProfileAvailability = {
-  routingProfileId: string;
-  routingProfileName: string;
-  available: number;
-  onCall: number;
-  acw: number;
-  offline: number;
-  unavailable: number;
-  total: number;
-};
-
-export function aggregateByRoutingProfile(agents: AgentRosterEntry[]): RoutingProfileAvailability[] {
-  const byProfile = new Map<string, RoutingProfileAvailability>();
-  for (const agent of agents) {
-    let row = byProfile.get(agent.routingProfileId);
-    if (!row) {
-      row = {
-        routingProfileId: agent.routingProfileId,
-        routingProfileName: agent.routingProfileName,
-        available: 0,
-        onCall: 0,
-        acw: 0,
-        offline: 0,
-        unavailable: 0,
-        total: 0,
-      };
-      byProfile.set(agent.routingProfileId, row);
-    }
-    row.total += 1;
-    switch (agent.effectiveStatus) {
-      case 'Available':
-        row.available += 1;
-        break;
-      case 'On Call':
-        row.onCall += 1;
-        break;
-      case 'ACW':
-        row.acw += 1;
-        break;
-      case 'Offline':
-        row.offline += 1;
-        break;
-      default:
-        row.unavailable += 1;
-    }
-  }
-  return [...byProfile.values()].sort((a, b) => a.available - b.available);
-}
+import { api } from '@/lib/api';
+import { aggregateByRoutingProfile } from '@/lib/agentRoster';
 
 export function AgentAvailabilityPanel({
   active,
