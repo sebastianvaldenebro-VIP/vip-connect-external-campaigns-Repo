@@ -25,7 +25,7 @@ ROUTES: dict[str, Handler] = {
     "GET /metrics/branded/history": branded_handler.get_history,
     # Audit log (read-only)
     "GET /audit": audit_handler.list_audit_entries,
-    "GET /audit/{entityId}": audit_handler.get_entity_history,
+    "GET /audit/{entityId+}": audit_handler.get_entity_history,
 }
 
 

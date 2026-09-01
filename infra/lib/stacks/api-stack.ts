@@ -212,7 +212,7 @@ export class ApiStack extends cdk.Stack {
       authorizer,
     });
     this.httpApi.addRoutes({
-      path: '/audit/{entityId}',
+      path: '/audit/{entityId+}',
       methods: [apigatewayv2.HttpMethod.GET],
       integration: metricsIntegration,
       authorizer,
