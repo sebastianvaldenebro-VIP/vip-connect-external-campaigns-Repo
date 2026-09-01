@@ -7,10 +7,9 @@ import {
   type BrandedCampaignRecord,
   type BrandedMetricSnapshot,
   type BrandedTodaySummary,
-  type RoutingProfileSummary,
 } from '@/lib/api';
-import { TEAM_LABELS, BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
-import { elapsedSeconds, elapsedMinutes, formatRuntime, formatElapsed, fmtTime } from '@/lib/utils';
+import { elapsedSeconds, elapsedMinutes, formatRuntime, fmtTime } from '@/lib/utils';
+import { AgentRoster } from './AgentRoster';
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
@@ -136,18 +135,6 @@ function StatusBadge({ status }: { status: string }): ReactNode {
 function AlertChip({ label, color }: { label: string; color: 'red' | 'amber' }): ReactNode {
   const colors = { red: 'bg-red-100 text-red-700', amber: 'bg-amber-100 text-amber-700' };
   return <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${colors[color]}`}>{label}</span>;
-}
-
-function FilterBtn({ active, variant, onClick, children }: {
-  active: boolean; variant?: 'default' | 'amber' | 'alert'; onClick: () => void; children: ReactNode;
-}): ReactNode {
-  const base = 'px-3 py-1 rounded-lg text-xs font-medium transition-colors';
-  const styles = {
-    default: active ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
-    amber:   active ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
-    alert:   active ? 'bg-amber-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
-  };
-  return <button onClick={onClick} className={`${base} ${styles[variant ?? 'default']}`}>{children}</button>;
 }
 
 // ── Daily KPI header ───────────────────────────────────────────────────────────
@@ -900,271 +887,6 @@ function LiveView({ date, onDateChange }: { date: string; onDateChange: (d: stri
   );
 }
 
-// ── Agents View ────────────────────────────────────────────────────────────────
-
-type AlertFilter = 'all' | 'alerts' | 'idle' | 'break';
-type SortCol     = 'name' | 'status' | 'time';
-const STATUS_ORDER: Record<string, number> = { Available: 0, 'On Call': 1, ACW: 2, Unavailable: 3, Offline: 4 };
-
-function AgentsKpiBar({ agents }: { agents: AgentRosterEntry[] }): ReactNode {
-  const total         = agents.length;
-  const available     = agents.filter(a => a.effectiveStatus === 'Available').length;
-  const onCall        = agents.filter(a => a.effectiveStatus === 'On Call').length;
-  const acw           = agents.filter(a => a.effectiveStatus === 'ACW').length;
-  const alertAgents   = agents.filter(a => agentIdleAlert(a) !== null).length;
-  const totalContacts = agents.reduce((s, a) => s + a.contactsCount, 0);
-  const kpis = [
-    { label: 'Total agents',   value: total,         cls: 'text-gray-900' },
-    { label: 'Available',      value: available,     cls: available === 0 ? 'text-red-600' : 'text-green-600' },
-    { label: 'On call',        value: onCall,        cls: 'text-blue-600' },
-    { label: 'ACW',            value: acw,           cls: 'text-purple-600' },
-    { label: 'Alerts',         value: alertAgents,   cls: alertAgents > 0 ? 'text-amber-600' : 'text-gray-400' },
-    { label: 'Contacts today', value: totalContacts, cls: 'text-gray-900' },
-  ];
-  return (
-    <div className="grid grid-cols-6 gap-2">
-      {kpis.map(k => (
-        <div key={k.label} className="bg-white rounded-xl border border-gray-200 p-3 text-center">
-          <div className="text-[9px] font-semibold text-gray-400 tracking-widest uppercase">{k.label}</div>
-          <div className={`text-xl font-bold tabular-nums mt-0.5 ${k.cls}`}>{k.value}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function AgentsView(): ReactNode {
-  const [statusFilter, setStatusFilter] = useState<string>('all');
-  const [teamFilter,   setTeamFilter]   = useState<string | null>(null);
-  const [rpFilters,    setRpFilters]    = useState<Set<string>>(new Set());
-  const [alertFilter,  setAlertFilter]  = useState<AlertFilter>('all');
-  const [sortCol,      setSortCol]      = useState<SortCol>('time');
-  const [sortDir,      setSortDir]      = useState<'asc' | 'desc'>('desc');
-
-  const agentQuery = useQuery({
-    queryKey: ['branded-agents'],
-    queryFn:  () => api.brandedMonitor.getAgentRoster(),
-    refetchInterval: 60_000,
-    staleTime: 30_000,
-  });
-
-  const agents: AgentRosterEntry[]               = agentQuery.data?.agents ?? [];
-  const routingProfiles: RoutingProfileSummary[] = agentQuery.data?.routingProfiles ?? [];
-  const lastUpdated = agentQuery.data?.lastUpdated;
-
-  // Pre-filter to only Patient Access + Appointment Services — the two teams that use the branded dialer
-  const brandedAgents = agents.filter(
-    a => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(a.routingProfileName) ?? '')
-  );
-
-  function selectTeam(team: string | null) {
-    setTeamFilter(team);
-    setRpFilters(new Set()); // clear individual RP selection when switching teams
-  }
-
-  function toggleRp(id: string) {
-    setRpFilters(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }
-
-  const statusCounts: Record<string, number> = {};
-  brandedAgents.forEach(a => { statusCounts[a.effectiveStatus] = (statusCounts[a.effectiveStatus] ?? 0) + 1; });
-  const alertCount = brandedAgents.filter(a => agentIdleAlert(a) !== null).length;
-
-  function applyFilters(list: AgentRosterEntry[]) {
-    return list
-      .filter(a => statusFilter === 'all' || a.effectiveStatus === statusFilter)
-      .filter(a => {
-        const inTeam = teamFilter === null || teamForProfile(a.routingProfileName) === teamFilter;
-        const inRp   = rpFilters.size === 0 || rpFilters.has(a.routingProfileId);
-        return inTeam && inRp;
-      })
-      .filter(a => {
-        if (alertFilter === 'all') return true;
-        const al = agentIdleAlert(a);
-        if (alertFilter === 'alerts') return al !== null;
-        return al === alertFilter;
-      });
-  }
-
-  function applySort(list: AgentRosterEntry[]) {
-    return [...list].sort((a, b) => {
-      let cmp = 0;
-      if (sortCol === 'name')   cmp = (a.agentName || a.agentId).localeCompare(b.agentName || b.agentId);
-      if (sortCol === 'status') cmp = (STATUS_ORDER[a.effectiveStatus] ?? 4) - (STATUS_ORDER[b.effectiveStatus] ?? 4);
-      if (sortCol === 'time')   cmp = elapsedMinutes(a.statusStartTimestamp) - elapsedMinutes(b.statusStartTimestamp);
-      return sortDir === 'asc' ? cmp : -cmp;
-    });
-  }
-
-  function toggleSort(col: SortCol) {
-    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    else { setSortCol(col); setSortDir('desc'); }
-  }
-
-  const hasActiveFilters = statusFilter !== 'all' || teamFilter !== null || rpFilters.size > 0 || alertFilter !== 'all';
-  const filtered = applyFilters(brandedAgents);
-  const sorted   = applySort(filtered);
-
-  const STATUS_FILTERS = [
-    { key: 'all', label: 'All' },
-    { key: 'Available', label: 'Available' },
-    { key: 'On Call', label: 'On Call' },
-    { key: 'ACW', label: 'ACW' },
-    { key: 'Unavailable', label: 'Away' },
-    { key: 'Offline', label: 'Offline' },
-  ];
-  const ALERT_FILTERS: { key: AlertFilter; label: string }[] = [
-    { key: 'all',    label: 'All agents' },
-    { key: 'alerts', label: `Alerts (${alertCount})` },
-    { key: 'idle',   label: 'Idle >10m' },
-    { key: 'break',  label: 'Break >20m' },
-  ];
-
-  return (
-    <div className="space-y-4">
-      {!agentQuery.isLoading && filtered.length > 0 && <AgentsKpiBar agents={filtered} />}
-
-      <div className="bg-white rounded-xl border border-gray-200 p-4 space-y-3">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Status</span>
-          {STATUS_FILTERS.map(({ key, label }) => (
-            <FilterBtn key={key} active={statusFilter === key} onClick={() => setStatusFilter(key)}>
-              {label} <span className="opacity-60">{key === 'all' ? brandedAgents.length : (statusCounts[key] ?? 0)}</span>
-            </FilterBtn>
-          ))}
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Alerts</span>
-          {ALERT_FILTERS.map(({ key, label }) => (
-            <FilterBtn
-              key={key}
-              active={alertFilter === key}
-              variant={key !== 'all' && alertFilter === key ? 'alert' : 'default'}
-              onClick={() => setAlertFilter(key as AlertFilter)}
-            >
-              {label}
-            </FilterBtn>
-          ))}
-        </div>
-        {routingProfiles.length > 0 && (() => {
-          // Derive which teams are actually present in the live roster
-          const activeTeams = (BRANDED_MONITOR_TEAMS as readonly string[]).filter(team =>
-            brandedAgents.some(a => teamForProfile(a.routingProfileName) === team)
-          );
-
-          // When a team is selected, narrow to that team's RPs.
-          // When no team is selected, still restrict to branded-team RPs so non-relevant profiles don't appear.
-          const visibleRps = teamFilter === null
-            ? routingProfiles.filter(rp => {
-                const t = teamForProfile(rp.name);
-                return t !== null && (BRANDED_MONITOR_TEAMS as readonly string[]).includes(t);
-              })
-            : routingProfiles.filter(rp => teamForProfile(rp.name) === teamFilter);
-
-          return (
-            <>
-              {activeTeams.length > 0 && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Team</span>
-                  <FilterBtn active={teamFilter === null && rpFilters.size === 0} variant="amber" onClick={() => selectTeam(null)}>All</FilterBtn>
-                  {activeTeams.map(team => {
-                    const count = brandedAgents.filter(a => teamForProfile(a.routingProfileName) === team).length;
-                    return (
-                      <FilterBtn key={team} active={teamFilter === team} variant="amber" onClick={() => selectTeam(team)}>
-                        {TEAM_LABELS[team] ?? team} <span className="opacity-60">{count}</span>
-                      </FilterBtn>
-                    );
-                  })}
-                </div>
-              )}
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[11px] text-gray-400 font-medium w-14 shrink-0">Routing profile</span>
-                <FilterBtn active={rpFilters.size === 0} variant="amber" onClick={() => setRpFilters(new Set())}>All</FilterBtn>
-                {visibleRps.map(rp => (
-                  <FilterBtn key={rp.id} active={rpFilters.has(rp.id)} variant="amber" onClick={() => toggleRp(rp.id)}>
-                    {rp.name} <span className="opacity-60">{brandedAgents.filter(a => a.routingProfileId === rp.id).length}</span>
-                    {rpFilters.has(rp.id) && <span className="ml-1">✓</span>}
-                  </FilterBtn>
-                ))}
-              </div>
-            </>
-          );
-        })()}
-        {hasActiveFilters && (
-          <div className="flex items-center gap-3 pt-1 border-t border-gray-100">
-            <span className="text-xs text-gray-500">Showing {filtered.length} of {brandedAgents.length} agents</span>
-            <button
-              onClick={() => { setStatusFilter('all'); setTeamFilter(null); setRpFilters(new Set()); setAlertFilter('all'); }}
-              className="text-xs text-amber-600 hover:text-amber-700 font-medium"
-            >
-              Clear filters
-            </button>
-          </div>
-        )}
-      </div>
-
-      {lastUpdated && !agentQuery.isLoading && (
-        <div className="text-[11px] text-gray-400">
-          Updated {elapsedMinutes(lastUpdated) === 0 ? 'just now' : `${elapsedMinutes(lastUpdated)}m ago`} · {brandedAgents.length} agents
-        </div>
-      )}
-
-      <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              {([['name', 'Name'], ['status', 'Status'], ['time', 'Time in status']] as [SortCol, string][]).map(([col, label]) => (
-                <th
-                  key={col}
-                  className="px-4 py-2.5 text-left text-xs font-medium text-gray-500 cursor-pointer select-none hover:text-gray-700"
-                  onClick={() => toggleSort(col)}
-                >
-                  {label} {sortCol === col && <span className="ml-1 opacity-60">{sortDir === 'asc' ? '↑' : '↓'}</span>}
-                </th>
-              ))}
-              <th className="px-4 py-2.5 text-left text-xs font-medium text-gray-500">Alert</th>
-              <th className="px-4 py-2.5 text-left text-xs font-medium text-gray-500">Contacts</th>
-              <th className="px-4 py-2.5 text-left text-xs font-medium text-gray-500">Routing profile</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {agentQuery.isLoading && (
-              <tr><td colSpan={6} className="px-4 py-10 text-center text-sm text-gray-400">Loading agents…</td></tr>
-            )}
-            {!agentQuery.isLoading && sorted.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-10 text-center text-sm text-gray-400">No agents match this filter.</td></tr>
-            )}
-            {sorted.map(agent => {
-              const alert   = agentIdleAlert(agent);
-              const elapsed = elapsedMinutes(agent.statusStartTimestamp);
-              return (
-                <tr
-                  key={agent.agentId}
-                  className={`hover:bg-gray-50 transition-colors ${alert === 'idle' ? 'bg-amber-50' : alert === 'break' ? 'bg-red-50' : ''}`}
-                >
-                  <td className="px-4 py-2.5 font-medium text-gray-900">{agent.agentName || agent.agentId}</td>
-                  <td className="px-4 py-2.5"><StatusBadge status={agent.effectiveStatus} /></td>
-                  <td className="px-4 py-2.5 tabular-nums text-gray-700">{formatElapsed(elapsed)}</td>
-                  <td className="px-4 py-2.5">
-                    {alert === 'idle'  && <AlertChip label="Idle"           color="amber" />}
-                    {alert === 'break' && <AlertChip label="Extended break" color="red" />}
-                  </td>
-                  <td className="px-4 py-2.5 text-gray-600 tabular-nums">{agent.contactsCount > 0 ? agent.contactsCount : '—'}</td>
-                  <td className="px-4 py-2.5 text-xs text-gray-400 max-w-[160px] truncate">{agent.routingProfileName}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
 // ── History View ───────────────────────────────────────────────────────────────
 
 function exitColor(reason?: string): string {
@@ -1270,7 +992,7 @@ export function BrandedMonitor(): ReactNode {
       </div>
 
       {tab === 'live'    && <LiveView    date={date} onDateChange={setDate} />}
-      {tab === 'agents'  && <AgentsView />}
+      {tab === 'agents'  && <AgentRoster />}
       {tab === 'history' && <HistoryView date={date} onDateChange={setDate} onNavigateLive={() => setTab('live')} />}
     </div>
   );
