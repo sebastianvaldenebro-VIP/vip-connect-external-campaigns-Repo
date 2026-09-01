@@ -27,12 +27,29 @@ npx cdk bootstrap aws://165505826690/us-east-1 \
 
 ### Deploy CDK stacks
 
+`cdk.json` lives at the **repo root** (`infra/bin/app.ts` is a relative path inside it) — run `cdk` from the repo root, not from `infra/`. Running from `infra/` fails with `--app is required either in command-line, in cdk.json or in ~/.cdk.json` (confirmed 2026-08-31).
+
 ```bash
-cd /home/devaju/projects/vip-connect-external-campaigns/infra
+cd /home/devaju/projects/vip-connect-external-campaigns
 
 # Full deploy — CDK resolves dependency order automatically
 npx cdk deploy --all --require-approval broadening --profile production
 ```
+
+For a code-only change to a single Lambda (no infra/IAM change), prefer deploying just that stack by name instead of `--all` — it's faster and keeps the blast radius to what you actually touched:
+
+```bash
+cd /home/devaju/projects/vip-connect-external-campaigns
+
+# Preview first — should show only the Lambda code S3Key changing for a pure code change
+npx cdk diff VipAdminApiPlansStack --profile production
+
+npx cdk deploy VipAdminApiPlansStack --require-approval broadening --profile production
+```
+
+**`cdk deploy <single-stack-name>` still deploys its dependency stacks — confirmed 2026-08-31.** `VipAdminApiPlansStack` depends on `VipAdminDataStack`, `ApiProgressiveDialerStack`, and `VipAdminApiSmsStack` (cross-stack `Fn::ImportValue` references), and CDK deployed all four when only `VipAdminApiPlansStack` was named on the command line — it is NOT scoped to just the named stack the way `cdk diff <single-stack-name>` might suggest. Don't assume naming one stack limits the blast radius; check `cdk diff` output for every stack it lists under "Including dependency stacks," not just the one you named, and expect all of them to actually deploy.
+
+**Known drift (as of 2026-08-31, now resolved by the 2026-08-31 deploy):** `ApiProgressiveDialerStack` and `VipAdminApiSmsStack` had shown a Lambda code S3Key diff with no corresponding source change (their CloudFormation state was stale relative to code pushed directly via `aws lambda update-function-code` outside CDK — see BUGLOG.md 2026-08-27 branded-stall incident). The 2026-08-31 `VipAdminApiPlansStack` deploy re-bundled and pushed those Lambdas as a side effect; post-deploy verification (downloaded the deployed code, diffed byte-for-byte against `main`) confirmed no functional change — just a repackage. If you see this drift again, verify the same way before assuming a scoped deploy is safe to run.
 
 CDK deploy order (managed by dependency graph):
 

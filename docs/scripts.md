@@ -157,9 +157,19 @@ AWS_PROFILE=production aws cloudfront create-invalidation \
 
 ### Deploy CDK stacks
 
+`cdk.json` lives at the **repo root**, not in `infra/` — run `cdk` from the repo root. Running from `infra/` fails with `--app is required either in command-line, in cdk.json or in ~/.cdk.json` (confirmed 2026-08-31).
+
 ```bash
-cd /home/devaju/projects/vip-connect-external-campaigns/infra
+cd /home/devaju/projects/vip-connect-external-campaigns
 npx cdk deploy --all --require-approval broadening --profile production
+```
+
+For a code-only change to one Lambda, naming just that stack still deploys its dependency stacks too (`VipAdminApiPlansStack` → `VipAdminDataStack`, `ApiProgressiveDialerStack`, `VipAdminApiSmsStack` — confirmed 2026-08-31, see `runbook.md` § Deploy CDK stacks). It's not a scoping mechanism, just a starting point — always check the "Including dependency stacks" line and be ready for all of them to deploy:
+
+```bash
+cd /home/devaju/projects/vip-connect-external-campaigns
+npx cdk diff VipAdminApiPlansStack --profile production
+npx cdk deploy VipAdminApiPlansStack --require-approval broadening --profile production
 ```
 
 CDK-managed stacks (monitoring is NOT in CDK):
