@@ -44,6 +44,18 @@ describe('aggregateByRoutingProfile', () => {
     });
   });
 
+  it('counts every effectiveStatus value distinctly', () => {
+    const agents = [
+      agent({ agentId: 'a1', effectiveStatus: 'Available' }),
+      agent({ agentId: 'a2', effectiveStatus: 'On Call' }),
+      agent({ agentId: 'a3', effectiveStatus: 'ACW' }),
+      agent({ agentId: 'a4', effectiveStatus: 'Offline' }),
+      agent({ agentId: 'a5', effectiveStatus: 'Unavailable' }),
+    ];
+    const [result] = aggregateByRoutingProfile(agents);
+    expect(result).toMatchObject({ available: 1, onCall: 1, acw: 1, offline: 1, unavailable: 1, total: 5 });
+  });
+
   it('sorts profiles by available count ascending (most understaffed first)', () => {
     const agents = [
       agent({ agentId: 'a1', routingProfileId: 'rp1', routingProfileName: 'Well staffed', effectiveStatus: 'Available' }),
