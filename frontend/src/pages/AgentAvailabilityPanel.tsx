@@ -2,9 +2,9 @@ import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 
-import { StatTile } from '@/components/ui/StatTile';
+import { AgentAvailabilityCard } from '@/components/AgentAvailabilityCard';
 import { api } from '@/lib/api';
-import { aggregateByRoutingProfile } from '@/lib/agentRoster';
+import { aggregateByRoutingProfile, classifyStaffing, minAvailableFor, STAFFING_RISK_ORDER } from '@/lib/agentRoster';
 import { teamForProfile } from '@/lib/routingProfileTeams';
 
 // Deliberately narrower than BRANDED_MONITOR_TEAMS: this compact panel is scoped to
@@ -29,11 +29,28 @@ export function AgentAvailabilityPanel({
   const patientAccessAgents = (query.data?.agents ?? []).filter(
     (a) => teamForProfile(a.routingProfileName) === PANEL_TEAM,
   );
-  const rows = aggregateByRoutingProfile(patientAccessAgents);
+  const rows = aggregateByRoutingProfile(patientAccessAgents)
+    .sort((a, b) =>
+      STAFFING_RISK_ORDER[classifyStaffing(a.available, minAvailableFor(a.routingProfileName)).risk]
+      - STAFFING_RISK_ORDER[classifyStaffing(b.available, minAvailableFor(b.routingProfileName)).risk],
+    );
+  const shownIds = new Set(rows.map((r) => r.routingProfileId));
+  const zeroAgentCount = (query.data?.allRoutingProfiles ?? []).filter(
+    (p) => teamForProfile(p.name) === PANEL_TEAM && !shownIds.has(p.id),
+  ).length;
 
   return (
     <div className={className}>
-      <h3 className="text-sm font-semibold text-gray-700 mb-2">Agent availability — Patient Access</h3>
+      <div className="mb-2 flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-gray-700">Agent availability — Patient Access</h3>
+        <button
+          type="button"
+          onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}`)}
+          className="text-[10px] font-medium text-amber-600 hover:text-amber-700"
+        >
+          All profiles →
+        </button>
+      </div>
       {query.isError ? (
         <p className="text-xs text-red-500">Failed to load agent roster.</p>
       ) : query.isPending ? (
@@ -41,29 +58,18 @@ export function AgentAvailabilityPanel({
       ) : rows.length === 0 ? (
         <p className="text-xs text-gray-400">No Patient Access agents online.</p>
       ) : (
-        <div
-          className="flex flex-wrap gap-2 cursor-pointer"
-          role="button"
-          tabIndex={0}
-          onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}`)}
-          title="View in Agent Roster"
-        >
+        <div className="flex flex-wrap gap-2">
           {rows.map((row) => (
-            <div key={row.routingProfileId} className="rounded-lg border border-gray-200 p-2.5 min-w-[160px] flex-1 basis-[180px] transition-shadow hover:shadow-md">
-              <div className="text-xs font-medium text-gray-700 truncate mb-1.5">{row.routingProfileName}</div>
-              <div className="grid grid-cols-4 gap-1.5">
-                <StatTile
-                  label="Avail"
-                  value={row.available}
-                  valueClassName={row.available === 0 ? 'text-red-600' : undefined}
-                />
-                <StatTile label="Call" value={row.onCall} />
-                <StatTile label="ACW" value={row.acw} />
-                <StatTile label="Off" value={row.offline + row.unavailable} />
-              </div>
-            </div>
+            <AgentAvailabilityCard
+              key={row.routingProfileId}
+              row={row}
+              onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}&profile=${row.routingProfileId}`)}
+            />
           ))}
         </div>
+      )}
+      {zeroAgentCount > 0 && (
+        <div className="mt-2 text-center text-xs text-gray-400">+{zeroAgentCount} profile{zeroAgentCount > 1 ? 's' : ''}</div>
       )}
     </div>
   );
