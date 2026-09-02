@@ -7,12 +7,11 @@ import {
   type BrandedCampaignRecord,
   type BrandedMetricSnapshot,
   type BrandedTodaySummary,
-  type RoutingProfileSummary,
 } from '@/lib/api';
 import { elapsedSeconds, elapsedMinutes, formatRuntime, fmtTime } from '@/lib/utils';
-import { BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
+import { BRANDED_MONITOR_TEAMS, TEAM_LABELS, teamForProfile } from '@/lib/routingProfileTeams';
 import { AgentAvailabilityCard } from '@/components/AgentAvailabilityCard';
-import { aggregateByRoutingProfile, classifyStaffing, minAvailableFor, STAFFING_RISK_ORDER } from '@/lib/agentRoster';
+import { aggregateAvailability, classifyStaffing, minAvailableForTeam, STAFFING_RISK_ORDER } from '@/lib/agentRoster';
 import { AgentRoster } from './AgentRoster';
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
@@ -660,25 +659,23 @@ function PlanDetailView({
 
 // ── Agent availability sidebar ─────────────────────────────────────────────────
 
-function AgentAvailabilitySidebar({ agents, allRoutingProfiles, isLoading, lastUpdated, onSelectProfile, onViewAllProfiles }: {
+function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated, onSelectTeam, onViewAllProfiles }: {
   agents: AgentRosterEntry[];
-  allRoutingProfiles: RoutingProfileSummary[];
   isLoading?: boolean;
   lastUpdated?: string;
-  onSelectProfile: (profileId: string) => void;
+  onSelectTeam: (team: string) => void;
   onViewAllProfiles: () => void;
 }): ReactNode {
-  const isBranded = (name: string) => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(name) ?? '');
-  const brandedAgents = agents.filter((a) => isBranded(a.routingProfileName));
+  const brandedAgents = agents.filter((a) => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(a.routingProfileName) ?? ''));
   const alertCount  = brandedAgents.filter(a => agentIdleAlert(a) !== null).length;
 
-  const rows = aggregateByRoutingProfile(brandedAgents)
+  const teamRows = (BRANDED_MONITOR_TEAMS as readonly string[])
+    .map((team) => ({ team, counts: aggregateAvailability(brandedAgents.filter((a) => teamForProfile(a.routingProfileName) === team)) }))
+    .filter(({ counts }) => counts.available + counts.onCall + counts.acw + counts.offline + counts.unavailable > 0)
     .sort((a, b) =>
-      STAFFING_RISK_ORDER[classifyStaffing(a.available, minAvailableFor(a.routingProfileName)).risk]
-      - STAFFING_RISK_ORDER[classifyStaffing(b.available, minAvailableFor(b.routingProfileName)).risk],
+      STAFFING_RISK_ORDER[classifyStaffing(a.counts.available, minAvailableForTeam(a.team)).risk]
+      - STAFFING_RISK_ORDER[classifyStaffing(b.counts.available, minAvailableForTeam(b.team)).risk],
     );
-  const shownIds = new Set(rows.map((r) => r.routingProfileId));
-  const zeroAgentCount = allRoutingProfiles.filter((p) => isBranded(p.name) && !shownIds.has(p.id)).length;
 
   return (
     <div className="flex flex-col gap-3">
@@ -698,8 +695,14 @@ function AgentAvailabilitySidebar({ agents, allRoutingProfiles, isLoading, lastU
       </div>
 
       <div className="flex flex-wrap gap-3">
-        {rows.map((row) => (
-          <AgentAvailabilityCard key={row.routingProfileId} row={row} onClick={() => onSelectProfile(row.routingProfileId)} />
+        {teamRows.map(({ team, counts }) => (
+          <AgentAvailabilityCard
+            key={team}
+            label={TEAM_LABELS[team] ?? team}
+            counts={counts}
+            minAvailable={minAvailableForTeam(team)}
+            onClick={() => onSelectTeam(team)}
+          />
         ))}
       </div>
 
@@ -711,11 +714,7 @@ function AgentAvailabilitySidebar({ agents, allRoutingProfiles, isLoading, lastU
         </div>
       )}
 
-      {zeroAgentCount > 0 && (
-        <div className="text-center text-xs text-gray-400">+{zeroAgentCount} profile{zeroAgentCount > 1 ? 's' : ''}</div>
-      )}
-
-      {rows.length === 0 && !isLoading && (
+      {teamRows.length === 0 && !isLoading && (
         <div className="text-sm text-gray-400 text-center py-6 rounded-xl border border-gray-200 bg-white">No agents online</div>
       )}
     </div>
@@ -741,10 +740,10 @@ const LEGEND = [
   { color: 'bg-red-400',    label: 'Failed' },
 ];
 
-function LiveView({ date, onDateChange, onSelectAgentProfile, onViewAllProfiles }: {
+function LiveView({ date, onDateChange, onSelectAgentTeam, onViewAllProfiles }: {
   date: string;
   onDateChange: (d: string) => void;
-  onSelectAgentProfile: (profileId: string) => void;
+  onSelectAgentTeam: (team: string) => void;
   onViewAllProfiles: () => void;
 }): ReactNode {
   const [campaignTab,    setCampaignTab]    = useState<CampaignTab>('active');
@@ -890,10 +889,9 @@ function LiveView({ date, onDateChange, onSelectAgentProfile, onViewAllProfiles 
         <div className={plansCollapsed ? 'lg:col-span-1' : ''}>
           <AgentAvailabilitySidebar
             agents={agentQuery.data?.agents ?? []}
-            allRoutingProfiles={agentQuery.data?.allRoutingProfiles ?? []}
             isLoading={agentQuery.isLoading}
             lastUpdated={agentQuery.data?.lastUpdated}
-            onSelectProfile={onSelectAgentProfile}
+            onSelectTeam={onSelectAgentTeam}
             onViewAllProfiles={onViewAllProfiles}
           />
         </div>
@@ -1018,8 +1016,8 @@ export function BrandedMonitor(): ReactNode {
         <LiveView
           date={date}
           onDateChange={setDate}
-          onSelectAgentProfile={(profileId) => {
-            setAgentsPreset({ profileId });
+          onSelectAgentTeam={(team) => {
+            setAgentsPreset({ team });
             setTab('agents');
           }}
           onViewAllProfiles={() => {

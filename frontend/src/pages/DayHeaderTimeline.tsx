@@ -119,6 +119,9 @@ export function DayHeaderTimeline({ plan, run }: { plan: PlanSummaryV2; run: Pla
 
   return (
     <div>
+      <div className="text-[10px] font-semibold uppercase tracking-widest text-gray-400 mb-1">
+        Time of day
+      </div>
       <div
         className="relative h-6 w-full rounded-full bg-gray-100 overflow-hidden"
         role="img"

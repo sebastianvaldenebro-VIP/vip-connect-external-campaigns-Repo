@@ -53,6 +53,45 @@ export function aggregateByRoutingProfile(agents: AgentRosterEntry[]): RoutingPr
   return [...byProfile.values()].sort((a, b) => a.available - b.available);
 }
 
+// ── Ungrouped availability tally (team-level cards) ──────────────────────────
+
+export type AvailabilityCounts = {
+  available: number;
+  onCall: number;
+  acw: number;
+  offline: number;
+  unavailable: number;
+};
+
+/**
+ * Same per-agent status tally as aggregateByRoutingProfile, but with no
+ * grouping key — the caller has already decided what these agents have in
+ * common (e.g. "same team"). Used for team-level cards, where several
+ * routing profiles collapse into one combined count.
+ */
+export function aggregateAvailability(agents: AgentRosterEntry[]): AvailabilityCounts {
+  const counts: AvailabilityCounts = { available: 0, onCall: 0, acw: 0, offline: 0, unavailable: 0 };
+  for (const agent of agents) {
+    switch (agent.effectiveStatus) {
+      case 'Available':
+        counts.available += 1;
+        break;
+      case 'On Call':
+        counts.onCall += 1;
+        break;
+      case 'ACW':
+        counts.acw += 1;
+        break;
+      case 'Offline':
+        counts.offline += 1;
+        break;
+      default:
+        counts.unavailable += 1;
+    }
+  }
+  return counts;
+}
+
 // ── Per-agent alerts ─────────────────────────────────────────────────────────
 
 export type AlertThresholds = {
@@ -152,6 +191,18 @@ export const DEFAULT_MIN_AVAILABLE = 1;
 
 export function minAvailableFor(routingProfileName: string): number {
   return MIN_AVAILABLE_BY_PROFILE[routingProfileName] ?? DEFAULT_MIN_AVAILABLE;
+}
+
+/**
+ * Per-team minimum staffing level, for cards that aggregate a whole team's
+ * routing profiles into one number. Empty by default, same rationale as
+ * MIN_AVAILABLE_BY_PROFILE — every team falls back to DEFAULT_MIN_AVAILABLE
+ * until real thresholds are tuned.
+ */
+export const MIN_AVAILABLE_BY_TEAM: Record<string, number> = {};
+
+export function minAvailableForTeam(team: string): number {
+  return MIN_AVAILABLE_BY_TEAM[team] ?? DEFAULT_MIN_AVAILABLE;
 }
 
 // ── Status → tone ────────────────────────────────────────────────────────────

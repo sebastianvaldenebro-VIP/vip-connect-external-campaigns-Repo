@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { AgentRosterEntry } from './api';
 import {
+  aggregateAvailability,
   aggregateByRoutingProfile,
   agentAlert,
   agentStatusTone,
@@ -9,6 +10,7 @@ import {
   DEFAULT_ALERT_THRESHOLDS,
   isBusinessHours,
   minAvailableFor,
+  minAvailableForTeam,
   totalActiveAlerts,
 } from './agentRoster';
 
@@ -72,6 +74,30 @@ describe('aggregateByRoutingProfile', () => {
 
   it('returns an empty array for no agents', () => {
     expect(aggregateByRoutingProfile([])).toEqual([]);
+  });
+});
+
+describe('aggregateAvailability', () => {
+  it('tallies every effectiveStatus across all agents with no grouping', () => {
+    const agents = [
+      agent({ agentId: 'a1', routingProfileId: 'rp1', effectiveStatus: 'Available' }),
+      agent({ agentId: 'a2', routingProfileId: 'rp2', effectiveStatus: 'Available' }),
+      agent({ agentId: 'a3', routingProfileId: 'rp1', effectiveStatus: 'On Call' }),
+      agent({ agentId: 'a4', routingProfileId: 'rp2', effectiveStatus: 'ACW' }),
+      agent({ agentId: 'a5', routingProfileId: 'rp1', effectiveStatus: 'Offline' }),
+      agent({ agentId: 'a6', routingProfileId: 'rp2', effectiveStatus: 'Unavailable' }),
+    ];
+    // rp1 and rp2 are different profiles — aggregateAvailability ignores that
+    // entirely and sums across all of them, unlike aggregateByRoutingProfile.
+    expect(aggregateAvailability(agents)).toEqual({
+      available: 2, onCall: 1, acw: 1, offline: 1, unavailable: 1,
+    });
+  });
+
+  it('returns all-zero counts for no agents', () => {
+    expect(aggregateAvailability([])).toEqual({
+      available: 0, onCall: 0, acw: 0, offline: 0, unavailable: 0,
+    });
   });
 });
 
@@ -167,6 +193,13 @@ describe('classifyStaffing — off hours', () => {
 describe('minAvailableFor', () => {
   it('falls back to DEFAULT_MIN_AVAILABLE for any profile not in the map', () => {
     expect(minAvailableFor('Some Profile Nobody Configured')).toBe(1);
+  });
+});
+
+describe('minAvailableForTeam', () => {
+  it('falls back to DEFAULT_MIN_AVAILABLE for any team not in the map', () => {
+    expect(minAvailableForTeam('patient-success')).toBe(1);
+    expect(minAvailableForTeam('appointment-services')).toBe(1);
   });
 });
 

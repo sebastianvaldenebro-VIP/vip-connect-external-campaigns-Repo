@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom';
 
 import { AgentAvailabilityCard } from '@/components/AgentAvailabilityCard';
 import { api } from '@/lib/api';
-import { aggregateByRoutingProfile, classifyStaffing, minAvailableFor, STAFFING_RISK_ORDER } from '@/lib/agentRoster';
+import { aggregateAvailability, minAvailableForTeam } from '@/lib/agentRoster';
 import { teamForProfile } from '@/lib/routingProfileTeams';
 
 // Deliberately narrower than BRANDED_MONITOR_TEAMS: this compact panel is scoped to
@@ -29,15 +29,7 @@ export function AgentAvailabilityPanel({
   const patientAccessAgents = (query.data?.agents ?? []).filter(
     (a) => teamForProfile(a.routingProfileName) === PANEL_TEAM,
   );
-  const rows = aggregateByRoutingProfile(patientAccessAgents)
-    .sort((a, b) =>
-      STAFFING_RISK_ORDER[classifyStaffing(a.available, minAvailableFor(a.routingProfileName)).risk]
-      - STAFFING_RISK_ORDER[classifyStaffing(b.available, minAvailableFor(b.routingProfileName)).risk],
-    );
-  const shownIds = new Set(rows.map((r) => r.routingProfileId));
-  const zeroAgentCount = (query.data?.allRoutingProfiles ?? []).filter(
-    (p) => teamForProfile(p.name) === PANEL_TEAM && !shownIds.has(p.id),
-  ).length;
+  const counts = aggregateAvailability(patientAccessAgents);
 
   return (
     <div className={className}>
@@ -55,21 +47,15 @@ export function AgentAvailabilityPanel({
         <p className="text-xs text-red-500">Failed to load agent roster.</p>
       ) : query.isPending ? (
         <p className="text-xs text-gray-400">Loading…</p>
-      ) : rows.length === 0 ? (
+      ) : patientAccessAgents.length === 0 ? (
         <p className="text-xs text-gray-400">No Patient Access agents online.</p>
       ) : (
-        <div className="flex flex-wrap gap-2">
-          {rows.map((row) => (
-            <AgentAvailabilityCard
-              key={row.routingProfileId}
-              row={row}
-              onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}&profile=${encodeURIComponent(row.routingProfileId)}`)}
-            />
-          ))}
-        </div>
-      )}
-      {zeroAgentCount > 0 && (
-        <div className="mt-2 text-center text-xs text-gray-400">+{zeroAgentCount} profile{zeroAgentCount > 1 ? 's' : ''}</div>
+        <AgentAvailabilityCard
+          label="Patient Access"
+          counts={counts}
+          minAvailable={minAvailableForTeam(PANEL_TEAM)}
+          onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}`)}
+        />
       )}
     </div>
   );

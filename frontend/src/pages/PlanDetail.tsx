@@ -137,6 +137,29 @@ function TimingMeta({
   );
 }
 
+// ── Plan progress bar ──────────────────────────────────────────────────────────
+// Distinct from DayHeaderTimeline below it: that bar plots buckets against
+// time-of-day (when they ran), this one plots completion against bucket
+// count (how much of the plan is done) — a plan whose buckets all ran
+// quickly within a small slice of the working-hours window can be nearly
+// finished while still looking mostly empty on the time-of-day bar.
+
+function PlanProgressBar({ run, totalBuckets }: { run: PlanRunV2; totalBuckets: number }) {
+  const completed = run.bucketStates.filter((b) => b.status === 'completed').length;
+  const pct = totalBuckets > 0 ? Math.round((completed / totalBuckets) * 100) : 0;
+  return (
+    <div>
+      <div className="flex items-center justify-between text-[11px] text-gray-500 mb-1">
+        <span className="font-semibold uppercase tracking-widest text-gray-400">Plan progress</span>
+        <span>{completed} of {totalBuckets} bucket{totalBuckets !== 1 ? 's' : ''} completed</span>
+      </div>
+      <div className="h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+        <div className="h-full bg-green-500 rounded-full transition-all" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
 // ── Campaign card ─────────────────────────────────────────────────────────────
 
 function groupCategory(group: string): string {
@@ -978,7 +1001,8 @@ export function PlanDetail(): ReactNode {
         </div>
 
         {displayRun && (
-          <div className="mt-3">
+          <div className="mt-3 space-y-3">
+            <PlanProgressBar run={displayRun} totalBuckets={plan.buckets.length} />
             <DayHeaderTimeline plan={planForDisplay} run={displayRun} />
           </div>
         )}
