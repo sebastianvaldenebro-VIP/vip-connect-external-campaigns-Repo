@@ -1,7 +1,8 @@
-import { useState, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 import { Button } from '@/components/ui';
+import { usePersistedState } from '@/hooks/usePersistedState';
 import { cn } from '@/lib/utils';
 
 const GROUPS = [
@@ -90,37 +91,43 @@ const GROUPS = [
 
 export function PlansLayout(): ReactNode {
   const navigate = useNavigate();
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = usePersistedState('plans-sidebar-collapsed', false);
 
   return (
     <div className="flex gap-8">
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
-      <aside className="w-52 shrink-0">
+      <aside className={cn('shrink-0 transition-all', collapsed ? 'w-12' : 'w-52')}>
         <div className="flex flex-col gap-5">
-          {GROUPS.map((group) => {
-            const isCollapsed = collapsed[group.label] ?? false;
-            return (
+          <button
+            type="button"
+            onClick={() => setCollapsed(!collapsed)}
+            className="flex items-center gap-1.5 px-3 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground hover:text-foreground"
+            title={collapsed ? 'Expand' : 'Collapse'}
+          >
+            <svg
+              viewBox="0 0 20 20"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              className={`h-3 w-3 shrink-0 transition-transform ${collapsed ? 'rotate-180' : ''}`}
+            >
+              <path d="M12 4l-6 6 6 6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            {!collapsed && 'Collapse'}
+          </button>
+
+          {GROUPS.map((group) => (
             <div key={group.label} className="flex flex-col gap-1">
-              <button
-                type="button"
-                onClick={() => setCollapsed((prev) => ({ ...prev, [group.label]: !isCollapsed }))}
-                className="flex items-center justify-between px-3 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground hover:text-foreground"
-              >
-                {group.label}
-                <svg
-                  viewBox="0 0 20 20"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  className={`h-3 w-3 shrink-0 transition-transform ${isCollapsed ? '' : 'rotate-90'}`}
-                >
-                  <path d="M7 5l6 5-6 5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              {!isCollapsed && group.items.map((item) => (
+              {!collapsed && (
+                <div className="px-3 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+                  {group.label}
+                </div>
+              )}
+              {group.items.map((item) => (
                 <NavLink
                   key={item.to}
                   to={item.to}
+                  title={collapsed ? item.label : undefined}
                   className={({ isActive }) =>
                     cn(
                       'flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
@@ -131,18 +138,19 @@ export function PlansLayout(): ReactNode {
                   }
                 >
                   {item.icon}
-                  {item.label}
+                  {!collapsed && item.label}
                 </NavLink>
               ))}
             </div>
-            );
-          })}
+          ))}
 
-          <div className="mt-2 px-3">
-            <Button size="sm" className="w-full" onClick={() => navigate('/plans/new')}>
-              New plan
-            </Button>
-          </div>
+          {!collapsed && (
+            <div className="mt-2 px-3">
+              <Button size="sm" className="w-full" onClick={() => navigate('/plans/new')}>
+                New plan
+              </Button>
+            </div>
+          )}
         </div>
       </aside>
 
