@@ -279,7 +279,9 @@ export const mockApi: typeof RealApi = {
       campaigns: [],
     }),
     getCampaignMetrics: async () => ({ campaignId: '', metrics: [] }),
-    getAgentRoster: async () => ({ agents: [], queueId: '', lastUpdated: new Date().toISOString(), routingProfiles: [] }),
+    getAgentRoster: async () => ({
+      agents: [], queueId: '', lastUpdated: new Date().toISOString(), routingProfiles: [], allRoutingProfiles: [],
+    }),
     getHistory: async () => ({ planId: '', days: 30, history: [] }),
   },
   audit: {

@@ -894,7 +894,13 @@ const realApi = {
         `/metrics/branded/campaigns/${encodeURIComponent(campaignId)}/metrics?limit=${limit}`,
       ),
     getAgentRoster: (queueId?: string) =>
-      request<{ agents: AgentRosterEntry[]; queueId: string; lastUpdated: string; routingProfiles: RoutingProfileSummary[] }>(
+      request<{
+        agents: AgentRosterEntry[];
+        queueId: string;
+        lastUpdated: string;
+        routingProfiles: RoutingProfileSummary[];
+        allRoutingProfiles: RoutingProfileSummary[];
+      }>(
         `/metrics/branded/agents${queueId ? `?queueId=${encodeURIComponent(queueId)}` : ''}`,
       ),
     getHistory: (planId: string, days = 30) =>

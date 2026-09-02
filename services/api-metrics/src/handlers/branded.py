@@ -204,13 +204,25 @@ def get_agent_roster(event: dict, context: object) -> dict:
     # GetCurrentUserData requires at least one non-empty filter field.
     # When a specific queue is requested, scope to that queue.
     # Otherwise, scope to all routing profiles (covers every agent in the instance).
+    #
+    # all_routing_profiles is the FULL Connect catalog (from list_routing_profiles,
+    # via _routing_profile_ids()) — unlike routing_profiles below, which is derived
+    # only from agents actually present in this response. A queue-scoped request
+    # never calls _routing_profile_ids(), so it stays [] rather than reusing a
+    # possibly-stale cache from a prior unscoped call.
+    all_routing_profiles: list[dict] = []
     if queue_id:
         filter_batches: list[dict] = [{"Queues": [queue_id]}]
     else:
         profile_ids = _routing_profile_ids()
+        all_routing_profiles = sorted(
+            [{"id": pid, "name": _rp_name_cache.get(pid, pid)} for pid in profile_ids],
+            key=lambda x: x["name"],
+        )
         if not profile_ids:
             return _ok({
                 "agents": [], "queueId": queue_id, "routingProfiles": [],
+                "allRoutingProfiles": [],
                 "lastUpdated": datetime.now(timezone.utc).isoformat(),
             })
         filter_batches = [{"RoutingProfiles": batch} for batch in _chunk(profile_ids, 100)]
@@ -307,6 +319,7 @@ def get_agent_roster(event: dict, context: object) -> dict:
         "agents": agents,
         "queueId": queue_id,
         "routingProfiles": routing_profiles,
+        "allRoutingProfiles": all_routing_profiles,
         "lastUpdated": datetime.now(timezone.utc).isoformat(),
     })
 

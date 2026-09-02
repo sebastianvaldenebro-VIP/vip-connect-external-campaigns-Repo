@@ -430,10 +430,68 @@ class TestRoutingProfileBatching:
         assert "NextToken" not in third_call_kwargs
 
 
+class TestAllRoutingProfilesCatalog:
+    """allRoutingProfiles must be the full Connect catalog (from list_routing_profiles),
+    not the routingProfiles field's agent-derived subset — a routing profile with zero
+    agents currently logged in must still appear here, or the frontend has no way to
+    know it exists at all.
+    """
+
+    def test_includes_profiles_with_zero_agents(self):
+        from handlers import branded
+
+        # 3 profiles registered in Connect; only rp-1 has an agent today.
+        profiles = [
+            {"Id": "rp-1", "Name": "Staffed Profile"},
+            {"Id": "rp-2", "Name": "Empty Profile A"},
+            {"Id": "rp-3", "Name": "Empty Profile B"},
+        ]
+        mock = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"RoutingProfileSummaryList": profiles}]
+        mock.get_paginator.return_value = paginator
+        mock.list_agent_statuses.return_value = {
+            "AgentStatusSummaryList": [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}],
+        }
+        mock.describe_user.return_value = {
+            "User": {"IdentityInfo": {"FirstName": "A", "LastName": "B"}, "Username": "ab"},
+        }
+        mock.get_current_user_data.return_value = {
+            "UserDataList": [_user_data(user_id="u-1", rp_id="rp-1", status_arn="arn:.../agent-status/s-avail")],
+        }
+
+        with patch("handlers.branded._connect", mock):
+            resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+
+        body = json.loads(resp["body"])
+        # routingProfiles (agent-derived) only has rp-1 — the pre-existing behavior.
+        assert {p["id"] for p in body["routingProfiles"]} == {"rp-1"}
+        # allRoutingProfiles has all 3, including the two with zero agents today.
+        assert {p["id"] for p in body["allRoutingProfiles"]} == {"rp-1", "rp-2", "rp-3"}
+        assert {p["name"] for p in body["allRoutingProfiles"]} == {
+            "Staffed Profile", "Empty Profile A", "Empty Profile B",
+        }
+
+    def test_queue_scoped_request_returns_empty_all_routing_profiles(self):
+        """A queueId-scoped request never calls list_routing_profiles (the existing
+        code path skips it entirely), so allRoutingProfiles must be [] rather than
+        stale/partial — never silently reuse a previous request's cache contents."""
+        from handlers import branded
+
+        ud = [_user_data(status_arn="arn:.../agent-status/s-avail")]
+        statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+
+        with patch("handlers.branded._connect", _mock_connect(ud, statuses)):
+            resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+        body = json.loads(resp["body"])
+        assert body["allRoutingProfiles"] == []
+
+
 class TestEmptyRosterResponseShape:
-    """The empty-roster early-return must carry the same 4 keys the TS type
-    declares non-optional (routingProfiles, lastUpdated) — a prior version
-    omitted them, which type-disagreed with the frontend contract."""
+    """The empty-roster early-return must carry the same 5 keys the TS type
+    declares non-optional (routingProfiles, allRoutingProfiles, lastUpdated) —
+    a prior version omitted some, which type-disagreed with the frontend contract."""
 
     def test_empty_roster_still_returns_routing_profiles_and_last_updated(self):
         from handlers import branded
@@ -449,4 +507,5 @@ class TestEmptyRosterResponseShape:
         body = json.loads(resp["body"])
         assert body["agents"] == []
         assert body["routingProfiles"] == []
+        assert body["allRoutingProfiles"] == []
         assert "lastUpdated" in body and body["lastUpdated"]
