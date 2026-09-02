@@ -9,6 +9,7 @@ import {
   type BrandedTodaySummary,
 } from '@/lib/api';
 import { elapsedSeconds, elapsedMinutes, formatRuntime, fmtTime } from '@/lib/utils';
+import { BRANDED_MONITOR_TEAMS, teamForProfile } from '@/lib/routingProfileTeams';
 import { AgentRoster } from './AgentRoster';
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
@@ -648,16 +649,20 @@ function PlanDetailView({
 
 // ── Agent availability sidebar ─────────────────────────────────────────────────
 
-function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated }: {
+function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated, onSelectProfile }: {
   agents: AgentRosterEntry[];
   isLoading?: boolean;
   lastUpdated?: string;
+  onSelectProfile: (profileId: string) => void;
 }): ReactNode {
-  const profiles    = [...new Map(agents.map(a => [a.routingProfileId, a.routingProfileName]))].sort((a, b) => a[1].localeCompare(b[1]));
-  const alertCount  = agents.filter(a => agentIdleAlert(a) !== null).length;
+  const brandedAgents = agents.filter(
+    (a) => (BRANDED_MONITOR_TEAMS as readonly string[]).includes(teamForProfile(a.routingProfileName) ?? ''),
+  );
+  const profiles    = [...new Map(brandedAgents.map(a => [a.routingProfileId, a.routingProfileName]))].sort((a, b) => a[1].localeCompare(b[1]));
+  const alertCount  = brandedAgents.filter(a => agentIdleAlert(a) !== null).length;
 
   return (
-    <div className="space-y-3">
+    <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-800">Agent availability</h2>
         {lastUpdated && !isLoading && (
@@ -668,37 +673,45 @@ function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated }: {
         {isLoading && <span className="text-[10px] text-gray-400 animate-pulse">Loading…</span>}
       </div>
 
-      {profiles.map(([profileId, profileName]) => {
-        const pa        = agents.filter(a => a.routingProfileId === profileId);
-        const available = pa.filter(a => a.effectiveStatus === 'Available').length;
-        const onCall    = pa.filter(a => a.effectiveStatus === 'On Call').length;
-        const acw       = pa.filter(a => a.effectiveStatus === 'ACW').length;
-        const online    = pa.filter(a => a.effectiveStatus !== 'Unavailable' && a.effectiveStatus !== 'Offline').length;
-        const lowAgents = available < 2;
-        return (
-          <div key={profileId} className={`rounded-xl border p-4 space-y-3 ${lowAgents ? 'border-red-200 bg-red-50' : 'border-gray-200 bg-white'}`}>
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${lowAgents ? 'bg-red-500' : 'bg-green-500'}`} />
-              <span className="text-xs font-semibold text-gray-700">{profileName}</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-center">
-              <div className={`rounded-lg py-2 ${lowAgents ? 'bg-red-100' : 'bg-gray-50'}`}>
-                <div className={`text-2xl font-bold tabular-nums ${lowAgents ? 'text-red-600' : 'text-green-600'}`}>{available}</div>
-                <div className="text-[10px] text-gray-500 uppercase">Available</div>
+      <div className="flex flex-wrap gap-3">
+        {profiles.map(([profileId, profileName]) => {
+          const pa        = brandedAgents.filter(a => a.routingProfileId === profileId);
+          const available = pa.filter(a => a.effectiveStatus === 'Available').length;
+          const onCall    = pa.filter(a => a.effectiveStatus === 'On Call').length;
+          const acw       = pa.filter(a => a.effectiveStatus === 'ACW').length;
+          const online    = pa.filter(a => a.effectiveStatus !== 'Unavailable' && a.effectiveStatus !== 'Offline').length;
+          const lowAgents = available < 2;
+          return (
+            <div
+              key={profileId}
+              onClick={() => onSelectProfile(profileId)}
+              role="button"
+              tabIndex={0}
+              className={`rounded-xl border p-4 space-y-3 min-w-[200px] flex-1 basis-[220px] cursor-pointer transition-shadow hover:shadow-md ${lowAgents ? 'border-red-200 bg-red-50' : 'border-gray-200 bg-white'}`}
+            >
+              <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${lowAgents ? 'bg-red-500' : 'bg-green-500'}`} />
+                <span className="text-xs font-semibold text-gray-700">{profileName}</span>
               </div>
-              <div className="rounded-lg py-2 bg-gray-50">
-                <div className="text-2xl font-bold tabular-nums text-blue-600">{onCall}</div>
-                <div className="text-[10px] text-gray-500 uppercase">On contact</div>
+              <div className="grid grid-cols-2 gap-2 text-center">
+                <div className={`rounded-lg py-2 ${lowAgents ? 'bg-red-100' : 'bg-gray-50'}`}>
+                  <div className={`text-2xl font-bold tabular-nums ${lowAgents ? 'text-red-600' : 'text-green-600'}`}>{available}</div>
+                  <div className="text-[10px] text-gray-500 uppercase">Available</div>
+                </div>
+                <div className="rounded-lg py-2 bg-gray-50">
+                  <div className="text-2xl font-bold tabular-nums text-blue-600">{onCall}</div>
+                  <div className="text-[10px] text-gray-500 uppercase">On contact</div>
+                </div>
               </div>
+              <div className="text-xs text-gray-500 flex gap-4">
+                <span>ACW <strong className="text-gray-700">{acw}</strong></span>
+                <span>Online <strong className="text-gray-700">{online}</strong></span>
+              </div>
+              {lowAgents && <div className="text-[11px] text-red-600 font-medium">⚠ Low available agents</div>}
             </div>
-            <div className="text-xs text-gray-500 flex gap-4">
-              <span>ACW <strong className="text-gray-700">{acw}</strong></span>
-              <span>Online <strong className="text-gray-700">{online}</strong></span>
-            </div>
-            {lowAgents && <div className="text-[11px] text-red-600 font-medium">⚠ Low available agents</div>}
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
 
       {alertCount > 0 && (
         <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
@@ -734,7 +747,7 @@ const LEGEND = [
   { color: 'bg-red-400',    label: 'Failed' },
 ];
 
-function LiveView({ date, onDateChange }: { date: string; onDateChange: (d: string) => void }): ReactNode {
+function LiveView({ date, onDateChange, onSelectAgentProfile }: { date: string; onDateChange: (d: string) => void; onSelectAgentProfile: (profileId: string) => void }): ReactNode {
   const [campaignTab,    setCampaignTab]    = useState<CampaignTab>('active');
   const [selectedGroup,  setSelectedGroup]  = useState<PlanRunGroup | null>(null);
   const [plansCollapsed, setPlansCollapsed] = useState(false);
@@ -880,6 +893,7 @@ function LiveView({ date, onDateChange }: { date: string; onDateChange: (d: stri
             agents={agentQuery.data?.agents ?? []}
             isLoading={agentQuery.isLoading}
             lastUpdated={agentQuery.data?.lastUpdated}
+            onSelectProfile={onSelectAgentProfile}
           />
         </div>
       </div>
@@ -968,7 +982,15 @@ type Tab = 'live' | 'agents' | 'history';
 const TAB_LABELS: Record<Tab, string> = { live: 'Live Monitor', agents: 'Agents', history: 'History' };
 
 export function BrandedMonitor(): ReactNode {
-  const [tab,  setTab]  = useState<Tab>('live');
+  const [tab, setTab] = useState<Tab>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const t = sp.get('tab');
+    return t === 'agents' || t === 'history' || t === 'live' ? t : 'live';
+  });
+  const [agentsPreset, setAgentsPreset] = useState<{ team?: string; profileId?: string }>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    return { team: sp.get('team') ?? undefined, profileId: sp.get('profile') ?? undefined };
+  });
   const [date, setDate] = useState(todayISO());
 
   return (
@@ -991,8 +1013,19 @@ export function BrandedMonitor(): ReactNode {
         </div>
       </div>
 
-      {tab === 'live'    && <LiveView    date={date} onDateChange={setDate} />}
-      {tab === 'agents'  && <AgentRoster />}
+      {tab === 'live'    && (
+        <LiveView
+          date={date}
+          onDateChange={setDate}
+          onSelectAgentProfile={(profileId) => {
+            setAgentsPreset({ profileId });
+            setTab('agents');
+          }}
+        />
+      )}
+      {tab === 'agents'  && (
+        <AgentRoster initialTeamFilter={agentsPreset.team} initialProfileFilter={agentsPreset.profileId} />
+      )}
       {tab === 'history' && <HistoryView date={date} onDateChange={setDate} onNavigateLive={() => setTab('live')} />}
     </div>
   );
