@@ -167,3 +167,20 @@ const AGENT_STATUS_TONE: Record<AgentRosterEntry['effectiveStatus'], StatusTone>
 export function agentStatusTone(effectiveStatus: AgentRosterEntry['effectiveStatus']): StatusTone {
   return AGENT_STATUS_TONE[effectiveStatus];
 }
+
+// ── Aggregate alert count (TopBar badge) ─────────────────────────────────────
+
+/**
+ * Total active-alert count across the whole roster: every agent with a
+ * per-agent alert (idle/break/longCall/longAcw), plus every routing profile
+ * whose staffing risk isn't healthy/off-hours. Two different alert families,
+ * summed into one number for a single global badge.
+ */
+export function totalActiveAlerts(agents: AgentRosterEntry[], nowMs: number = Date.now()): number {
+  const agentAlertCount = agents.filter((a) => agentAlert(a, DEFAULT_ALERT_THRESHOLDS, nowMs) !== null).length;
+  const profileRiskCount = aggregateByRoutingProfile(agents).filter((row) => {
+    const risk = classifyStaffing(row.available, minAvailableFor(row.routingProfileName), nowMs).risk;
+    return risk !== 'healthy' && risk !== 'off-hours';
+  }).length;
+  return agentAlertCount + profileRiskCount;
+}

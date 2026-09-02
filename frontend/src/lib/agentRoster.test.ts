@@ -9,6 +9,7 @@ import {
   DEFAULT_ALERT_THRESHOLDS,
   isBusinessHours,
   minAvailableFor,
+  totalActiveAlerts,
 } from './agentRoster';
 
 function agent(overrides: Partial<AgentRosterEntry>): AgentRosterEntry {
@@ -176,5 +177,45 @@ describe('agentStatusTone', () => {
     expect(agentStatusTone('ACW')).toBe('acw');
     expect(agentStatusTone('Unavailable')).toBe('warning');
     expect(agentStatusTone('Offline')).toBe('neutral');
+  });
+});
+
+describe('totalActiveAlerts', () => {
+  it('sums a per-agent idle alert with that same agent\'s profile-level risk', () => {
+    const agents = [
+      // 20 min idle > the 10-min idle threshold → 1 agent alert.
+      agent({ effectiveStatus: 'Available', statusStartTimestamp: new Date(BUSINESS_HOURS_MS - 20 * 60_000).toISOString() }),
+    ];
+    // Same agent is also this profile's only one: available=1, default min=1 → 'at-minimum' → +1 profile risk.
+    expect(totalActiveAlerts(agents, BUSINESS_HOURS_MS)).toBe(2);
+  });
+
+  it('counts a per-profile staffing risk even when no per-agent alert applies', () => {
+    const agents = [
+      // Only 1 min idle — well under the 10-min threshold, no agent alert.
+      agent({ effectiveStatus: 'Available', statusStartTimestamp: new Date(BUSINESS_HOURS_MS - 60_000).toISOString() }),
+    ];
+    // available=1, default min=1 → 'at-minimum', which IS an active risk on its own.
+    expect(totalActiveAlerts(agents, BUSINESS_HOURS_MS)).toBe(1);
+  });
+
+  it('returns 0 for a healthy, alert-free roster', () => {
+    const agents = [
+      agent({ agentId: 'a1', effectiveStatus: 'Available', statusStartTimestamp: new Date(BUSINESS_HOURS_MS - 60_000).toISOString() }),
+      agent({ agentId: 'a2', effectiveStatus: 'Available', statusStartTimestamp: new Date(BUSINESS_HOURS_MS - 60_000).toISOString() }),
+    ];
+    // 2 available agents, default min=1 → available > min → 'healthy'. Neither agent is idle long enough to alert.
+    expect(totalActiveAlerts(agents, BUSINESS_HOURS_MS)).toBe(0);
+  });
+
+  it('suppresses profile-risk counts outside business hours for the identical roster', () => {
+    const agents = [
+      // effectiveStatus 'On Call', not 'Available' — 0 available agents in this profile.
+      agent({ effectiveStatus: 'On Call', statusStartTimestamp: new Date(OFF_HOURS_MS - 60_000).toISOString() }),
+    ];
+    // available=0 < min=1 → 'no-coverage' during business hours — a real, counted risk.
+    expect(totalActiveAlerts(agents, BUSINESS_HOURS_MS)).toBeGreaterThan(0);
+    // The exact same roster, evaluated off-hours, must not count that risk at all.
+    expect(totalActiveAlerts(agents, OFF_HOURS_MS)).toBe(0);
   });
 });
