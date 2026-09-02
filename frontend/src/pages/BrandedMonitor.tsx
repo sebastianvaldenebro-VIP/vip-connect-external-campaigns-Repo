@@ -264,6 +264,14 @@ function CampaignCard({
         </div>
       )}
 
+      {!compact && (
+        <div className="flex items-center gap-3 text-[11px] text-gray-500">
+          <span>Start <span className="font-medium text-gray-700">{fmtTime(campaign.startedAt)}</span></span>
+          <span>·</span>
+          <span>End <span className="font-medium text-gray-700">{campaign.completedAt ? fmtTime(campaign.completedAt) : (isRunning ? 'Running' : '—')}</span></span>
+        </div>
+      )}
+
       {/* Pace */}
       {!compact && paceSec !== null && (
         <div className="text-xs flex items-center gap-2 flex-wrap">
