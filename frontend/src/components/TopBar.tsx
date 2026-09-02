@@ -5,7 +5,7 @@ import { useLocation } from 'react-router-dom';
 import { signOut } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { totalActiveAlerts } from '@/lib/agentRoster';
-import { breadcrumbLabelForPath } from '@/lib/navConfig';
+import { breadcrumbGroupForPath, breadcrumbLabelForPath } from '@/lib/navConfig';
 import { fmtTime } from '@/lib/utils';
 import { useAuth } from '@/hooks/useAuth';
 
@@ -41,7 +41,7 @@ export function TopBar(): ReactNode {
   return (
     <header className="flex h-14 items-center justify-between border-b border-border bg-card px-6">
       <div className="text-sm text-muted-foreground">
-        Contact center <span className="mx-1.5 text-border">/</span>
+        {breadcrumbGroupForPath(location.pathname)} <span className="mx-1.5 text-border">/</span>
         <span className="font-medium text-foreground">{breadcrumbLabelForPath(location.pathname)}</span>
       </div>
       <div className="flex items-center gap-4">

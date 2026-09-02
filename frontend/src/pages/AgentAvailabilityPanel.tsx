@@ -48,7 +48,7 @@ export function AgentAvailabilityPanel({
           onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}`)}
           className="text-[10px] font-medium text-amber-600 hover:text-amber-700"
         >
-          All profiles →
+          All PA profiles →
         </button>
       </div>
       {query.isError ? (
@@ -63,7 +63,7 @@ export function AgentAvailabilityPanel({
             <AgentAvailabilityCard
               key={row.routingProfileId}
               row={row}
-              onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}&profile=${row.routingProfileId}`)}
+              onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}&profile=${encodeURIComponent(row.routingProfileId)}`)}
             />
           ))}
         </div>

@@ -25,6 +25,16 @@ export function AgentAvailabilityCard({
   return (
     <div
       onClick={onClick}
+      onKeyDown={
+        onClick
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
       role={onClick ? 'button' : undefined}
       tabIndex={onClick ? 0 : undefined}
       className={`min-w-[200px] flex-1 basis-[220px] space-y-2 rounded-xl border p-3 transition-shadow ${

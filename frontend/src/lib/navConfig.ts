@@ -40,3 +40,26 @@ export function breadcrumbLabelForPath(pathname: string): string {
   }
   return best?.label ?? 'Monitor';
 }
+
+/**
+ * The active top-level nav item's enclosing group label for a given
+ * pathname — used by the TopBar breadcrumb's first segment. Same
+ * longest-prefix-match logic as breadcrumbLabelForPath, but returns the
+ * NavGroup's own label instead of the matched item's label, so routes in
+ * the "Admin" group don't incorrectly read "Contact center".
+ */
+export function breadcrumbGroupForPath(pathname: string): string {
+  let best: NavItem | null = null;
+  let bestGroup = 'Contact center';
+  for (const group of NAV_GROUPS) {
+    for (const item of group.items) {
+      if (pathname === item.to || pathname.startsWith(`${item.to}/`)) {
+        if (!best || item.to.length > best.to.length) {
+          best = item;
+          bestGroup = group.label;
+        }
+      }
+    }
+  }
+  return bestGroup;
+}

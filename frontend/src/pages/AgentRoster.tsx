@@ -85,7 +85,7 @@ export function AgentRoster({
   const nowMs = useNowTick();
 
   const query = useQuery({
-    queryKey: ['branded-agents'],
+    queryKey: ['agent-roster', 'all'],
     queryFn: () => api.brandedMonitor.getAgentRoster(),
     refetchInterval: 60_000,
     staleTime: 30_000,

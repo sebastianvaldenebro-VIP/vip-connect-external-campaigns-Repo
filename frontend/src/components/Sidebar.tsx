@@ -90,6 +90,7 @@ export function Sidebar(): ReactNode {
               <NavLink
                 key={item.to}
                 to={item.to}
+                end={item.to === '/plans'}
                 title={collapsed ? item.label : undefined}
                 className={({ isActive }) =>
                   cn(

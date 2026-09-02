@@ -759,7 +759,7 @@ function LiveView({ date, onDateChange, onSelectAgentProfile, onViewAllProfiles 
   });
 
   const agentQuery = useQuery({
-    queryKey: ['branded-agents'],
+    queryKey: ['agent-roster', 'all'],
     queryFn:  () => api.brandedMonitor.getAgentRoster(),
     refetchInterval: 60_000,
     staleTime: 30_000,
