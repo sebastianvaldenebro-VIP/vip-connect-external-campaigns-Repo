@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 import { Button } from '@/components/ui';
@@ -90,18 +90,34 @@ const GROUPS = [
 
 export function PlansLayout(): ReactNode {
   const navigate = useNavigate();
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   return (
     <div className="flex gap-8">
       {/* ── Sidebar ─────────────────────────────────────────────────── */}
       <aside className="w-52 shrink-0">
         <div className="flex flex-col gap-5">
-          {GROUPS.map((group) => (
+          {GROUPS.map((group) => {
+            const isCollapsed = collapsed[group.label] ?? false;
+            return (
             <div key={group.label} className="flex flex-col gap-1">
-              <p className="px-3 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">
+              <button
+                type="button"
+                onClick={() => setCollapsed((prev) => ({ ...prev, [group.label]: !isCollapsed }))}
+                className="flex items-center justify-between px-3 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground hover:text-foreground"
+              >
                 {group.label}
-              </p>
-              {group.items.map((item) => (
+                <svg
+                  viewBox="0 0 20 20"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  className={`h-3 w-3 shrink-0 transition-transform ${isCollapsed ? '' : 'rotate-90'}`}
+                >
+                  <path d="M7 5l6 5-6 5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              {!isCollapsed && group.items.map((item) => (
                 <NavLink
                   key={item.to}
                   to={item.to}
@@ -119,7 +135,8 @@ export function PlansLayout(): ReactNode {
                 </NavLink>
               ))}
             </div>
-          ))}
+            );
+          })}
 
           <div className="mt-2 px-3">
             <Button size="sm" className="w-full" onClick={() => navigate('/plans/new')}>
