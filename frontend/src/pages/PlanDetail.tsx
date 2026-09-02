@@ -184,7 +184,12 @@ function CampaignCard({
 
   const timingItems: { label: string; value: string }[] = [
     { label: 'Start', value: fmtTime(actualStart) },
-    ...(etaDate ? [{ label: 'ETA', value: fmtTime(etaDate) }] : []),
+    // Once the campaign has a real completedAt, show that instead of the
+    // projected ETA — a finished campaign's actual end time is always more
+    // useful than a stale projection.
+    ...(cs.completedAt
+      ? [{ label: 'End', value: fmtTime(cs.completedAt) }]
+      : etaDate ? [{ label: 'ETA', value: fmtTime(etaDate) }] : []),
     ...(isTimeBased && durMin > 0 ? [{ label: 'Dur', value: `${durMin}m` }] : []),
   ];
 
