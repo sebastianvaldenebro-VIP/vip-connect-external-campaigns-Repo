@@ -7,6 +7,11 @@ import { api } from '@/lib/api';
 import { aggregateByRoutingProfile } from '@/lib/agentRoster';
 import { teamForProfile } from '@/lib/routingProfileTeams';
 
+// Deliberately narrower than BRANDED_MONITOR_TEAMS: this compact panel is scoped to
+// Patient Access only by design, and its click-through must always land on this same
+// team — kept in one constant so the two can't drift apart.
+const PANEL_TEAM = 'patient-success';
+
 export function AgentAvailabilityPanel({
   active,
   className,
@@ -22,25 +27,25 @@ export function AgentAvailabilityPanel({
   });
 
   const patientAccessAgents = (query.data?.agents ?? []).filter(
-    (a) => teamForProfile(a.routingProfileName) === 'patient-success',
+    (a) => teamForProfile(a.routingProfileName) === PANEL_TEAM,
   );
   const rows = aggregateByRoutingProfile(patientAccessAgents);
 
   return (
     <div className={className}>
-      <h3 className="text-sm font-semibold text-gray-700 mb-2">Agent availability</h3>
+      <h3 className="text-sm font-semibold text-gray-700 mb-2">Agent availability — Patient Access</h3>
       {query.isError ? (
         <p className="text-xs text-red-500">Failed to load agent roster.</p>
       ) : query.isPending ? (
         <p className="text-xs text-gray-400">Loading…</p>
       ) : rows.length === 0 ? (
-        <p className="text-xs text-gray-400">No agents online.</p>
+        <p className="text-xs text-gray-400">No Patient Access agents online.</p>
       ) : (
         <div
           className="flex flex-wrap gap-2 cursor-pointer"
           role="button"
           tabIndex={0}
-          onClick={() => navigate('/plans/branded-monitor?tab=agents&team=patient-success')}
+          onClick={() => navigate(`/plans/branded-monitor?tab=agents&team=${PANEL_TEAM}`)}
           title="View in Agent Roster"
         >
           {rows.map((row) => (

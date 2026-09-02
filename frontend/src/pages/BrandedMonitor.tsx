@@ -672,7 +672,7 @@ function AgentAvailabilitySidebar({ agents, isLoading, lastUpdated, onSelectProf
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-gray-800">Agent availability</h2>
+        <h2 className="text-sm font-semibold text-gray-800">Agent availability — Branded teams</h2>
         {lastUpdated && !isLoading && (
           <span className="text-[10px] text-gray-400">
             {elapsedMinutes(lastUpdated) === 0 ? 'updated just now' : `updated ${elapsedMinutes(lastUpdated)}m ago`}
