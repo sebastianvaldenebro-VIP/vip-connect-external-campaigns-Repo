@@ -67,6 +67,21 @@ const SEGMENT_COLOR: Record<BucketStateV2['status'], string> = {
   completed: 'bg-green-500',
 };
 
+const RENDER_PRIORITY: Record<BucketStateV2['status'], number> = {
+  queued: 0,
+  warming: 1,
+  running: 2,
+  completed: 3,
+};
+
+/** Sorts segments so higher-priority statuses (completed last) paint on top —
+ * absolutely-positioned overlapping segments otherwise stack by array order,
+ * which can visually bury a completed (green) segment under a later-indexed
+ * queued/running one. Stable sort: same-status segments keep their relative order. */
+export function sortSegmentsForRender(segments: TimelineSegment[]): TimelineSegment[] {
+  return [...segments].sort((a, b) => RENDER_PRIORITY[a.status] - RENDER_PRIORITY[b.status]);
+}
+
 const LEGEND: { status: BucketStateV2['status']; label: string }[] = [
   { status: 'queued', label: 'Queued' },
   { status: 'warming', label: 'Warming' },
@@ -109,7 +124,7 @@ export function DayHeaderTimeline({ plan, run }: { plan: PlanSummaryV2; run: Pla
         role="img"
         aria-label={`Bucket timeline from ${fmtTime(windowStart)} to ${fmtTime(windowEnd)}, now at ${fmtTime(now)}`}
       >
-        {segments.map((seg) => (
+        {sortSegmentsForRender(segments).map((seg) => (
           <div
             key={seg.bucketIndex}
             className={`absolute top-0 h-full ${SEGMENT_COLOR[seg.status]}`}

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { PlanRunV2, PlanSummaryV2 } from '@/lib/api';
 
-import { computeTimelineSegments } from './DayHeaderTimeline';
+import { computeTimelineSegments, sortSegmentsForRender } from './DayHeaderTimeline';
 
 const windowStart = new Date('2026-08-31T13:00:00.000Z'); // 8:00 AM COT (UTC-5)
 const windowEnd = new Date('2026-09-01T01:00:00.000Z');   // 8:00 PM COT
@@ -74,5 +74,44 @@ describe('computeTimelineSegments', () => {
     expect(segments).toHaveLength(2);
     expect(segments[0].bucketIndex).toBe(0);
     expect(segments[1].bucketIndex).toBe(1);
+  });
+});
+
+describe('sortSegmentsForRender', () => {
+  it('renders completed segments last (on top), regardless of input order', () => {
+    const queued    = { bucketIndex: 0, startPct: 0,  endPct: 10, status: 'queued' as const };
+    const running   = { bucketIndex: 1, startPct: 10, endPct: 20, status: 'running' as const };
+    const completed = { bucketIndex: 2, startPct: 20, endPct: 30, status: 'completed' as const };
+    const warming   = { bucketIndex: 3, startPct: 30, endPct: 40, status: 'warming' as const };
+
+    const result = sortSegmentsForRender([completed, queued, running, warming]);
+    expect(result[result.length - 1]).toBe(completed);
+  });
+
+  it('sorts strictly by status priority: queued, warming, running, completed', () => {
+    const queued    = { bucketIndex: 0, startPct: 0,  endPct: 10, status: 'queued' as const };
+    const warming   = { bucketIndex: 1, startPct: 10, endPct: 20, status: 'warming' as const };
+    const running   = { bucketIndex: 2, startPct: 20, endPct: 30, status: 'running' as const };
+    const completed = { bucketIndex: 3, startPct: 30, endPct: 40, status: 'completed' as const };
+
+    const result = sortSegmentsForRender([completed, running, warming, queued]);
+    expect(result.map((s) => s.status)).toEqual(['queued', 'warming', 'running', 'completed']);
+  });
+
+  it('does not mutate the input array', () => {
+    const input = [
+      { bucketIndex: 0, startPct: 0, endPct: 10, status: 'completed' as const },
+      { bucketIndex: 1, startPct: 10, endPct: 20, status: 'queued' as const },
+    ];
+    const inputCopy = [...input];
+    sortSegmentsForRender(input);
+    expect(input).toEqual(inputCopy);
+  });
+
+  it('preserves relative order between segments of the same status', () => {
+    const a = { bucketIndex: 0, startPct: 0,  endPct: 10, status: 'queued' as const };
+    const b = { bucketIndex: 1, startPct: 10, endPct: 20, status: 'queued' as const };
+    const result = sortSegmentsForRender([a, b]);
+    expect(result).toEqual([a, b]);
   });
 });
