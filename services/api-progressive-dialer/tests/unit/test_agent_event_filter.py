@@ -1,4 +1,3 @@
-import pytest
 from agent_event_filter import is_agent_available, extract_agent_info
 
 # ── is_agent_available ────────────────────────────────────────────────

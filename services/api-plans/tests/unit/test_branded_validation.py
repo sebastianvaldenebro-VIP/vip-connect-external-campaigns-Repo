@@ -1,6 +1,7 @@
 """Tests for branded campaign field validation in plan save boundary."""
 from __future__ import annotations
 
+import json as _json
 import sys
 import os
 from unittest.mock import MagicMock, patch
@@ -430,9 +431,6 @@ class TestUpdatePlanTemplateSchedule:
 # never ran _validate_plan_body, so a template carrying an out-of-set
 # maxLeadAgeMinutes (or any other invalid campaign field) was copied verbatim
 # into every new plan cloned from it, bypassing the validation added above.
-
-import json as _json
-
 
 def _json_response(status: int, body: object) -> dict:
     return {"statusCode": status, "body": _json.dumps(body)}

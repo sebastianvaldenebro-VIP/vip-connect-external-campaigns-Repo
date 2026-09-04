@@ -1,4 +1,5 @@
-import base64, json
+import base64
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 import pytest
@@ -44,10 +45,10 @@ def test_skips_heartbeat_events():
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
     }):
         with patch("handler_consumer.AgentLock") as mock_lock, \
-             patch("handler_consumer.CampaignQueue") as mock_queue, \
-             patch("handler_consumer.FirstOrionClient") as mock_fo:
+             patch("handler_consumer.CampaignQueue"), \
+             patch("handler_consumer.FirstOrionClient"):
             from handler_consumer import lambda_handler
-            result = lambda_handler(event, None)
+            lambda_handler(event, None)
             mock_lock.return_value.acquire.assert_not_called()
 
 
@@ -92,7 +93,7 @@ def test_dispatches_contact_when_agent_available():
             fo_cls.build_from_secret.return_value = mock_fo
             from handler_consumer import lambda_handler
             event = _build_kinesis_event("arn:agent/001", "ROUTABLE", "Available")
-            result = lambda_handler(event, None)
+            lambda_handler(event, None)
 
         mock_fo.push.assert_called_once()
         mock_sqs.send_message.assert_called_once()
@@ -185,7 +186,9 @@ class TestGsiCampaignLookup:
         })
         mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -212,7 +215,9 @@ class TestGsiCampaignLookup:
         queue = mocker.patch("handler_consumer._get_queue").return_value
         queue.dequeue.return_value = None  # both empty — just verify order
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -420,7 +425,9 @@ class TestGsiCampaignLookup:
         mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
         lock = mocker.patch("handler_consumer._get_lock").return_value
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -447,7 +454,9 @@ class TestGsiCampaignLookup:
         queue = mocker.patch("handler_consumer._get_queue").return_value
         queue.dequeue.return_value = None
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -466,7 +475,9 @@ class TestGsiCampaignLookup:
         mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
         lock = mocker.patch("handler_consumer._get_lock").return_value
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -504,7 +515,9 @@ class TestGsiCampaignLookup:
         mock_sqs.send_message.return_value = {}
         mocker.patch("handler_consumer.boto3.client", return_value=mock_sqs)
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
         handler_consumer._process_record(record)
 
@@ -562,7 +575,9 @@ class TestH8LockReleaseOnException:
         })
         mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
 
-        import handler_consumer, base64, json
+        import handler_consumer
+        import base64
+        import json
         record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
 
         with pytest.raises(RuntimeError, match="DynamoDB throttled"):

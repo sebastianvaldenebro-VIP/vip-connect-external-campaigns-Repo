@@ -1,7 +1,5 @@
 # services/api-progressive-dialer/tests/unit/test_handler_seeder.py
 import json
-import sys
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -198,7 +196,7 @@ def test_lambda_handler_access_denied_returns_403():
 # ---------------------------------------------------------------------------
 
 def test_lambda_handler_success_seeds_contacts():
-    from unittest.mock import MagicMock, patch, call
+    from unittest.mock import MagicMock, patch
     mock_cp = MagicMock()
     mock_cp.get_segment_definition.return_value = {
         "SegmentGroups": {

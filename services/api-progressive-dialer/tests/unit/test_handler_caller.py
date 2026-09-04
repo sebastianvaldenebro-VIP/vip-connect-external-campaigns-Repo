@@ -41,7 +41,7 @@ def test_calls_start_outbound_voice_contact():
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
              patch("handler_caller.AgentLock", return_value=mock_lock):
             from handler_caller import lambda_handler
-            result = lambda_handler(_make_sqs_event(), None)
+            lambda_handler(_make_sqs_event(), None)
 
         # Verify phone is read from DDB (not from SQS body)
         mock_queue.get_phone.assert_called_once_with("campaign-1", "2026-06-16T14:00:00.000Z#uuid-1")

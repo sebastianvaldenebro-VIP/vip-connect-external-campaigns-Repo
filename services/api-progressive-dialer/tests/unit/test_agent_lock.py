@@ -1,5 +1,4 @@
 from unittest.mock import MagicMock
-import pytest
 from agent_lock import AgentLock
 
 TABLE_NAME = "VipProgressiveAgentLocks"

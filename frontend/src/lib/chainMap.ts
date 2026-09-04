@@ -54,16 +54,9 @@ export function buildChainMap(plan: Plan): Map<string, ChainInfo> {
   }
 
   for (const bucket of plan.buckets ?? []) {
-    // Track which chain indices are already used in this bucket.
-    // When two independent non-merge campaigns would inherit the same chain index
-    // (e.g. after a merge node collapses two chains into one), the second one gets
-    // a fresh index so it renders in its own column instead of stacking.
-    const takenInBucket = new Set<number>();
-
     for (const campaign of bucket.campaigns) {
       if (campaign.dependsOn.length === 0) {
         const idx = nextChain++;
-        takenInBucket.add(idx);
         result.set(campaign.id, { chainIndex: idx, isMerge: false, parentNames: [] });
         continue;
       }
@@ -94,13 +87,6 @@ export function buildChainMap(plan: Plan): Map<string, ChainInfo> {
         isMerge = true;
       }
 
-      // Non-merge: if this chain index was already claimed in this bucket by another
-      // campaign, assign a new one so each independent parallel campaign gets its own column.
-      if (!isMerge && takenInBucket.has(chainIndex)) {
-        chainIndex = nextChain++;
-      }
-
-      takenInBucket.add(chainIndex);
       result.set(campaign.id, { chainIndex, isMerge, parentNames });
     }
   }

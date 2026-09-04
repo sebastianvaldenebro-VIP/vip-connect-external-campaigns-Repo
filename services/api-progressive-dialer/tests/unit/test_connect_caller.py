@@ -1,6 +1,5 @@
 from unittest.mock import MagicMock
-import pytest
-from connect_caller import ConnectCaller, DialResult
+from connect_caller import ConnectCaller
 
 INSTANCE_ID = "6b3f17ba-68a4-472a-9b20-db1991507009"
 FLOW_ID = "3d24320b-c1e3-40f3-90a2-b6867ef70c85"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import sys
 import os
 from unittest.mock import patch, MagicMock
@@ -18,8 +19,6 @@ for _mod in ("vip_shared", "vip_shared.application", "vip_shared.application.htt
     _VIP_SHARED_STUB[_mod] = MagicMock()
 
 # json_response must return a real dict so handler assertions work.
-import json as _json
-
 def _json_response(status: int, body: object) -> dict:
     return {"statusCode": status, "body": _json.dumps(body)}
 

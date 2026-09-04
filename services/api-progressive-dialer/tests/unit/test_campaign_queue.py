@@ -1,6 +1,5 @@
-from unittest.mock import MagicMock, patch
-import pytest
-from campaign_queue import CampaignQueue, Contact
+from unittest.mock import MagicMock
+from campaign_queue import CampaignQueue
 
 TABLE_NAME = "VipProgressiveCampaignQueue"
 

@@ -8,8 +8,7 @@ All AWS clients are mocked — no real AWS calls.
 """
 import json
 import sys
-import os
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
