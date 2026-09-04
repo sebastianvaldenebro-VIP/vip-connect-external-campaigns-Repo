@@ -27,6 +27,42 @@ def _get_ddb():
     return _ddb_client
 
 
+def _validated_index(raw: str, field: str, upper_bound: int) -> int:
+    """Parse a path-param index and bounds-check it against the real run.
+
+    Without this, a negative value silently indexes from the end of the list
+    (e.g. -1 targets the *last* bucket while looking like an ordinary request
+    in logs), an out-of-range positive value raises an unguarded IndexError
+    (500), and a non-numeric value raises a bare ValueError (500).
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be an integer") from None
+    if value < 0 or value >= upper_bound:
+        raise ValueError(f"{field} {value} out of range (0..{upper_bound - 1})")
+    return value
+
+
+def _get_run_or_404(plan_id: str, run_id: str) -> dict:
+    run = store.get_run(plan_id, run_id)
+    if not run:
+        raise _RunNotFound(run_id)
+    return run
+
+
+class _RunNotFound(Exception):
+    def __init__(self, run_id: str) -> None:
+        super().__init__(run_id)
+        self.run_id = run_id
+
+
+def _not_found_response(run_id: str) -> dict:
+    return json_response(
+        404, {"error": {"code": "NOT_FOUND", "message": f"Run {run_id} not found"}}
+    )
+
+
 def trigger_run(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     caller = extract_caller(event)
@@ -150,8 +186,15 @@ def force_finish_run(event: dict, path_params: dict) -> dict:
 def force_start_bucket(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     run_id = path_params["runId"]
-    bucket_index = int(path_params["bucketIndex"])
     caller = extract_caller(event)
+
+    try:
+        existing = _get_run_or_404(plan_id, run_id)
+    except _RunNotFound as exc:
+        return _not_found_response(exc.run_id)
+    bucket_index = _validated_index(
+        path_params["bucketIndex"], "bucketIndex", len(existing.get("bucketStates", []))
+    )
 
     run = executor.force_start_bucket(plan_id, run_id, bucket_index)
     build_audit().record(
@@ -170,8 +213,15 @@ def force_start_bucket(event: dict, path_params: dict) -> dict:
 def force_stop_bucket(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     run_id = path_params["runId"]
-    bucket_index = int(path_params["bucketIndex"])
     caller = extract_caller(event)
+
+    try:
+        existing = _get_run_or_404(plan_id, run_id)
+    except _RunNotFound as exc:
+        return _not_found_response(exc.run_id)
+    bucket_index = _validated_index(
+        path_params["bucketIndex"], "bucketIndex", len(existing.get("bucketStates", []))
+    )
 
     run = executor.force_stop_bucket(plan_id, run_id, bucket_index)
     build_audit().record(
@@ -190,9 +240,20 @@ def force_stop_bucket(event: dict, path_params: dict) -> dict:
 def force_start_campaign(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     run_id = path_params["runId"]
-    bucket_index = int(path_params["bucketIndex"])
-    campaign_index = int(path_params["campaignIndex"])
     caller = extract_caller(event)
+
+    try:
+        existing = _get_run_or_404(plan_id, run_id)
+    except _RunNotFound as exc:
+        return _not_found_response(exc.run_id)
+    bucket_index = _validated_index(
+        path_params["bucketIndex"], "bucketIndex", len(existing.get("bucketStates", []))
+    )
+    campaign_index = _validated_index(
+        path_params["campaignIndex"],
+        "campaignIndex",
+        len(existing["bucketStates"][bucket_index].get("campaignStates", [])),
+    )
 
     run = executor.force_start_campaign(plan_id, run_id, bucket_index, campaign_index)
     build_audit().record(
@@ -211,9 +272,20 @@ def force_start_campaign(event: dict, path_params: dict) -> dict:
 def force_stop_campaign(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     run_id = path_params["runId"]
-    bucket_index = int(path_params["bucketIndex"])
-    campaign_index = int(path_params["campaignIndex"])
     caller = extract_caller(event)
+
+    try:
+        existing = _get_run_or_404(plan_id, run_id)
+    except _RunNotFound as exc:
+        return _not_found_response(exc.run_id)
+    bucket_index = _validated_index(
+        path_params["bucketIndex"], "bucketIndex", len(existing.get("bucketStates", []))
+    )
+    campaign_index = _validated_index(
+        path_params["campaignIndex"],
+        "campaignIndex",
+        len(existing["bucketStates"][bucket_index].get("campaignStates", [])),
+    )
 
     run = executor.force_stop_campaign(plan_id, run_id, bucket_index, campaign_index)
     build_audit().record(
@@ -232,9 +304,20 @@ def force_stop_campaign(event: dict, path_params: dict) -> dict:
 def skip_campaign(event: dict, path_params: dict) -> dict:
     plan_id = path_params["id"]
     run_id = path_params["runId"]
-    bucket_index = int(path_params["bucketIndex"])
-    campaign_index = int(path_params["campaignIndex"])
     caller = extract_caller(event)
+
+    try:
+        existing = _get_run_or_404(plan_id, run_id)
+    except _RunNotFound as exc:
+        return _not_found_response(exc.run_id)
+    bucket_index = _validated_index(
+        path_params["bucketIndex"], "bucketIndex", len(existing.get("bucketStates", []))
+    )
+    campaign_index = _validated_index(
+        path_params["campaignIndex"],
+        "campaignIndex",
+        len(existing["bucketStates"][bucket_index].get("campaignStates", [])),
+    )
 
     run = executor.skip_campaign(plan_id, run_id, bucket_index, campaign_index)
     build_audit().record(
