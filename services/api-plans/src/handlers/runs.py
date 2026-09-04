@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import boto3
@@ -15,6 +16,9 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 
 import executor
 import store
+
+_LOG = logging.getLogger(__name__)
+_LOG.setLevel(logging.INFO)
 
 _BRANDED_RUN_SUMMARY_TABLE = os.environ.get("BRANDED_RUN_SUMMARY_TABLE", "")
 _ddb_client = None
@@ -409,8 +413,15 @@ def branded_progress(event: dict, path_params: dict) -> dict:
                     "dialed": dialed,
                     "total": pending + dialed,
                 }
-            except Exception:
-                pass  # DDB transient error — omit this campaign, don't 500
+            except Exception as exc:
+                # Intentionally non-fatal — omit this campaign rather than 500
+                # the whole response — but log it, otherwise a broken
+                # integration is indistinguishable from "no queue activity".
+                _LOG.warning(
+                    "branded_progress_count_failed campaign_id=%s error=%s",
+                    campaign_id,
+                    type(exc).__name__,
+                )
 
     return json_response(200, {"progress": progress})
 
@@ -442,8 +453,13 @@ def branded_queue(event: dict, path_params: dict) -> dict:
                 continue
             try:
                 items[campaign_id] = executor.get_branded_queue_items(branded_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Same non-fatal-by-design pattern as branded_progress above.
+                _LOG.warning(
+                    "branded_queue_items_failed campaign_id=%s error=%s",
+                    campaign_id,
+                    type(exc).__name__,
+                )
 
     return json_response(200, {"items": items})
 
