@@ -120,7 +120,11 @@ def lambda_handler(event: dict, context) -> dict:
     )
     path_params = event.get("pathParameters") or {}
 
-    _logger.info("request_received", route_key=route_key, path_params=path_params)
+    _logger.info(
+        "request_received",
+        route_key=route_key,
+        path_param_keys=sorted(path_params.keys()),
+    )
 
     handler = resolve(route_key)
     if handler is None:
@@ -145,7 +149,13 @@ def lambda_handler(event: dict, context) -> dict:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         message = exc.response.get("Error", {}).get("Message", str(exc))
         _logger.error("aws_error", code=code, message=message, route_key=route_key)
-        return error_response(_aws_status(code), code, message)
+        # Never return the raw AWS Message to the client — it can leak internal
+        # ARNs, account IDs, and resource names. The full detail is logged above.
+        return error_response(
+            _aws_status(code),
+            code,
+            "Request could not be completed. If this persists, contact support.",
+        )
 
     except Exception as exc:
         _logger.error("unhandled_error", error=str(exc), route_key=route_key)

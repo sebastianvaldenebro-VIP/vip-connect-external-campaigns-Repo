@@ -18,7 +18,11 @@ def lambda_handler(event: dict, context) -> dict:
     )
     path_params = event.get("pathParameters") or {}
 
-    _logger.info("request_received", route_key=route_key, path_params=path_params)
+    _logger.info(
+        "request_received",
+        route_key=route_key,
+        path_param_keys=sorted(path_params.keys()),
+    )
 
     handler = resolve(route_key)
     if handler is None:
@@ -35,12 +39,22 @@ def lambda_handler(event: dict, context) -> dict:
         code = exc.response.get("Error", {}).get("Code", "ClientError")
         message = exc.response.get("Error", {}).get("Message", str(exc))
         status = _aws_error_to_status(code)
-        _logger.error("aws_error", code=code, message=message, route_key=route_key)
+        request_id = context.aws_request_id if context else None
+        _logger.error(
+            "aws_error",
+            code=code,
+            message=message,
+            route_key=route_key,
+            request_id=request_id,
+        )
+        # Never return the raw AWS Message to the client — it can leak internal
+        # ARNs, account IDs, and resource names. The full detail is logged above
+        # server-side, correlated by request_id.
         return error_response(
             status,
             code,
-            message,
-            request_id=context.aws_request_id if context else None,
+            "Request could not be completed. If this persists, contact support with the request ID.",
+            request_id=request_id,
         )
 
     except Exception as exc:
