@@ -21,9 +21,11 @@ from botocore.exceptions import ClientError
 
 from vip_shared.application.http import error_response, extract_caller, json_response
 from vip_shared.infrastructure.persistence.audit import build_from_env as build_audit
+from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
 
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.INFO)
+_STRUCTURED_LOG = StructuredLogger(service="api-plans-contacts")
 
 _CONNECT_INSTANCE_ID = os.environ["CONNECT_INSTANCE_ID"]
 # Use .get() so a code-only deploy before CDK doesn't crash every route in this Lambda.
@@ -116,12 +118,12 @@ def get_artifacts(event: dict, path_params: dict) -> dict:
         if url
     ]
 
-    _LOG.info(
-        "contact_artifacts_access | caller_email=%s contactId=%s date=%s found=%s",
-        caller.email,
-        contact_id,
-        date_prefix,
-        artifacts_found,
+    _STRUCTURED_LOG.info(
+        "contact_artifacts_access",
+        caller_email=caller.email,
+        contact_id=contact_id,
+        date_prefix=date_prefix,
+        artifacts_found=artifacts_found,
     )
 
     build_audit().record(

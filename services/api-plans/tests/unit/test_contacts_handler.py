@@ -34,12 +34,19 @@ _mock_audit_recorder = MagicMock()
 _mock_audit_mod = MagicMock()
 _mock_audit_mod.build_from_env.return_value = _mock_audit_recorder
 
+_mock_structured_logger_mod = MagicMock()
+_mock_structured_logger_mod.StructuredLogger.return_value = MagicMock()
+
 sys.modules.setdefault("vip_shared", MagicMock())
 sys.modules.setdefault("vip_shared.application", MagicMock())
 sys.modules["vip_shared.application.http"] = _mock_http
 sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules["vip_shared.infrastructure.persistence.audit"] = _mock_audit_mod
+sys.modules.setdefault("vip_shared.infrastructure.telemetry", MagicMock())
+sys.modules["vip_shared.infrastructure.telemetry.structured_logger"] = (
+    _mock_structured_logger_mod
+)
 
 _ENV = {
     "CONNECT_INSTANCE_ID": "6b3f17ba-68a4-472a-9b20-db1991507009",
