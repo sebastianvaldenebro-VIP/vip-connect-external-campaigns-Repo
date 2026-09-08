@@ -12,6 +12,14 @@ jobs:
   services-python:
     name: services · ${{ matrix.service }}
     runs-on: ubuntu-latest
+    env:
+      # boto3 requires a region even for moto-mocked (offline) tests -- without
+      # this, any handler that instantiates a client at import time fails
+      # collection with botocore.exceptions.NoRegionError before a single test
+      # runs. Never set here before; api-metrics/api-plans/api-progressive-dialer
+      # only "passed" locally for whoever had AWS_REGION/AWS_PROFILE in their
+      # own shell env, never in CI itself.
+      AWS_DEFAULT_REGION: us-east-1
     strategy:
       fail-fast: false
       matrix:
