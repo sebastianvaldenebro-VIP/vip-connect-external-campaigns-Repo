@@ -43,6 +43,7 @@ describe('DataStack', () => {
       'ExternalCampaignAudit',
       'AdminAuditLog',
       'VipAdminSegmentFilterConfig',
+      'VipConnectOptOutList',
     ];
     for (const tableName of tableNames) {
       template.hasResourceProperties('AWS::DynamoDB::Table', {
@@ -51,7 +52,7 @@ describe('DataStack', () => {
         DeletionProtectionEnabled: true,
       });
     }
-    template.resourceCountIs('AWS::DynamoDB::Table', 5);
+    template.resourceCountIs('AWS::DynamoDB::Table', 6);
   });
 
   it('enables point-in-time recovery on every table', () => {
@@ -110,7 +111,7 @@ describe('DataStack', () => {
     expect(stack.node.tryFindChild('PermissionsBoundary')).toBeUndefined();
   });
 
-  it('emits the 7 documented CfnOutputs', () => {
+  it('emits the 8 documented CfnOutputs', () => {
     const template = Template.fromStack(buildStack());
     template.hasOutput('DataKeyArn', {});
     template.hasOutput('SegmentFilterConfigTableArn', {});
@@ -118,6 +119,7 @@ describe('DataStack', () => {
     template.hasOutput('TrackingTableArn', {});
     template.hasOutput('AuditTableArn', {});
     template.hasOutput('AdminAuditTableArn', {});
+    template.hasOutput('OptOutTableArn', {});
     template.hasOutput('AuditRetentionYears', { Value: '6' });
   });
 
