@@ -84,6 +84,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             "totalFailed": 0,
             "totalOptedOut": 0,
             "totalSkippedOptOut": 0,
+            "totalSqsSendFailed": 0,
             "createdAt": now_iso,
             "updatedAt": now_iso,
             "pipelineVersion": "v1",
@@ -158,19 +159,24 @@ def lambda_handler(event: dict, context: object) -> dict:
         enqueued += batch_ok
         failed += batch_failed
 
-    # Update enqueued/failed/skipped-opt-out counts.
+    # Update enqueued/skipped-opt-out/sqs-send-failed counts.
     #
-    # NOTE: this writes totalSkippedOptOut, NOT totalOptedOut. totalOptedOut is a
-    # different counter owned by sms_processor_handler.py — it means "we enqueued
-    # this contact and EUM's own managed suppression list rejected the send" (those
-    # contacts ARE inside totalEnqueued). totalSkippedOptOut means "we never
-    # enqueued this contact at all — skipped before send using our own opt-out
-    # list". Writing to totalOptedOut here would race with the processor's atomic
-    # ADD (SQS-driven sends can start firing while this loop is still running) and
-    # would conflate two different populations in downstream reporting/UI.
+    # NOTE: this writes totalSkippedOptOut and totalSqsSendFailed, NOT totalOptedOut
+    # or totalFailed. Those two are owned by sms_processor_handler.py and mean
+    # "we enqueued this contact, then EUM/DDB rejected it after the fact" — those
+    # contacts ARE inside totalEnqueued. totalSkippedOptOut and totalSqsSendFailed
+    # mean "we never enqueued this contact at all" — skipped before send (our own
+    # opt-out list) or rejected by send_message_batch itself. Writing to
+    # totalOptedOut/totalFailed here would race with the processor's atomic ADD
+    # (SQS-driven sends can start firing while this loop is still running) and would
+    # conflate two different populations in downstream reporting/UI — the exact bug
+    # this split exists to avoid.
     _ddb.Table(_RUNS_TABLE).update_item(
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
-        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, totalSkippedOptOut = :o, updatedAt = :t",
+        UpdateExpression=(
+            "SET totalEnqueued = :n, totalSqsSendFailed = :f, "
+            "totalSkippedOptOut = :o, updatedAt = :t"
+        ),
         ExpressionAttributeValues={
             ":n": enqueued,
             ":f": failed,
@@ -183,7 +189,7 @@ def lambda_handler(event: dict, context: object) -> dict:
         "sms_sender_enqueued",
         campaign_id=campaign_id,
         enqueued=enqueued,
-        failed=failed,
+        sqs_send_failed=failed,
         skipped_opt_out=opted_out,
     )
     return {"enqueued": enqueued, "failed": failed}
@@ -199,8 +205,9 @@ def _flush_sms_batch(
 
     send_message_batch does not raise on a partial failure — some entries can fail
     while the call itself returns 200. Items whose SQS entry failed are written as
-    SQS_SEND_FAILED (visible in the queue table and counted in totalFailed) instead
-    of PENDING, since no message exists for them to ever be picked up.
+    SQS_SEND_FAILED (visible in the queue table and counted in totalSqsSendFailed,
+    not totalFailed — see the note at the call site) instead of PENDING, since no
+    message exists for them to ever be picked up.
     """
     resp = _sqs.send_message_batch(QueueUrl=_SQS_QUEUE_URL, Entries=sqs_batch)
     failed_entries = resp.get("Failed", [])

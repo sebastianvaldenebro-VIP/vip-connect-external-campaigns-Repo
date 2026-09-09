@@ -247,7 +247,7 @@ def test_sender_partial_sqs_failure_marks_item_failed_not_pending():
     assert put_calls[0]["status"] == "SQS_SEND_FAILED"
 
 
-def test_sender_partial_sqs_failure_updates_run_summary_total_failed():
+def test_sender_partial_sqs_failure_updates_run_summary_total_sqs_send_failed():
     handler = _load_handler()
 
     mock_runs_table = MagicMock()
@@ -275,6 +275,11 @@ def test_sender_partial_sqs_failure_updates_run_summary_total_failed():
     runs_update_kwargs = mock_runs_table.update_item.call_args.kwargs
     assert runs_update_kwargs["ExpressionAttributeValues"][":f"] == 1
     assert runs_update_kwargs["ExpressionAttributeValues"][":n"] == 0
+    # The SQS-rejected count must land on totalSqsSendFailed, never totalFailed —
+    # totalFailed is exclusively owned by sms_processor_handler.py's atomic ADD for
+    # a different population (enqueued-then-rejected, which IS inside totalEnqueued).
+    assert "totalSqsSendFailed = :f" in runs_update_kwargs["UpdateExpression"]
+    assert "totalFailed" not in runs_update_kwargs["UpdateExpression"]
 
 
 def test_sender_mixed_success_and_failure_in_same_batch():

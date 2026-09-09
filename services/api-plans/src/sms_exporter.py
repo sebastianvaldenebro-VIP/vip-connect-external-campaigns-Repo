@@ -55,6 +55,7 @@ def export_sms_runs() -> dict:
             "total_failed":             int(item.get("totalFailed", 0) or 0),
             "total_opted_out":          int(item.get("totalOptedOut", 0) or 0),
             "total_skipped_opt_out":    int(item.get("totalSkippedOptOut", 0) or 0),
+            "total_sqs_send_failed":    int(item.get("totalSqsSendFailed", 0) or 0),
             "status":                   item.get("status", ""),
             "started_at":               item.get("startedAt", ""),
             "completed_at":             item.get("completedAt", ""),
