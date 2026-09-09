@@ -4,17 +4,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# handler_caller.py imports vip_shared.infrastructure.persistence.opt_out at module
-# level. No real vip_shared source is on this test's sys.path (this repo's local/CI
-# test runs never put services/shared/python on PYTHONPATH for consumer services —
-# same gap as api-plans/executor.py's vip_shared.infrastructure.persistence.audit
-# import), so stub it the same way test_executor_v2.py does. Individual tests below
-# still override the bound name via patch("handler_caller.build_opt_out_from_env", ...).
-sys.modules.setdefault("vip_shared", MagicMock())
-sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
-sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
-sys.modules.setdefault("vip_shared.infrastructure.persistence.opt_out", MagicMock())
-
 
 def _make_sqs_event(correlation_id: str | None = "abc12345") -> dict:
     # destinationPhone is intentionally absent — caller reads it from DynamoDB
