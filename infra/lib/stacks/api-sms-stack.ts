@@ -153,10 +153,12 @@ export class ApiSmsStack extends cdk.Stack {
       memorySize: 512,
       environmentEncryption: dataKey,
       deadLetterQueue: dlq,
-      // reservedConcurrentExecutions intentionally NOT set — pending CloudWatch
-      // invocation-history review before assigning a value (Sebastian,
-      // 2026-09-08: "investiga con los logs si es necesario realmente tener
-      // reserved concurrency"). Tracked, not skipped.
+      // CloudWatch, 2026-09-09 (90d window): only 1 invocation total, max observed
+      // ConcurrentExecutions = 1, 0 throttles — invoked once per SMS campaign run,
+      // not per message (fans out via SQS to SmsProcessorFunction, which already
+      // caps at 10). 5 is a generous margin given the near-zero real traffic and
+      // the fact this function only enqueues, never calls a rate-limited API itself.
+      reservedConcurrentExecutions: 5,
       environment: {
         SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
         SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,

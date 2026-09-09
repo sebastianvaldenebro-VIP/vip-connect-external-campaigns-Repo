@@ -290,9 +290,20 @@ export class HostingStack extends cdk.Stack {
     // stack's current design per the class docstring above), AWS ignores
     // minimumProtocolVersion and always accepts TLS 1.0+ via SNI. Already set
     // to TLS_V1_2_2021 above so the setting takes effect the moment a custom
-    // domain is added — the finding tracks a real gap (no custom domain yet),
-    // not a missed config, and reopens automatically for a future distribution
-    // change since it isn't suppressed per-resource.
+    // domain is added. Accepted as a known risk for now — Sebastian, 2026-09-09:
+    // "Documentar como riesgo aceptado por ahora" — real fix requires a domain
+    // decision, tracked separately, not a config change in this PR.
+    skipCheckovChecks(this.distribution, [
+      {
+        id: 'CKV_AWS_174',
+        comment:
+          'Accepted risk (Sebastian, 2026-09-09): no custom domain yet, so ' +
+          'CloudFront ignores minimumProtocolVersion on the default ' +
+          '*.cloudfront.net domain regardless of setting. Already set to ' +
+          'TLS_V1_2_2021 so it takes effect the moment a custom domain is added.',
+      },
+    ]);
+
     new cdk.CfnOutput(this, 'AssetBucketName', {
       value: this.assetBucket.bucketName,
       description: 'Upload built assets here with aws s3 sync',

@@ -268,6 +268,10 @@ export class ApiMetricsStack extends cdk.Stack {
         logGroup: collectorLogGroup,
         environmentEncryption: props.dataKey,
         deadLetterQueue: dlq,
+        // CloudWatch, 2026-09-09 (14d window): ~20,160 invocations (rate(1 minute)
+        // schedule), max observed ConcurrentExecutions = 1, 0 throttles. 2 gives a
+        // small margin over the observed ceiling without opening this up unbounded.
+        reservedConcurrentExecutions: 2,
         environment: {
           ACTIVE_BRANDED_CAMPAIGNS_TABLE: props.activeBrandedCampaignsTable.tableName,
           BRANDED_CAMPAIGN_METRICS_TABLE: props.brandedCampaignMetricsTable.tableName,
@@ -280,10 +284,6 @@ export class ApiMetricsStack extends cdk.Stack {
         },
       });
       skipCheckovChecks(collectorFn, [VPC_SKIP]);
-      // CKV_AWS_115 (reserved concurrency) intentionally NOT set here — pending
-      // CloudWatch invocation-history review before assigning a value (Sebastian,
-      // 2026-09-08: "investiga con los logs si es necesario realmente tener
-      // reserved concurrency"). Tracked, not skipped.
 
       // EventBridge rule created via CLI (cfn-exec-role lacks events:DescribeRule).
       // Rule name: vip-branded-metrics-collector-1min — rate(1 minute) → this Lambda.

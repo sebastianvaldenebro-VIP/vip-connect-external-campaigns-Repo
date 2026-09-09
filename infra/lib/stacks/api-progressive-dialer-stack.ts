@@ -189,10 +189,10 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
       environmentEncryption: dataKey,
-      // reservedConcurrentExecutions intentionally NOT set — pending CloudWatch
-      // invocation-history review before assigning a value (Sebastian,
-      // 2026-09-08: "investiga con los logs si es necesario realmente tener
-      // reserved concurrency"). Tracked, not skipped.
+      // CloudWatch, 2026-09-09 (14d window): 97,153 invocations (Kinesis-triggered,
+      // bounded by shard count), max observed ConcurrentExecutions = 4, 0 throttles.
+      // 10 gives ~2.5x headroom over the observed ceiling for traffic spikes.
+      reservedConcurrentExecutions: 10,
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
@@ -327,10 +327,10 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       memorySize: 256,
       environmentEncryption: dataKey,
       deadLetterQueue: dlq,
-      // reservedConcurrentExecutions intentionally NOT set — pending CloudWatch
-      // invocation-history review before assigning a value (Sebastian,
-      // 2026-09-08: "investiga con los logs si es necesario realmente tener
-      // reserved concurrency"). Tracked, not skipped.
+      // CloudWatch, 2026-09-09 (14d window): only 5 invocations, max observed
+      // ConcurrentExecutions = 1, 0 throttles — genuinely low-traffic (HTTP,
+      // seeds a campaign on demand). 2 gives a small margin without guessing.
+      reservedConcurrentExecutions: 2,
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
