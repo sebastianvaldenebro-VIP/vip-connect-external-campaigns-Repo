@@ -369,6 +369,10 @@ export function EnableCampaignModal({
   );
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function buildCampaignName(segmentName: string, segmentStates: string[]): string {
   const now = new Date();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
@@ -384,7 +388,12 @@ function buildCampaignName(segmentName: string, segmentStates: string[]): string
   let statePart = state;
   let groupsAttempts = '';
   if (state) {
-    const re = new RegExp('(?:^|-)([^-]*' + state + '[^-]*)-', 'i');
+    // state is escapeRegExp()'d before interpolation -- it's treated as a
+    // literal, closing the regex-injection/ReDoS surface the rule flags.
+    // The remaining [^-]* groups are fixed by this function, not attacker
+    // input. Verified 2026-09-08.
+    // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
+    const re = new RegExp('(?:^|-)([^-]*' + escapeRegExp(state) + '[^-]*)-', 'i');
     const matched = re.exec(withoutTime);
     if (matched) {
       statePart = matched[1];
