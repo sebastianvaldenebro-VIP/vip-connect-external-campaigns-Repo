@@ -7,8 +7,10 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
 
 export interface ApiSegmentsStackProps extends cdk.StackProps {
   readonly adminAuditTable: dynamodb.ITable;
@@ -55,6 +57,28 @@ export class ApiSegmentsStack extends cdk.Stack {
 
     this.sharedLayer = buildSharedLayer(this, 'SharedLayer');
 
+    // Access-log bucket for SnapshotBucket
+    const snapshotLogBucket = new s3.Bucket(this, 'SnapshotBucketLogs', {
+      bucketName: `vip-admin-segment-snapshots-logs-${this.account}`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      lifecycleRules: [
+        { expiration: cdk.Duration.days(90), noncurrentVersionExpiration: cdk.Duration.days(30) },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    skipCheckovChecks(snapshotLogBucket, [
+      {
+        id: 'CKV_AWS_18',
+        comment:
+          'This bucket IS the access-log destination for SnapshotBucket. Enabling ' +
+          'access logging on the log bucket itself would create a self-referential ' +
+          'logging loop — AWS explicitly documents not doing this.',
+      },
+    ]);
+
     // S3 bucket for segment snapshot exports
     this.snapshotBucket = new s3.Bucket(this, 'SnapshotBucket', {
       bucketName: `vip-admin-segment-snapshots-${this.account}`,
@@ -72,6 +96,8 @@ export class ApiSegmentsStack extends cdk.Stack {
       ],
       removalPolicy: cdk.RemovalPolicy.RETAIN,
       enforceSSL: true,
+      serverAccessLogsBucket: snapshotLogBucket,
+      serverAccessLogsPrefix: 'snapshots/',
     });
 
     // Dedicated role that Customer Profiles assumes to write snapshots to our
@@ -212,6 +238,13 @@ export class ApiSegmentsStack extends cdk.Stack {
       { mutable: false },
     );
 
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-ui-api-segments-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: props.dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionSegments', {
       functionName: 'vip-admin-ui-api-segments',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -227,6 +260,8 @@ export class ApiSegmentsStack extends cdk.Stack {
       role,
       logGroup,
       reservedConcurrentExecutions: 10,
+      environmentEncryption: props.dataKey,
+      deadLetterQueue: dlq,
       vpc,
       vpcSubnets: {
         subnets: props.redisVpc.subnetIds.map((sid, i) =>
