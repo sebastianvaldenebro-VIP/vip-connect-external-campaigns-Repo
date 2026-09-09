@@ -30,6 +30,23 @@ def test_acquire_fails_when_lock_exists():
     assert lock.acquire("agent-001", campaign_id="campaign-1") is False
 
 
+def test_acquire_reraises_non_conditional_check_errors():
+    """A ClientError with a code other than ConditionalCheckFailedException (e.g.
+    throttling or a permissions issue) must propagate — it is not a lock-contention
+    signal and swallowing it would silently skip dispatch."""
+    from botocore.exceptions import ClientError
+    import pytest
+
+    lock, table = _make_lock()
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": ""}},
+        "PutItem",
+    )
+    table.put_item.side_effect = error
+    with pytest.raises(ClientError):
+        lock.acquire("agent-001", campaign_id="campaign-1")
+
+
 def test_release_deletes_lock():
     lock, table = _make_lock()
     lock.release("agent-001")

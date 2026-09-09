@@ -226,6 +226,52 @@ def test_export_branded_runs_enriches_with_last_metric():
     assert df.iloc[0]["final_answer_rate"] == pytest.approx(0.7)
 
 
+def test_export_branded_runs_skips_metrics_rows_missing_campaign_id():
+    """A metrics snapshot with no brandedCampaignId must be skipped when
+    building the last-metric index, not crash or get keyed under ''."""
+    exporter = _load_exporter()
+
+    orphan_metric = dict(_SAMPLE_METRIC)
+    orphan_metric["brandedCampaignId"] = ""
+
+    mock_ddb = MagicMock()
+    runs_table = MagicMock()
+    metrics_table = MagicMock()
+    runs_table.scan.return_value = {"Items": [_SAMPLE_RUN]}
+    metrics_table.scan.return_value = {"Items": [orphan_metric]}
+
+    def table_factory(name):
+        if "Metrics" in name:
+            return metrics_table
+        return runs_table
+
+    mock_ddb.Table.side_effect = table_factory
+    mock_glue = MagicMock()
+    captured_dfs = []
+
+    def capture_parquet(df, **kwargs):
+        captured_dfs.append(df)
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(exporter, "_ddb", mock_ddb),
+        patch.object(exporter, "_glue", mock_glue),
+        patch("branded_exporter.wr") as mock_wr,
+    ):
+        mock_wr.s3.to_parquet.side_effect = capture_parquet
+        exporter.export_branded_runs()
+
+    df = captured_dfs[0]
+    # No last_metric entry was recorded for cmp-1 (orphan had no id to key on),
+    # so final_* fields fall back to their zero defaults.
+    assert df.iloc[0]["final_contacts_placed"] == 0
+
+
+def test_scan_table_returns_empty_list_when_table_name_blank():
+    exporter = _load_exporter()
+    assert exporter._scan_table("") == []
+
+
 # ── export_branded_metrics ────────────────────────────────────────────────────
 
 def test_export_branded_metrics_empty_scan_returns_zero_without_glue():

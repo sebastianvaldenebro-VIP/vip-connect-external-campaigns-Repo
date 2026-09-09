@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from vip_shared.infrastructure.persistence.audit import (
     AUDIT_RETENTION_DAYS,
     AuditRecorder,
+    build_from_env,
 )
 
 
@@ -125,3 +127,41 @@ def test_optional_fields_omitted_when_none():
     assert "ip_address" not in item
     assert "user_agent" not in item
     assert "extra" not in item
+
+
+def test_before_and_extra_are_serialized_when_provided():
+    mock_table = MagicMock()
+    mock_resource = MagicMock()
+    mock_resource.Table.return_value = mock_table
+
+    recorder = AuditRecorder(
+        table_name="AdminAuditLog", dynamodb_resource=mock_resource
+    )
+
+    recorder.record(
+        entity_type="segment",
+        entity_id="nj-1st",
+        action="update",
+        actor_sub="u",
+        actor_email="u@example.com",
+        before={"displayName": "old"},
+        extra={"reason": "manual correction"},
+    )
+
+    item = mock_table.put_item.call_args.kwargs["Item"]
+    assert json.loads(item["before"]) == {"displayName": "old"}
+    assert json.loads(item["extra"]) == {"reason": "manual correction"}
+
+
+def test_build_from_env_reads_table_name_and_constructs_resource(monkeypatch):
+    monkeypatch.setenv("AUDIT_TABLE", "AdminAuditLog")
+    mock_table = MagicMock()
+    mock_resource = MagicMock()
+    mock_resource.Table.return_value = mock_table
+
+    with patch("boto3.resource", return_value=mock_resource) as mock_boto_resource:
+        recorder = build_from_env()
+
+    mock_boto_resource.assert_called_once_with("dynamodb")
+    mock_resource.Table.assert_called_once_with("AdminAuditLog")
+    assert isinstance(recorder, AuditRecorder)

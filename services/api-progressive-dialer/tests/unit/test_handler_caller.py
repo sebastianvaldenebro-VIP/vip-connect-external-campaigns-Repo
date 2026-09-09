@@ -205,6 +205,120 @@ def test_reset_and_lock_released_when_phone_not_found():
         )
 
 
+def test_permanent_dial_failure_resets_contact_and_releases_lock():
+    """A non-throttle dial failure (e.g. InvalidParameterException) must reset
+    the contact to PENDING and release the agent lock, without raising."""
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+    }):
+        from connect_caller import DialResult
+        mock_caller = MagicMock()
+        mock_caller.dial.return_value = DialResult(
+            success=False, error_code="InvalidParameterException"
+        )
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = "+15551234567"
+        mock_lock = MagicMock()
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock):
+            from handler_caller import lambda_handler
+            result = lambda_handler(_make_sqs_event(), None)
+
+        assert result == {"status": "ok"}
+        mock_queue.mark_dialed.assert_not_called()
+        mock_queue.reset_to_pending.assert_called_once_with(
+            "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
+        )
+        mock_lock.release.assert_called_once_with(
+            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
+        )
+
+
+def test_permanent_dial_failure_logs_but_does_not_raise_when_reset_fails():
+    """reset_to_pending raising must be caught and logged, not propagate — a
+    permanent dial failure must always ack the SQS message."""
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+    }):
+        from connect_caller import DialResult
+        mock_caller = MagicMock()
+        mock_caller.dial.return_value = DialResult(
+            success=False, error_code="InvalidParameterException"
+        )
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = "+15551234567"
+        mock_queue.reset_to_pending.side_effect = RuntimeError("DynamoDB throttled")
+        mock_lock = MagicMock()
+        mock_lock.release.side_effect = RuntimeError("DynamoDB throttled")
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock):
+            from handler_caller import lambda_handler
+            result = lambda_handler(_make_sqs_event(), None)
+
+        assert result == {"status": "ok"}
+
+
+def test_missing_phone_logs_but_does_not_raise_when_reset_and_release_fail():
+    """When get_phone returns None AND both reset_to_pending and lock.release
+    raise, _process_message must still swallow both and return cleanly."""
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+    }):
+        mock_caller = MagicMock()
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = None
+        mock_queue.reset_to_pending.side_effect = RuntimeError("DynamoDB throttled")
+        mock_lock = MagicMock()
+        mock_lock.release.side_effect = RuntimeError("DynamoDB throttled")
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock):
+            from handler_caller import lambda_handler
+            result = lambda_handler(_make_sqs_event(), None)
+
+        assert result == {"status": "ok"}
+        mock_caller.dial.assert_not_called()
+
+
+def test_emit_metric_swallows_cloudwatch_errors():
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+    }):
+        import handler_caller
+
+        mock_cw = MagicMock()
+        mock_cw.put_metric_data.side_effect = RuntimeError("CloudWatch unavailable")
+        with patch("handler_caller._get_cw", return_value=mock_cw):
+            handler_caller._emit_metric("SomeMetric")  # must not raise
+
+        mock_cw.put_metric_data.assert_called_once()
+
+
 def test_correlation_id_fallback_when_absent_from_message():
     """Fix #3 backward compat: messages without correlationId fall back to contactSk[:8]."""
     if "handler_caller" in sys.modules:

@@ -416,6 +416,134 @@ class TestGsiCampaignLookup:
         }
         assert "LastDispatchedAtWriteFailed" in metric_names
 
+    def test_get_active_campaigns_paginates_through_last_evaluated_key(self, mocker):
+        camp1 = self._make_campaign_item("camp-1", created_at="2026-06-18T09:00:00")
+        camp2 = self._make_campaign_item("camp-2", created_at="2026-06-18T09:30:00")
+        ddb = mocker.patch("handler_consumer._get_ddb").return_value
+        ddb.query.side_effect = [
+            {"Items": [camp1], "LastEvaluatedKey": {"campaignId": {"S": "camp-1"}}},
+            {"Items": [camp2]},
+        ]
+
+        import handler_consumer
+
+        result = handler_consumer._get_active_campaigns("arn::queue/q1")
+
+        assert {c["campaignId"]["S"] for c in result} == {"camp-1", "camp-2"}
+        assert ddb.query.call_count == 2
+        second_call_kwargs = ddb.query.call_args_list[1].kwargs
+        assert second_call_kwargs["ExclusiveStartKey"] == {"campaignId": {"S": "camp-1"}}
+
+    def test_missing_agent_arn_skips_dispatch(self, mocker):
+        """An agent event with no ARN must be skipped without attempting to
+        query for active campaigns or acquire a lock."""
+        ddb = mocker.patch("handler_consumer._get_ddb").return_value
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={"agent_arn": None, "queue_arn": "arn::queue/q1"},
+        )
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+
+        import handler_consumer
+        import base64
+        import json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        ddb.query.assert_not_called()
+        lock.acquire.assert_not_called()
+
+    def test_disallowed_queue_is_skipped(self, mocker):
+        """A queue not present in ALLOWED_QUEUE_ARNS must never be queried for
+        active campaigns, even if it's the agent's only queue."""
+        ddb = mocker.patch("handler_consumer._get_ddb").return_value
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={
+                "agent_arn": "arn::agent/a1",
+                "queue_arn": "arn::queue/not-allowed",
+            },
+        )
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=False)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+
+        import handler_consumer
+        import base64
+        import json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        ddb.query.assert_not_called()
+        lock.acquire.assert_not_called()
+
+    def test_lock_already_held_skips_dispatch(self, mocker):
+        """acquire() returning False (another warm invocation already holds the
+        lock) must skip dispatch without touching the campaign queue."""
+        campaign_item = self._make_campaign_item("camp-1")
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {
+            "Items": [campaign_item]
+        }
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={"agent_arn": "arn::agent/a1", "queue_arn": "arn::queue/q1"},
+        )
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = False
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+
+        import handler_consumer
+        import base64
+        import json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        queue.dequeue.assert_not_called()
+
+    def test_first_orion_push_failure_still_enqueues_sqs_and_emits_metric(self, mocker):
+        """A First Orion push failure must be logged/metric'd but must not block
+        the SQS enqueue — the caller Lambda still fires the dial regardless."""
+        from campaign_queue import Contact
+
+        campaign_item = self._make_campaign_item("camp-1")
+        mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {
+            "Items": [campaign_item]
+        }
+        mocker.patch("handler_consumer.is_agent_available", return_value=True)
+        mocker.patch(
+            "handler_consumer.extract_agent_info",
+            return_value={"agent_arn": "arn::agent/a1", "queue_arn": "arn::queue/q1"},
+        )
+        mocker.patch("handler_consumer.is_queue_allowed", return_value=True)
+        lock = mocker.patch("handler_consumer._get_lock").return_value
+        lock.acquire.return_value = True
+        queue = mocker.patch("handler_consumer._get_queue").return_value
+        queue.dequeue.return_value = Contact(
+            campaign_id="camp-1", contact_uuid="uuid-1", sk="ts1#uuid-1",
+            phone="+15551234567",
+        )
+        mock_fo = mocker.MagicMock()
+        mock_fo.push.return_value = False
+        mocker.patch("handler_consumer.FirstOrionClient").build_from_secret.return_value = mock_fo
+        mock_sqs = mocker.MagicMock()
+        mocker.patch("handler_consumer._get_sqs", return_value=mock_sqs)
+        mock_cw = mocker.patch("handler_consumer._get_cw").return_value
+
+        import handler_consumer
+        import base64
+        import json
+        record = {"kinesis": {"data": base64.b64encode(json.dumps({}).encode()).decode()}}
+        handler_consumer._process_record(record)
+
+        mock_sqs.send_message.assert_called_once()
+        metric_names = {
+            m["MetricName"] for m in mock_cw.put_metric_data.call_args.kwargs["MetricData"]
+        }
+        assert "FirstOrionPushFailed" in metric_names
+
     def test_no_active_campaigns_skips_dispatch(self, mocker):
         mocker.patch("handler_consumer._get_ddb").return_value.query.return_value = {"Items": []}
         mocker.patch("handler_consumer.is_agent_available", return_value=True)
@@ -584,3 +712,56 @@ class TestH8LockReleaseOnException:
             handler_consumer._process_record(record)
 
         lock.release.assert_called_once_with(agent_arn)
+
+
+# ---------------------------------------------------------------------------
+# Lazy AWS client singleton getters + metric emission
+# ---------------------------------------------------------------------------
+
+
+class TestLazyClientGettersAndMetrics:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("CAMPAIGN_QUEUE_TABLE", "VipProgressiveCampaignQueue")
+        monkeypatch.setenv("AGENT_LOCK_TABLE", "VipProgressiveAgentLocks")
+        monkeypatch.setenv("SQS_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/queue")
+        monkeypatch.setenv("CONNECT_INSTANCE_ID", "instance-1")
+        monkeypatch.setenv("ACTIVE_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns")
+        monkeypatch.setenv("FIRSTORION_SECRET_NAME", "vip/firstorion/credentials")
+        sys.modules.pop("handler_consumer", None)
+        import handler_consumer  # noqa: F401
+        yield
+        sys.modules.pop("handler_consumer", None)
+
+    def test_get_cw_constructs_and_caches_client(self, mocker):
+        import handler_consumer
+
+        fake_client = mocker.MagicMock()
+        mock_boto = mocker.patch("boto3.client", return_value=fake_client)
+        first = handler_consumer._get_cw()
+        second = handler_consumer._get_cw()
+        mock_boto.assert_called_once_with("cloudwatch")
+        assert first is fake_client
+        assert second is fake_client
+
+    def test_get_ddb_constructs_and_caches_client(self, mocker):
+        import handler_consumer
+
+        fake_client = mocker.MagicMock()
+        mock_boto = mocker.patch("boto3.client", return_value=fake_client)
+        first = handler_consumer._get_ddb()
+        second = handler_consumer._get_ddb()
+        mock_boto.assert_called_once_with("dynamodb")
+        assert first is fake_client
+        assert second is fake_client
+
+    def test_emit_metric_swallows_cloudwatch_errors(self, mocker):
+        import handler_consumer
+
+        mock_cw = mocker.MagicMock()
+        mock_cw.put_metric_data.side_effect = RuntimeError("CloudWatch unavailable")
+        mocker.patch("handler_consumer._get_cw", return_value=mock_cw)
+
+        handler_consumer._emit_metric("SomeMetric")  # must not raise
+
+        mock_cw.put_metric_data.assert_called_once()

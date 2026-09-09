@@ -366,6 +366,84 @@ def test_s3_access_denied_returns_null_not_crash():
     assert result["body"]["voicemail"] is None
 
 
+def test_s3_client_error_non_access_denied_returns_null_not_crash():
+    """A ClientError code other than AccessDenied/403 (e.g. a throttle) must
+    hit the generic 'else' warning branch and return null, not raise."""
+    handler = _load_handler()
+
+    mock_connect = MagicMock()
+    mock_connect.describe_contact.return_value = {
+        "Contact": {"InitiationTimestamp": _INITIATION_TS}
+    }
+
+    mock_s3 = MagicMock()
+    mock_s3.list_objects_v2.side_effect = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+        "ListObjectsV2",
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_connect_client", mock_connect),
+        patch.object(handler, "_s3_client", mock_s3),
+    ):
+        result = handler.get_artifacts({}, {"contactId": _VALID_UUID})
+
+    assert result["statusCode"] == 200
+    assert result["body"]["voicemail"] is None
+
+
+def test_presigned_url_generation_failure_returns_null_for_that_artifact():
+    """generate_presigned_url raising must be swallowed per-artifact, not
+    crash the whole request."""
+    handler = _load_handler()
+
+    mock_connect = MagicMock()
+    mock_connect.describe_contact.return_value = {
+        "Contact": {"InitiationTimestamp": _INITIATION_TS}
+    }
+
+    mock_s3 = MagicMock()
+    mock_s3.list_objects_v2.return_value = {"Contents": [{"Key": "some/key.wav"}]}
+    mock_s3.generate_presigned_url.side_effect = RuntimeError("KMS error")
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_connect_client", mock_connect),
+        patch.object(handler, "_s3_client", mock_s3),
+    ):
+        result = handler.get_artifacts({}, {"contactId": _VALID_UUID})
+
+    assert result["statusCode"] == 200
+    assert result["body"]["voicemail"] is None
+    assert result["body"]["recording"] is None
+    assert result["body"]["transcript"] is None
+
+
+def test_get_connect_constructs_and_caches_client():
+    handler = _load_handler()
+    handler._connect_client = None
+    fake_client = MagicMock()
+    with patch("boto3.client", return_value=fake_client) as mock_boto:
+        first = handler._get_connect()
+        second = handler._get_connect()
+    mock_boto.assert_called_once_with("connect")
+    assert first is fake_client
+    assert second is fake_client
+
+
+def test_get_s3_constructs_and_caches_client():
+    handler = _load_handler()
+    handler._s3_client = None
+    fake_client = MagicMock()
+    with patch("boto3.client", return_value=fake_client) as mock_boto:
+        first = handler._get_s3()
+        second = handler._get_s3()
+    mock_boto.assert_called_once_with("s3")
+    assert first is fake_client
+    assert second is fake_client
+
+
 def test_s3_generic_error_returns_null_for_that_artifact():
     handler = _load_handler()
 

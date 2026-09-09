@@ -73,6 +73,81 @@ def test_applies_tag_on_segment_and_audits():
     assert audit.record.call_args.kwargs["after"] == {"syncMode": "manual"}
 
 
+def test_live_to_manual_seeds_filter_config_when_rules_evaluable():
+    from handlers import sync_mode
+
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "nj",
+        "SegmentDefinitionArn": "arn:nj",
+        "Tags": {"VipSyncMode": "live", "VipFamily": "nj", "VipVersion": "3"},
+        "Description": "NJ available leads",
+        "SegmentGroups": {
+            "Groups": [
+                {
+                    "Type": "ALL",
+                    "Dimensions": [
+                        {
+                            "ProfileAttributes": {
+                                "Attributes": {
+                                    "available": {
+                                        "DimensionType": "EQUAL",
+                                        "Values": ["1"],
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    config_store = MagicMock()
+    config_store.get.return_value = None
+
+    with (
+        patch("handlers.sync_mode.build_cp", return_value=cp),
+        patch("handlers.sync_mode.build_audit", return_value=MagicMock()),
+        patch("handlers.sync_mode.build_filter_config_store", return_value=config_store),
+    ):
+        sync_mode.update_sync_mode(_event({"syncMode": "manual"}), {"id": "nj"})
+
+    config_store.put.assert_called_once()
+    put_kwargs = config_store.put.call_args.kwargs
+    assert put_kwargs["family"] == "nj"
+    assert put_kwargs["current_version"] == 3
+    assert put_kwargs["description"] == "NJ available leads"
+
+
+def test_live_to_manual_skips_seeding_when_config_already_exists():
+    from handlers import sync_mode
+
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "nj",
+        "SegmentDefinitionArn": "arn:nj",
+        "Tags": {"VipSyncMode": "live", "VipFamily": "nj"},
+        "SegmentGroups": {"Groups": []},
+    }
+    config_store = MagicMock()
+    config_store.get.return_value = MagicMock()  # already has a row
+
+    with (
+        patch("handlers.sync_mode.build_cp", return_value=cp),
+        patch("handlers.sync_mode.build_audit", return_value=MagicMock()),
+        patch("handlers.sync_mode.build_filter_config_store", return_value=config_store),
+    ):
+        sync_mode.update_sync_mode(_event({"syncMode": "manual"}), {"id": "nj"})
+
+    config_store.put.assert_not_called()
+
+
+def test_int_tag_falls_back_to_default_on_malformed_value():
+    from handlers import sync_mode
+
+    assert sync_mode._int_tag({"VipVersion": "bad"}, "VipVersion", default=1) == 1
+
+
 def test_create_persists_syncMode_and_identity_tags():
     """Sanity check that segments create wires the new tags.
 

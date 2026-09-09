@@ -131,6 +131,163 @@ def test_returns_counts_from_estimate_and_redis_scan():
     audit.record.assert_called_once()
 
 
+def test_uses_persisted_filter_config_when_present():
+    from handlers import verify
+    from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
+
+    cp = MagicMock()
+    definition = _manual_definition("nj-v1")
+    definition["SegmentGroups"] = {"Groups": []}  # frozen — must NOT be used
+    cp.get_segment_definition.return_value = definition
+    cp.create_segment_estimate.return_value = {"EstimateId": "est-1"}
+    cp.wait_for_estimate.return_value = {"Estimate": "1"}
+
+    config = MagicMock()
+    config.rules = [FilterRule(field="available", operator=FilterOperator.EQ, values=("1",))]
+    config.combinator = "ALL"
+    config_store = MagicMock()
+    config_store.get.return_value = config
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [{"id": "cust-a", "customerid": "cust-a", "available": "1"}]
+    )
+
+    with (
+        patch("handlers.verify.build_cp", return_value=cp),
+        patch("handlers.verify.build_redis_source", return_value=redis_source),
+        patch("handlers.verify.build_audit", return_value=MagicMock()),
+        patch("handlers.verify.build_filter_config_store", return_value=config_store),
+    ):
+        response = verify.verify_segment(_event(), {"id": "nj-v1"})
+
+    body = json.loads(response["body"])
+    assert body["redisCount"] == 1
+    assert body["notes"] == {}  # no legacy warning when config is persisted
+
+
+def test_legacy_warning_present_when_no_config_and_rebuilt():
+    from handlers import verify
+
+    cp = MagicMock()
+    definition = _manual_definition("nj-v3")
+    definition["Tags"]["VipVersion"] = "3"
+    cp.get_segment_definition.return_value = definition
+    cp.create_segment_estimate.return_value = {"EstimateId": "est-1"}
+    cp.wait_for_estimate.return_value = {"Estimate": "0"}
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter([])
+
+    with (
+        patch("handlers.verify.build_cp", return_value=cp),
+        patch("handlers.verify.build_redis_source", return_value=redis_source),
+        patch("handlers.verify.build_audit", return_value=MagicMock()),
+        patch("handlers.verify.build_filter_config_store", return_value=_no_config_store()),
+    ):
+        response = verify.verify_segment(_event(), {"id": "nj-v3"})
+
+    body = json.loads(response["body"])
+    assert "legacyFilter" in body["notes"]
+    assert "Recreate with the original filter" in body["notes"]["legacyFilter"]
+
+
+def test_legacy_warning_for_never_rebuilt_v1_segment():
+    from handlers import verify
+
+    cp = MagicMock()
+    definition = _manual_definition("nj-v1")
+    cp.get_segment_definition.return_value = definition
+    cp.create_segment_estimate.return_value = {"EstimateId": "est-1"}
+    cp.wait_for_estimate.return_value = {"Estimate": "0"}
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter([])
+
+    with (
+        patch("handlers.verify.build_cp", return_value=cp),
+        patch("handlers.verify.build_redis_source", return_value=redis_source),
+        patch("handlers.verify.build_audit", return_value=MagicMock()),
+        patch("handlers.verify.build_filter_config_store", return_value=_no_config_store()),
+    ):
+        response = verify.verify_segment(_event(), {"id": "nj-v1"})
+
+    body = json.loads(response["body"])
+    assert "will keep working until first rebuild" in body["notes"]["legacyFilter"]
+
+
+def test_scan_redis_skips_blank_customer_ids():
+    from handlers import verify
+    from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [
+            {"customerid": "", "available": "1"},
+            {"customerid": "cust-a", "available": "1"},
+        ]
+    )
+    rules = [FilterRule(field="available", operator=FilterOperator.EQ, values=("1",))]
+
+    with patch("handlers.verify.build_redis_source", return_value=redis_source):
+        ids, sample_index = verify._scan_redis(rules, "ALL")
+
+    assert ids == {"cust-a"}
+    assert set(sample_index.keys()) == {"cust-a"}
+
+
+class TestParseEstimate:
+    def test_parses_numeric_value(self):
+        from handlers import verify
+
+        assert verify._parse_estimate(42) == 42
+        assert verify._parse_estimate(42.5) == 42
+
+    def test_parses_dict_with_total_count(self):
+        from handlers import verify
+
+        assert verify._parse_estimate({"TotalCount": 10}) == 10
+        assert verify._parse_estimate({"totalCount": 20}) == 20
+
+    def test_parses_numeric_string(self):
+        from handlers import verify
+
+        assert verify._parse_estimate("15") == 15
+
+    def test_returns_none_for_malformed_string(self):
+        from handlers import verify
+
+        assert verify._parse_estimate("not-a-number") is None
+
+    def test_returns_none_for_none_input(self):
+        from handlers import verify
+
+        assert verify._parse_estimate(None) is None
+
+
+class TestTagHelpers:
+    def test_sync_mode_from_tags_defaults_to_live(self):
+        from handlers import verify
+
+        assert verify._sync_mode_from_tags({}) == "live"
+        assert verify._sync_mode_from_tags({"VipSyncMode": "MANUAL"}) == "manual"
+        assert verify._sync_mode_from_tags(None) == "live"
+
+    def test_family_from_tags_returns_none_when_absent(self):
+        from handlers import verify
+
+        assert verify._family_from_tags({}) is None
+        assert verify._family_from_tags({"VipFamily": "nj"}) == "nj"
+        assert verify._family_from_tags(None) is None
+
+    def test_version_from_tags_falls_back_to_1_on_malformed_value(self):
+        from handlers import verify
+
+        assert verify._version_from_tags({"VipVersion": "bad"}) == 1
+        assert verify._version_from_tags({}) == 1
+        assert verify._version_from_tags({"VipVersion": "4"}) == 4
+
+
 def test_filters_out_leads_that_do_not_match_segment_rules():
     from handlers import verify
 

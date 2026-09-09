@@ -56,6 +56,36 @@ def test_sms_export_reraises_instead_of_swallowing():
             campaign_exporter_handler.lambda_handler({"action": "sms_export"}, None)
 
 
+def test_branded_export_returns_ok_on_success():
+    branded_exporter_mock = MagicMock()
+    branded_exporter_mock.export_branded_runs.return_value = {"exported": 3}
+    branded_exporter_mock.export_branded_metrics.return_value = {"exported": 7}
+    with patch.dict(sys.modules, {"branded_exporter": branded_exporter_mock}):
+        result = campaign_exporter_handler.lambda_handler(
+            {"action": "branded_export"}, None
+        )
+
+    assert result == {
+        "ok": True,
+        "runs": {"exported": 3},
+        "metrics": {"exported": 7},
+    }
+    branded_exporter_mock.export_branded_runs.assert_called_once()
+    branded_exporter_mock.export_branded_metrics.assert_called_once()
+
+
+def test_sms_export_returns_ok_on_success():
+    sms_exporter_mock = MagicMock()
+    sms_exporter_mock.export_sms_runs.return_value = {
+        "exported": 12,
+        "table": "SMS_CAMPAIGN_RUNS",
+    }
+    with patch.dict(sys.modules, {"sms_exporter": sms_exporter_mock}):
+        result = campaign_exporter_handler.lambda_handler({"action": "sms_export"}, None)
+
+    assert result == {"ok": True, "exported": 12, "table": "SMS_CAMPAIGN_RUNS"}
+
+
 def test_campaign_export_still_returns_ok_on_success():
     with patch.object(
         campaign_exporter_handler.exporter,

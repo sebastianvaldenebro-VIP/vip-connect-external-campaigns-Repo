@@ -39,11 +39,83 @@ def test_get_campaign_metrics_returns_totals_and_series():
     assert "Delivery" in body["series"]
 
 
+def test_get_campaigns_summary_returns_per_campaign_totals():
+    from handlers import metrics
+
+    mock_oc = MagicMock()
+    mock_oc.list_campaigns.return_value = {
+        "campaignSummaryList": [
+            {"id": "c-1", "name": "NJ Spring", "status": "Running"},
+            {"id": "c-2", "name": "FL Spring", "status": "Paused"},
+        ]
+    }
+    mock_cw = MagicMock()
+    mock_cw.get_campaign_totals.return_value = {"Delivery": 500}
+
+    with (
+        patch("handlers.metrics.build_oc", return_value=mock_oc),
+        patch("handlers.metrics.build_cw", return_value=mock_cw),
+    ):
+        response = metrics.get_campaigns_summary(
+            {"queryStringParameters": {"lookbackHours": "12"}}, {}
+        )
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["lookbackHours"] == 12
+    assert len(body["campaigns"]) == 2
+    assert body["campaigns"][0]["id"] == "c-1"
+    assert body["campaigns"][0]["totals"]["Delivery"] == 500
+    assert mock_cw.get_campaign_totals.call_count == 2
+
+
+def test_get_campaigns_summary_skips_entries_missing_id():
+    from handlers import metrics
+
+    mock_oc = MagicMock()
+    mock_oc.list_campaigns.return_value = {
+        "campaignSummaryList": [
+            {"name": "no id here", "status": "Running"},
+            {"id": "c-2", "name": "FL Spring", "status": "Paused"},
+        ]
+    }
+    mock_cw = MagicMock()
+    mock_cw.get_campaign_totals.return_value = {"Delivery": 500}
+
+    with (
+        patch("handlers.metrics.build_oc", return_value=mock_oc),
+        patch("handlers.metrics.build_cw", return_value=mock_cw),
+    ):
+        response = metrics.get_campaigns_summary({"queryStringParameters": {}}, {})
+
+    body = json.loads(response["body"])
+    assert len(body["campaigns"]) == 1
+    assert body["campaigns"][0]["id"] == "c-2"
+
+
 def test_get_current_realtime_requires_queue_id():
     from handlers import metrics
 
     with pytest.raises(ValueError, match="queueId"):
         metrics.get_current_realtime({"queryStringParameters": None}, {})
+
+
+def test_get_current_realtime_delegates_to_queue_realtime():
+    from handlers import metrics
+
+    mock_client = MagicMock()
+    mock_client.get_current_metric_data.return_value = [
+        {"Collections": [{"Metric": {"Name": "AGENTS_AVAILABLE"}, "Value": 5.0}]}
+    ]
+
+    with patch("handlers.metrics.build_connect", return_value=mock_client):
+        response = metrics.get_current_realtime(
+            {"queryStringParameters": {"queueId": "q-1"}}, {}
+        )
+
+    body = json.loads(response["body"])
+    assert body["queueId"] == "q-1"
+    assert body["metrics"] == {"AGENTS_AVAILABLE": 5.0}
 
 
 def test_get_queue_realtime_flattens_metric_collections():
