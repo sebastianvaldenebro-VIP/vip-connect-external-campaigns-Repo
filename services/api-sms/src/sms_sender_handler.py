@@ -83,6 +83,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             "totalSent": 0,
             "totalFailed": 0,
             "totalOptedOut": 0,
+            "totalSkippedOptOut": 0,
             "createdAt": now_iso,
             "updatedAt": now_iso,
             "pipelineVersion": "v1",
@@ -157,10 +158,19 @@ def lambda_handler(event: dict, context: object) -> dict:
         enqueued += batch_ok
         failed += batch_failed
 
-    # Update enqueued/failed/opted-out counts
+    # Update enqueued/failed/skipped-opt-out counts.
+    #
+    # NOTE: this writes totalSkippedOptOut, NOT totalOptedOut. totalOptedOut is a
+    # different counter owned by sms_processor_handler.py — it means "we enqueued
+    # this contact and EUM's own managed suppression list rejected the send" (those
+    # contacts ARE inside totalEnqueued). totalSkippedOptOut means "we never
+    # enqueued this contact at all — skipped before send using our own opt-out
+    # list". Writing to totalOptedOut here would race with the processor's atomic
+    # ADD (SQS-driven sends can start firing while this loop is still running) and
+    # would conflate two different populations in downstream reporting/UI.
     _ddb.Table(_RUNS_TABLE).update_item(
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
-        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, totalOptedOut = :o, updatedAt = :t",
+        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, totalSkippedOptOut = :o, updatedAt = :t",
         ExpressionAttributeValues={
             ":n": enqueued,
             ":f": failed,
@@ -170,7 +180,11 @@ def lambda_handler(event: dict, context: object) -> dict:
     )
 
     _logger.info(
-        "sms_sender_enqueued", campaign_id=campaign_id, enqueued=enqueued, failed=failed
+        "sms_sender_enqueued",
+        campaign_id=campaign_id,
+        enqueued=enqueued,
+        failed=failed,
+        skipped_opt_out=opted_out,
     )
     return {"enqueued": enqueued, "failed": failed}
 

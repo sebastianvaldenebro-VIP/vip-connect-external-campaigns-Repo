@@ -402,11 +402,17 @@ function CampaignCard({
               <span className="font-medium text-red-500">{smsRun.totalFailed}</span>
               {' failed · '}
               <span className="text-gray-400">{smsRun.totalOptedOut}</span>
-              {' opted out'}
+              {' opted out · '}
+              <span className="text-gray-400">{smsRun.totalSkippedOptOut}</span>
+              {' skipped (opt-out)'}
             </span>
             {smsRun.totalEnqueued > 0 && (
               <span className="text-gray-400 ml-auto">
-                {Math.round(((smsRun.totalSent + smsRun.totalFailed + smsRun.totalOptedOut) / smsRun.totalEnqueued) * 100)}%
+                {/* Numerator is sent+failed+totalOptedOut only — all three are counted
+                    inside totalEnqueued (the denominator). totalSkippedOptOut contacts
+                    were never enqueued at all, so including them here would double-count
+                    against the denominator and could push the percentage over 100%. */}
+                {Math.min(100, Math.round(((smsRun.totalSent + smsRun.totalFailed + smsRun.totalOptedOut) / smsRun.totalEnqueued) * 100))}%
               </span>
             )}
           </div>

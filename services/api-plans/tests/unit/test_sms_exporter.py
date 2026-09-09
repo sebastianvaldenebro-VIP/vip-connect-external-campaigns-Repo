@@ -169,6 +169,7 @@ def test_export_column_mapping_correct():
     assert "total_sent" in df.columns
     assert "total_failed" in df.columns
     assert "total_opted_out" in df.columns
+    assert "total_skipped_opt_out" in df.columns
     assert "extracted_at" in df.columns
     # Verify values
     assert df.iloc[0]["plan_id"] == "plan-1"

@@ -343,6 +343,7 @@ export type SmsCampaignRunRecord = {
   totalSent: number;
   totalFailed: number;
   totalOptedOut: number;
+  totalSkippedOptOut: number;
   status: 'RUNNING' | 'COMPLETED' | 'ABORTED';
   startedAt: string;
   completedAt?: string;

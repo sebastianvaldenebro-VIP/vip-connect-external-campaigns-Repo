@@ -110,6 +110,11 @@ def test_sender_skips_phone_on_opt_out_list_and_counts_opted_out():
     mock_opt_out.is_blocked.assert_any_call("+15125558888")
     runs_update = mock_runs_table.update_item.call_args.kwargs
     assert runs_update["ExpressionAttributeValues"][":o"] == 1
+    # :o must be bound to totalSkippedOptOut (contacts never enqueued at all), not
+    # totalOptedOut (a different counter owned by sms_processor_handler.py for
+    # contacts EUM's own suppression list rejected after enqueue).
+    assert "totalSkippedOptOut" in runs_update["UpdateExpression"]
+    assert "totalOptedOut" not in runs_update["UpdateExpression"]
 
 
 def test_sender_skips_invalid_phone_formats():
