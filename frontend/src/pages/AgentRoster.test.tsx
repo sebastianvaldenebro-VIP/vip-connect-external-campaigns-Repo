@@ -14,7 +14,7 @@ vi.mock('@/lib/api', () => ({
   },
 }));
 
-import { AgentRoster } from './AgentRoster';
+import { AgentRoster, groupAgentsByProfile } from './AgentRoster';
 
 // 2026-09-09T15:00:00Z — business hours window (12-23 UTC).
 const FIXED_NOW = new Date('2026-09-09T15:00:00.000Z');
@@ -54,6 +54,10 @@ const BASE_AGENTS: AgentRosterEntry[] = [
   agent({ agentId: 'a6', agentName: 'Fabi Ortiz', routingProfileId: 'rp-as', routingProfileName: 'Appointment Services Agent', effectiveStatus: 'ACW', statusStartTimestamp: minsAgo(5) }), // longAcw warn
   // Not a branded-monitor team — must be filtered out of every count/list.
   agent({ agentId: 'a7', agentName: 'Front Desk Gina', routingProfileId: 'rp-fd', routingProfileName: 'Front Desk NYC', effectiveStatus: 'Available', statusStartTimestamp: minsAgo(1) }),
+  // Profile with no team mapping at all (teamForProfile returns null) — exercises
+  // the `?? ''` fallback in the top-level team filter, distinct from a7 above
+  // (a7's team is real, just not a branded-monitor one).
+  agent({ agentId: 'a8', agentName: 'Unmapped Umberto', routingProfileId: 'rp-zzz', routingProfileName: 'Zzz Totally Unmapped Profile', effectiveStatus: 'Available', statusStartTimestamp: minsAgo(1) }),
 ];
 
 function renderRoster(props: Partial<Parameters<typeof AgentRoster>[0]> = {}): void {
@@ -121,10 +125,12 @@ describe('<AgentRoster /> — populated roster', () => {
 
   it('excludes non-branded-monitor agents from every count and shows workforce totals', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
-    // Front Desk Gina (a7) must never appear.
+    // Front Desk Gina (a7, classified but non-branded team) and Unmapped
+    // Umberto (a8, unclassified profile) must never appear.
     expect(screen.queryByText('Front Desk Gina')).not.toBeInTheDocument();
+    expect(screen.queryByText('Unmapped Umberto')).not.toBeInTheDocument();
 
     expect(screen.getByText('updated 5m ago')).toBeInTheDocument();
 
@@ -166,7 +172,7 @@ describe('<AgentRoster /> — populated roster', () => {
 
   it('falls back to agentId for the empty-name agent, and maps "Unavailable" to the "Away" chip label', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     // a5 has agentName: '' — row + avatar fall back to the agentId.
     expect(screen.getAllByText('a5').length).toBeGreaterThan(0);
@@ -176,68 +182,83 @@ describe('<AgentRoster /> — populated roster', () => {
 
   it('filters agents by the search box', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.type(screen.getByPlaceholderText(/search name, profile, team/i), 'Ana Lopez');
 
-    await waitFor(() => expect(screen.getByText('Agents (1)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (1)' })).toBeInTheDocument());
     expect(screen.getByText('Showing 1 of 6 agents')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: /clear all/i }));
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
   });
 
   it('filters agents by status via the Status select', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.selectOptions(screen.getByRole('combobox', { name: /status/i }), 'Offline');
 
-    await waitFor(() => expect(screen.getByText('Agents (1)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (1)' })).toBeInTheDocument());
     expect(screen.getByText('Cora Diaz')).toBeInTheDocument();
+
+    // Selecting the empty "All" option clears the status filter again.
+    await user.selectOptions(screen.getByRole('combobox', { name: /status/i }), '');
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
   });
 
   it('filters agents by team, which resets any active profile filter', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.selectOptions(screen.getByRole('combobox', { name: /profile/i }), 'rp-ps');
-    await waitFor(() => expect(screen.getByText('Agents (3)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (3)' })).toBeInTheDocument());
 
     await user.selectOptions(screen.getByRole('combobox', { name: /team/i }), 'appointment-services');
-    await waitFor(() => expect(screen.getByText('Agents (3)')).toBeInTheDocument());
-    expect(screen.getByText('Deb Reyes')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (3)' })).toBeInTheDocument());
+    // Deb Reyes is flagged (longCall), so she renders both in "Needs attention"
+    // and in the agent list row — same multi-match pattern as the a5/"Away"
+    // assertion above.
+    expect(screen.getAllByText('Deb Reyes').length).toBeGreaterThan(0);
 
     const profileSelect = screen.getByRole('combobox', { name: /profile/i }) as HTMLSelectElement;
     expect(profileSelect.value).toBe('');
+
+    // Selecting the empty "All" option clears the team filter again.
+    await user.selectOptions(screen.getByRole('combobox', { name: /team/i }), '');
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
   });
 
   it('filters agents by routing profile', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.selectOptions(screen.getByRole('combobox', { name: /profile/i }), 'rp-as');
 
-    await waitFor(() => expect(screen.getByText('Agents (3)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (3)' })).toBeInTheDocument());
+
+    // Selecting the empty "All profiles" option clears the profile filter again.
+    await user.selectOptions(screen.getByRole('combobox', { name: /profile/i }), '');
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
   });
 
   it('filters agents by "needs attention" via the Alerts select', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.selectOptions(screen.getByRole('combobox', { name: /alerts/i }), 'any');
 
-    await waitFor(() => expect(screen.getByText('Agents (4)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (4)' })).toBeInTheDocument());
   });
 
   it('toggles grouping by routing profile', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     // Grouped by default: per-profile header with flagged count shows.
     expect(screen.getByText('1 flagged')).toBeInTheDocument();
@@ -253,25 +274,25 @@ describe('<AgentRoster /> — populated roster', () => {
 
   it('clears all active filters via "Clear all"', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     const user = userEvent.setup({ delay: null });
     await user.type(screen.getByPlaceholderText(/search name, profile, team/i), 'Beto');
-    await waitFor(() => expect(screen.getByText('Agents (1)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (1)' })).toBeInTheDocument());
 
     await user.click(screen.getByRole('button', { name: /clear all/i }));
 
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /clear all/i })).not.toBeInTheDocument();
   });
 
   it('advances the live "now" tick so elapsed timers keep counting', async () => {
     renderRoster();
-    await waitFor(() => expect(screen.getByText('Agents (6)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument());
 
     await vi.advanceTimersByTimeAsync(2_000);
     // No crash / still rendered after the tick interval fires.
-    expect(screen.getByText('Agents (6)')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Agents (6)' })).toBeInTheDocument();
   });
 });
 
@@ -288,8 +309,10 @@ describe('<AgentRoster /> — zero-available edge case', () => {
     });
     renderRoster();
 
-    await waitFor(() => expect(screen.getByText('Agents (1)')).toBeInTheDocument());
-    const availableTile = screen.getByText('Available').closest('div')!.parentElement!;
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (1)' })).toBeInTheDocument());
+    // "Available" also appears in the capacity table's legend — the workforce
+    // summary tile renders first in DOM order, so index 0 is the stat tile.
+    const availableTile = screen.getAllByText('Available')[0]!.closest('div')!.parentElement!;
     expect(within(availableTile).getByText('0')).toBeInTheDocument();
   });
 });
@@ -305,8 +328,32 @@ describe('<AgentRoster /> — initial filter props', () => {
     });
     renderRoster({ initialTeamFilter: 'patient-success', initialProfileFilter: 'rp-ps' });
 
-    await waitFor(() => expect(screen.getByText('Agents (3)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Agents (3)' })).toBeInTheDocument());
     const teamSelect = screen.getByRole('combobox', { name: /team/i }) as HTMLSelectElement;
     expect(teamSelect.value).toBe('patient-success');
+  });
+});
+
+describe('groupAgentsByProfile — sort ordering', () => {
+  // Two "no-coverage" (0 available) profiles, both fully flagged, different
+  // sizes — ties on both "has a flagged agent" and staffing risk, so the
+  // comparator must fall through to the final agent-count tie-break.
+  const flaggedSmall = [
+    agent({ agentId: 'fs1', routingProfileId: 'rp-fs', routingProfileName: 'Appointment Services Agent', effectiveStatus: 'Unavailable', statusStartTimestamp: minsAgo(25) }), // break error
+  ];
+  const flaggedBig = [
+    agent({ agentId: 'fb1', routingProfileId: 'rp-fb', routingProfileName: 'Appointment Services Management', effectiveStatus: 'On Call', statusStartTimestamp: minsAgo(20) }), // longCall warn
+    agent({ agentId: 'fb2', routingProfileId: 'rp-fb', routingProfileName: 'Appointment Services Management', effectiveStatus: 'ACW', statusStartTimestamp: minsAgo(5) }), // longAcw warn
+  ];
+  const unflagged = agent({ agentId: 'u1', routingProfileId: 'rp-u', routingProfileName: 'PC - New Leads', effectiveStatus: 'Available', statusStartTimestamp: minsAgo(1) });
+
+  it('ranks flagged profiles before an unflagged one, and — among equally-flagged, equally-risky profiles — the larger one first', () => {
+    // Exercised with the unflagged group in different input positions so the
+    // sort comparator sees both argument orders across the two calls.
+    const orderA = groupAgentsByProfile([unflagged, ...flaggedSmall, ...flaggedBig], FIXED_NOW_MS);
+    expect(orderA.map((g) => g.routingProfileId)).toEqual(['rp-fb', 'rp-fs', 'rp-u']);
+
+    const orderB = groupAgentsByProfile([...flaggedSmall, ...flaggedBig, unflagged], FIXED_NOW_MS);
+    expect(orderB.map((g) => g.routingProfileId)).toEqual(['rp-fb', 'rp-fs', 'rp-u']);
   });
 });

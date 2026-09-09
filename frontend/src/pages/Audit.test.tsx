@@ -14,7 +14,7 @@ vi.mock('@/lib/api', () => ({
   },
 }));
 
-import { Audit } from './Audit';
+import { actionTone, Audit } from './Audit';
 
 function entry(overrides: Partial<AuditEntry>): AuditEntry {
   return {
@@ -85,7 +85,10 @@ describe('<Audit /> — detail panel', () => {
       count: 1,
     });
     renderAudit();
-    await waitFor(() => expect(screen.getByText('create')).toBeInTheDocument());
+    // 'create' is also a static <option> in the Action filter select, always
+    // present regardless of load state — scope to the Badge's <span> so this
+    // genuinely waits for the row to render.
+    await waitFor(() => expect(screen.getByText('create', { selector: 'span' })).toBeInTheDocument());
     expect(screen.getByText('Click a row to see the full before/after diff.')).toBeInTheDocument();
   });
 
@@ -105,7 +108,10 @@ describe('<Audit /> — detail panel', () => {
       count: 1,
     });
     renderAudit();
-    await waitFor(() => expect(screen.getByText('update')).toBeInTheDocument());
+    // 'update' is also a static <option> in the Action filter select, always
+    // present regardless of load state — scope to the Badge's <span> so this
+    // genuinely waits for the row to render.
+    await waitFor(() => expect(screen.getByText('update', { selector: 'span' })).toBeInTheDocument());
 
     const user = userEvent.setup();
     await user.click(screen.getByText('segment/s1'));
@@ -124,7 +130,10 @@ describe('<Audit /> — detail panel', () => {
       count: 1,
     });
     renderAudit();
-    await waitFor(() => expect(screen.getByText('estimate')).toBeInTheDocument());
+    // 'estimate' is also a static <option> in the Action filter select, always
+    // present regardless of load state — scope to the Badge's <span> so this
+    // genuinely waits for the row to render.
+    await waitFor(() => expect(screen.getByText('estimate', { selector: 'span' })).toBeInTheDocument());
 
     const user = userEvent.setup();
     await user.click(screen.getByText('segment/s2'));
@@ -144,15 +153,20 @@ describe('<Audit /> — detail panel', () => {
       count: 2,
     });
     renderAudit();
-    await waitFor(() => expect(screen.getByText('create')).toBeInTheDocument());
+    // 'create' is also a static <option> in the Action filter select, always
+    // present regardless of load state — scope to the Badge's <span> so this
+    // genuinely waits for the row to render.
+    await waitFor(() => expect(screen.getByText('create', { selector: 'span' })).toBeInTheDocument());
 
     const user = userEvent.setup();
     await user.click(screen.getByText('segment/s1'));
-    const rowOne = screen.getByText('segment/s1').closest('tr')!;
+    // Once selected, the entity id also renders in the detail panel's <p> —
+    // scope to the table's <td> to keep this pointed at the row.
+    const rowOne = screen.getByText('segment/s1', { selector: 'td' }).closest('tr')!;
     expect(rowOne.className).toContain('bg-blue-50');
 
     await user.click(screen.getByText('segment/s2'));
-    const rowTwo = screen.getByText('segment/s2').closest('tr')!;
+    const rowTwo = screen.getByText('segment/s2', { selector: 'td' }).closest('tr')!;
     expect(rowTwo.className).toContain('bg-blue-50');
     expect(rowOne.className).not.toContain('bg-blue-50');
   });
@@ -203,5 +217,26 @@ describe('<Audit /> — filters', () => {
     await waitFor(() =>
       expect(listMock).toHaveBeenLastCalledWith({ actor: undefined, action: undefined, entityType: undefined, limit: 100 }),
     );
+  });
+});
+
+describe('actionTone', () => {
+  it.each([
+    ['create', 'success'],
+    ['start', 'success'],
+    ['resume', 'success'],
+    ['bucket_started', 'success'],
+    ['bucket_completed', 'success'],
+    ['pause', 'warning'],
+    ['estimate', 'warning'],
+    ['snapshot', 'warning'],
+    ['window_closed', 'warning'],
+    ['reconcile_retry', 'warning'],
+    ['delete', 'danger'],
+    ['stop', 'danger'],
+    ['creation_failed', 'danger'],
+    ['some_future_action', 'default'],
+  ] as const)('maps "%s" to the "%s" tone', (action, tone) => {
+    expect(actionTone(action)).toBe(tone);
   });
 });
