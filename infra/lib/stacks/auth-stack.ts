@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import { skipCheckovChecks } from '../utils/checkov-skip';
 
 export interface AuthStackProps extends cdk.StackProps {
   readonly permissionsBoundaryName?: string;
@@ -55,6 +56,22 @@ export class AuthStack extends cdk.Stack {
       deletionProtection: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
+
+    // CDK auto-creates this role for MFA SMS delivery (mfaSecondFactor.sms above).
+    // Its sns:Publish statement is Resource: "*" because SNS has no ARN concept
+    // for a destination phone number — confirmed by inspecting the synthesized
+    // policy (no scoping mechanism exists; this is a hard AWS API constraint,
+    // not a permission we chose to widen). Verified 2026-09-08.
+    const smsRole = this.userPool.node.findChild('smsRole') as iam.Role;
+    skipCheckovChecks(smsRole, [
+      {
+        id: 'CKV_AWS_111',
+        comment:
+          'sns:Publish for direct-to-phone-number SMS has no resource-level ARN ' +
+          'in the SNS API — Resource: "*" is unavoidable, not a chosen scope. ' +
+          'CDK generates this role automatically for Cognito MFA SMS delivery.',
+      },
+    ]);
 
     this.userPoolClient = this.userPool.addClient('AdminPoolClient', {
       userPoolClientName: 'vip-admin-ui-client',

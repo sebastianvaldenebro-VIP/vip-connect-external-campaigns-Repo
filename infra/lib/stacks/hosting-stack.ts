@@ -5,6 +5,8 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
+import { skipCheckovChecks } from '../utils/checkov-skip';
 
 export interface HostingStackProps extends cdk.StackProps {
   readonly permissionsBoundaryName?: string;
@@ -61,8 +63,112 @@ export class HostingStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
-      lifecycleRules: [{ expiration: cdk.Duration.days(90) }],
+      versioned: true,
+      lifecycleRules: [
+        { expiration: cdk.Duration.days(90), noncurrentVersionExpiration: cdk.Duration.days(30) },
+      ],
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    // This bucket is itself the access-log destination — pointing its own
+    // access logging back at itself would create a self-referential logging
+    // loop, which is why AWS's own S3 logging docs say not to do this.
+    skipCheckovChecks(accessLogBucket, [
+      {
+        id: 'CKV_AWS_18',
+        comment:
+          'This bucket IS the access-log destination for AssetBucket. Enabling ' +
+          'access logging on the log bucket itself would create a self-referential ' +
+          'logging loop — AWS explicitly documents not doing this.',
+      },
+    ]);
+
+    // Dedicated bucket for CloudFront's own standard logs (separate from the S3
+    // server-access-log bucket above — CloudFront's classic logging delivers via
+    // ACL grant to the awslogsdelivery canonical user, which needs
+    // BUCKET_OWNER_PREFERRED ownership; mixing that into the BucketOwnerEnforced
+    // S3-access-log bucket would weaken its ACL posture for no reason).
+    const cloudFrontLogBucket = new s3.Bucket(this, 'CloudFrontLogs', {
+      bucketName: `vip-admin-ui-cloudfront-logs-${this.account}`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_PREFERRED,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      lifecycleRules: [
+        { expiration: cdk.Duration.days(90), noncurrentVersionExpiration: cdk.Duration.days(30) },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    skipCheckovChecks(cloudFrontLogBucket, [
+      {
+        id: 'CKV_AWS_18',
+        comment:
+          'This bucket IS a log destination (CloudFront standard logs). Enabling ' +
+          'access logging on it would create a self-referential logging loop.',
+      },
+    ]);
+
+    // WAFv2 Web ACL — AWS managed Core rule set + rate limiting. Must be
+    // created in us-east-1 for CLOUDFRONT scope (this stack is deployed there).
+    const webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
+      name: 'vip-admin-ui-waf',
+      scope: 'CLOUDFRONT',
+      defaultAction: { allow: {} },
+      visibilityConfig: {
+        sampledRequestsEnabled: true,
+        cloudWatchMetricsEnabled: true,
+        metricName: 'vip-admin-ui-waf',
+      },
+      rules: [
+        {
+          name: 'AWS-AWSManagedRulesCommonRuleSet',
+          priority: 0,
+          overrideAction: { none: {} },
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesCommonRuleSet',
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWSManagedRulesCommonRuleSet',
+          },
+        },
+        {
+          name: 'AWS-AWSManagedRulesKnownBadInputsRuleSet',
+          priority: 1,
+          overrideAction: { none: {} },
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesKnownBadInputsRuleSet',
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWSManagedRulesKnownBadInputsRuleSet',
+          },
+        },
+        {
+          name: 'RateLimit',
+          priority: 2,
+          action: { block: {} },
+          statement: {
+            rateBasedStatement: {
+              limit: 2000,
+              aggregateKeyType: 'IP',
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'RateLimit',
+          },
+        },
+      ],
     });
 
     this.assetBucket = new s3.Bucket(this, 'AssetBucket', {
@@ -140,6 +246,9 @@ export class HostingStack extends cdk.Stack {
       defaultRootObject: 'index.html',
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+      webAclId: webAcl.attrArn,
+      logBucket: cloudFrontLogBucket,
+      logFilePrefix: 'cloudfront/',
       defaultBehavior: {
         origin,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -175,6 +284,15 @@ export class HostingStack extends cdk.Stack {
       ],
     });
 
+    // CKV_AWS_174 requires MinimumProtocolVersion enforcement, but CloudFront
+    // only honors that setting with a custom domain + ACM certificate — on the
+    // default *.cloudfront.net domain (CloudFrontDefaultCertificate: true, this
+    // stack's current design per the class docstring above), AWS ignores
+    // minimumProtocolVersion and always accepts TLS 1.0+ via SNI. Already set
+    // to TLS_V1_2_2021 above so the setting takes effect the moment a custom
+    // domain is added — the finding tracks a real gap (no custom domain yet),
+    // not a missed config, and reopens automatically for a future distribution
+    // change since it isn't suppressed per-resource.
     new cdk.CfnOutput(this, 'AssetBucketName', {
       value: this.assetBucket.bucketName,
       description: 'Upload built assets here with aws s3 sync',

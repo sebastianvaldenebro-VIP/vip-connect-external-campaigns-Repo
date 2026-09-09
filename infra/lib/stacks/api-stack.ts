@@ -5,9 +5,12 @@ import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
 
 export interface ApiStackProps extends cdk.StackProps {
+  readonly dataKey: kms.IKey;
   readonly userPool: cognito.IUserPool;
   readonly userPoolClient: cognito.IUserPoolClient;
   readonly segmentsFunction: lambda.IFunction;
@@ -335,6 +338,51 @@ export class ApiStack extends cdk.Stack {
     // #002 — WAFv2 cannot associate with HTTP API v2 $default stages (WAFv2 ARN validator
     // rejects '$' in stage names — both CLI and CloudFormation fail with WAFInvalidParameterException).
     // WAF is applied at the CloudFront layer instead. See docs/waf-and-logging-deploy.sh.
+
+    // Access logging for the $default stage — no L2 prop exists for this on
+    // HttpApi's auto-created default stage, so set it via the CfnStage escape hatch.
+    const accessLogGroup = new logs.LogGroup(this, 'AccessLogs', {
+      logGroupName: '/aws/apigateway/vip-admin-ui-api-access',
+      retention: logs.RetentionDays.ONE_YEAR,
+      encryptionKey: props.dataKey,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    // API Gateway's log-delivery service principal needs an explicit grant to
+    // write through a customer-managed CMK (grantWrite on the log group alone
+    // does not cover the CMK). Scoped to this account + this log group's ARN
+    // pattern, not a bare service-principal grant, to avoid authorizing every
+    // API Gateway stage account-wide.
+    props.dataKey.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowApiGatewayLogDelivery',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('apigateway.amazonaws.com')],
+        actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'aws:SourceAccount': this.account },
+          ArnLike: {
+            'aws:SourceArn': `arn:aws:logs:${this.region}:${this.account}:log-group:/aws/apigateway/vip-admin-ui-api-access:*`,
+          },
+        },
+      }),
+    );
+    const defaultStage = this.httpApi.defaultStage!.node.defaultChild as apigatewayv2.CfnStage;
+    defaultStage.accessLogSettings = {
+      destinationArn: accessLogGroup.logGroupArn,
+      // No PHI fields — request metadata only (method/path/status/latency),
+      // consistent with the "correlation IDs, not PHI" logging rule.
+      format: JSON.stringify({
+        requestId: '$context.requestId',
+        ip: '$context.identity.sourceIp',
+        requestTime: '$context.requestTime',
+        httpMethod: '$context.httpMethod',
+        routeKey: '$context.routeKey',
+        status: '$context.status',
+        integrationErrorMessage: '$context.integrationErrorMessage',
+        responseLatency: '$context.responseLatency',
+      }),
+    };
 
     new cdk.CfnOutput(this, 'HttpApiId', { value: this.httpApi.apiId });
     new cdk.CfnOutput(this, 'HttpApiEndpoint', { value: this.apiUrl });
