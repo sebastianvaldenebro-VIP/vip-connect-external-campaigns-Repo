@@ -42,6 +42,11 @@ export function buildSharedLayer(scope: Construct, id = 'SharedLayer'): lambda.L
             if (spawnSync('pip', ['--version'], { stdio: 'ignore' }).status !== 0) {
               return false;
             }
+            // outputDir is a temp directory CDK's own asset-bundling framework
+            // creates and passes to this callback at `cdk synth`/`deploy` time
+            // -- build-time tooling, not a request-handling path. No external
+            // or attacker-controlled input reaches this join. Verified 2026-09-08.
+            // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
             const outputPython = path.join(outputDir, 'python');
             const inputPython = path.join(sharedRoot, 'python');
             const requirements = path.join(sharedRoot, 'requirements.txt');

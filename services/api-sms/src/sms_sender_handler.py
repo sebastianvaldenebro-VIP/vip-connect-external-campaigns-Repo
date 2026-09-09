@@ -19,6 +19,10 @@ from datetime import datetime, timezone
 
 import boto3
 
+from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
+
+_logger = StructuredLogger(service="api-sms-sender")
+
 _QUEUE_TABLE = os.environ["SMS_CAMPAIGN_QUEUE_TABLE"]
 _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
 _SQS_QUEUE_URL = os.environ["SMS_SQS_QUEUE_URL"]
@@ -152,7 +156,9 @@ def lambda_handler(event: dict, context: object) -> dict:
         ExpressionAttributeValues={":n": enqueued, ":f": failed, ":t": now_iso},
     )
 
-    print(f"sms_sender: enqueued={enqueued} failed={failed} campaign={campaign_id}")
+    _logger.info(
+        "sms_sender_enqueued", campaign_id=campaign_id, enqueued=enqueued, failed=failed
+    )
     return {"enqueued": enqueued, "failed": failed}
 
 
@@ -174,10 +180,12 @@ def _flush_sms_batch(
     failed_ids = {f["Id"] for f in failed_entries}
     if failed_entries:
         # PHI rule: no phone numbers here — only the SQS-assigned Id and error code.
-        print(
-            f"sms_sender: send_message_batch partial failure campaign={campaign_id} "
-            f"failed={len(failed_entries)}/{len(sqs_batch)} "
-            f"codes={sorted({f.get('Code', '') for f in failed_entries})}"
+        _logger.warn(
+            "sms_sender_batch_partial_failure",
+            campaign_id=campaign_id,
+            failed_count=len(failed_entries),
+            batch_size=len(sqs_batch),
+            codes=sorted({f.get("Code", "") for f in failed_entries}),
         )
     with queue_table.batch_writer() as bw:
         for entry_id, item in ddb_items_by_id.items():
@@ -227,7 +235,7 @@ def _get_segment_phones(segment_name: str) -> list[str]:
                 break
             kwargs["NextToken"] = next_token
     except Exception as exc:
-        print(f"sms_sender: _get_segment_phones error type={type(exc).__name__}")
+        _logger.warn("sms_sender_get_segment_phones_failed", error=type(exc).__name__)
     return phones
 
 

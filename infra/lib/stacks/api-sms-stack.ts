@@ -2,12 +2,23 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only via SQS event ' +
+    'source or programmatic InvokeFunction, never a direct target). Talks only to ' +
+    'AWS public APIs (DynamoDB, EUM SMS, Customer Profiles) already secured by ' +
+    'TLS+IAM, not to any private-VPC-only resource.',
+};
 
 export interface ApiSmsStackProps extends cdk.StackProps {
   /** KMS CMK ARN — passed as string to avoid cross-stack Fn::ImportValue dependency */
@@ -95,6 +106,22 @@ export class ApiSmsStack extends cdk.Stack {
     });
 
     const sharedLayer = buildSharedLayer(this);
+    const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
+
+    // Both sender and processor roles below are imported with mutable:false —
+    // every grant CDK would normally add for environmentEncryption /
+    // deadLetterQueue (kms:Decrypt on dataKey, sqs:SendMessage on this DLQ)
+    // silently no-ops (confirmed via `cdk synth`, same as LocationOnboardingGuard
+    // in api-plans-stack.ts) and must be pre-attached via the existing CLI
+    // policy-file flow documented above (SmsSenderPerms / SmsProcessorPerms):
+    //   kms:Decrypt on <dataKeyArn>
+    //   sqs:SendMessage on <DeadLetterQueue arn from `cdk synth` output>
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-sms-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
 
     // ── Lambda: SMS Sender ────────────────────────────────────────────
     // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
@@ -124,6 +151,14 @@ export class ApiSmsStack extends cdk.Stack {
       logGroup: senderLogGroup,
       timeout: cdk.Duration.minutes(5),
       memorySize: 512,
+      environmentEncryption: dataKey,
+      deadLetterQueue: dlq,
+      // CloudWatch, 2026-09-09 (90d window): only 1 invocation total, max observed
+      // ConcurrentExecutions = 1, 0 throttles — invoked once per SMS campaign run,
+      // not per message (fans out via SQS to SmsProcessorFunction, which already
+      // caps at 10). 5 is a generous margin given the near-zero real traffic and
+      // the fact this function only enqueues, never calls a rate-limited API itself.
+      reservedConcurrentExecutions: 5,
       environment: {
         SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
         SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,
@@ -131,6 +166,7 @@ export class ApiSmsStack extends cdk.Stack {
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
       },
     });
+    skipCheckovChecks(this.smsSenderFunction, [VPC_SKIP]);
 
     // ── Lambda: SMS Processor ─────────────────────────────────────────
     // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
@@ -163,6 +199,8 @@ export class ApiSmsStack extends cdk.Stack {
       // 10 = safe default for 10DLC pools. Adjust per origination number type:
       //   TOLL_FREE: 3 | TEN_DLC: 10–100 | SHORT_CODE: up to 100
       reservedConcurrentExecutions: 10,
+      environmentEncryption: dataKey,
+      deadLetterQueue: dlq,
       environment: {
         SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
         SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,
@@ -170,6 +208,7 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_OPT_OUT_LIST_NAME: props.smsOptOutListName,
       },
     });
+    skipCheckovChecks(this.smsProcessorFunction, [VPC_SKIP]);
 
     // SQS trigger — one message per invocation
     this.smsProcessorFunction.addEventSource(new SqsEventSource(this.smsSendQueue, {

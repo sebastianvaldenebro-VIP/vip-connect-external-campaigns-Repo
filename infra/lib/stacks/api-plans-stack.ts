@@ -5,11 +5,22 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import { DynamoEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import { DynamoEventSource, SqsDlq } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as sns from 'aws-cdk-lib/aws-sns';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only by a DynamoDB ' +
+    'Streams event source, never a direct target). Talks only to SNS (already ' +
+    'secured by TLS+IAM), not to any private-VPC-only resource — no Redis or other ' +
+    'VPC-bound dependency, unlike FunctionPlans in this same stack.',
+};
 
 export interface ApiPlansStackProps extends cdk.StackProps {
   readonly adminAuditTable: dynamodb.ITable;
@@ -418,6 +429,14 @@ export class ApiPlansStack extends cdk.Stack {
 
     // ── Lambda function ──────────────────────────────────────────────
     const sharedLayer = buildSharedLayer(this);
+
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-ui-api-plans-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: props.dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionPlans', {
       functionName: 'vip-admin-ui-api-plans',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -432,6 +451,8 @@ export class ApiPlansStack extends cdk.Stack {
       role,
       logGroup,
       reservedConcurrentExecutions: 5,
+      environmentEncryption: props.dataKey,
+      deadLetterQueue: dlq,
       vpc,
       vpcSubnets: {
         subnets: props.redisVpc.subnetIds.map((sid, i) =>
@@ -580,18 +601,44 @@ export class ApiPlansStack extends cdk.Stack {
         role: guardRole,
         logGroup: guardLogGroup,
         reservedConcurrentExecutions: 1,
+        environmentEncryption: props.dataKey,
+        // Function-level deadLetterQueue intentionally omitted: for a
+        // stream-triggered Lambda the effective failure path is the event
+        // source mapping's own onFailure destination (wired below via
+        // SqsDlq), not the async-invoke DeadLetterConfig that prop sets.
+        // guardRole is imported with { mutable: false }, so CDK's grant for
+        // that onFailure destination silently no-ops (confirmed via `cdk
+        // synth` — no IAM statement added, no synth warning either).
+        // Granted manually, same pattern as the other CLI-applied grants in
+        // this stack:
+        //   aws iam put-role-policy --role-name vip-location-onboarding-guard-role \
+        //     --policy-name location-onboarding-guard-dlq --policy-document \
+        //     '{"Version":"2012-10-17","Statement":[{"Sid":"OnFailureDlq",
+        //     "Effect":"Allow","Action":"sqs:SendMessage","Resource":"<DeadLetterQueue arn from `cdk synth` output>"}]}'
         environment: {
           SNS_ALERTS_TOPIC_ARN: alertsTopic.topicArn,
           LOCATION_MAPPING_TABLE: 'VipLocationMapping',
           LOG_LEVEL: 'INFO',
         },
       });
+      skipCheckovChecks(guardFunction, [
+        VPC_SKIP,
+        {
+          id: 'CKV_AWS_116',
+          comment:
+            'Function-level DeadLetterConfig only applies to async invocations; this ' +
+            'Lambda is stream-triggered (DynamoDB Streams). Its real failure path is ' +
+            'the event source mapping\'s onFailure destination, wired above via SqsDlq ' +
+            'to the same DeadLetterQueue.',
+        },
+      ]);
 
       guardFunction.addEventSource(
         new DynamoEventSource(locationMappingTableWithStream, {
           startingPosition: lambda.StartingPosition.LATEST,
           batchSize: 10,
           retryAttempts: 2,
+          onFailure: new SqsDlq(dlq),
           filters: [
             lambda.FilterCriteria.filter({
               eventName: lambda.FilterRule.isEqual('INSERT'),

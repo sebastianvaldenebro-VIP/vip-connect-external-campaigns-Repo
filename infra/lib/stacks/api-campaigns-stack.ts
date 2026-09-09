@@ -5,8 +5,20 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only via API Gateway ' +
+    'HttpLambdaIntegration, never a direct target). Talks only to AWS public APIs ' +
+    '(Connect, Connect Campaigns, DynamoDB) already secured by TLS+IAM, not to any ' +
+    'private-VPC-only resource (contrast FunctionPlans/FunctionSegments, which ' +
+    'correctly use VPC for their ElastiCache Redis dependency).',
+};
 
 export interface ApiCampaignsStackProps extends cdk.StackProps {
   readonly adminAuditTable: dynamodb.ITable;
@@ -120,6 +132,13 @@ export class ApiCampaignsStack extends cdk.Stack {
 
     props.dataKey.grantEncryptDecrypt(role);
 
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-ui-api-campaigns-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: props.dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionCampaigns', {
       functionName: 'vip-admin-ui-api-campaigns',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -133,6 +152,8 @@ export class ApiCampaignsStack extends cdk.Stack {
       role,
       logGroup,
       reservedConcurrentExecutions: 10,
+      environmentEncryption: props.dataKey,
+      deadLetterQueue: dlq,
       environment: {
         CONNECT_INSTANCE_ID: props.connectInstanceId,
         AWS_ACCOUNT_ID: this.account,
@@ -143,6 +164,7 @@ export class ApiCampaignsStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-campaigns',
       },
     });
+    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
   }

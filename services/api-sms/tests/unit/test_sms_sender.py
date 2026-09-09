@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
-from unittest.mock import MagicMock, call, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
@@ -79,8 +76,6 @@ def test_sender_enqueues_valid_e164_phones():
 
     assert result["enqueued"] == 1
     mock_sqs.send_message_batch.assert_called()
-    call_args = mock_sqs.send_message_batch.call_args
-    entries = call_args.kwargs.get("Entries") or call_args.args[0] if call_args.args else call_args.kwargs.get("Entries")
 
 
 def test_sender_skips_invalid_phone_formats():
@@ -405,8 +400,14 @@ def test_sender_pagination_follows_next_token():
     assert cp.get_segment_membership.call_count == 2
 
 
-def test_sender_get_segment_phones_exception_returns_zero(capsys):
-    """Exception inside _get_segment_phones is caught and returns empty list (lines 183-184)."""
+def test_sender_get_segment_phones_exception_returns_zero():
+    """Exception inside _get_segment_phones is caught and returns empty list (lines 183-184).
+
+    Asserts against the StructuredLogger call directly rather than capsys —
+    StructuredLogger's underlying `logging.getLogger(name)` is a process-wide
+    singleton whose StreamHandler binds `sys.stdout` once, the first time any
+    test instantiates it; later tests' capsys wrappers never see that output.
+    """
     handler = _load_handler()
 
     mock_ddb = MagicMock()
@@ -420,16 +421,18 @@ def test_sender_get_segment_phones_exception_returns_zero(capsys):
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
+        patch.object(handler, "_logger") as mock_logger,
     ):
         result = handler.lambda_handler(_base_event(), None)
 
     assert result["enqueued"] == 0
-    captured = capsys.readouterr()
-    assert "RuntimeError" in captured.out
+    mock_logger.warn.assert_called_once()
+    _, kwargs = mock_logger.warn.call_args
+    assert kwargs["error"] == "RuntimeError"
 
 
-def test_sender_no_phi_in_print_calls(capsys):
-    """Phone numbers must NOT appear in any print() output."""
+def test_sender_no_phi_in_print_calls():
+    """Phone numbers must NOT appear in any StructuredLogger call (formerly print())."""
     handler = _load_handler()
 
     mock_ddb = MagicMock()
@@ -442,9 +445,11 @@ def test_sender_no_phi_in_print_calls(capsys):
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_logger") as mock_logger,
     ):
         handler.lambda_handler(_base_event(), None)
 
-    captured = capsys.readouterr()
-    assert "+15125559876" not in captured.out
-    assert "+15125559876" not in captured.err
+    all_calls = mock_logger.info.call_args_list + mock_logger.warn.call_args_list
+    assert all_calls, "expected at least one log call"
+    for logged_call in all_calls:
+        assert "+15125559876" not in str(logged_call)

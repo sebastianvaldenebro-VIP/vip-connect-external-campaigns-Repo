@@ -6,10 +6,21 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
-import { KinesisEventSource, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as kms from 'aws-cdk-lib/aws-kms';
+import { KinesisEventSource, SqsDlq, SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only via Kinesis/SQS ' +
+    'event sources or API Gateway HttpLambdaIntegration, never a direct target). ' +
+    'Talks only to AWS public APIs (DynamoDB, Connect, Customer Profiles, Secrets ' +
+    'Manager) already secured by TLS+IAM, not to any private-VPC-only resource.',
+};
 
 export interface ApiProgressiveDialerStackProps extends cdk.StackProps {
   /** KMS CMK ARN — passed as string to avoid cross-stack Fn::ImportValue dependency */
@@ -130,6 +141,22 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
 
     // ── Shared Layer ──────────────────────────────────────────────────
     const sharedLayer = buildSharedLayer(this);
+    const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
+
+    // All 3 roles below (consumer/caller/seeder) are imported with mutable:false —
+    // every grant CDK would normally add for environmentEncryption / deadLetterQueue
+    // (kms:Decrypt on dataKey, sqs:SendMessage on this DLQ) silently no-ops
+    // (confirmed via `cdk synth`, same as LocationOnboardingGuard in
+    // api-plans-stack.ts) and must be pre-attached via the existing CLI
+    // policy-file flow documented on each role below:
+    //   kms:Decrypt on <dataKeyArn>
+    //   sqs:SendMessage on <DeadLetterQueue arn from `cdk synth` output>
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-progressive-dialer-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
 
     // ── Lambda: Consumer (Kinesis) ────────────────────────────────────
     // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
@@ -161,6 +188,11 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       logGroup: consumerLogGroup,
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
+      environmentEncryption: dataKey,
+      // CloudWatch, 2026-09-09 (14d window): 97,153 invocations (Kinesis-triggered,
+      // bounded by shard count), max observed ConcurrentExecutions = 4, 0 throttles.
+      // 10 gives ~2.5x headroom over the observed ceiling for traffic spikes.
+      reservedConcurrentExecutions: 10,
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
@@ -172,6 +204,17 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
         ...(props.allowedQueueArns ? { ALLOWED_QUEUE_ARNS: props.allowedQueueArns } : {}),
       },
     });
+    skipCheckovChecks(consumerFn, [
+      VPC_SKIP,
+      {
+        id: 'CKV_AWS_116',
+        comment:
+          'Function-level DeadLetterConfig only applies to async invocations; this ' +
+          'Lambda is stream-triggered (Kinesis). Its real failure path is the event ' +
+          'source mapping\'s onFailure destination, wired below via SqsDlq to the ' +
+          'same DeadLetterQueue.',
+      },
+    ]);
 
     // Kinesis ESM — filter to STATE_CHANGE only to reduce invocations
     const agentStream = kinesis.Stream.fromStreamArn(
@@ -181,6 +224,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       startingPosition: lambda.StartingPosition.LATEST,
       batchSize: 100,
       bisectBatchOnError: true,
+      onFailure: new SqsDlq(dlq),
       filters: [
         lambda.FilterCriteria.filter({
           data: { EventType: lambda.FilterRule.isEqual('STATE_CHANGE') },
@@ -220,13 +264,30 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       memorySize: 256,
       // Throttle to 2 concurrent max — matches StartOutboundVoiceContact 2 RPS limit
       reservedConcurrentExecutions: 2,
+      environmentEncryption: dataKey,
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
         FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
       },
     });
+    skipCheckovChecks(callerFn, [
+      VPC_SKIP,
+      {
+        id: 'CKV_AWS_116',
+        comment:
+          'Function-level DeadLetterConfig only applies to async invocations; this ' +
+          'Lambda is SQS-triggered. Its real failure path is the source queue\'s own ' +
+          'RedrivePolicy (vip-progressive-dialer-calls, configured via CLI per the ' +
+          'comment above), not the async-invoke DeadLetterConfig.',
+      },
+    ]);
 
+    // Function-level deadLetterQueue intentionally omitted: for an SQS-triggered
+    // Lambda the effective failure path is the source queue's own RedrivePolicy
+    // (already configured via CLI on vip-progressive-dialer-calls per the
+    // comment above), not the async-invoke DeadLetterConfig — SQS event sources
+    // never actually deliver via the async-invoke path this prop targets.
     callerFn.addEventSource(new SqsEventSource(dialQueue, {
       batchSize: 1, // one dial per invocation
     }));
@@ -264,11 +325,18 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
       logGroup: seederLogGroup,
       timeout: cdk.Duration.seconds(60),
       memorySize: 256,
+      environmentEncryption: dataKey,
+      deadLetterQueue: dlq,
+      // CloudWatch, 2026-09-09 (14d window): only 5 invocations, max observed
+      // ConcurrentExecutions = 1, 0 throttles — genuinely low-traffic (HTTP,
+      // seeds a campaign on demand). 2 gives a small margin without guessing.
+      reservedConcurrentExecutions: 2,
       environment: {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
       },
     });
+    skipCheckovChecks(this.seederFunction, [VPC_SKIP]);
 
     // ── Lambda: Kickstart (DynamoDB Streams) ─────────────────────────────
     // Fixes the event-driven gap: consumer fires only on AVAILABLE *transitions*; this

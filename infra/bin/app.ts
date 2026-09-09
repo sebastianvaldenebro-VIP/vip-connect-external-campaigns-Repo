@@ -217,6 +217,7 @@ const corsAllowOrigins = (app.node.tryGetContext('corsAllowOrigins') as string[]
 new ApiStack(app, 'VipAdminApiStack', {
   env,
   description: 'API Gateway HTTP API + Cognito JWT Authorizer fronting admin Lambdas',
+  dataKey: data.dataKey,
   userPool: auth.userPool,
   userPoolClient: auth.userPoolClient,
   segmentsFunction: segments.lambdaFunction,

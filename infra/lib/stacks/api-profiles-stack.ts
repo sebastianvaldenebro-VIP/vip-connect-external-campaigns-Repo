@@ -4,8 +4,20 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only via API Gateway ' +
+    'HttpLambdaIntegration, never a direct target). Talks only to the Customer ' +
+    'Profiles public API, already secured by TLS+IAM, not to any private-VPC-only ' +
+    'resource (contrast FunctionPlans/FunctionSegments, which correctly use VPC for ' +
+    'their ElastiCache Redis dependency).',
+};
 
 export interface ApiProfilesStackProps extends cdk.StackProps {
   readonly dataKey: kms.IKey;
@@ -62,6 +74,13 @@ export class ApiProfilesStack extends cdk.Stack {
 
     props.dataKey.grantDecrypt(role);
 
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-ui-api-profiles-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: props.dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionProfiles', {
       functionName: 'vip-admin-ui-api-profiles',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -75,6 +94,8 @@ export class ApiProfilesStack extends cdk.Stack {
       role,
       logGroup,
       reservedConcurrentExecutions: 10,
+      environmentEncryption: props.dataKey,
+      deadLetterQueue: dlq,
       environment: {
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
         PROFILE_OBJECT_TYPE: props.profileObjectType ?? 'leads-data-mapping',
@@ -83,6 +104,7 @@ export class ApiProfilesStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-profiles',
       },
     });
+    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
   }

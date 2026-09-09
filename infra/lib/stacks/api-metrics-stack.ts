@@ -5,8 +5,20 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'path';
 import { buildSharedLayer } from '../utils/shared-layer';
+import { skipCheckovChecks } from '../utils/checkov-skip';
+
+const VPC_SKIP = {
+  id: 'CKV_AWS_117',
+  comment:
+    'Not internet-reachable regardless of VPC config (invoked only via API Gateway ' +
+    'HttpLambdaIntegration or internal event sources, never a direct target). Talks ' +
+    'only to AWS public APIs (DynamoDB, Connect, CloudWatch) already secured by ' +
+    'TLS+IAM, not to any private-VPC-only resource (contrast FunctionPlans/' +
+    'FunctionSegments, which correctly use VPC for their ElastiCache Redis dependency).',
+};
 
 export interface ApiMetricsStackProps extends cdk.StackProps {
   readonly adminAuditTable: dynamodb.ITable;
@@ -121,6 +133,13 @@ export class ApiMetricsStack extends cdk.Stack {
 
     const sharedLayer = buildSharedLayer(this);
 
+    const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
+      queueName: 'vip-admin-ui-api-metrics-dlq',
+      encryption: sqs.QueueEncryption.KMS,
+      encryptionMasterKey: props.dataKey,
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
     this.lambdaFunction = new lambda.Function(this, 'FunctionMetrics', {
       functionName: 'vip-admin-ui-api-metrics',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -134,6 +153,8 @@ export class ApiMetricsStack extends cdk.Stack {
       role,
       logGroup,
       reservedConcurrentExecutions: 10,
+      environmentEncryption: props.dataKey,
+      deadLetterQueue: dlq,
       environment: {
         CONNECT_INSTANCE_ID: props.connectInstanceId,
         AUDIT_TABLE: props.adminAuditTable.tableName,
@@ -142,6 +163,7 @@ export class ApiMetricsStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-metrics',
       },
     });
+    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
 
     if (props.brandedRunSummaryTable) {
       this.lambdaFunction.addEnvironment(
@@ -244,6 +266,12 @@ export class ApiMetricsStack extends cdk.Stack {
         tracing: lambda.Tracing.ACTIVE,
         role: collectorRole,
         logGroup: collectorLogGroup,
+        environmentEncryption: props.dataKey,
+        deadLetterQueue: dlq,
+        // CloudWatch, 2026-09-09 (14d window): ~20,160 invocations (rate(1 minute)
+        // schedule), max observed ConcurrentExecutions = 1, 0 throttles. 2 gives a
+        // small margin over the observed ceiling without opening this up unbounded.
+        reservedConcurrentExecutions: 2,
         environment: {
           ACTIVE_BRANDED_CAMPAIGNS_TABLE: props.activeBrandedCampaignsTable.tableName,
           BRANDED_CAMPAIGN_METRICS_TABLE: props.brandedCampaignMetricsTable.tableName,
@@ -255,6 +283,7 @@ export class ApiMetricsStack extends cdk.Stack {
           }),
         },
       });
+      skipCheckovChecks(collectorFn, [VPC_SKIP]);
 
       // EventBridge rule created via CLI (cfn-exec-role lacks events:DescribeRule).
       // Rule name: vip-branded-metrics-collector-1min — rate(1 minute) → this Lambda.
