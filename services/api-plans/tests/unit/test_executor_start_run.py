@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,7 +18,7 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
-import executor  # noqa: E402
+import executor  # noqa: E402, F401
 
 
 def _plan(plan_id="p1", buckets=None, **overrides):

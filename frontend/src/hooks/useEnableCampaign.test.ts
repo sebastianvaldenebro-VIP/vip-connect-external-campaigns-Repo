@@ -42,7 +42,7 @@ describe('useEnableCampaign', () => {
     campaignsCreate.mockResolvedValueOnce({ id: 'cmp-1', arn: 'arn:cmp-1' });
     campaignsStart.mockResolvedValueOnce({ id: 'cmp-1', state: 'Running' });
 
-    const config = useEnableCampaign() as {
+    const config = useEnableCampaign() as unknown as {
       mutationFn: (b: CreateCampaignBody) => Promise<unknown>;
     };
     const result = await config.mutationFn(body);
@@ -56,7 +56,7 @@ describe('useEnableCampaign', () => {
     campaignsCreate.mockResolvedValueOnce({ id: 'cmp-2', arn: 'arn:cmp-2' });
     campaignsStart.mockRejectedValueOnce(new Error('Connect throttled the start request'));
 
-    const config = useEnableCampaign() as {
+    const config = useEnableCampaign() as unknown as {
       mutationFn: (b: CreateCampaignBody) => Promise<unknown>;
     };
     const result = await config.mutationFn(body);
@@ -73,7 +73,7 @@ describe('useEnableCampaign', () => {
     // eslint-disable-next-line prefer-promise-reject-errors
     campaignsStart.mockRejectedValueOnce('raw string failure');
 
-    const config = useEnableCampaign() as {
+    const config = useEnableCampaign() as unknown as {
       mutationFn: (b: CreateCampaignBody) => Promise<unknown>;
     };
     const result = await config.mutationFn(body);
@@ -88,7 +88,7 @@ describe('useEnableCampaign', () => {
   it('propagates a create() failure (never attempts start)', async () => {
     campaignsCreate.mockRejectedValueOnce(new Error('Segment ARN is invalid'));
 
-    const config = useEnableCampaign() as {
+    const config = useEnableCampaign() as unknown as {
       mutationFn: (b: CreateCampaignBody) => Promise<unknown>;
     };
     await expect(config.mutationFn(body)).rejects.toThrow('Segment ARN is invalid');

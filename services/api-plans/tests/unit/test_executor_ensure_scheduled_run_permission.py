@@ -8,10 +8,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
 from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
@@ -21,7 +19,7 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
-import executor  # noqa: E402
+import executor  # noqa: E402, F401
 
 
 def _client_error(code, op="DescribeRule"):

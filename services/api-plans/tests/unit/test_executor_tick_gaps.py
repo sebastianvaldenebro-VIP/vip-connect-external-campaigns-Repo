@@ -14,7 +14,6 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
@@ -23,7 +22,7 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
-import executor  # noqa: E402
+import executor  # noqa: E402, F401
 
 
 def _campaign_def(cid, **overrides):
@@ -324,7 +323,7 @@ class TestExternalDeletionAbort:
             patch("executor._dispatch_cross_bucket_ready", return_value=False),
             patch("executor._all_campaigns_terminal", return_value=True),
             patch("executor._fire_campaign_chains"),
-            patch("executor.save_run") as mock_save,
+            patch("executor.save_run") ,
             patch("executor._notify_sns") as mock_notify,
             patch("executor._advance_bucket") as mock_advance,
         ):

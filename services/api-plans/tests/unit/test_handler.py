@@ -45,7 +45,7 @@ sys.modules.setdefault(
 sys.modules.setdefault("router", MagicMock())
 sys.modules.setdefault("executor", MagicMock())
 
-import handler  # noqa: E402
+import handler  # noqa: E402, F401
 
 
 def _json_response(status, body, **_kw):
@@ -73,7 +73,6 @@ def _context(request_id: str = "req-1"):
 
 class TestTickAction:
     def test_tick_success_returns_executor_result(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.tick.return_value = {"ok": True}
@@ -86,7 +85,6 @@ class TestTickAction:
         mock_executor.tick.assert_called_once_with("p1", "r1", 2)
 
     def test_tick_concurrent_write_is_swallowed(self):
-        import handler
         from store import ConcurrentWriteError
 
         with patch("handler.executor") as mock_executor:
@@ -98,7 +96,6 @@ class TestTickAction:
         assert result == {"ok": True, "reason": "concurrent_write"}
 
     def test_tick_unhandled_exception_notifies_sns_and_returns_error(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.tick.side_effect = RuntimeError("boom")
@@ -114,7 +111,6 @@ class TestTickAction:
         assert call_kwargs["attributes"]["planId"] == "p1"
 
     def test_tick_defaults_bucket_index_to_zero(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.tick.return_value = {"ok": True}
@@ -125,7 +121,6 @@ class TestTickAction:
 
 class TestScheduledRunAction:
     def test_scheduled_run_success(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.scheduled_run.return_value = {"ok": True, "started": True}
@@ -137,7 +132,6 @@ class TestScheduledRunAction:
         mock_executor.scheduled_run.assert_called_once_with("p1")
 
     def test_scheduled_run_error_returns_ok_false(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.scheduled_run.side_effect = RuntimeError("db down")
@@ -150,7 +144,6 @@ class TestScheduledRunAction:
 
 class TestChainTriggerAction:
     def test_chain_trigger_success(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             result = handler.lambda_handler(
@@ -161,7 +154,6 @@ class TestChainTriggerAction:
         mock_executor.start_run_chained.assert_called_once_with("p1")
 
     def test_chain_trigger_error_returns_ok_false(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.start_run_chained.side_effect = RuntimeError("chain failed")
@@ -174,7 +166,6 @@ class TestChainTriggerAction:
 
 class TestPrestartCheckAction:
     def test_prestart_check_success_merges_result(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.prestart_check.return_value = {"warmed": ["p1", "p2"]}
@@ -183,7 +174,6 @@ class TestPrestartCheckAction:
         assert result == {"ok": True, "warmed": ["p1", "p2"]}
 
     def test_prestart_check_error_returns_ok_false(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.prestart_check.side_effect = RuntimeError("boom")
@@ -194,7 +184,6 @@ class TestPrestartCheckAction:
 
 class TestJanitorAction:
     def test_janitor_success_merges_result(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.janitor_cleanup_orphan_schedules.return_value = {
@@ -205,7 +194,6 @@ class TestJanitorAction:
         assert result == {"ok": True, "deleted": ["sched-1"]}
 
     def test_janitor_error_returns_ok_false(self):
-        import handler
 
         with patch("handler.executor") as mock_executor:
             mock_executor.janitor_cleanup_orphan_schedules.side_effect = RuntimeError("boom")
@@ -225,7 +213,6 @@ class TestHttpRouting:
         }
 
     def test_dispatches_to_resolved_route(self):
-        import handler
 
         fake_handler = MagicMock(return_value={"statusCode": 200, "body": "{}"})
         with patch("handler.resolve", return_value=fake_handler):
@@ -234,7 +221,6 @@ class TestHttpRouting:
         assert response["statusCode"] == 200
 
     def test_reads_route_key_from_request_context_when_missing_top_level(self):
-        import handler
 
         fake_handler = MagicMock(return_value={"statusCode": 200, "body": "{}"})
         event = {"requestContext": {"routeKey": "GET /plans"}, "pathParameters": {}}
@@ -244,7 +230,6 @@ class TestHttpRouting:
         mock_resolve.assert_called_once_with("GET /plans")
 
     def test_returns_404_when_no_route_matches(self):
-        import handler
 
         with (
             patch("handler.resolve", return_value=None),
@@ -257,7 +242,6 @@ class TestHttpRouting:
         assert body["error"]["code"] == "ROUTE_NOT_FOUND"
 
     def test_maps_value_error_to_400(self):
-        import handler
 
         fake_handler = MagicMock(side_effect=ValueError("bad input"))
         with (
@@ -271,7 +255,6 @@ class TestHttpRouting:
         assert body["error"]["code"] == "VALIDATION_ERROR"
 
     def test_maps_concurrent_write_error_to_409(self):
-        import handler
         from store import ConcurrentWriteError
 
         fake_handler = MagicMock(side_effect=ConcurrentWriteError("busy"))
@@ -298,7 +281,6 @@ class TestHttpRouting:
         ],
     )
     def test_maps_client_error_codes_to_status(self, aws_code, expected_status):
-        import handler
 
         error = ClientError(
             error_response={"Error": {"Code": aws_code, "Message": "internal detail"}},
@@ -317,7 +299,6 @@ class TestHttpRouting:
         assert "internal detail" not in body["error"]["message"]
 
     def test_maps_unhandled_exception_to_500_with_request_id(self):
-        import handler
 
         fake_handler = MagicMock(side_effect=RuntimeError("boom"))
         with (
@@ -332,7 +313,6 @@ class TestHttpRouting:
         assert body["error"]["requestId"] == "req-9"
 
     def test_unhandled_exception_without_context_omits_request_id(self):
-        import handler
 
         fake_handler = MagicMock(side_effect=RuntimeError("boom"))
         with (

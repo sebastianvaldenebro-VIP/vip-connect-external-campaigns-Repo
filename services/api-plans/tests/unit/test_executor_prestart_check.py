@@ -19,7 +19,7 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
-import executor  # noqa: E402
+import executor  # noqa: E402, F401
 
 _COT = timezone(timedelta(hours=-5))
 
@@ -195,7 +195,7 @@ class TestFallbackTrigger:
             patch("executor.get_latest_run", return_value=None),
             patch("executor.scheduled_run") as mock_scheduled,
         ):
-            result = executor.prestart_check()  # must not raise
+            executor.prestart_check()  # must not raise
         mock_scheduled.assert_called_once_with("p1")
 
 

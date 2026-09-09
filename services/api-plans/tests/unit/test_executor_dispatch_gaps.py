@@ -9,7 +9,6 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
@@ -18,7 +17,7 @@ sys.modules.setdefault("vip_shared.infrastructure", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence", MagicMock())
 sys.modules.setdefault("vip_shared.infrastructure.persistence.audit", MagicMock())
 
-import executor  # noqa: E402
+import executor  # noqa: E402, F401
 
 
 def _campaign_state(cid, status="queued", **overrides):
