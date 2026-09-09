@@ -27,4 +27,29 @@ describe('pickPhoneForStates for Pennsylvania', () => {
     const picked = pickPhoneForStates(phones, ['PA']);
     expect(picked?.number).toBe('+12154009168');
   });
+
+  it('falls back to the first available phone when no canonical or area-code match exists', () => {
+    const phones = [
+      { number: '+19999999999' }, // no matching area code for any known state
+      { number: '+18888888888' },
+    ];
+    const picked = pickPhoneForStates(phones, ['PA']);
+    expect(picked?.number).toBe('+19999999999');
+  });
+});
+
+describe('pickPhoneForStates — general edge cases', () => {
+  it('returns null when the phone list is empty', () => {
+    expect(pickPhoneForStates([], ['NY'])).toBeNull();
+  });
+
+  it('falls back to the first phone when states is empty', () => {
+    const phones = [{ number: '+15551234567' }, { number: '+15559876543' }];
+    expect(pickPhoneForStates(phones, [])?.number).toBe('+15551234567');
+  });
+
+  it('falls back to the first phone for an unrecognized state code', () => {
+    const phones = [{ number: '+15551234567' }, { number: '+15559876543' }];
+    expect(pickPhoneForStates(phones, ['ZZ'])?.number).toBe('+15551234567');
+  });
 });

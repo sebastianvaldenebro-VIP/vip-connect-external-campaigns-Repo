@@ -168,6 +168,53 @@ class TestAwsToRules:
         assert rules == []
         assert combinator == "ALL"
 
+    def test_skips_dimension_missing_dimension_type(self, translator):
+        aws = {
+            "Groups": [
+                {
+                    "Type": "ALL",
+                    "Dimensions": [
+                        {
+                            "ProfileAttributes": {
+                                "Attributes": {
+                                    "location": {"Values": ["NJ"]},
+                                    "available": {
+                                        "DimensionType": "EQUAL",
+                                        "Values": [True],
+                                    },
+                                }
+                            }
+                        }
+                    ],
+                }
+            ]
+        }
+        rules, _ = translator.aws_to_rules(aws)
+        assert [r.field for r in rules] == ["available"]
+
+    def test_skips_dimension_with_empty_values(self, translator):
+        aws = {
+            "Groups": [
+                {
+                    "Type": "ALL",
+                    "Dimensions": [
+                        {
+                            "ProfileAttributes": {
+                                "Attributes": {
+                                    "location": {
+                                        "DimensionType": "EQUAL",
+                                        "Values": [],
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                }
+            ]
+        }
+        rules, _ = translator.aws_to_rules(aws)
+        assert rules == []
+
 
 class TestCustomerIdsToSegmentGroups:
     def test_single_chunk_when_under_cap(self, translator):
@@ -207,6 +254,35 @@ class TestCustomerIdsToSegmentGroups:
         attrs = dims[0]["ProfileAttributes"]["Attributes"]
         field_spec = next(iter(attrs.values()))
         assert field_spec["Values"] == ["__no_records__"]
+
+
+class TestPhonesToSegmentGroups:
+    def test_empty_phones_produces_no_match_sentinel(self, translator):
+        groups = translator.phones_to_segment_groups([])
+        dims = groups["Groups"][0]["Dimensions"]
+        assert groups["Groups"][0]["Type"] == "ALL"
+        assert len(dims) == 1
+        phone_dim = dims[0]["ProfileAttributes"]["PhoneNumber"]
+        assert phone_dim["DimensionType"] == "INCLUSIVE"
+        assert phone_dim["Values"] == ["__no_records__"]
+
+    def test_single_chunk_when_under_cap(self, translator):
+        phones = [f"+1512555{i:04d}" for i in range(10)]
+        groups = translator.phones_to_segment_groups(phones)
+        dimensions = groups["Groups"][0]["Dimensions"]
+        assert len(dimensions) == 1
+        assert dimensions[0]["ProfileAttributes"]["PhoneNumber"]["Values"] == phones
+
+    def test_partitions_into_chunks_of_50(self, translator):
+        phones = [f"+1512555{i:04d}" for i in range(125)]
+        groups = translator.phones_to_segment_groups(phones)
+        dimensions = groups["Groups"][0]["Dimensions"]
+        assert len(dimensions) == 3
+        assert groups["Groups"][0]["Type"] == "ANY"
+        sizes = [
+            len(d["ProfileAttributes"]["PhoneNumber"]["Values"]) for d in dimensions
+        ]
+        assert sizes == [50, 50, 25]
 
 
 class TestMatchesGroup:

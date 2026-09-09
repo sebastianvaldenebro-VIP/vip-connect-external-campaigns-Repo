@@ -69,4 +69,21 @@ describe('groupAgentsByProfile', () => {
   it('returns an empty array for no agents', () => {
     expect(groupAgentsByProfile([], T0)).toEqual([]);
   });
+
+  it('breaks a tie in flagged-state and staffing risk by putting the larger group first', () => {
+    const recent = new Date(T0 - 1 * 60_000).toISOString();
+    const groups = groupAgentsByProfile(
+      [
+        // Both groups: 0 flagged, staffing 'healthy' (available > default min of 1) — tied on both.
+        agent({ agentId: 's1', routingProfileId: 'small', routingProfileName: 'Small RP', effectiveStatus: 'Available', statusStartTimestamp: recent }),
+        agent({ agentId: 's2', routingProfileId: 'small', routingProfileName: 'Small RP', effectiveStatus: 'Available', statusStartTimestamp: recent }),
+        agent({ agentId: 'l1', routingProfileId: 'large', routingProfileName: 'Large RP', effectiveStatus: 'Available', statusStartTimestamp: recent }),
+        agent({ agentId: 'l2', routingProfileId: 'large', routingProfileName: 'Large RP', effectiveStatus: 'Available', statusStartTimestamp: recent }),
+        agent({ agentId: 'l3', routingProfileId: 'large', routingProfileName: 'Large RP', effectiveStatus: 'Available', statusStartTimestamp: recent }),
+      ],
+      T0,
+    );
+    expect(groups[0]!.routingProfileId).toBe('large');
+    expect(groups[1]!.routingProfileId).toBe('small');
+  });
 });

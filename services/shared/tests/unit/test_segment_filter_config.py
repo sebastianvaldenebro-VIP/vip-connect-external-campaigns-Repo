@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from vip_shared.domain.entities.filter_rule import FilterOperator, FilterRule
 from vip_shared.infrastructure.persistence.segment_filter_config import (
     SegmentFilterConfigStore,
+    build_from_env,
 )
 
 
@@ -41,6 +42,36 @@ def test_put_writes_rules_as_json_string():
     # rules are serialised as JSON so DDB doesn't have to fight the operator enum.
     parsed = json.loads(item["filter_rules"])
     assert parsed == [{"field": "location", "operator": "in", "values": ["NJ"]}]
+
+
+def test_put_writes_description_when_provided():
+    store, table = _store_with_table()
+    store.put(
+        family="nj-available-leads",
+        rules=[
+            FilterRule(field="location", operator=FilterOperator.IN, values=("NJ",)),
+        ],
+        combinator="ALL",
+        sync_mode="manual",
+        created_by="user@medwork.io",
+        description="NJ available leads for the morning campaign",
+    )
+    item = table.put_item.call_args.kwargs["Item"]
+    assert item["description"] == "NJ available leads for the morning campaign"
+
+
+def test_build_from_env_reads_table_name(monkeypatch):
+    monkeypatch.setenv("SEGMENT_FILTER_CONFIG_TABLE", "VipAdminSegmentFilterConfig")
+    mock_table = MagicMock()
+    mock_resource = MagicMock()
+    mock_resource.Table.return_value = mock_table
+
+    with patch("boto3.resource", return_value=mock_resource) as mock_boto_resource:
+        store = build_from_env()
+
+    mock_boto_resource.assert_called_once_with("dynamodb")
+    mock_resource.Table.assert_called_once_with("VipAdminSegmentFilterConfig")
+    assert isinstance(store, SegmentFilterConfigStore)
 
 
 def test_get_roundtrips_rules():

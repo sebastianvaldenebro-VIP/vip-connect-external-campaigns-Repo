@@ -29,6 +29,15 @@ describe('formatActivityEntry', () => {
       .toBe('Bucket "NJ/CT" completed — all_campaigns_done');
   });
 
+  it('formats bucket_completed with no bucketName', () => {
+    expect(formatActivityEntry(entry('bucket_completed', { bucketIndex: 1, bucketName: null, reason: 'all_campaigns_done' })))
+      .toBe('Bucket 2 completed — all_campaigns_done');
+  });
+
+  it('defaults a missing extra field to an empty object instead of throwing', () => {
+    expect(formatActivityEntry(entry('bucket_started', undefined))).toBe('Bucket NaN started');
+  });
+
   it('formats window_closed', () => {
     expect(formatActivityEntry(entry('window_closed', { reason: 'working_hours_cutoff' })))
       .toBe('Operating window closed — working_hours_cutoff');

@@ -1,5 +1,6 @@
 import os
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -73,6 +74,83 @@ def test_no_alarm_when_state_already_existed(monkeypatch):
     guard.lambda_handler(event, None)
 
     assert published == []
+
+
+def test_ignores_insert_records_missing_state_code_or_location(monkeypatch):
+    published = []
+
+    class FakeSns:
+        def publish(self, **kwargs):
+            published.append(kwargs)
+
+    monkeypatch.setattr(guard, "_sns_client", lambda: FakeSns())
+
+    missing_state = {
+        "eventName": "INSERT",
+        "dynamodb": {"NewImage": {"location": {"S": "NJ - Hoboken"}}},
+    }
+    missing_location = {
+        "eventName": "INSERT",
+        "dynamodb": {"NewImage": {"stateCode": {"S": "NJ"}}},
+    }
+    guard.lambda_handler({"Records": [missing_state, missing_location]}, None)
+
+    assert published == []
+
+
+def test_sns_client_constructs_and_caches_client():
+    guard._sns = None
+    fake_client = MagicMock()
+    with patch("boto3.client", return_value=fake_client) as mock_boto:
+        first = guard._sns_client()
+        second = guard._sns_client()
+    mock_boto.assert_called_once_with("sns")
+    assert first is fake_client
+    assert second is fake_client
+    guard._sns = None  # reset module singleton for other tests
+
+
+def test_table_constructs_and_caches_resource():
+    guard._ddb_table = None
+    fake_table = MagicMock()
+    fake_resource = MagicMock()
+    fake_resource.Table.return_value = fake_table
+    with patch("boto3.resource", return_value=fake_resource) as mock_boto:
+        first = guard._table()
+        second = guard._table()
+    mock_boto.assert_called_once_with("dynamodb")
+    fake_resource.Table.assert_called_once_with("VipLocationMapping")
+    assert first is fake_table
+    assert second is fake_table
+    guard._ddb_table = None  # reset module singleton for other tests
+
+
+class TestIsFirstOccurrenceOfState:
+    def test_returns_true_when_no_other_locations_have_this_state(self):
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {"Items": []}
+        with patch.object(guard, "_table", return_value=mock_table):
+            assert guard._is_first_occurrence_of_state("ZZ", {"ZZ - Townsville"}) is True
+
+    def test_returns_false_when_another_location_already_has_this_state(self):
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {"Items": [{"location": "NJ - Newark"}]}
+        with patch.object(guard, "_table", return_value=mock_table):
+            assert guard._is_first_occurrence_of_state("NJ", {"NJ - Hoboken"}) is False
+
+    def test_excludes_batch_sibling_locations_from_the_scan_result(self):
+        """A batch-sibling location that DOES appear in the scan result (since
+        it's already durably committed) must be excluded, not counted as
+        pre-existing evidence."""
+        mock_table = MagicMock()
+        mock_table.scan.return_value = {
+            "Items": [{"location": "ZZ - Townsville"}, {"location": "ZZ - Villageburg"}]
+        }
+        with patch.object(guard, "_table", return_value=mock_table):
+            result = guard._is_first_occurrence_of_state(
+                "ZZ", {"ZZ - Townsville", "ZZ - Villageburg"}
+            )
+        assert result is True
 
 
 def test_ignores_non_insert_events(monkeypatch):

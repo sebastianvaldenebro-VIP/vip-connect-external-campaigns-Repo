@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import sys
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
+import builders  # noqa: E402
 from builders import (  # noqa: E402
     _abbreviate,
     all_known_locations,
@@ -21,6 +22,7 @@ from builders import (  # noqa: E402
     get_all_location_groups,
     locations_for_state_codes,
     resolve_campaign_flow_arn,
+    resolve_journey_flow_arn,
 )
 
 # ── DynamoDB stub — used by all tests that touch the location mapping ──────────
@@ -88,6 +90,13 @@ def test_abbreviate_caps_at_4():
     assert _abbreviate("No Show Left Voicemail") == "NSLV"
 
 
+def test_abbreviate_returns_att_fallback_for_no_words():
+    """A category string with no alphabetic words at all (e.g. pure digits/
+    punctuation) falls back to the generic 'att' abbreviation."""
+    assert _abbreviate("123") == "att"
+    assert _abbreviate("") == "att"
+
+
 # ── build_attempts_part ───────────────────────────────────────────────────────
 
 
@@ -120,6 +129,15 @@ def test_attempts_part_mixed_types():
 
 def test_attempts_part_empty():
     assert build_attempts_part([]) == ""
+
+
+def test_attempts_part_falls_back_to_stripped_category_when_all_parts_have_digits():
+    """When splitting on '/' produces no part free of digits (e.g. a bare
+    "3rd Attempt" with no leading category label), the fallback strips the
+    digit-word out of the first part instead of leaving `category` as None."""
+    result = build_attempts_part(["3rd Attempt"])
+    # "3rd" is stripped, leaving "Attempt" as the category to abbreviate.
+    assert result == "Att-3"
 
 
 # ── locations_for_state_codes ─────────────────────────────────────────────────
@@ -386,6 +404,85 @@ def test_campaign_params_ignores_stored_flow_arn_in_config():
     assert "connectCampaignFlowArn" not in params
 
 
+def test_campaign_params_campaign_level_config_overrides_bucket_level():
+    """A v2 campaign's own campaignConfig must override the bucket-level one
+    for overlapping fields (e.g. a per-campaign dialingCapacity)."""
+    bucket = _campaign_bucket()
+    campaign = {
+        "campaignConfig": {
+            "queueId": "q-campaign-override",
+            "dialingCapacity": 2.5,
+        }
+    }
+    params = build_campaign_params(
+        bucket,
+        segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        start_time="2026-05-01T13:00:00Z",
+        end_time="2026-05-01T21:00:00Z",
+        campaign_name="test-campaign",
+        campaign=campaign,
+    )
+    telephony = params["channelSubtypeConfig"]["telephony"]
+    assert telephony["connectQueueId"] == "q-campaign-override"
+    assert telephony["capacity"] == 2.5
+    # contactFlowId/sourcePhoneNumber not overridden by the campaign — still
+    # come from the bucket-level config.
+    assert telephony["defaultOutboundConfig"]["connectContactFlowId"] == "cf-1"
+
+
+def test_campaign_params_journey_delivery_type_sets_type_and_limits_override():
+    bucket = _campaign_bucket()
+    params = build_campaign_params(
+        bucket,
+        segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        start_time="2026-05-01T13:00:00Z",
+        end_time="2026-05-01T21:00:00Z",
+        campaign_name="test-campaign",
+        delivery_type="journey",
+    )
+    assert params["type"] == "JOURNEY"
+    assert params["communicationLimitsOverride"] == {
+        "allChannelSubtypes": {"communicationLimitsList": []},
+        "instanceLimitsHandling": "OPT_IN",
+    }
+
+
+def test_campaign_params_campaign_delivery_type_omits_journey_fields():
+    bucket = _campaign_bucket()
+    params = build_campaign_params(
+        bucket,
+        segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        start_time="2026-05-01T13:00:00Z",
+        end_time="2026-05-01T21:00:00Z",
+        campaign_name="test-campaign",
+        delivery_type="campaign",
+    )
+    assert "type" not in params
+    assert "communicationLimitsOverride" not in params
+
+
+def test_campaign_params_ring_timeout_included_when_set():
+    bucket = _campaign_bucket()
+    bucket["campaignConfig"]["ringTimeout"] = 20
+    params = build_campaign_params(
+        bucket,
+        segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        start_time="2026-05-01T13:00:00Z",
+        end_time="2026-05-01T21:00:00Z",
+        campaign_name="test-campaign",
+    )
+    default_cfg = params["channelSubtypeConfig"]["telephony"]["defaultOutboundConfig"]
+    assert default_cfg["ringTimeout"] == 20
+
+
 # ── get_all_location_groups ───────────────────────────────────────────────────
 
 
@@ -508,6 +605,167 @@ def test_resolve_campaign_flow_arn_returns_none_when_create_and_retry_both_fail(
     with patch("builders.boto3.client", return_value=fake_client):
         arn = resolve_campaign_flow_arn(["PA"], "instance-id")
     assert arn is None
+
+
+def test_resolve_campaign_flow_arn_returns_none_when_retry_list_also_raises():
+    """If create fails AND the retry list_contact_flows call itself raises
+    (not just returns no match), the function must still fail closed (None),
+    not propagate the exception."""
+    fake_client = MagicMock()
+    fake_client.list_contact_flows.side_effect = [
+        {"ContactFlowSummaryList": []},  # initial list: no match
+        Exception("Connect unavailable"),  # retry list: raises
+    ]
+    fake_client.create_contact_flow.side_effect = Exception("DuplicateResourceException")
+
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+    assert arn is None
+
+
+def test_resolve_campaign_flow_arn_paginates_initial_list():
+    fake_client = MagicMock()
+    fake_client.list_contact_flows.side_effect = [
+        {
+            "ContactFlowSummaryList": [{"Name": "campaign-OTHER", "Arn": "arn:other"}],
+            "NextToken": "page-2",
+        },
+        {"ContactFlowSummaryList": [{"Name": "campaign-PA", "Arn": "arn:pa"}]},
+    ]
+
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_campaign_flow_arn(["PA"], "instance-id")
+
+    assert arn == "arn:pa"
+    assert fake_client.list_contact_flows.call_count == 2
+    second_call_kwargs = fake_client.list_contact_flows.call_args_list[1].kwargs
+    assert second_call_kwargs["NextToken"] == "page-2"
+
+
+# ── resolve_journey_flow_arn ──────────────────────────────────────────────────
+
+
+class _FakeConnectClientJourney:
+    def __init__(self, list_pages, version_pages=None, versions_side_effect=None):
+        self._list_pages = list(list_pages)
+        self._version_pages = list(version_pages or [])
+        self._versions_side_effect = versions_side_effect
+
+    def list_contact_flows(self, **kwargs):
+        return self._list_pages.pop(0) if self._list_pages else {"ContactFlowSummaryList": []}
+
+    def list_contact_flow_versions(self, **kwargs):
+        if self._versions_side_effect is not None:
+            raise self._versions_side_effect
+        return self._version_pages.pop(0) if self._version_pages else {"ContactFlowVersionSummaryList": []}
+
+
+def test_resolve_journey_flow_arn_returns_pinned_env_var(monkeypatch):
+    monkeypatch.setenv("JOURNEY_FLOW_ARN", "arn:pinned")
+    # boto3.client must never even be called when the env var short-circuits.
+    with patch("builders.boto3.client") as mock_client:
+        arn = resolve_journey_flow_arn("instance-id")
+    assert arn == "arn:pinned"
+    mock_client.assert_not_called()
+
+
+def test_resolve_journey_flow_arn_returns_none_when_not_found(monkeypatch):
+    monkeypatch.delenv("JOURNEY_FLOW_ARN", raising=False)
+    fake_client = _FakeConnectClientJourney(
+        list_pages=[{"ContactFlowSummaryList": []}]
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_journey_flow_arn("instance-id")
+    assert arn is None
+
+
+def test_resolve_journey_flow_arn_paginates_initial_list(monkeypatch):
+    monkeypatch.delenv("JOURNEY_FLOW_ARN", raising=False)
+    fake_client = _FakeConnectClientJourney(
+        list_pages=[
+            {
+                "ContactFlowSummaryList": [{"Name": "Other-Flow", "Arn": "arn:other"}],
+                "NextToken": "p2",
+            },
+            {
+                "ContactFlowSummaryList": [
+                    {"Name": builders._JOURNEY_FLOW_NAME, "Arn": "arn:aws:connect:us-east-1:1:instance/i/contact-flow/f1"}
+                ]
+            },
+        ],
+        version_pages=[{"ContactFlowVersionSummaryList": []}],
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_journey_flow_arn("instance-id")
+    # No versions found -> falls back to the base ARN.
+    assert arn == "arn:aws:connect:us-east-1:1:instance/i/contact-flow/f1"
+
+
+def test_resolve_journey_flow_arn_returns_latest_version_arn(monkeypatch):
+    monkeypatch.delenv("JOURNEY_FLOW_ARN", raising=False)
+    base_arn = "arn:aws:connect:us-east-1:1:instance/i/contact-flow/f1"
+    fake_client = _FakeConnectClientJourney(
+        list_pages=[
+            {"ContactFlowSummaryList": [{"Name": builders._JOURNEY_FLOW_NAME, "Arn": base_arn}]}
+        ],
+        version_pages=[
+            {
+                "ContactFlowVersionSummaryList": [
+                    {"Arn": f"{base_arn}:1", "Version": "1"},
+                    {"Arn": f"{base_arn}:3", "Version": "3"},
+                    {"Arn": f"{base_arn}:2", "Version": "2"},
+                ],
+                "NextToken": "vp2",
+            },
+            {"ContactFlowVersionSummaryList": []},
+        ],
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_journey_flow_arn("instance-id")
+    assert arn == f"{base_arn}:3"
+    assert fake_client.list_contact_flows  # sanity: didn't crash
+
+
+def test_resolve_journey_flow_arn_falls_back_to_base_arn_when_versions_api_fails(monkeypatch):
+    """list_contact_flow_versions failing must not raise — falls back to the
+    base ARN, logging via the structured logger (which conftest.py stubs as
+    a MagicMock, so it never itself raises here)."""
+    monkeypatch.delenv("JOURNEY_FLOW_ARN", raising=False)
+    base_arn = "arn:aws:connect:us-east-1:1:instance/i/contact-flow/f1"
+    fake_client = _FakeConnectClientJourney(
+        list_pages=[
+            {"ContactFlowSummaryList": [{"Name": builders._JOURNEY_FLOW_NAME, "Arn": base_arn}]}
+        ],
+        versions_side_effect=RuntimeError("AccessDeniedException"),
+    )
+    with patch("builders.boto3.client", return_value=fake_client):
+        arn = resolve_journey_flow_arn("instance-id")
+    assert arn == base_arn
+
+
+def test_resolve_journey_flow_arn_falls_back_to_bare_logger_when_structured_logger_also_fails(monkeypatch):
+    """If even the structured-logger error call itself raises, the bare
+    stdlib logger.error fallback must run instead — and the function still
+    returns the base ARN rather than propagating."""
+    monkeypatch.delenv("JOURNEY_FLOW_ARN", raising=False)
+    base_arn = "arn:aws:connect:us-east-1:1:instance/i/contact-flow/f1"
+    fake_client = _FakeConnectClientJourney(
+        list_pages=[
+            {"ContactFlowSummaryList": [{"Name": builders._JOURNEY_FLOW_NAME, "Arn": base_arn}]}
+        ],
+        versions_side_effect=RuntimeError("AccessDeniedException"),
+    )
+    failing_sl_module = MagicMock()
+    failing_sl_module.StructuredLogger.side_effect = RuntimeError("logger unavailable")
+    with (
+        patch("builders.boto3.client", return_value=fake_client),
+        patch.dict(
+            sys.modules,
+            {"vip_shared.infrastructure.telemetry.structured_logger": failing_sl_module},
+        ),
+    ):
+        arn = resolve_journey_flow_arn("instance-id")
+    assert arn == base_arn
 
 
 # ── campaign_to_segment_filters — maxLeadAgeMinutes passthrough (2026-08-28) ───
