@@ -241,8 +241,8 @@ def test_blocked_number_skips_dial_and_releases_lock():
 
         mock_opt_out.is_blocked.assert_called_once_with("+15551234567")
         mock_caller.dial.assert_not_called()
-        mock_queue.mark_outcome.assert_called_once_with(
-            "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1", "blocked_dnc"
+        mock_queue.mark_blocked.assert_called_once_with(
+            "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
         )
         mock_lock.release.assert_called_once_with(
             "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"

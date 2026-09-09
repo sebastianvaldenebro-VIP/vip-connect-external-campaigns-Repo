@@ -124,6 +124,35 @@ class CampaignQueue:
         except self._table.meta.client.exceptions.ConditionalCheckFailedException:
             pass  # already transitioned by another invocation — safe to ignore
 
+    def mark_blocked(self, campaign_id: str, sk: str) -> None:
+        """Terminal close for a DISPATCHING contact that will never be dialed.
+
+        Used when the opt-out gate blocks a contact after dequeue: mark_outcome()
+        alone only sets the `outcome` attribute and never advances `status`, so a
+        blocked contact stays DISPATCHING forever — never DONE, never PENDING.
+        Since _count_branded_queue (api-plans/executor.py) counts status IN
+        (PENDING, DISPATCHING) to decide when a branded campaign is finished, a
+        single stuck DISPATCHING contact means that count can never reach zero,
+        and the campaign only ends via the run_duration_minutes force-stop timeout
+        instead of a clean completion.
+
+        Writes status=DONE and outcome=blocked_dnc in one update, guarded by the
+        same status=DISPATCHING condition reset_to_pending() uses, so this only
+        fires while the contact is still in the state dequeue() left it in.
+        ConditionalCheckFailedException is swallowed — another invocation already
+        advanced this contact, so there is nothing left to do.
+        """
+        try:
+            self._table.update_item(
+                Key={"campaignId": campaign_id, "sk": sk},
+                UpdateExpression="SET #s = :done, #o = :outcome",
+                ConditionExpression=Attr("status").eq("DISPATCHING"),
+                ExpressionAttributeNames={"#s": "status", "#o": "outcome"},
+                ExpressionAttributeValues={":done": "DONE", ":outcome": "blocked_dnc"},
+            )
+        except self._table.meta.client.exceptions.ConditionalCheckFailedException:
+            pass  # already transitioned by another invocation — safe to ignore
+
     def mark_outcome(self, campaign_id: str, sk: str, outcome: str) -> None:
         """Persist call outcome on a DIALED item (idempotent).
 

@@ -98,6 +98,27 @@ def test_reset_to_pending_updates_status():
     assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
 
 
+def test_mark_blocked_writes_status_done_and_outcome():
+    q, table = _make_queue()
+    q.mark_blocked("campaign-1", "ts1#uuid1")
+    table.update_item.assert_called_once()
+    call_kwargs = table.update_item.call_args[1]
+    assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
+    assert "DONE" in str(call_kwargs["ExpressionAttributeValues"])
+    assert "blocked_dnc" in str(call_kwargs["ExpressionAttributeValues"])
+    # Must guard on the same status=DISPATCHING condition reset_to_pending() uses.
+    assert call_kwargs.get("ConditionExpression") is not None
+
+
+def test_mark_blocked_is_idempotent_on_conditional_check_failed():
+    """Contact already advanced past DISPATCHING by another invocation — must not raise."""
+    q, table = _make_queue()
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = Exception("ConditionalCheckFailed")
+    # Must not raise
+    q.mark_blocked("campaign-1", "ts1#uuid1")
+
+
 def test_get_phone_returns_phone():
     """Caller reads phone from DDB instead of SQS body — PHI stays out of the queue."""
     q, table = _make_queue()

@@ -140,13 +140,15 @@ def _process_message(body: dict) -> None:
             campaign_id,
             correlation_id,
         )
-        # Terminal state, not a retry candidate — reuses the outcome field rather
-        # than adding a new queue-state method for a number we will never dial.
+        # Terminal state, not a retry candidate — advances status to DONE (not just
+        # outcome) so this contact stops being counted as PENDING/DISPATCHING by
+        # _count_branded_queue, letting the branded campaign reach a real completion
+        # instead of being stuck until the run_duration_minutes force-stop timeout.
         try:
-            _get_queue().mark_outcome(campaign_id, contact_sk, "blocked_dnc")
+            _get_queue().mark_blocked(campaign_id, contact_sk)
         except Exception as e:
             logger.error(
-                "mark_outcome_failed_on_opt_out correlation_id=%s error=%s",
+                "mark_blocked_failed_on_opt_out correlation_id=%s error=%s",
                 correlation_id,
                 type(e).__name__,
             )
