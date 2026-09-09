@@ -269,6 +269,7 @@ export class ApiProgressiveDialerStack extends cdk.Stack {
         CAMPAIGN_QUEUE_TABLE: campaignQueueTable.tableName,
         AGENT_LOCK_TABLE: agentLockTable.tableName,
         FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
+        OPT_OUT_TABLE: 'VipConnectOptOutList',
       },
     });
     skipCheckovChecks(callerFn, [
