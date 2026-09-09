@@ -124,6 +124,33 @@ def test_fetch_phones_skips_profiles_without_phone_number():
     assert mock_cp.search_profiles.call_count == 3
 
 
+def test_get_table_constructs_and_caches_resource():
+    handler_seeder._ddb_table = None
+    fake_table = MagicMock()
+    fake_resource = MagicMock()
+    fake_resource.Table.return_value = fake_table
+    with patch("boto3.resource", return_value=fake_resource) as mock_boto:
+        first = handler_seeder._get_table()
+        second = handler_seeder._get_table()
+    mock_boto.assert_called_once_with("dynamodb")
+    fake_resource.Table.assert_called_once_with("test-table")
+    assert first is fake_table
+    assert second is fake_table
+    handler_seeder._ddb_table = None  # reset module singleton for other tests
+
+
+def test_get_cp_constructs_and_caches_client():
+    handler_seeder._cp_client = None
+    fake_client = MagicMock()
+    with patch("boto3.client", return_value=fake_client) as mock_boto:
+        first = handler_seeder._get_cp()
+        second = handler_seeder._get_cp()
+    mock_boto.assert_called_once_with("customer-profiles")
+    assert first is fake_client
+    assert second is fake_client
+    handler_seeder._cp_client = None  # reset module singleton for other tests
+
+
 def test_fetch_phones_empty_list():
     # _fetch_phones has an early-return guard — _get_cp() must never be called with empty input
     with patch("handler_seeder._get_cp") as mock_get_cp:
@@ -149,6 +176,13 @@ def test_lambda_handler_missing_campaign_id():
     resp = handler_seeder.lambda_handler(_api_event(), None)
     assert resp["statusCode"] == 400
     assert "missing campaign id" in json.loads(resp["body"])["error"]
+
+
+def test_lambda_handler_invalid_json_body_returns_400():
+    event = {"pathParameters": {"id": "camp-1"}, "body": "{not valid json"}
+    resp = handler_seeder.lambda_handler(event, None)
+    assert resp["statusCode"] == 400
+    assert "invalid JSON body" in json.loads(resp["body"])["error"]
 
 
 def test_lambda_handler_missing_segment_name():
@@ -189,6 +223,21 @@ def test_lambda_handler_access_denied_returns_403():
         )
     assert resp["statusCode"] == 403
     assert "access denied" in json.loads(resp["body"])["error"]
+
+
+def test_lambda_handler_unmapped_client_error_returns_500():
+    from botocore.exceptions import ClientError
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.side_effect = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "slow down"}},
+        "GetSegmentDefinition",
+    )
+    with patch("handler_seeder._get_cp", return_value=mock_cp):
+        resp = handler_seeder.lambda_handler(
+            _api_event("camp-1", {"segmentName": "some-seg"}), None
+        )
+    assert resp["statusCode"] == 500
+    assert "failed to read segment" in json.loads(resp["body"])["error"]
 
 
 # ---------------------------------------------------------------------------

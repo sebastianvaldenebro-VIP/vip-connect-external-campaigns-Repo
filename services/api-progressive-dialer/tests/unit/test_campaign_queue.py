@@ -59,6 +59,60 @@ def test_dequeue_skips_non_pending_items():
     assert contact.contact_uuid == "uuid2"
 
 
+def test_dequeue_retries_next_item_when_race_lost():
+    """Two Lambdas racing for the same PENDING item: the loser's conditional
+    update fails and dequeue must move on to try the next item instead of
+    raising or returning None."""
+    items = [
+        {"campaignId": "campaign-1", "sk": "ts1#uuid1", "contactUUID": "uuid1",
+         "phone": "+15551111111", "status": "PENDING"},
+        {"campaignId": "campaign-1", "sk": "ts2#uuid2", "contactUUID": "uuid2",
+         "phone": "+15552222222", "status": "PENDING"},
+    ]
+    q, table = _make_queue(items=items)
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = [Exception("lost the race"), {}]
+
+    contact = q.dequeue("campaign-1")
+
+    assert contact is not None
+    assert contact.contact_uuid == "uuid2"
+    assert table.update_item.call_count == 2
+
+
+def test_dequeue_paginates_across_query_pages():
+    """A first page with no PENDING items but a LastEvaluatedKey must be
+    followed to a second page before giving up."""
+    q, table = _make_queue()
+    table.query.side_effect = [
+        {
+            "Items": [
+                {"campaignId": "campaign-1", "sk": "ts0#uuid0", "contactUUID": "uuid0",
+                 "phone": "+15550000000", "status": "DISPATCHING"}
+            ],
+            "LastEvaluatedKey": {"campaignId": "campaign-1", "sk": "ts0#uuid0"},
+        },
+        {
+            "Items": [
+                {"campaignId": "campaign-1", "sk": "ts1#uuid1", "contactUUID": "uuid1",
+                 "phone": "+15551111111", "status": "PENDING"}
+            ]
+        },
+    ]
+    table.update_item.return_value = {}
+
+    contact = q.dequeue("campaign-1")
+
+    assert contact is not None
+    assert contact.contact_uuid == "uuid1"
+    assert table.query.call_count == 2
+    second_call_kwargs = table.query.call_args_list[1][1]
+    assert second_call_kwargs["ExclusiveStartKey"] == {
+        "campaignId": "campaign-1",
+        "sk": "ts0#uuid0",
+    }
+
+
 def test_mark_dialed_updates_status():
     q, table = _make_queue()
     q.mark_dialed("campaign-1", "ts1#uuid1", "contact-id-xyz")
@@ -96,6 +150,32 @@ def test_reset_to_pending_updates_status():
     call_kwargs = table.update_item.call_args[1]
     assert "PENDING" in str(call_kwargs["ExpressionAttributeValues"])
     assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
+
+
+def test_reset_to_pending_is_idempotent_on_conditional_check_failed():
+    """Another invocation already transitioned the item away from DISPATCHING —
+    reset_to_pending must swallow the conditional failure, not raise."""
+    q, table = _make_queue()
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = Exception("ConditionalCheckFailed")
+    q.reset_to_pending("campaign-1", "ts1#uuid1")  # must not raise
+
+
+def test_mark_outcome_writes_outcome_when_unset():
+    q, table = _make_queue()
+    q.mark_outcome("campaign-1", "ts1#uuid1", "voicemail")
+    call_kwargs = table.update_item.call_args[1]
+    assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
+    assert call_kwargs["ExpressionAttributeValues"] == {":o": "voicemail"}
+    assert call_kwargs["ConditionExpression"] == "attribute_not_exists(#o)"
+
+
+def test_mark_outcome_is_idempotent_when_already_set():
+    """A concurrent invocation already recorded the outcome — must not raise."""
+    q, table = _make_queue()
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = Exception("ConditionalCheckFailed")
+    q.mark_outcome("campaign-1", "ts1#uuid1", "answered")  # must not raise
 
 
 def test_get_phone_returns_phone():

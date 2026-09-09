@@ -22,6 +22,9 @@ htmlcov/
 venv/
 *.egg-info/
 
+# JS/TS coverage reports
+coverage/
+
 # Lambda build artifacts
 services/*/dist/
 services/*/.aws-sam/

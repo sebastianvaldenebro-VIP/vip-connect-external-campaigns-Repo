@@ -81,6 +81,41 @@ def test_get_estimate_in_progress_omits_count():
     assert "estimate" not in body
 
 
+def test_get_estimate_surfaces_status_code_when_present():
+    from handlers import estimate
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_estimate.return_value = {
+        "Status": "FAILED",
+        "StatusCode": "INTERNAL_FAILURE",
+    }
+
+    with patch("handlers.estimate.build_cp", return_value=mock_cp):
+        response = estimate.get_estimate(
+            _caller_event(), {"id": "seg-1", "estimateId": "e-1"}
+        )
+
+    body = json.loads(response["body"])
+    assert body["statusCode"] == "INTERNAL_FAILURE"
+
+
+def test_normalize_estimate_parses_dict_with_total_count():
+    from handlers import estimate
+
+    assert estimate._normalize_estimate({"TotalCount": 42}) == {"totalCount": 42}
+    assert estimate._normalize_estimate({"totalCount": 7}) == {"totalCount": 7}
+
+
+def test_normalize_estimate_returns_raw_when_unparseable():
+    from handlers import estimate
+
+    result = estimate._normalize_estimate("not-a-number")
+    assert result == {"totalCount": None, "raw": "not-a-number"}
+
+    result = estimate._normalize_estimate({"unrelated": "value"})
+    assert result == {"totalCount": None, "raw": {"unrelated": "value"}}
+
+
 def test_get_estimate_failed_surfaces_message():
     from handlers import estimate
 

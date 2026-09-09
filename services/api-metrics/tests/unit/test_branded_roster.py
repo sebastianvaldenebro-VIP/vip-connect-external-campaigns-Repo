@@ -65,6 +65,76 @@ def _mock_connect(user_data_list, agent_statuses):
     return mock
 
 
+def test_get_agent_roster_returns_503_when_instance_id_not_configured(monkeypatch):
+    from handlers import branded
+
+    monkeypatch.setattr(branded, "_CONNECT_INSTANCE_ID", "")
+    resp = branded.get_agent_roster({"queryStringParameters": {}}, {})
+    assert resp["statusCode"] == 503
+
+
+def test_active_contact_yields_on_call_effective_status():
+    from handlers import branded
+
+    ud = [
+        _user_data(
+            status_arn="arn:.../agent-status/s-avail",
+            status_name="Available",
+            contacts=[
+                {
+                    "AgentContactState": "CONNECTED",
+                    "StateStartTimestamp": "2026-08-11T09:59:00+00:00",
+                }
+            ],
+        )
+    ]
+    statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+
+    with patch("handlers.branded._connect", _mock_connect(ud, statuses)):
+        resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+    body = json.loads(resp["body"])
+    assert body["agents"][0]["effectiveStatus"] == "On Call"
+    assert body["agents"][0]["statusStartTimestamp"] == "2026-08-11T09:59:00+00:00"
+    assert body["agents"][0]["activeContactState"] == "CONNECTED"
+
+
+def test_get_agent_roster_returns_502_when_connect_call_raises():
+    from handlers import branded
+
+    mock = MagicMock()
+    mock.get_current_user_data.side_effect = RuntimeError("Connect unavailable")
+    statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+    mock.list_agent_statuses.return_value = {"AgentStatusSummaryList": statuses}
+
+    with patch("handlers.branded._connect", mock):
+        resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+    assert resp["statusCode"] == 502
+
+
+def test_hits_page_safety_bound_and_logs_warning_without_crashing():
+    """If a filter batch never stops returning a NextToken, the hardcoded
+    50-page safety bound must cut it off (and log) rather than looping
+    forever."""
+    from handlers import branded
+
+    mock = MagicMock()
+    # Every page includes a NextToken — would loop forever without the bound.
+    mock.get_current_user_data.return_value = {
+        "UserDataList": [],
+        "NextToken": "always-more",
+    }
+    statuses = [{"Id": "s-avail", "Name": "Available", "Type": "ROUTABLE"}]
+    mock.list_agent_statuses.return_value = {"AgentStatusSummaryList": statuses}
+
+    with patch("handlers.branded._connect", mock):
+        resp = branded.get_agent_roster({"queryStringParameters": {"queueId": "q-1"}}, {})
+
+    assert resp["statusCode"] == 200
+    assert mock.get_current_user_data.call_count == 50  # _MAX_PAGES_PER_BATCH
+
+
 class TestStatusTypeResolution:
     """StatusType must come from ListAgentStatuses (keyed by StatusArn), not from
     a field GetCurrentUserData never returns.

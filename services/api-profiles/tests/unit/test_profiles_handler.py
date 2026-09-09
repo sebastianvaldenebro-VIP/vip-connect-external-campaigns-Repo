@@ -107,6 +107,33 @@ def test_batch_get_returns_serialized_profiles():
     assert body["errors"] == []
 
 
+def test_get_profile_returns_serialized_profile_when_found():
+    from handlers import profiles
+
+    mock_cp = MagicMock()
+    mock_cp.batch_get_profile.return_value = {
+        "Profiles": [
+            {
+                "ProfileId": "p-1",
+                "FirstName": "Alex",
+                "LastName": "Doe",
+                "EmailAddress": "alex.doe@example.com",
+                "PhoneNumber": "+15125550100",
+                "Attributes": {},
+            }
+        ],
+        "Errors": [],
+    }
+
+    with patch("handlers.profiles.build_cp", return_value=mock_cp):
+        response = profiles.get_profile(_event(), {"profileId": "p-1"})
+
+    body = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert body["profile"]["profileId"] == "p-1"
+    assert body["profile"]["email"] == "alex.doe@example.com"
+
+
 def test_get_profile_returns_404_when_not_found():
     from handlers import profiles
 
@@ -148,6 +175,26 @@ def test_list_objects_respects_custom_object_type():
     call_kwargs = mock_cp.list_profile_objects.call_args.kwargs
     assert call_kwargs["object_type_name"] == "custom-ot"
     assert call_kwargs["max_results"] == 5
+
+
+def test_list_calculated_attrs():
+    from handlers import profiles
+
+    mock_cp = MagicMock()
+    mock_cp.list_calculated_attributes_for_profile.return_value = {
+        "Items": [{"Name": "total_contacts", "Value": "3"}]
+    }
+
+    with patch("handlers.profiles.build_cp", return_value=mock_cp):
+        response = profiles.list_calculated_attrs(_event(), {"profileId": "p-1"})
+
+    body = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert body["profileId"] == "p-1"
+    assert body["calculatedAttributes"] == [{"Name": "total_contacts", "Value": "3"}]
+    mock_cp.list_calculated_attributes_for_profile.assert_called_once_with(
+        profile_id="p-1"
+    )
 
 
 def test_get_calculated_attr():
