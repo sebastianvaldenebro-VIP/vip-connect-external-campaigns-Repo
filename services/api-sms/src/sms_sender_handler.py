@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 
 import boto3
 
+from vip_shared.infrastructure.persistence.opt_out import (
+    build_from_env as build_opt_out_from_env,
+)
 from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
 
 _logger = StructuredLogger(service="api-sms-sender")
@@ -32,6 +35,7 @@ _TTL_SECONDS = 30 * 24 * 3600  # 30 days
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
 _cp = boto3.client("customer-profiles")
+_opt_out = build_opt_out_from_env()
 
 # US 10-digit numbers in E.164 format only
 _E164_RE = re.compile(r"^\+1\d{10}$")
@@ -98,12 +102,16 @@ def lambda_handler(event: dict, context: object) -> dict:
     # invisible, and never retried.
     enqueued = 0
     failed = 0
+    opted_out = 0
     queue_table = _ddb.Table(_QUEUE_TABLE)
     sqs_batch: list[dict] = []
     ddb_items_by_id: dict[str, dict] = {}
 
     for phone in phones:
         if not _E164_RE.match(phone):
+            continue
+        if _opt_out.is_blocked(phone):
+            opted_out += 1
             continue
         item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
         entry_id = uuid.uuid4().hex[:8]
@@ -149,11 +157,16 @@ def lambda_handler(event: dict, context: object) -> dict:
         enqueued += batch_ok
         failed += batch_failed
 
-    # Update enqueued/failed counts
+    # Update enqueued/failed/opted-out counts
     _ddb.Table(_RUNS_TABLE).update_item(
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
-        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, updatedAt = :t",
-        ExpressionAttributeValues={":n": enqueued, ":f": failed, ":t": now_iso},
+        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, totalOptedOut = :o, updatedAt = :t",
+        ExpressionAttributeValues={
+            ":n": enqueued,
+            ":f": failed,
+            ":o": opted_out,
+            ":t": now_iso,
+        },
     )
 
     _logger.info(

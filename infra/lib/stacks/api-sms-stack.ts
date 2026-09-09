@@ -164,6 +164,7 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,
         SMS_SQS_QUEUE_URL: this.smsSendQueue.queueUrl,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
+        OPT_OUT_TABLE: 'VipConnectOptOutList',
       },
     });
     skipCheckovChecks(this.smsSenderFunction, [VPC_SKIP]);
