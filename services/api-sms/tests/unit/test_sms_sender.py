@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
-from unittest.mock import MagicMock, call, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
@@ -79,8 +76,6 @@ def test_sender_enqueues_valid_e164_phones():
 
     assert result["enqueued"] == 1
     mock_sqs.send_message_batch.assert_called()
-    call_args = mock_sqs.send_message_batch.call_args
-    entries = call_args.kwargs.get("Entries") or call_args.args[0] if call_args.args else call_args.kwargs.get("Entries")
 
 
 def test_sender_skips_invalid_phone_formats():
