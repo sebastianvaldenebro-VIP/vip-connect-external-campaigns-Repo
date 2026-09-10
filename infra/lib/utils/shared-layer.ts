@@ -1,7 +1,7 @@
 import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as path from 'path';
-import { spawnSync } from 'node:child_process';
+import { buildBundledPythonCode } from './python-bundling';
 
 /**
  * Build a per-stack copy of the shared vip_shared layer.
@@ -21,59 +21,10 @@ export function buildSharedLayer(scope: Construct, id = 'SharedLayer'): lambda.L
     layerVersionName: undefined, // let CFN generate per-stack unique names
     compatibleRuntimes: [lambda.Runtime.PYTHON_3_12],
     description: 'vip_shared domain + infrastructure + deps',
-    code: lambda.Code.fromAsset(sharedRoot, {
-      bundling: {
-        image: lambda.Runtime.PYTHON_3_12.bundlingImage,
-        command: [
-          'bash',
-          '-c',
-          [
-            'mkdir -p /asset-output/python',
-            'cp -r /asset-input/python/. /asset-output/python/',
-            'pip install -r /asset-input/requirements.txt -t /asset-output/python --no-cache-dir',
-          ].join(' && '),
-        ],
-        // Prefer native pip when available — avoids the Docker round-trip and
-        // works on dev machines without Docker Desktop. Falls back to the
-        // image above if pip isn't on PATH. Using spawnSync (no shell) so
-        // paths are passed as argv, not interpolated.
-        local: {
-          tryBundle(outputDir: string): boolean {
-            if (spawnSync('pip', ['--version'], { stdio: 'ignore' }).status !== 0) {
-              return false;
-            }
-            // outputDir is a temp directory CDK's own asset-bundling framework
-            // creates and passes to this callback at `cdk synth`/`deploy` time
-            // -- build-time tooling, not a request-handling path. No external
-            // or attacker-controlled input reaches this join. Verified 2026-09-08.
-            // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-            const outputPython = path.join(outputDir, 'python');
-            const inputPython = path.join(sharedRoot, 'python');
-            const requirements = path.join(sharedRoot, 'requirements.txt');
-            const steps: Array<[string, string[]]> = [
-              ['mkdir', ['-p', outputPython]],
-              ['cp', ['-r', `${inputPython}/.`, outputPython]],
-              [
-                'pip',
-                [
-                  'install',
-                  '-r',
-                  requirements,
-                  '-t',
-                  outputPython,
-                  '--no-cache-dir',
-                  '--quiet',
-                ],
-              ],
-            ];
-            for (const [cmd, args] of steps) {
-              const result = spawnSync(cmd, args, { stdio: 'inherit' });
-              if (result.status !== 0) return false;
-            }
-            return true;
-          },
-        },
-      },
+    code: buildBundledPythonCode({
+      assetRoot: sharedRoot,
+      srcSubdir: 'python',
+      outputSubdir: 'python',
     }),
   });
 }

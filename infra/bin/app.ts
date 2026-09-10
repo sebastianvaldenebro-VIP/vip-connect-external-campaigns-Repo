@@ -7,6 +7,8 @@ import { ApiMetricsStack } from '../lib/stacks/api-metrics-stack';
 import { ApiProgressiveDialerStack } from '../lib/stacks/api-progressive-dialer-stack';
 import { ApiPlansStack } from '../lib/stacks/api-plans-stack';
 import { ApiProfilesStack } from '../lib/stacks/api-profiles-stack';
+import { ApiDenyListStack } from '../lib/stacks/api-deny-list-stack';
+import { ApiAuthorizerStack } from '../lib/stacks/api-authorizer-stack';
 import { ApiSegmentsStack } from '../lib/stacks/api-segments-stack';
 import { ApiStack } from '../lib/stacks/api-stack';
 import { AuthStack } from '../lib/stacks/auth-stack';
@@ -209,23 +211,46 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
   permissionsBoundaryName,
 });
 
-// 10. API Gateway fronting all 5 Lambdas with Cognito JWT Authorizer
+// 9. api-deny-list Lambda — manual "block this number" entry, backs the
+// existing vip-connect-deny-list table (owned by Connect-batch-redis-refactor's
+// Quick Connect Lambdas, not by this app).
+const denyList = new ApiDenyListStack(app, 'VipAdminApiDenyListStack', {
+  env,
+  description: 'api-deny-list Lambda — manual blocked-number entry portal',
+  adminAuditTable: data.adminAuditTable,
+  dataKey: data.dataKey,
+  permissionsBoundaryName,
+});
+
+// 9b. Custom Lambda authorizer — Cognito-group-based per-route authorization.
+// Deployed separately from ApiStack so an authorizer-only change (or a
+// rollback) doesn't touch the HTTP API / route resources at all.
+const apiAuthorizer = new ApiAuthorizerStack(app, 'VipAdminApiAuthorizerStack', {
+  env,
+  description: 'Custom Lambda authorizer — Cognito Admin/Agent group enforcement per route',
+  dataKey: data.dataKey,
+  userPool: auth.userPool,
+  userPoolClient: auth.userPoolClient,
+  permissionsBoundaryName,
+});
+
+// 10. API Gateway fronting all 7 Lambdas with the custom Lambda authorizer
 const corsAllowOrigins = (app.node.tryGetContext('corsAllowOrigins') as string[]) ?? [
   'http://localhost:5173',
 ];
 
 new ApiStack(app, 'VipAdminApiStack', {
   env,
-  description: 'API Gateway HTTP API + Cognito JWT Authorizer fronting admin Lambdas',
+  description: 'API Gateway HTTP API + custom Lambda authorizer (Cognito group-based) fronting admin Lambdas',
   dataKey: data.dataKey,
-  userPool: auth.userPool,
-  userPoolClient: auth.userPoolClient,
+  authorizer: apiAuthorizer.authorizer,
   segmentsFunction: segments.lambdaFunction,
   campaignsFunction: campaigns.lambdaFunction,
   metricsFunction: metrics.lambdaFunction,
   profilesFunction: profiles.lambdaFunction,
   plansFunction: plans.lambdaFunction,
   progressiveDialerSeedFunction: progressiveDialer.seederFunction,
+  denyListFunction: denyList.lambdaFunction,
   corsAllowOrigins,
   permissionsBoundaryName,
 });

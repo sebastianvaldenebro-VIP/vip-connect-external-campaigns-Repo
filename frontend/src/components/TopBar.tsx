@@ -20,7 +20,7 @@ function initialsFor(username: string): string {
 
 export function TopBar(): ReactNode {
   const location = useLocation();
-  const { user } = useAuth();
+  const { user, groups, loading: authLoading } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const [now, setNow] = useState(() => new Date());
 
@@ -29,12 +29,20 @@ export function TopBar(): ReactNode {
     return () => clearInterval(id);
   }, []);
 
+  // /metrics/branded/agents is Admin-only under the Lambda authorizer — an
+  // Agent-group user polling it every 20s would just accumulate recurring
+  // background 403s for the life of the tab. Wait for groups to load before
+  // deciding (default false while loading, not true) so an Agent's very
+  // first render doesn't fire one avoidable request either.
+  const isAdmin = groups.includes('Admin');
+
   // Same query key AgentAvailabilityPanel.tsx already uses — React Query
   // dedupes the network call when both are mounted on the same page.
   const agentQuery = useQuery({
     queryKey: ['agent-roster', 'all'],
     queryFn: () => api.brandedMonitor.getAgentRoster(),
     refetchInterval: 20_000,
+    enabled: !authLoading && isAdmin,
   });
   const alertCount = totalActiveAlerts(agentQuery.data?.agents ?? []);
 
