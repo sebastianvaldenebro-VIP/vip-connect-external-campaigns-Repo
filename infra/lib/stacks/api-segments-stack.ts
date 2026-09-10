@@ -261,7 +261,6 @@ export class ApiSegmentsStack extends cdk.Stack {
       logGroup,
       reservedConcurrentExecutions: 10,
       environmentEncryption: props.dataKey,
-      deadLetterQueue: dlq,
       vpc,
       vpcSubnets: {
         subnets: props.redisVpc.subnetIds.map((sid, i) =>
@@ -287,6 +286,23 @@ export class ApiSegmentsStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-segments',
       },
     });
+
+    // deadLetterQueue prop intentionally omitted above: it would call
+    // dlq.grantSendMessage(role), and role is a CDK-managed iam.Role (not an
+    // import) — CDK would try to PutRolePolicy on FunctionRoleDefaultPolicy,
+    // which EngineeringPermissionBoundary explicitly denies for the CFN exec
+    // role (confirmed 2026-09-09). Set DeadLetterConfig via the L1 escape
+    // hatch instead — same CFN property, no grant call. Granted manually via
+    // a separate inline policy CDK never touches (same pattern as
+    // events-list-rules-cli / BrandedMetricsHistoryRead elsewhere in this repo):
+    //   aws iam put-role-policy --role-name <FunctionRole physical name> \
+    //     --policy-name dlq-send-message --policy-document '{"Version":
+    //     "2012-10-17","Statement":[{"Sid":"DlqSendMessage","Effect":"Allow",
+    //     "Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:165505826690:
+    //     vip-admin-ui-api-segments-dlq"}]}'
+    (this.lambdaFunction.node.defaultChild as lambda.CfnFunction).deadLetterConfig = {
+      targetArn: dlq.queueArn,
+    };
 
     // #003 — inject Redis AUTH secret ARN when configured
     if (props.redis.passwordSecretArn) {

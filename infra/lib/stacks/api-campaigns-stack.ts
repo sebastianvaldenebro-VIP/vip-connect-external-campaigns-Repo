@@ -153,7 +153,6 @@ export class ApiCampaignsStack extends cdk.Stack {
       logGroup,
       reservedConcurrentExecutions: 10,
       environmentEncryption: props.dataKey,
-      deadLetterQueue: dlq,
       environment: {
         CONNECT_INSTANCE_ID: props.connectInstanceId,
         AWS_ACCOUNT_ID: this.account,
@@ -165,6 +164,17 @@ export class ApiCampaignsStack extends cdk.Stack {
       },
     });
     skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
+
+    // deadLetterQueue prop intentionally omitted above — see api-segments-stack.ts
+    // for the full explanation. Granted manually via a separate inline policy:
+    //   aws iam put-role-policy --role-name <FunctionRole physical name> \
+    //     --policy-name dlq-send-message --policy-document '{"Version":
+    //     "2012-10-17","Statement":[{"Sid":"DlqSendMessage","Effect":"Allow",
+    //     "Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:165505826690:
+    //     vip-admin-ui-api-campaigns-dlq"}]}'
+    (this.lambdaFunction.node.defaultChild as lambda.CfnFunction).deadLetterConfig = {
+      targetArn: dlq.queueArn,
+    };
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
   }

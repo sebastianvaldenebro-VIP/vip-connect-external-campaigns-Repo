@@ -452,7 +452,6 @@ export class ApiPlansStack extends cdk.Stack {
       logGroup,
       reservedConcurrentExecutions: 5,
       environmentEncryption: props.dataKey,
-      deadLetterQueue: dlq,
       vpc,
       vpcSubnets: {
         subnets: props.redisVpc.subnetIds.map((sid, i) =>
@@ -480,6 +479,17 @@ export class ApiPlansStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-plans',
       },
     });
+
+    // deadLetterQueue prop intentionally omitted above — see api-segments-stack.ts
+    // for the full explanation. Granted manually via a separate inline policy:
+    //   aws iam put-role-policy --role-name <FunctionRole physical name> \
+    //     --policy-name dlq-send-message --policy-document '{"Version":
+    //     "2012-10-17","Statement":[{"Sid":"DlqSendMessage","Effect":"Allow",
+    //     "Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:165505826690:
+    //     vip-admin-ui-api-plans-dlq"}]}'
+    (this.lambdaFunction.node.defaultChild as lambda.CfnFunction).deadLetterConfig = {
+      targetArn: dlq.queueArn,
+    };
 
     // Hardcoded ARN to avoid CDK circular dependency — same pattern as the
     // schedulerRole policy below. functionArn token creates a cycle.
@@ -614,7 +624,8 @@ export class ApiPlansStack extends cdk.Stack {
         //   aws iam put-role-policy --role-name vip-location-onboarding-guard-role \
         //     --policy-name location-onboarding-guard-dlq --policy-document \
         //     '{"Version":"2012-10-17","Statement":[{"Sid":"OnFailureDlq",
-        //     "Effect":"Allow","Action":"sqs:SendMessage","Resource":"<DeadLetterQueue arn from `cdk synth` output>"}]}'
+        //     "Effect":"Allow","Action":"sqs:SendMessage","Resource":
+        //     "arn:aws:sqs:us-east-1:165505826690:vip-admin-ui-api-plans-dlq"}]}'
         environment: {
           SNS_ALERTS_TOPIC_ARN: alertsTopic.topicArn,
           LOCATION_MAPPING_TABLE: 'VipLocationMapping',
