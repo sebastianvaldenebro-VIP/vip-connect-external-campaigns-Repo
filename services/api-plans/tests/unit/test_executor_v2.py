@@ -7206,7 +7206,7 @@ class TestSmsReconcile:
             "name": "SMS Reconcile Test",
             "deliveryType": "sms",
             "campaignConfig": {
-                "smsMessageTemplate": "Hello {{firstName}}",
+                "smsMessageTemplate": "Hello {{FirstName}}",
                 "smsOriginationNumberArn": "arn:aws:sms-voice:us-east-1:123:phone-number-id/abc",
                 "smsOriginationNumber": "+18885550100",
             },

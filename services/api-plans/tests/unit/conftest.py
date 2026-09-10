@@ -1,9 +1,40 @@
 """Shared pytest fixtures for api-plans unit tests."""
 
+import importlib.util
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# handlers/plans.py's _validate_sms_campaign (Task 3, precall SMS personalization)
+# needs vip_shared.domain.services.sms_template's REAL ALLOWED_FIELDS/
+# extract_placeholders/max_rendered_length — a generic MagicMock stub (like the
+# blind-stub loop below) would make every template look like it has an unknown
+# placeholder, since Mock's `__sub__`/`__bool__` don't implement real set
+# semantics.
+#
+# Load the real module from its file directly (bypassing the normal package
+# import machinery, which would otherwise need `vip_shared`/`vip_shared.domain`
+# to be real packages too — they're not; see the blind-stub loop below) and
+# register it under its exact dotted name. Python's import system resolves a
+# fully-qualified name straight out of sys.modules before ever consulting a
+# parent package's __path__, so this works regardless of what `vip_shared`
+# itself is stubbed to, and regardless of collection order — this must run
+# before any test file imports handlers.plans, hence living here rather than in
+# one test file.
+_SMS_TEMPLATE_MODULE_NAME = "vip_shared.domain.services.sms_template"
+if _SMS_TEMPLATE_MODULE_NAME not in sys.modules:
+    _sms_template_path = os.path.join(
+        os.path.dirname(__file__),
+        "../../../shared/python/vip_shared/domain/services/sms_template.py",
+    )
+    _spec = importlib.util.spec_from_file_location(
+        _SMS_TEMPLATE_MODULE_NAME, _sms_template_path
+    )
+    _sms_template_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_sms_template_module)
+    sys.modules[_SMS_TEMPLATE_MODULE_NAME] = _sms_template_module
 
 # Permanent (never reverted) blind stub for vip_shared's submodule tree.
 #

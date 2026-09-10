@@ -231,11 +231,15 @@ def test_url_blocked():
 
 
 def test_double_brace_placeholder_blocked():
+    """Stays rejected after the allowlist narrowing: the allowlist is
+    case-sensitive ("FirstName"), so lowercase "firstName" is not an allowed
+    field — this is deliberate case-sensitivity, not an oversight to "fix"."""
     errors = _validate(_campaign(template="Hello {{firstName}}, your appointment is ready."), "b", 0)
     assert any("PHI" in e or "placeholder" in e for e in errors)
 
 
 def test_dollar_brace_placeholder_blocked():
+    """${...} stays banned outright — no renderer supports it, unlike {{...}}."""
     errors = _validate(_campaign(template="Hello ${firstName}, your appointment is ready."), "b", 0)
     assert any("PHI" in e or "placeholder" in e for e in errors)
 
@@ -243,3 +247,60 @@ def test_dollar_brace_placeholder_blocked():
 def test_generic_template_with_year_only_passes():
     errors = _validate(_campaign(template="Your 2026 plan benefits are active. Reply STOP to opt out."), "b", 0)
     assert errors == []
+
+
+# ── Task 3: placeholder allowlist narrowing (renderer now exists) ────────────
+
+
+def test_allowlisted_placeholders_are_accepted():
+    errors = _validate(
+        _campaign(
+            template="Hi {{FirstName}}! This is {{ClinicName}}, calling shortly."
+        ),
+        "b",
+        0,
+    )
+    assert errors == []
+
+
+def test_non_allowlisted_placeholder_is_rejected_by_name():
+    errors = _validate(
+        _campaign(template="Your {{Diagnosis}} result is ready."), "b", 0
+    )
+    assert any("Diagnosis" in e for e in errors)
+
+
+def test_lastname_is_not_allowlisted():
+    errors = _validate(_campaign(template="Hi {{FirstName}} {{LastName}}!"), "b", 0)
+    assert any("LastName" in e for e in errors)
+
+
+def test_dollar_brace_syntax_stays_banned():
+    """No renderer supports ${...}; it can only be a mistake."""
+    errors = _validate(_campaign(template="Hi ${FirstName}!"), "b", 0)
+    assert errors != []
+
+
+def test_other_phi_patterns_still_enforced_alongside_placeholders():
+    """Narrowing the placeholder rule must not weaken the eight non-placeholder
+    patterns (SSN, email, dates, long numeric IDs, URLs, clinical terms, ...)."""
+    for bad in (
+        "Hi {{FirstName}}, ssn 123-45-6789",
+        "Hi {{FirstName}}, see https://x.co",
+        "Hi {{FirstName}}, your diagnosis is ready",
+        "Hi {{FirstName}}, acct 12345678",
+        "Hi {{FirstName}}, on 01/02/2026",
+    ):
+        assert _validate(_campaign(template=bad), "b", 0) != [], bad
+
+
+def test_length_is_measured_on_the_rendered_worst_case():
+    """158 raw chars passes a raw check but renders to 165, over the ceiling.
+
+    "Hi {{FirstName}}! " is 18 chars, of which the placeholder is 13; at the
+    20-char name budget the prefix becomes 25, so 25 + 140 = 165 > 160.
+    A raw len() check would have accepted this template.
+    """
+    tmpl = "Hi {{FirstName}}! " + "x" * 140
+    errors = _validate(_campaign(template=tmpl), "b", 0)
+    assert any("160" in e for e in errors)

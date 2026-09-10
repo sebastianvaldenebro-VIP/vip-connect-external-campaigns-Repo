@@ -504,6 +504,12 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
     """Return validation errors for an SMS campaign's required config fields + PHI guard."""
     import re as _re
 
+    from vip_shared.domain.services.sms_template import (
+        ALLOWED_FIELDS,
+        extract_placeholders,
+        max_rendered_length,
+    )
+
     errors = []
     cfg = campaign.get("campaignConfig") or {}
     prefix = f"bucket '{bucket_name}' campaign[{ci}]"
@@ -511,11 +517,33 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
     tmpl = cfg.get("smsMessageTemplate", "")
     if not tmpl:
         errors.append(f"{prefix}: deliveryType='sms' requires campaignConfig.smsMessageTemplate")
-    elif len(tmpl) > 160:
-        errors.append(
-            f"{prefix}: smsMessageTemplate must be ≤160 chars (got {len(tmpl)})"
-        )
     else:
+        # Placeholder policy: a NAMED ALLOWLIST, not a blanket ban.
+        # The blanket {{...}} ban existed partly because no renderer existed —
+        # sms_processor_handler passes the template verbatim to EUM, so a
+        # placeholder would reach the patient as literal braces. That renderer now
+        # exists (vip_shared.domain.services.sms_template), so the ban narrows to
+        # "only these fields". Everything else stays blocked, and ${...} stays
+        # banned outright because no renderer supports it.
+        unknown = extract_placeholders(tmpl) - ALLOWED_FIELDS
+        if unknown:
+            errors.append(
+                f"{prefix}: smsMessageTemplate uses non-allowlisted placeholder(s) "
+                f"{sorted(unknown)}. Allowed: {sorted(ALLOWED_FIELDS)}."
+            )
+        else:
+            # Only computable once every placeholder is allowlisted —
+            # max_rendered_length (via render()) raises ValueError on an unknown
+            # placeholder, so this must run after the allowlist check above, not
+            # before it, or a rejected template would crash validation instead
+            # of reporting cleanly.
+            rendered_len = max_rendered_length(tmpl, campaign=cfg)
+            if rendered_len > 160:
+                errors.append(
+                    f"{prefix}: smsMessageTemplate must render to ≤160 chars "
+                    f"(worst case {rendered_len})"
+                )
+
         # Active PHI detection — block templates with identifiable information
         _PHI_PATTERNS = [
             (_re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "SSN-like number"),
@@ -525,14 +553,18 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
             (_re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "ISO date (possible DOB)"),
             (_re.compile(r"\b\d{7,}\b"), "long numeric ID (possible MRN/account)"),
             (_re.compile(r"https?://"), "URL"),
-            (_re.compile(r"\{\{[^}]+\}\}"), "template placeholder"),
             (_re.compile(r"\$\{[^}]+\}"), "template placeholder"),
             (
                 _re.compile(r"\b(?:diagnosis|dx|condition|prescribed|medication)\b", _re.IGNORECASE),
                 "clinical term",
             ),
         ]
-        violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(tmpl)]
+        # Run the remaining PHI patterns against the template with placeholders
+        # stripped, so an allowlisted placeholder cannot itself trip a pattern
+        # (e.g. the clinical-term regex) while real violations elsewhere in the
+        # copy still do.
+        scannable = _re.sub(r"\{\{[^}]+\}\}", "", tmpl)
+        violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(scannable)]
         if violations:
             errors.append(
                 f"{prefix}: smsMessageTemplate may contain PHI — detected: "

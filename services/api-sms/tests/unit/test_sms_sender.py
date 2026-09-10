@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -26,18 +27,22 @@ def _load_handler():
             return sms_sender_handler
 
 
-def _base_event() -> dict:
-    return {
+def _base_event(message_template: str | None = None, clinic_name: str | None = None) -> dict:
+    event = {
         "campaignId": "cmp-test-1",
         "planId": "plan-1",
         "runId": "run-1",
         "planName": "Test Plan",
         "segmentArn": "arn:aws:profile:us-east-1:123:domains/test/segment-definitions/seg-1",
         "segmentName": "seg-1",
-        "messageTemplate": "Your appointment is confirmed. Reply STOP to opt out.",
+        "messageTemplate": message_template
+        or "Your appointment is confirmed. Reply STOP to opt out.",
         "originationNumberArn": "arn:aws:sms-voice:us-east-1:123:phone-number/p-1",
         "originationNumber": "+15125551111",
     }
+    if clinic_name is not None:
+        event["clinicName"] = clinic_name
+    return event
 
 
 def _make_mock_cp(phone_ids: list[str] = None, phones: list[str] = None):
@@ -52,6 +57,30 @@ def _make_mock_cp(phone_ids: list[str] = None, phones: list[str] = None):
         "Profiles": [{"PhoneNumber": p} for p in phones],
     }
     return cp
+
+
+def _make_mock_cp_profiles(profiles: list[dict]):
+    """Build a mock CP client whose segment membership + BatchGetProfile return
+    the exact given profile dicts (e.g. {"PhoneNumber": ..., "FirstName": ...}),
+    unlike _make_mock_cp which only carries a phone number."""
+    ids = [f"profile-{i:03d}" for i in range(len(profiles))]
+    cp = MagicMock()
+    cp.get_segment_membership.return_value = {"Profiles": ids}
+    cp.batch_get_profile.return_value = {"Profiles": profiles}
+    return cp
+
+
+def _mock_ddb():
+    """A DDB mock whose .Table(name) returns one consistent MagicMock per name,
+    so callers can inspect e.g. put_item calls on a specific table by name."""
+    tables: dict[str, MagicMock] = {}
+
+    def _table(name):
+        return tables.setdefault(name, MagicMock())
+
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = _table
+    return mock_ddb
 
 
 def test_sender_enqueues_valid_e164_phones():
@@ -581,3 +610,147 @@ def test_sender_no_phi_in_print_calls():
     assert all_calls, "expected at least one log call"
     for logged_call in all_calls:
         assert "+15125559876" not in str(logged_call)
+
+
+# ── Task 3: template personalization (renderer wired into the sender) ────────
+
+
+def test_sender_renders_first_name_per_recipient():
+    handler = _load_handler()
+    sent_bodies = []
+    mock_sqs = MagicMock()
+    mock_sqs.send_message_batch.side_effect = lambda **kw: (
+        sent_bodies.extend(json.loads(e["MessageBody"]) for e in kw["Entries"]),
+        {"Failed": []},
+    )[1]
+
+    mock_cp = _make_mock_cp_profiles(
+        [
+            {"PhoneNumber": "+12125551234", "FirstName": "Maria"},
+            {"PhoneNumber": "+12125555678", "FirstName": "Jose"},
+        ]
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", _mock_ddb()),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        handler.lambda_handler(
+            _base_event(
+                message_template="Hi {{FirstName}}! This is {{ClinicName}}.",
+                clinic_name="VIP Medical Group",
+            ),
+            None,
+        )
+
+    bodies = sorted(b["messageTemplate"] for b in sent_bodies)
+    assert bodies == [
+        "Hi Jose! This is VIP Medical Group.",
+        "Hi Maria! This is VIP Medical Group.",
+    ]
+
+
+def test_sender_never_writes_a_rendered_body_to_dynamo():
+    """The queue item must stay body-free — it is the long-lived record."""
+    handler = _load_handler()
+
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp_profiles(
+        [{"PhoneNumber": "+12125551234", "FirstName": "Maria"}]
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        handler.lambda_handler(
+            _base_event(
+                message_template="Hi {{FirstName}}!", clinic_name="VIP Medical Group"
+            ),
+            None,
+        )
+
+    written = [
+        c.kwargs["Item"]
+        for c in mock_queue_table.batch_writer.return_value.__enter__.return_value.put_item.call_args_list
+    ]
+    assert written, "expected at least one DDB write"
+    for item in written:
+        assert "messageTemplate" not in item and "messageBody" not in item
+
+
+def test_sender_never_logs_a_name_or_a_rendered_body():
+    """Rendered text (which may contain a first name) must never reach the
+    structured logger — same PHI rule that already applies to phone numbers."""
+    handler = _load_handler()
+
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = MagicMock()
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp_profiles(
+        [{"PhoneNumber": "+12125551234", "FirstName": "Maria"}]
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+        patch.object(handler, "_logger") as mock_logger,
+    ):
+        handler.lambda_handler(
+            _base_event(
+                message_template="Hi {{FirstName}}!", clinic_name="VIP Medical Group"
+            ),
+            None,
+        )
+
+    all_calls = mock_logger.info.call_args_list + mock_logger.warn.call_args_list
+    assert all_calls, "expected at least one log call"
+    for logged_call in all_calls:
+        assert "Maria" not in str(logged_call)
+
+
+def test_sender_skips_campaign_when_render_rejects_unallowlisted_placeholder():
+    """Defense in depth: _validate_sms_campaign should already have rejected a
+    template like this. If one slips through anyway, render() raises — the
+    sender must not send anything rather than deliver literal braces."""
+    handler = _load_handler()
+
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = MagicMock()
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp_profiles(
+        [{"PhoneNumber": "+12125551234", "FirstName": "Maria"}]
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        result = handler.lambda_handler(
+            _base_event(message_template="Your {{Diagnosis}} is ready."), None
+        )
+
+    assert result["enqueued"] == 0
+    mock_sqs.send_message_batch.assert_not_called()

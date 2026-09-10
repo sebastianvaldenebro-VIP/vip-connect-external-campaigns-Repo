@@ -3,9 +3,14 @@ SMS Sender Lambda — reads CP segment phone numbers and enqueues them into
 VipSmsCampaignQueue (DDB) and SQS vip-sms-campaign-queue for async delivery.
 
 PHI rule:
-  - Only E.164 phone numbers are stored in VipSmsCampaignQueue.
-  - No names, DOBs, conditions, diagnoses, or any other PHI.
-  - Phone numbers are NOT logged.
+  - Only E.164 phone numbers are stored in VipSmsCampaignQueue (DDB) — the
+    long-lived, 30-day-TTL record. No names, DOBs, conditions, diagnoses, or
+    any other PHI ever lands there.
+  - The SQS message body DOES carry the rendered message text (which may
+    include the recipient's first name, per
+    vip_shared.domain.services.sms_template's allowlist) — this is transient,
+    consumed once by sms_processor_handler.py, and never written to DDB.
+  - Phone numbers and rendered text are NOT logged.
 """
 
 from __future__ import annotations
@@ -21,6 +26,11 @@ import boto3
 
 from vip_shared.domain.services.quiet_hours import (
     is_within_quiet_hours as _is_within_quiet_hours,
+)
+from vip_shared.domain.services.sms_template import (
+    ALLOWED_FIELDS,
+    extract_placeholders,
+    render as _render,
 )
 from vip_shared.infrastructure.persistence.opt_out import (
     build_from_env as build_opt_out_from_env,
@@ -53,7 +63,15 @@ def lambda_handler(event: dict, context: object) -> dict:
       "planName": str,
       "segmentArn": str,               # existing CP segment ARN
       "segmentName": str,
-      "messageTemplate": str,          # PHI-free template, max 160 chars
+      "messageTemplate": str,          # allowlisted-placeholder template, e.g.
+                                        # "Hi {{FirstName}}! This is {{ClinicName}}."
+                                        # — rendered once per recipient below, max
+                                        # 160 chars once rendered (see
+                                        # vip_shared.domain.services.sms_template)
+      "clinicName": str,               # optional; interpolated into {{ClinicName}}.
+                                        # If the template contains {{ClinicName}}
+                                        # and this key is omitted, it renders empty
+                                        # and the patient reads "This is .".
       "originationNumberArn": str,     # EUM SMS phone number ARN
       "originationNumber": str,        # friendly E.164 (e.g. +15125551234)
     }
@@ -96,8 +114,8 @@ def lambda_handler(event: dict, context: object) -> dict:
         ConditionExpression="attribute_not_exists(sk)",
     )
 
-    # Extract phone numbers from CP segment
-    phones = _get_segment_phones(segment_name)
+    # Extract recipients (phone + allowlisted render fields) from CP segment
+    recipients = _get_segment_recipients(segment_name)
 
     # Batch-write to DDB and SQS. Both batches are flushed together at the same
     # size (10, SQS's own hard cap) and keyed by the SQS entry Id, so a partial
@@ -114,7 +132,13 @@ def lambda_handler(event: dict, context: object) -> dict:
     sqs_batch: list[dict] = []
     ddb_items_by_id: dict[str, dict] = {}
 
-    for phone in phones:
+    # Set only if rendering rejects the template (see the `except ValueError`
+    # below) — a template-level problem, not a per-recipient one, since every
+    # recipient renders the same template.
+    rejected_fields: set[str] | None = None
+
+    for recipient in recipients:
+        phone = recipient["phone"]
         if not _E164_RE.match(phone):
             continue
         if _opt_out.is_blocked(phone):
@@ -126,6 +150,22 @@ def lambda_handler(event: dict, context: object) -> dict:
         if not _is_within_quiet_hours(phone):
             outside_quiet_hours += 1
             continue
+        try:
+            body = _render(
+                message_tmpl,
+                recipient=recipient,
+                campaign={"clinicName": event.get("clinicName", "")},
+            )
+        except ValueError:
+            # Defense in depth: _validate_sms_campaign (api-plans) should already
+            # have rejected any template with a non-allowlisted placeholder. If
+            # one slipped through anyway, sending it would deliver literal
+            # `{{...}}` braces to a patient — worse than sending nothing. The
+            # template (not this recipient) is what's broken, so every remaining
+            # recipient would fail identically — abandon the whole campaign
+            # rather than skip just this one.
+            rejected_fields = extract_placeholders(message_tmpl) - ALLOWED_FIELDS
+            break
         item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
         entry_id = uuid.uuid4().hex[:8]
         sqs_batch.append(
@@ -136,7 +176,12 @@ def lambda_handler(event: dict, context: object) -> dict:
                         "campaignId": campaign_id,
                         "sk": item_sk,
                         "phone": phone,
-                        "messageTemplate": message_tmpl,
+                        # Key name retained deliberately: it now carries the
+                        # rendered message, not the raw template. Renaming it
+                        # (e.g. to "messageBody") would strand every in-flight
+                        # message across the deploy boundary — the processor
+                        # would KeyError on messages enqueued by an older sender.
+                        "messageTemplate": body,
                         "originationNumberArn": origination_arn,
                         "planId": event["planId"],
                         "runId": event["runId"],
@@ -169,6 +214,15 @@ def lambda_handler(event: dict, context: object) -> dict:
         )
         enqueued += batch_ok
         failed += batch_failed
+
+    if rejected_fields is not None:
+        # PHI rule: log the offending field NAMES only — never the template body
+        # or any recipient value.
+        _logger.warn(
+            "sms_sender_template_rejected_non_allowlisted_placeholder",
+            campaign_id=campaign_id,
+            fields=sorted(rejected_fields),
+        )
 
     # Update enqueued/skipped-opt-out/sqs-send-failed counts.
     #
@@ -245,13 +299,14 @@ def _flush_sms_batch(
 _BATCH_GET_PROFILE_MAX = 100  # CP API limit per BatchGetProfile call
 
 
-def _get_segment_phones(segment_name: str) -> list[str]:
-    """Read all phone numbers from a CP segment via GetSegmentMembership.
+def _get_segment_recipients(segment_name: str) -> list[dict]:
+    """Read recipients (phone + allowlisted render fields) from a CP segment via
+    GetSegmentMembership.
 
     Collects all profile IDs per membership page, then calls BatchGetProfile
     in groups of up to 100 — reducing API calls from O(n) to O(n/100).
     """
-    phones: list[str] = []
+    recipients: list[dict] = []
     try:
         kwargs: dict = {
             "DomainName": _DOMAIN,
@@ -276,14 +331,21 @@ def _get_segment_phones(segment_name: str) -> list[str]:
                 for profile in batch_resp.get("Profiles", []):
                     raw = profile.get("PhoneNumber") or profile.get("MobilePhoneNumber") or ""
                     if raw:
-                        phones.append(_normalize_phone(raw))
+                        # Minimum necessary: carry ONLY the allowlisted render
+                        # fields out of the profile, never the whole record.
+                        recipients.append(
+                            {
+                                "phone": _normalize_phone(raw),
+                                "FirstName": profile.get("FirstName") or "",
+                            }
+                        )
             next_token = resp.get("NextToken")
             if not next_token:
                 break
             kwargs["NextToken"] = next_token
     except Exception as exc:
         _logger.warn("sms_sender_get_segment_phones_failed", error=type(exc).__name__)
-    return phones
+    return recipients
 
 
 def _normalize_phone(raw: str) -> str:
