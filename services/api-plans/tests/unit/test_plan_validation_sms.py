@@ -33,14 +33,18 @@ def _campaign(
     template: str = "Your appointment is confirmed. Reply STOP to opt out.",
     origination_arn: str = "arn:aws:sms-voice:us-east-1:123:phone-number/p-1",
     phi_acknowledged: bool = True,
+    clinic_name: str | None = None,
 ) -> dict:
+    cfg = {
+        "smsMessageTemplate": template,
+        "smsOriginationNumberArn": origination_arn,
+        "phiAcknowledged": phi_acknowledged,
+    }
+    if clinic_name is not None:
+        cfg["clinicName"] = clinic_name
     return {
         "deliveryType": "sms",
-        "campaignConfig": {
-            "smsMessageTemplate": template,
-            "smsOriginationNumberArn": origination_arn,
-            "phiAcknowledged": phi_acknowledged,
-        },
+        "campaignConfig": cfg,
     }
 
 
@@ -257,6 +261,12 @@ def test_generic_template_with_year_only_passes():
 
 
 def test_allowlisted_placeholders_are_accepted():
+    """{{ClinicName}} is allowlisted, but bulk-SMS's campaignConfig has no
+    clinicName set here — an unset value would render {{ClinicName}} as an
+    empty string ("This is ." shipped to a patient), so this must now be
+    rejected by the same clinicName-required guard _validate_precall_sms
+    already has. See test_allowlisted_placeholders_are_accepted_with_clinicname_set
+    for the corresponding accept path."""
     errors = _validate(
         _campaign(
             template="Hi {{FirstName}}! This is {{ClinicName}}, calling shortly."
@@ -264,7 +274,36 @@ def test_allowlisted_placeholders_are_accepted():
         "b",
         0,
     )
+    assert any("clinicName" in e for e in errors)
+
+
+def test_allowlisted_placeholders_are_accepted_with_clinicname_set():
+    errors = _validate(
+        _campaign(
+            template="Hi {{FirstName}}! This is {{ClinicName}}, calling shortly.",
+            clinic_name="VIP Medical Group",
+        ),
+        "b",
+        0,
+    )
     assert errors == []
+
+
+def test_bulk_sms_requires_clinicname_when_template_uses_the_placeholder():
+    """Mirrors _validate_precall_sms's identical guard: bulk-SMS's
+    campaignConfig has no clinicName field anywhere in the frontend or
+    executor invocation, so an unset value always renders empty."""
+    errors = _validate(
+        _campaign(template="This is {{ClinicName}} calling."),
+        "b",
+        0,
+    )
+    assert any("clinicName" in e for e in errors)
+
+
+def test_bulk_sms_does_not_require_clinicname_when_template_omits_the_placeholder():
+    errors = _validate(_campaign(template="Hi {{FirstName}}, quick reminder."), "b", 0)
+    assert not any("clinicName" in e for e in errors)
 
 
 def test_non_allowlisted_placeholder_is_rejected_by_name():
@@ -283,6 +322,47 @@ def test_dollar_brace_syntax_stays_banned():
     """No renderer supports ${...}; it can only be a mistake."""
     errors = _validate(_campaign(template="Hi ${FirstName}!"), "b", 0)
     assert errors != []
+
+
+def test_phi_disguised_inside_malformed_braces_is_still_caught():
+    """{{123-45-6789}} is not a well-formed \\w+ placeholder token — it must not
+    be stripped by the PHI-scan's brace-removal step, or the SSN inside it
+    would sail past the PHI regexes and reach render() untouched (since
+    render()'s own _PLACEHOLDER_RE would also skip it), landing verbatim in
+    the outbound SMS. Confirmed via live repro: the old `{{[^}]+}}` strip
+    regex in this function was broader than extract_placeholders'/render's
+    `\\{\\{\\s*(\\w+)\\s*\\}\\}`, so it silently deleted this from the
+    scannable text before any PHI pattern ever saw it."""
+    errors = _validate(
+        _campaign(template="Your SSN is {{123-45-6789}}, please confirm."),
+        "b",
+        0,
+    )
+    assert any("PHI" in e or "SSN" in e for e in errors)
+
+
+def test_email_disguised_inside_malformed_braces_is_still_caught():
+    errors = _validate(
+        _campaign(template="Contact {{jane@example.com}} for details."),
+        "b",
+        0,
+    )
+    assert any("PHI" in e or "email" in e for e in errors)
+
+
+def test_precall_phi_disguised_inside_malformed_braces_is_still_caught():
+    """Same guard via _validate_precall_sms's shared _screen_sms_template_content
+    call — the pre-call channel must not diverge from bulk-SMS here."""
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, your SSN is {{123-45-6789}}.",
+            "clinicName": "VIP Medical Group",
+            "originationNumberArn": "arn:x",
+        }
+    )
+    errors = validate_plan(plan)
+    assert any("PHI" in e or "SSN" in e for e in errors)
 
 
 def test_other_phi_patterns_still_enforced_alongside_placeholders():

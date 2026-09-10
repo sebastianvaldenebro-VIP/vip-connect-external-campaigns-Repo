@@ -61,6 +61,18 @@ def extract_placeholders(template: str) -> set[str]:
     return set(_PLACEHOLDER_RE.findall(template or ""))
 
 
+def strip_placeholders(template: str) -> str:
+    """Remove only well-formed {{word}} placeholders, leaving anything
+    shaped like {{...}} but not a valid \\w+ token untouched — so PHI
+    disguised inside malformed braces (e.g. {{123-45-6789}}) still reaches
+    a caller's PHI scanner instead of being silently discarded.
+
+    Uses the exact same regex as extract_placeholders()/render() so this can
+    never drift from what they recognize as a placeholder.
+    """
+    return _PLACEHOLDER_RE.sub("", template or "")
+
+
 def _clean_first_name(raw: object) -> str:
     if not isinstance(raw, str):
         return _FIRST_NAME_FALLBACK

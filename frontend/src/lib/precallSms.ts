@@ -70,10 +70,16 @@ export function validatePrecallSms(
   if (!template.trim()) errors.push('Pre-call SMS: messageTemplate is required');
   if (!String(cfg.originationNumberArn ?? '').trim())
     errors.push('Pre-call SMS: originationNumberArn is required');
-  if (!clinicName.trim())
+  const placeholders = extractPlaceholders(template);
+  // Mirrors the backend's conditional guard exactly (_validate_precall_sms):
+  // `"ClinicName" in extract_placeholders(tmpl) and not precall.get("clinicName")`.
+  // Requiring clinicName unconditionally — whenever enabled — was stricter
+  // than the server and rejected valid configs whose template never
+  // references {{ClinicName}} at all.
+  if (placeholders.has('ClinicName') && !clinicName.trim())
     errors.push('Pre-call SMS: clinicName is required (it is interpolated into the message)');
 
-  const unknown = [...extractPlaceholders(template)].filter(
+  const unknown = [...placeholders].filter(
     (f) => !PRECALL_ALLOWED_PLACEHOLDERS.has(f),
   );
   if (unknown.length)

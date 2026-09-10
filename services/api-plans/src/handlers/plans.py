@@ -533,6 +533,7 @@ def _screen_sms_template_content(
         ALLOWED_FIELDS,
         extract_placeholders,
         max_rendered_length,
+        strip_placeholders,
     )
 
     errors: list[str] = []
@@ -582,7 +583,18 @@ def _screen_sms_template_content(
     # stripped, so an allowlisted placeholder cannot itself trip a pattern
     # (e.g. the clinical-term regex) while real violations elsewhere in the
     # copy still do.
-    scannable = _re.sub(r"\{\{[^}]+\}\}", "", tmpl)
+    #
+    # Must use strip_placeholders (== extract_placeholders'/render()'s own
+    # \{\{\s*(\w+)\s*\}\} regex), NOT a broader hand-rolled pattern like
+    # `\{\{[^}]+\}\}` — that broader pattern would also match and delete
+    # something like {{123-45-6789}} or {{jane@example.com}}, which is
+    # neither a recognized placeholder (extract_placeholders ignores it, so
+    # the unknown-placeholder check above never fires) nor substituted by
+    # render() (it's left untouched in the outbound SMS verbatim). Stripping
+    # only well-formed tokens here ensures anything shaped like {{...}} but
+    # not a valid placeholder stays in `scannable` for the PHI patterns below
+    # to catch.
+    scannable = strip_placeholders(tmpl)
     violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(scannable)]
     if violations:
         errors.append(
@@ -606,6 +618,17 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
         errors.extend(
             _screen_sms_template_content(tmpl, prefix, "smsMessageTemplate", cfg)
         )
+        from vip_shared.domain.services.sms_template import extract_placeholders
+
+        # An unset clinicName renders {{ClinicName}} as an empty string —
+        # "This is ." shipped to a patient — so require the value whenever
+        # the template actually references the placeholder. Mirrors the
+        # identical guard in _validate_precall_sms below.
+        if "ClinicName" in extract_placeholders(tmpl) and not cfg.get("clinicName"):
+            errors.append(
+                f"{prefix}: smsMessageTemplate uses {{{{ClinicName}}}} but "
+                f"campaignConfig.clinicName is not set"
+            )
 
     if not cfg.get("smsOriginationNumberArn"):
         errors.append(

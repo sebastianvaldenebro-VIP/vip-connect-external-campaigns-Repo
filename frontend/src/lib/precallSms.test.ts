@@ -129,6 +129,21 @@ describe('required fields', () => {
       }),
     ).toEqual([]);
   });
+
+  it('does not require clinicName when the template does not reference {{ClinicName}}', () => {
+    // Mirrors the backend's conditional guard in _validate_precall_sms:
+    // `"ClinicName" in extract_placeholders(tmpl) and not precall.get("clinicName")`.
+    // A template that never uses {{ClinicName}} has nothing to interpolate,
+    // so an operator config with no clinicName set must still be accepted —
+    // the old unconditional check rejected this even though the server would
+    // not have.
+    const errs = validatePrecallSms({
+      enabled: true,
+      messageTemplate: 'Hi {{FirstName}}, quick reminder about your visit.',
+      originationNumberArn: 'arn:x',
+    });
+    expect(errs.some((e) => e.includes('clinicName'))).toBe(false);
+  });
 });
 
 describe('availability — the UI must not offer a config the API rejects', () => {

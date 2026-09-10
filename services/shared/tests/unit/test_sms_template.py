@@ -10,6 +10,7 @@ from vip_shared.domain.services.sms_template import (
     extract_placeholders,
     max_rendered_length,
     render,
+    strip_placeholders,
 )
 
 _CAMPAIGN = {"clinicName": "VIP Medical Group"}
@@ -86,3 +87,29 @@ def test_max_rendered_length_budgets_for_the_longest_realistic_name():
     """A 140-char template with {{FirstName}} can exceed 160 once rendered."""
     tmpl = "Hi {{FirstName}}! " + ("x" * 140)
     assert max_rendered_length(tmpl, campaign=_CAMPAIGN) > len(tmpl)
+
+
+def test_strip_placeholders_removes_only_well_formed_tokens():
+    """strip_placeholders must strip EXACTLY what extract_placeholders/render()
+    recognize as a placeholder — no broader, no narrower — so PHI disguised
+    inside malformed braces (not a \\w+ token) stays in the string for the
+    caller's PHI scanner to catch, instead of being silently discarded."""
+    out = strip_placeholders("Hi {{FirstName}}, SSN {{123-45-6789}}")
+    assert out == "Hi , SSN {{123-45-6789}}"
+
+
+def test_strip_placeholders_matches_extract_placeholders_exactly():
+    """Single source of truth: anything extract_placeholders finds must be what
+    gets stripped, and anything it does NOT find must be left untouched."""
+    tmpl = "Hi {{FirstName}}, SSN {{123-45-6789}}, email {{jane@example.com}}"
+    found = extract_placeholders(tmpl)
+    stripped = strip_placeholders(tmpl)
+    assert found == {"FirstName"}
+    assert "{{123-45-6789}}" in stripped
+    assert "{{jane@example.com}}" in stripped
+    assert "{{FirstName}}" not in stripped
+
+
+def test_strip_placeholders_handles_empty_and_none():
+    assert strip_placeholders("") == ""
+    assert strip_placeholders(None) == ""
