@@ -20,6 +20,43 @@ from typing import Any
 
 import boto3
 
+# TCPA quiet hours are a property of the *recipient's* local time, not of a
+# timezone the operator picks once per campaign. Connect Campaigns V2 resolves
+# the recipient's timezone itself; we only declare the window.
+#
+# AREA_CODE over ZIP_CODE: every phone number has an area code, whereas
+# ZIP_CODE needs a populated Customer Profiles address we have not confirmed.
+#
+# The window is the FULL statutory TCPA span on the hours axis (08:00-21:00
+# recipient-local) and stricter than statute on the day axis: Monday-Saturday
+# only. TCPA does not exempt Sunday; excluding it is a VIP business choice.
+#
+# The "T" prefix is mandatory — Iso8601Time's pattern is T\d{2}:\d{2}. Note
+# that botocore does NOT enforce string patterns: a bare "08:00" validates
+# clean locally and is sent to the service. The unit tests are the only guard.
+#
+# SUNDAY is excluded by OMITTING the key from dailyHours. An empty list
+# ("SUNDAY": []) is equally valid per the model but its semantics are
+# undocumented; see the shape table in this task.
+_QUIET_HOURS_START = "T08:00"
+_QUIET_HOURS_END = "T21:00"
+_CONTACT_DAYS = (
+    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY",
+)
+
+
+def _open_hours() -> dict[str, Any]:
+    """A TimeWindow gating one channel to the recipient-local quiet-hours window."""
+    return {
+        "openHours": {
+            "dailyHours": {
+                day: [{"startTime": _QUIET_HOURS_START, "endTime": _QUIET_HOURS_END}]
+                for day in _CONTACT_DAYS
+            }
+        }
+    }
+
+
 # ── State → location values — loaded from DynamoDB VipLocationMapping ─────────
 # Table PK: location (String). Each item also has stateCode, stateName, slug,
 # stateSortOrder. Cached in-process for _CACHE_TTL seconds to avoid per-request
@@ -552,7 +589,12 @@ def build_campaign_params(
         "source": {"customerProfilesSegmentArn": segment_arn},
         "schedule": {"startTime": start_time, "endTime": end_time},
         "communicationTimeConfig": {
-            "localTimeZoneConfig": {"defaultTimeZone": "America/New_York"}
+            "localTimeZoneConfig": {
+                # Fallback only, for area codes Connect cannot resolve.
+                "defaultTimeZone": "America/New_York",
+                "localTimeZoneDetection": ["AREA_CODE"],
+            },
+            "telephony": _open_hours(),
         },
     }
 

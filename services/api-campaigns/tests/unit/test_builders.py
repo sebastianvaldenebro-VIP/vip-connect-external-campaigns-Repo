@@ -180,3 +180,81 @@ def test_communication_limits_translation():
     assert per_day["maxCountPerRecipient"] == 3
     assert per_week["maxCountPerRecipient"] == 10
     assert per_month["maxCountPerRecipient"] == 20
+
+
+_CONTACT_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"]
+
+
+def test_communication_time_config_uses_per_recipient_area_code_detection():
+    """One operator-picked timezone per campaign is the wrong axis — TCPA quiet
+    hours are per-recipient-local, so Connect must resolve each recipient's own
+    timezone from their area code."""
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    ltz = params["communicationTimeConfig"]["localTimeZoneConfig"]
+    assert ltz["localTimeZoneDetection"] == ["AREA_CODE"]
+    assert ltz["defaultTimeZone"] == "America/New_York"  # fallback only
+
+
+def test_communication_time_config_sets_telephony_open_hours_monday_to_saturday():
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert sorted(daily) == sorted(_CONTACT_DAYS)
+    for day in _CONTACT_DAYS:
+        assert daily[day] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+
+
+def test_sunday_key_is_absent_from_daily_hours():
+    """No contact on Sunday. Encoded by OMITTING the key, not by an empty list —
+    see the shape table: both are syntactically valid, and this is the one whose
+    semantics we are betting on. Task 7 verifies it against a real dial attempt.
+    """
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert "SUNDAY" not in daily
+
+
+def test_open_hours_times_carry_the_iso8601_t_prefix():
+    """Iso8601Time's pattern is T\\d{2}:\\d{2}.
+
+    botocore does NOT enforce string patterns, so a missing T validates clean
+    locally and is sent to the service — this test is the only thing standing
+    between a typo and a rejected (or misread) CreateCampaign in production.
+    Nothing else in this repo uses openHours, so there is no precedent to
+    compare against.
+    """
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    for ranges in daily.values():
+        for rng in ranges:
+            assert rng["startTime"].startswith("T")
+            assert rng["endTime"].startswith("T")
+
+
+def test_communication_time_config_emitted_even_without_communication_time_key():
+    """Previously a segment campaign created without body['communicationTime']
+    got NO communicationTimeConfig at all — i.e. zero quiet-hours enforcement.
+    That hole is the point of this change."""
+    body = _base_body()
+    body.pop("communicationTime", None)
+    params = build_create_campaign_params(
+        body,
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    assert "communicationTimeConfig" in params

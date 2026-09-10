@@ -363,8 +363,25 @@ def test_campaign_params_structure():
     assert params["name"] == "test-campaign"
     assert params["connectInstanceId"] == "instance-1"
     assert params["source"]["customerProfilesSegmentArn"].endswith("/s")
-    assert "communicationTimeConfig" in params
     assert "connectCampaignFlowArn" not in params  # empty string → omitted
+
+
+def test_campaign_params_gates_telephony_on_per_lead_local_open_hours():
+    params = build_campaign_params(
+        _campaign_bucket(),
+        segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        start_time="2026-05-01T13:00:00Z",
+        end_time="2026-05-01T21:00:00Z",
+        campaign_name="test-campaign",
+    )
+    ctc = params["communicationTimeConfig"]
+    assert ctc["localTimeZoneConfig"]["localTimeZoneDetection"] == ["AREA_CODE"]
+    assert ctc["localTimeZoneConfig"]["defaultTimeZone"] == "America/New_York"
+    daily = ctc["telephony"]["openHours"]["dailyHours"]
+    assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+    assert "SUNDAY" not in daily  # no contact on Sunday
 
 
 def test_campaign_params_includes_flow_arn_via_override():
