@@ -22,7 +22,11 @@ with patch.dict(sys.modules, _stub_modules):
     with patch("boto3.client"), patch("boto3.resource"):
         from handlers import plans as plans_handler  # noqa: E402
 
+from vip_shared.domain.services.sms_template import max_rendered_length  # noqa: E402
+
 _validate = plans_handler._validate_sms_campaign
+_MAX_SMS_CHARS = plans_handler._MAX_SMS_CHARS
+validate_plan = plans_handler._validate_plan_body
 
 
 def _campaign(
@@ -304,3 +308,186 @@ def test_length_is_measured_on_the_rendered_worst_case():
     tmpl = "Hi {{FirstName}}! " + "x" * 140
     errors = _validate(_campaign(template=tmpl), "b", 0)
     assert any("160" in e for e in errors)
+
+
+# ── Task 5: precall SMS config validation (_validate_precall_sms) ────────────
+
+
+def _plan_with_precall(
+    precall: dict | None = None,
+    delivery_type: str = "campaign",
+    depends_on: list[str] | None = None,
+) -> dict:
+    """Build a minimal single-bucket plan around one campaign carrying a
+    campaignConfig.precallSms block.
+
+    Default `precall`, when None, is the valid business-approved Pain
+    Management config (see the plan's Task 5 "Origination number" example) —
+    not merely present but valid — so test_valid_precall_campaign_has_no_errors
+    exercises the real accept path rather than a false negative.
+    """
+    if precall is None:
+        precall = {
+            "enabled": True,
+            "messageTemplate": (
+                "Hi {{FirstName}}! {{ClinicName}} here. We're calling you in "
+                "just a moment to discuss your pain management request. Talk soon!"
+            ),
+            "clinicName": "VIP Medical Group",
+            "originationNumberArn": "arn:aws:sms-voice:us-east-1:165505826690:phone-number/phone-ba711707215947e3a0e5112c0872014b",
+        }
+    campaign: dict = {
+        "id": "c1",
+        "name": "Campaign",
+        "deliveryType": delivery_type,
+        "campaignConfig": {"precallSms": precall},
+    }
+    if depends_on is not None:
+        campaign["dependsOn"] = depends_on
+    return {
+        "name": "Test Plan",
+        "buckets": [
+            {
+                "name": "Bucket A",
+                "campaigns": [campaign],
+            }
+        ],
+    }
+
+
+def test_precall_requires_template_when_enabled():
+    plan = _plan_with_precall(precall={"enabled": True})
+    assert any("messageTemplate" in e for e in validate_plan(plan))
+
+
+def test_precall_requires_origination_number_when_enabled():
+    plan = _plan_with_precall(precall={"enabled": True, "messageTemplate": "Hi!"})
+    assert any("originationNumberArn" in e for e in validate_plan(plan))
+
+
+def test_precall_requires_clinic_name_if_template_uses_it():
+    """An unset config value renders as an empty string — 'This is .' shipped
+    to a patient. Require the value whenever the placeholder is present."""
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}! This is {{ClinicName}}.",
+            "originationNumberArn": "arn:x",
+            "clinicName": "",
+        }
+    )
+    assert any("clinicName" in e for e in validate_plan(plan))
+
+
+def test_precall_template_goes_through_the_same_phi_guard():
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, your {{Diagnosis}} is ready.",
+            "originationNumberArn": "arn:x",
+        }
+    )
+    assert any("Diagnosis" in e for e in validate_plan(plan))
+
+
+def test_precall_is_rejected_on_a_non_voice_campaign():
+    """precallSms on an SMS campaign is nonsense — there is no dial to precede."""
+    plan = _plan_with_precall(delivery_type="sms")
+    assert any("precallSms" in e for e in validate_plan(plan))
+
+
+def test_precall_is_rejected_when_the_campaign_has_dependsOn():
+    """A campaign with dependsOn is never pre-warmed (executor.py:2180, 2571-2573),
+    so it has no segmentArn at activation and the pre-call SMS would silently
+    never fire. Reject at save time instead of failing quietly at run time."""
+    plan = _plan_with_precall(depends_on=["other"])
+    assert any("dependsOn" in e for e in validate_plan(plan))
+
+
+# The literal approved strings, not a paraphrase. If these ever diverge from the
+# business document the test is worthless, so keep them verbatim and dated.
+_APPROVED_COPY_2026_09_10 = {
+    "Vein": (
+        "Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a "
+        "quick call regarding your vein consultation request. "
+        "Look out for our call!"
+    ),
+    "Pain": (
+        "Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a "
+        "moment to discuss your pain management request. Talk soon!"
+    ),
+}
+
+
+def test_approved_pain_copy_renders_within_the_length_ceiling():
+    """Pain fits at the 20-char worst case: 135 rendered."""
+    rendered = max_rendered_length(
+        _APPROVED_COPY_2026_09_10["Pain"],
+        campaign={"clinicName": "VIP Medical Group"},
+    )
+    assert rendered == 135
+    assert rendered <= _MAX_SMS_CHARS
+
+
+def test_approved_vein_copy_renders_within_the_length_ceiling():
+    """Vein fits at the 20-char worst case: 153 rendered.
+
+    This is the SHORTENED closing Sebastian approved on 2026-09-10 (OQ-9,
+    option 3): "Look out for our call!". His first draft ended "Look out for a
+    call from this number!", which rendered 168 and did not fit. Asserting the
+    exact number, not just <= the ceiling, so restoring the longer closing fails
+    here instead of failing silently at the API boundary.
+    """
+    rendered = max_rendered_length(
+        _APPROVED_COPY_2026_09_10["Vein"],
+        campaign={"clinicName": "VIP Medical Group"},
+    )
+    assert rendered == 153
+    assert rendered <= _MAX_SMS_CHARS
+
+
+def test_both_approved_templates_pass_the_real_validator():
+    """The measurements above are worthless if the validator disagrees."""
+    for specialty, tmpl in _APPROVED_COPY_2026_09_10.items():
+        plan = _plan_with_precall(
+            precall={
+                "enabled": True,
+                "messageTemplate": tmpl,
+                "clinicName": "VIP Medical Group",
+                "originationNumberArn": "arn:x",
+            }
+        )
+        assert validate_plan(plan) == [], specialty
+
+
+def test_approved_copy_is_pure_gsm7():
+    """A curly apostrophe (U+2019) instead of ASCII ' silently forces UCS-2
+    encoding, which cuts the per-segment budget from 160 to 70 — Vein would
+    split into three segments and Pain into two, and this plan's whole length
+    analysis would be wrong. Copy pasted out of a Word/Google doc is the usual
+    source.
+    """
+    for specialty, tmpl in _APPROVED_COPY_2026_09_10.items():
+        assert "’" not in tmpl, specialty
+        assert "‘" not in tmpl, specialty
+        assert "“" not in tmpl and "”" not in tmpl, specialty
+        assert "—" not in tmpl and "–" not in tmpl, specialty
+        assert "…" not in tmpl, specialty
+
+
+def test_specialty_placeholder_is_not_allowlisted():
+    """No approved template uses {{Specialty}}, so it is not interpolatable and a
+    template using it must be rejected like any other unknown field."""
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, about your {{Specialty}} visit.",
+            "originationNumberArn": "arn:x",
+            "clinicName": "VIP Medical Group",
+        }
+    )
+    assert any("Specialty" in e for e in validate_plan(plan))
+
+
+def test_valid_precall_campaign_has_no_errors():
+    assert validate_plan(_plan_with_precall()) == []

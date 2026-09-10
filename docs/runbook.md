@@ -655,7 +655,55 @@ A: In the Connect instance's configured S3 bucket (pre-existing, not managed by 
 
 ---
 
-## 7. Planned enhancements
+## 7. Pre-Call SMS (Phase I)
+
+A short text sent to a voice campaign's own segment, immediately before the first dial, so the patient recognizes the incoming call. This section documents the semantics — the click path lives in the Plan editor's "Pre-Call SMS" panel (Task 6).
+
+**Configuration lives on the voice campaign, not as a separate campaign.** Set `campaignConfig.precallSms` on the voice campaign itself (the "Pre-Call SMS" panel on the campaign card in the plan editor). There is no separate SMS campaign to create and no bucket to add.
+
+Required fields when `enabled: true`:
+
+| Field | Notes |
+|---|---|
+| `messageTemplate` | Only `{{FirstName}}` and `{{ClinicName}}` are interpolatable. Any other `{{...}}` placeholder is rejected at save time. |
+| `originationNumberArn` | EUM SMS origination number ARN. |
+| `clinicName` | Required whenever `messageTemplate` references `{{ClinicName}}` — an unset value renders as an empty string ("This is ." shipped to a patient). |
+
+**The campaign must not have `dependsOn`.** A campaign with `dependsOn` is never pre-warmed, so no segment exists at bucket activation and the pre-call SMS would silently never fire. Save-time validation rejects the combination; the UI disables the toggle while dependencies are checked.
+
+**Ordering is automatic, not configurable.** The SMS is enqueued at bucket activation, and Connect's own campaign `startTime` is warm-time + 6 minutes, so the first dial follows roughly 1–6 minutes later. There is no lead-time setting to tune.
+
+**Specialty copy — one voice campaign per specialty, each with its own hand-written `messageTemplate`.** The specialty is baked into the sentence, not substituted from a value — copy the approved string for that specialty verbatim from the table below. **Phase I ships two specialties only: Vein and Pain Management.** Fibroid and General are deferred and out of scope — if an operator needs pre-call SMS for either, that is a copy-approval request to Sebastian, not a configuration an operator may compose.
+
+**Never edit an approved string in the panel.** The 160-character ceiling (`_MAX_SMS_CHARS` in `services/api-plans/src/handlers/plans.py`) applies to the *rendered* message (worst-case 20-character first name), not the raw template, and both approved templates were measured against it:
+
+| Specialty | Status | `messageTemplate` | Rendered (20-char name) |
+|---|---|---|---|
+| Vein | APPROVED (final) | `Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a quick call regarding your vein consultation request. Look out for our call!` | 153 |
+| Pain Management | APPROVED (final) | `Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a moment to discuss your pain management request. Talk soon!` | 135 |
+
+Both are business-approved verbatim (2026-09-10) and must be pasted, not retyped — copy pasted out of a Word/Google doc commonly carries a curly apostrophe (`’`) or other non-ASCII punctuation, which silently forces UCS-2 encoding and cuts the per-segment budget from 160 to 70 chars. Neither template contains an opt-out instruction — that was declined by Sebastian on 2026-09-10 and must not be re-added as an implementation detail.
+
+Example valid config:
+
+```json
+{
+  "precallSms": {
+    "enabled": true,
+    "messageTemplate": "Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a moment to discuss your pain management request. Talk soon!",
+    "clinicName": "VIP Medical Group",
+    "originationNumberArn": "arn:aws:sms-voice:us-east-1:165505826690:phone-number/phone-ba711707215947e3a0e5112c0872014b"
+  }
+}
+```
+
+**Quiet hours are enforced per recipient, not per campaign.** A lead whose area code puts them outside 08:00–21:00 local, or in any timezone where it is Sunday, is skipped and counted in `totalSkippedQuietHours` on the run record. A pre-call SMS run with fewer sends than the segment size is normal, not a failure.
+
+**Opt-out.** The origination number above is registered `TRANSACTIONAL`, which fits "we are calling you in a moment" — but that is not an exemption from opt-out handling. `VipConnectOptOutList` only ever populates from *inbound* `STOP` messages; neither approved template advertises this, but the gate still applies to every send regardless.
+
+---
+
+## 8. Planned enhancements
 
 - [ ] Custom dashboards per-campaign in Analytics screen
 - [ ] Multi-role RBAC (admin vs. read-only analyst)
