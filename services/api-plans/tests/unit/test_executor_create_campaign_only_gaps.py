@@ -176,6 +176,138 @@ class TestCreateCampaignOnlyStartCampaignFailureSwallowed:
         assert warmup_started is False  # start_campaign failed but is not fatal here
 
 
+class TestCreateCampaignOnlyPrecallSmsGate:
+    """Touch point A (2026-09 adversarial-review fix): a precall-SMS-enabled
+    campaign must be paused immediately after a successful warm-start, so it
+    cannot dial while paused regardless of its 6-min-ahead startTime."""
+
+    def test_precall_enabled_pauses_immediately_after_start_campaign(self):
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-4"}
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                connect_id, *_rest = executor._create_campaign_only(bucket, campaign, run)
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert connect_id == "connect-4"
+        mock_oc.pause_campaign.assert_called_once_with("connect-4")
+
+    def test_precall_disabled_never_pauses(self):
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {"id": "c1", "name": "TX-NL", "states": ["TX"]}  # no campaignConfig at all
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-5"}
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                executor._create_campaign_only(bucket, campaign, run)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.pause_campaign.assert_not_called()
+
+    def test_precall_enabled_but_start_campaign_failed_never_pauses(self):
+        """warmup_started=False means StartCampaign never actually succeeded —
+        pausing a campaign that never started would be a no-op at best and a
+        confusing Connect API error at worst. Nothing to gate on either way:
+        this degrades to the pre-existing race, same as a pause failure would."""
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-6"}
+        mock_oc.start_campaign.side_effect = RuntimeError("Connect busy")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                _connect_id, _seg, _arn, warmup_started, _exp, _act = (
+                    executor._create_campaign_only(bucket, campaign, run)
+                )
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert warmup_started is False
+        mock_oc.pause_campaign.assert_not_called()
+
+    def test_pause_campaign_failure_is_logged_and_does_not_raise(self):
+        """A pause failure must not fail the whole pre-warm — accepted residual
+        risk: the resume-based gate simply has nothing to gate on for this
+        campaign, degrading to the pre-existing timer race, not a new failure."""
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-7"}
+        mock_oc.pause_campaign.side_effect = RuntimeError("pause failed")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                connect_id, *_rest = executor._create_campaign_only(
+                    bucket, campaign, run
+                )  # must not raise despite pause_campaign failing
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert connect_id == "connect-7"
+
+
 class TestPollCampaignState:
     def _cs(self, **overrides):
         cs = {

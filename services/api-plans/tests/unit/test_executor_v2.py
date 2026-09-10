@@ -7635,6 +7635,41 @@ def _make_run_with_two_specialties() -> tuple[dict, dict]:
     return run, plan
 
 
+def _stub_precall_oc(mock_oc: MagicMock | None = None) -> tuple[MagicMock, dict]:
+    """Stub the vip_shared oc client via sys.modules — every call site resolves
+    it through a function-local import (`from vip_shared...outbound_campaigns_client
+    import build as build_oc`), never a module attribute, so mocker.patch("executor.oc",
+    ...) has no effect. Same technique as TestPrecallSmsOrdering below.
+
+    Needed here because the 2026-09 adversarial-review fix makes
+    _fire_precall_sms_for_campaign attempt oc.resume_campaign() whenever
+    cs["connectCampaignId"] is truthy — which every "warming" fixture in this
+    class has — so any test that doesn't stub oc would attempt a real boto3 call.
+    """
+    if mock_oc is None:
+        mock_oc = MagicMock()
+    vip_stub = MagicMock()
+    vip_stub.build = MagicMock(return_value=mock_oc)
+    modules_to_stub = [
+        "vip_shared",
+        "vip_shared.infrastructure",
+        "vip_shared.infrastructure.persistence",
+        "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+    ]
+    originals = {m: sys.modules.get(m) for m in modules_to_stub}
+    for m in modules_to_stub:
+        sys.modules[m] = vip_stub
+    return mock_oc, originals
+
+
+def _unstub_precall_oc(originals: dict) -> None:
+    for m, orig in originals.items():
+        if orig is None:
+            sys.modules.pop(m, None)
+        else:
+            sys.modules[m] = orig
+
+
 class TestFirePrecallSms:
     """The pre-call SMS fires at bucket activation, strictly before any dial."""
 
@@ -7647,14 +7682,20 @@ class TestFirePrecallSms:
         cs["segmentArn"] = "arn:cp:seg/vein-abc"
         cs["segmentName"] = "vein-abc"
         invoke = mocker.patch("executor._invoke_sms_sender")
-
-        executor._fire_precall_sms(run, plan, 0)
+        mock_oc, originals = _stub_precall_oc()
+        try:
+            executor._fire_precall_sms(run, plan, 0)
+        finally:
+            _unstub_precall_oc(originals)
 
         assert invoke.call_count == 1
         kwargs = invoke.call_args.kwargs
         assert kwargs["segmentArn"] == "arn:cp:seg/vein-abc"
         assert "{{FirstName}}" in kwargs["messageTemplate"]  # rendered by the sender
         assert cs["precallSmsSentAt"]
+        # Dial gate: the campaign is resumed once the send attempt has resolved.
+        mock_oc.resume_campaign.assert_called_once_with("cc-vein-1")
+        assert cs["precallGateResumedAt"]
 
     def test_uses_the_same_segment_as_the_voice_campaign(self, mocker):
         """Same-list is the core guarantee. There is only ever ONE segment —
@@ -7668,14 +7709,18 @@ class TestFirePrecallSms:
         cs["segmentName"] = "vein-abc"
         create_seg = mocker.patch("executor._create_segment")
         mocker.patch("executor._invoke_sms_sender")
-
-        executor._fire_precall_sms(run, plan, 0)
+        _, originals = _stub_precall_oc()
+        try:
+            executor._fire_precall_sms(run, plan, 0)
+        finally:
+            _unstub_precall_oc(originals)
 
         create_seg.assert_not_called()
 
     def test_is_idempotent_across_retries(self, mocker):
         """_prestart_plan is retry-aware and _activate_warming_bucket can re-run
-        after a failed save — a second pass must not re-text the cohort."""
+        after a failed save — a second pass must not re-text the cohort, and must
+        not attempt a second resume once the dial gate already resolved."""
         import executor
 
         run, plan = _make_run_with_precall_voice()
@@ -7684,11 +7729,15 @@ class TestFirePrecallSms:
         cs["segmentArn"] = "arn:cp:seg/vein-abc"
         cs["segmentName"] = "vein-abc"
         invoke = mocker.patch("executor._invoke_sms_sender")
-
-        executor._fire_precall_sms(run, plan, 0)
-        executor._fire_precall_sms(run, plan, 0)
+        mock_oc, originals = _stub_precall_oc()
+        try:
+            executor._fire_precall_sms(run, plan, 0)
+            executor._fire_precall_sms(run, plan, 0)
+        finally:
+            _unstub_precall_oc(originals)
 
         assert invoke.call_count == 1
+        assert mock_oc.resume_campaign.call_count == 1
 
     @pytest.mark.parametrize("status", ["error", "cancelled", "queued"])
     def test_does_not_fire_for_a_campaign_that_failed_to_warm(self, mocker, status):
@@ -7765,7 +7814,9 @@ class TestFirePrecallSms:
         invoke.assert_not_called()
 
     def test_sms_send_failure_does_not_block_the_voice_campaign(self, mocker):
-        """A failed pre-call text must degrade to 'no text', never to 'no call'."""
+        """A failed pre-call text must degrade to 'no text', never to 'no call' —
+        and, critically, must never leave the campaign stuck paused: the dial
+        gate's resume is decoupled from whether the send above succeeded."""
         import executor
 
         run, plan = _make_run_with_precall_voice()
@@ -7774,8 +7825,15 @@ class TestFirePrecallSms:
         cs["segmentArn"] = "arn:cp:seg/vein-abc"
         cs["segmentName"] = "vein-abc"
         mocker.patch("executor._invoke_sms_sender", side_effect=RuntimeError("boom"))
+        mock_oc, originals = _stub_precall_oc()
+        try:
+            executor._fire_precall_sms(run, plan, 0)  # must not raise
+        finally:
+            _unstub_precall_oc(originals)
 
-        executor._fire_precall_sms(run, plan, 0)  # must not raise
+        assert cs.get("precallSmsSentAt") is None  # send failed — never marked sent
+        mock_oc.resume_campaign.assert_called_once_with("cc-vein-1")
+        assert cs["precallGateResumedAt"]  # dial gate still released
 
     def test_each_specialty_campaign_gets_its_own_copy_and_segment(self, mocker):
         """Specialty copy comes from per-campaign config, not a lookup table."""
@@ -7783,8 +7841,11 @@ class TestFirePrecallSms:
 
         run, plan = _make_run_with_two_specialties()
         invoke = mocker.patch("executor._invoke_sms_sender")
-
-        executor._fire_precall_sms(run, plan, 0)
+        mock_oc, originals = _stub_precall_oc()
+        try:
+            executor._fire_precall_sms(run, plan, 0)
+        finally:
+            _unstub_precall_oc(originals)
 
         assert invoke.call_count == 2
         pairs = {
@@ -7792,6 +7853,7 @@ class TestFirePrecallSms:
             for c in invoke.call_args_list
         }
         assert len(pairs) == 2
+        assert mock_oc.resume_campaign.call_count == 2
 
 
 class TestPrecallSmsOrdering:
@@ -7842,10 +7904,16 @@ class TestPrecallSmsOrdering:
 
         assert order and order[0] == "sms"
 
-    def test_start_run_fires_sms_before_starting_bucket_zero(self, mocker):
-        """Isolates call site #1 (inside start_run's pendingWarmup branch) by mocking
-        _activate_warming_bucket wholesale as the 'dial' marker — its own internal
-        call to _fire_precall_sms is covered by the test above, not this one."""
+    def test_start_run_no_longer_fires_sms_directly_before_activate_warming_bucket(
+        self, mocker
+    ):
+        """Regression test for finding #4 (2026-09 adversarial review): start_run's
+        pendingWarmup branch used to fire+persist the SMS itself, BEFORE
+        _activate_warming_bucket's _schedule_tick had run/confirmed success —
+        risking a "false promise" text if scheduling then failed. That redundant
+        early call is now removed; start_run must delegate entirely to
+        _activate_warming_bucket (whose own, correctly-ordered call is covered by
+        the test above)."""
         import executor
 
         plan = _make_plan([_bucket_def("b0", [_campaign_def("voice-vein")])])
@@ -7871,7 +7939,7 @@ class TestPrecallSmsOrdering:
         mocker.patch("executor.create_run", return_value=run)
         mocker.patch("executor.save_run")
         mocker.patch("executor.update_plan_pending_warmup")
-        mocker.patch(
+        fire_sms = mocker.patch(
             "executor._fire_precall_sms",
             side_effect=lambda *a, **k: order.append("sms"),
         )
@@ -7882,4 +7950,31 @@ class TestPrecallSmsOrdering:
 
         executor.start_run("plan-1")
 
-        assert order == ["sms", "dial"]
+        # start_run itself never calls _fire_precall_sms — only _activate_warming_bucket
+        # does (internally, after its own _schedule_tick succeeds), and that call is
+        # mocked wholesale here so it never reaches the real _fire_precall_sms either.
+        fire_sms.assert_not_called()
+        assert order == ["dial"]
+
+    def test_no_sms_sent_if_schedule_tick_fails_in_activate_warming_bucket(
+        self, mocker
+    ):
+        """False-promise regression for finding #4: with start_run's redundant early
+        call removed (see the test above), the ONLY call to _fire_precall_sms on the
+        pendingWarmup path is _activate_warming_bucket's own — which runs AFTER
+        _schedule_tick. If _schedule_tick raises, the real SMS send must never have
+        been reached at all — texting a cohort whose bucket then fails to schedule
+        would be exactly the false promise this fix closes."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        invoke = mocker.patch("executor._invoke_sms_sender")
+        mocker.patch("executor._record_plan_event")
+        mocker.patch(
+            "executor._schedule_tick", side_effect=RuntimeError("Scheduler down")
+        )
+
+        with pytest.raises(RuntimeError, match="Scheduler down"):
+            executor._activate_warming_bucket(run, plan, 0)
+
+        invoke.assert_not_called()
