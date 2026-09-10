@@ -105,7 +105,10 @@ export class ApiSmsStack extends cdk.Stack {
       keyArn: props.dataKeyArn,
     });
 
-    const sharedLayer = buildSharedLayer(this);
+    // This stack's Lambda needs `phonenumbers` (TCPA quiet-hours resolution)
+    // which no other stack uses — pass the SMS-specific superset file so
+    // only this stack's layer copy carries the extra ~48 MB.
+    const sharedLayer = buildSharedLayer(this, 'SharedLayer', 'requirements-sms.txt');
     const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
 
     // Both sender and processor roles below are imported with mutable:false —

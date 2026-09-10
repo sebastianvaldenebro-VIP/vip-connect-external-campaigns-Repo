@@ -44,6 +44,7 @@ jest.mock('aws-cdk-lib/aws-lambda', () => {
 });
 
 import * as cdk from 'aws-cdk-lib';
+import type * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Template } from 'aws-cdk-lib/assertions';
 import { buildSharedLayer } from './shared-layer';
 
@@ -53,12 +54,19 @@ function statusResult(status: number): SpawnSyncReturns<Buffer> {
   return { status, signal: null, output: [], pid: 1, stdout: Buffer.from(''), stderr: Buffer.from('') };
 }
 
-function buildStackWithLayer(id?: string) {
+function buildStackWithLayer(id?: string, requirementsFile?: string) {
   const app = new cdk.App();
   const stack = new cdk.Stack(app, 'TestStack', {
     env: { account: '165505826690', region: 'us-east-1' },
   });
-  const layer = id === undefined ? buildSharedLayer(stack) : buildSharedLayer(stack, id);
+  let layer: lambda.LayerVersion;
+  if (id === undefined) {
+    layer = buildSharedLayer(stack);
+  } else if (requirementsFile === undefined) {
+    layer = buildSharedLayer(stack, id);
+  } else {
+    layer = buildSharedLayer(stack, id, requirementsFile);
+  }
   return { stack, layer };
 }
 
@@ -88,9 +96,30 @@ describe('buildSharedLayer', () => {
     expect(stack.node.tryFindChild('SharedLayer')).toBeUndefined();
   });
 
-  describe('local.tryBundle', () => {
-    function getTryBundle(): (outputDir: string) => boolean {
+  describe('requirementsFile parameter', () => {
+    it('bundles from requirements.txt by default when no requirementsFile is given', () => {
       buildStackWithLayer('TestLayer');
+      const command = capturedBundling?.command as string[] | undefined;
+      if (!command) {
+        throw new Error('bundling.command was not captured');
+      }
+      expect(command.join(' ')).toContain('/asset-input/requirements.txt');
+      expect(command.join(' ')).not.toContain('/asset-input/requirements-sms.txt');
+    });
+
+    it('bundles from the given requirementsFile instead of the default', () => {
+      buildStackWithLayer('TestLayer', 'requirements-sms.txt');
+      const command = capturedBundling?.command as string[] | undefined;
+      if (!command) {
+        throw new Error('bundling.command was not captured');
+      }
+      expect(command.join(' ')).toContain('/asset-input/requirements-sms.txt');
+    });
+  });
+
+  describe('local.tryBundle', () => {
+    function getTryBundle(requirementsFile?: string): (outputDir: string) => boolean {
+      buildStackWithLayer('TestLayer', requirementsFile);
       const local = capturedBundling?.local;
       if (!local?.tryBundle) {
         throw new Error('bundling.local.tryBundle was not captured');
@@ -155,6 +184,27 @@ describe('buildSharedLayer', () => {
       for (const call of mockedSpawnSync.mock.calls.slice(1)) {
         expect(call[2]).toEqual({ stdio: 'inherit' });
       }
+    });
+
+    it('installs from requirements.txt by default when no requirementsFile is given', () => {
+      mockedSpawnSync.mockReturnValue(statusResult(0));
+      const tryBundle = getTryBundle();
+
+      tryBundle('/tmp/out');
+      const pipCallArgs = mockedSpawnSync.mock.calls[3][1] as string[];
+      const requirementsArg = pipCallArgs.find((arg) => arg.endsWith('requirements.txt'));
+      expect(requirementsArg).toBeDefined();
+      expect(pipCallArgs.some((arg) => arg.endsWith('requirements-sms.txt'))).toBe(false);
+    });
+
+    it('installs from the given requirementsFile instead of the default', () => {
+      mockedSpawnSync.mockReturnValue(statusResult(0));
+      const tryBundle = getTryBundle('requirements-sms.txt');
+
+      tryBundle('/tmp/out');
+      const pipCallArgs = mockedSpawnSync.mock.calls[3][1] as string[];
+      const requirementsArg = pipCallArgs.find((arg) => arg.endsWith('requirements-sms.txt'));
+      expect(requirementsArg).toBeDefined();
     });
   });
 });
