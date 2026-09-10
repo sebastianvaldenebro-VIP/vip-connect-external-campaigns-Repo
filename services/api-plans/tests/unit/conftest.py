@@ -36,6 +36,26 @@ if _SMS_TEMPLATE_MODULE_NAME not in sys.modules:
     _spec.loader.exec_module(_sms_template_module)
     sys.modules[_SMS_TEMPLATE_MODULE_NAME] = _sms_template_module
 
+# Same real-module-loading trick, now for builders.py's TCPA openHours import
+# (fix_later cleanup: builders.py used to define _open_hours()/_QUIET_HOURS_*
+# locally; it now imports connect_open_hours from this shared module). Needs
+# the REAL function — a generic MagicMock stub would make
+# build_campaign_params/build_create_campaign_params's communicationTimeConfig
+# assertions compare against Mock() attribute-access noise instead of the
+# actual openHours dict the tests pin down byte-for-byte.
+_QUIET_HOURS_MODULE_NAME = "vip_shared.domain.services.quiet_hours"
+if _QUIET_HOURS_MODULE_NAME not in sys.modules:
+    _quiet_hours_path = os.path.join(
+        os.path.dirname(__file__),
+        "../../../shared/python/vip_shared/domain/services/quiet_hours.py",
+    )
+    _spec = importlib.util.spec_from_file_location(
+        _QUIET_HOURS_MODULE_NAME, _quiet_hours_path
+    )
+    _quiet_hours_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_quiet_hours_module)
+    sys.modules[_QUIET_HOURS_MODULE_NAME] = _quiet_hours_module
+
 # Permanent (never reverted) blind stub for vip_shared's submodule tree.
 #
 # Real vip_shared isn't installed/importable in this test env — it lives in a

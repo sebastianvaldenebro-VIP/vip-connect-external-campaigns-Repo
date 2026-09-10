@@ -7802,7 +7802,7 @@ class TestFirePrecallSms:
         run, plan = _make_run_with_precall_voice()
         assert executor._precall_sms_campaign_id(run, 0, 0) != str(
             uuid.uuid5(
-                uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+                executor._SMS_UUID_NAMESPACE,
                 f"{run['planId']}#{run['runId']}#0#0",
             )
         )

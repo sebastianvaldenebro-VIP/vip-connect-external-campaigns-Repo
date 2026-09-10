@@ -638,6 +638,14 @@ function CampaignCard({
   const patchPrecall = (patch: Partial<NonNullable<BucketCampaignConfig['precallSms']>>) =>
     updateCfg({ precallSms: { ...(cfg.precallSms ?? EMPTY_PRECALL), ...patch } });
 
+  // Shared by every change that can invalidate an enabled precallSms config
+  // (adding a dependsOn, switching to a non-voice deliveryType, ...) — a
+  // stale enabled precallSms would otherwise fail server-side validation with
+  // a confusing error at save time. Centralized so a future invalidating
+  // condition gets one call site instead of another copy-paste.
+  const clearPrecallIf = (shouldClear: boolean | undefined) =>
+    shouldClear ? { campaignConfig: { ...cfg, precallSms: undefined } } : {};
+
   const toggleDep = (depId: string) => {
     const isAdding = !campaign.dependsOn.includes(depId);
     const deps = isAdding
@@ -645,11 +653,10 @@ function CampaignCard({
       : campaign.dependsOn.filter((d) => d !== depId);
     // A dependent campaign is never pre-warmed, so a stale enabled precallSms
     // would fail server-side validation with a confusing error at save time.
-    const clearPrecall = isAdding && cfg.precallSms?.enabled;
     onChange({
       ...campaign,
       dependsOn: deps,
-      ...(clearPrecall ? { campaignConfig: { ...cfg, precallSms: undefined } } : {}),
+      ...clearPrecallIf(isAdding && cfg.precallSms?.enabled),
     });
   };
 
@@ -808,11 +815,10 @@ function CampaignCard({
                     // An SMS-delivery campaign has no call for a pre-call text to
                     // precede, so a stale enabled precallSms would fail server-side
                     // validation with a confusing error at save time.
-                    const clearPrecall = newType === 'sms' && cfg.precallSms?.enabled;
                     onChange({
                       ...campaign,
                       deliveryType: newType,
-                      ...(clearPrecall ? { campaignConfig: { ...cfg, precallSms: undefined } } : {}),
+                      ...clearPrecallIf(newType === 'sms' && cfg.precallSms?.enabled),
                     });
                   }
                 }}

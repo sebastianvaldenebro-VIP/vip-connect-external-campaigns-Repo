@@ -131,6 +131,13 @@ _STUCK_RUN_HOURS: Final = 4
 _NO_ACTIVE_CAMPAIGN_MINUTES: Final = 5
 _ACTIVE_CAMPAIGN_STATUSES: Final = frozenset({"creating", "warming", "running"})
 
+# Deterministic-uuid5 namespace for both the real deliveryType='sms' bulk
+# campaign id and the precall#-prefixed pre-call SMS id (_precall_sms_campaign_id
+# below) — the two paths deliberately share one namespace and are kept from
+# colliding by the "precall#" name prefix instead, not by a different
+# namespace. Arbitrary, fixed UUID; changing it would change every derived id.
+_SMS_UUID_NAMESPACE: Final[uuid.UUID] = uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0")
+
 # ── Campaign exit reasons ─────────────────────────────────────────────────────
 
 REASON_COMPLETED: Final = "completed"
@@ -391,7 +398,7 @@ def _precall_sms_campaign_id(run: dict, bucket_index: int, campaign_index: int) 
     """
     return str(
         uuid.uuid5(
-            uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+            _SMS_UUID_NAMESPACE,
             f"precall#{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
         )
     )
@@ -3962,7 +3969,7 @@ def _start_one_campaign(
         # sender Lambda calls from generating orphaned VipSmsCampaignQueue items.
         sms_campaign_id = str(
             uuid.uuid5(
-                uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+                _SMS_UUID_NAMESPACE,
                 f"{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
             )
         )

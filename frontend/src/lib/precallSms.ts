@@ -38,15 +38,26 @@ export function renderedWorstCaseLength(
     .replace(/\{\{\s*ClinicName\s*\}\}/g, clinicName ?? '').length;
 }
 
+/**
+ * Mirrors the backend's ALLOWLIST exactly (_VOICE_DELIVERY_TYPES in
+ * handlers/plans.py) rather than a denylist of just 'sms'. A denylist of one
+ * value happens to produce the same result as this allowlist for today's 4
+ * known deliveryType values, but a future non-voice type would silently pass
+ * a denylist and only get caught server-side, after the operator has already
+ * filled out the whole precall panel. Keep in sync with _VOICE_DELIVERY_TYPES.
+ */
+const VOICE_DELIVERY_TYPES = new Set(['campaign', 'branded', 'journey']);
+
 export function precallSmsAvailability(campaign: {
   deliveryType?: string;
   dependsOn?: string[];
 }): { available: boolean; reason?: string } {
-  if (campaign.deliveryType === 'sms') {
+  const deliveryType = campaign.deliveryType ?? 'campaign';
+  if (!VOICE_DELIVERY_TYPES.has(deliveryType)) {
     return {
       available: false,
       reason:
-        'Pre-call SMS applies to voice campaigns — an SMS campaign has no dial to precede.',
+        `Pre-call SMS applies to voice campaigns — a '${deliveryType}' campaign has no dial to precede.`,
     };
   }
   if ((campaign.dependsOn ?? []).length > 0) {

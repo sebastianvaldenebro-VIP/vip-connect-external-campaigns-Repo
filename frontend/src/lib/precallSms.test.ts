@@ -178,4 +178,14 @@ describe('availability — the UI must not offer a config the API rejects', () =
         .available,
     ).toBe(true);
   });
+
+  it('is unavailable on a hypothetical future non-voice deliveryType', () => {
+    // The forward-looking gap this allowlist closes: a denylist of just
+    // 'sms' would silently pass any new deliveryType that isn't 'sms',
+    // deferring the rejection to the server. The allowlist rejects anything
+    // not explicitly known-voice, matching _VOICE_DELIVERY_TYPES's semantics.
+    const a = precallSmsAvailability({ deliveryType: 'email', dependsOn: [] });
+    expect(a.available).toBe(false);
+    expect(a.reason).toMatch(/email/i);
+  });
 });

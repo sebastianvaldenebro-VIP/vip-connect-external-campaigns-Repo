@@ -654,8 +654,9 @@ def _validate_precall_sms(campaign: dict, bucket_name: str, ci: int) -> list[str
 
     Two checks are specific to precall and have no bulk-SMS equivalent:
 
-    - deliveryType must be a voice campaign ('campaign' or 'branded') — a
-      pre-call SMS on an 'sms' campaign has no dial to precede.
+    - deliveryType must be a voice campaign — one of _VOICE_DELIVERY_TYPES
+      ('campaign', 'branded', or 'journey') — a pre-call SMS on an 'sms'
+      campaign has no dial to precede.
     - dependsOn must be empty — a campaign with dependsOn is never
       pre-warmed (see _fire_precall_sms's docstring in executor.py), so it
       never reaches "warming" with a real segmentArn and the SMS would
