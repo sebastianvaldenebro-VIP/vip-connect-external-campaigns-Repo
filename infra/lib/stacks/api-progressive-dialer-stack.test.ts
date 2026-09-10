@@ -158,6 +158,7 @@ describe('ApiProgressiveDialerStack', () => {
         CAMPAIGN_QUEUE_TABLE: 'VipProgressiveCampaignQueue',
         AGENT_LOCK_TABLE: 'VipProgressiveAgentLocks',
         FIRSTORION_SECRET_NAME: 'vip/firstorion/credentials',
+        OPT_OUT_TABLE: 'VipConnectOptOutList',
       });
     });
 

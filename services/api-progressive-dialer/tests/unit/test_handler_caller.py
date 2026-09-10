@@ -29,6 +29,7 @@ def test_calls_start_outbound_voice_contact():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -39,7 +40,8 @@ def test_calls_start_outbound_voice_contact():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             lambda_handler(_make_sqs_event(), None)
 
@@ -66,6 +68,7 @@ def test_raises_on_throttle_for_sqs_retry():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -78,7 +81,8 @@ def test_raises_on_throttle_for_sqs_retry():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             # Exception must propagate so SQS redelivers the message
             with pytest.raises(RuntimeError, match="throttled"):
@@ -104,6 +108,7 @@ def test_first_orion_repushed_before_raise_on_throttle():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
 
@@ -125,7 +130,8 @@ def test_first_orion_repushed_before_raise_on_throttle():
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
              patch("handler_caller.AgentLock", return_value=mock_lock), \
-             patch("handler_caller.FirstOrionClient", mock_fo_class):
+             patch("handler_caller.FirstOrionClient", mock_fo_class), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             with pytest.raises(RuntimeError, match="throttled"):
                 lambda_handler(_make_sqs_event(), None)
@@ -152,6 +158,7 @@ def test_lock_held_after_mark_dialed_for_call_connect_window():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -162,7 +169,8 @@ def test_lock_held_after_mark_dialed_for_call_connect_window():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             lambda_handler(_make_sqs_event(correlation_id="corr0001"), None)
 
@@ -180,6 +188,7 @@ def test_reset_and_lock_released_when_phone_not_found():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         mock_caller = MagicMock()
         mock_queue = MagicMock()
@@ -188,7 +197,8 @@ def test_reset_and_lock_released_when_phone_not_found():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             result = lambda_handler(_make_sqs_event(correlation_id="corr0002"), None)
 
@@ -205,6 +215,40 @@ def test_reset_and_lock_released_when_phone_not_found():
         )
 
 
+def test_blocked_number_skips_dial_and_releases_lock():
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
+    }):
+        mock_caller = MagicMock()
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = "+15551234567"
+        mock_lock = MagicMock()
+        mock_opt_out = MagicMock()
+        mock_opt_out.is_blocked.return_value = True
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=mock_opt_out):
+            from handler_caller import lambda_handler
+            lambda_handler(_make_sqs_event(), None)
+
+        mock_opt_out.is_blocked.assert_called_once_with("+15551234567")
+        mock_caller.dial.assert_not_called()
+        mock_queue.mark_blocked.assert_called_once_with(
+            "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
+        )
+        mock_lock.release.assert_called_once_with(
+            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
+        )
+
+
 def test_permanent_dial_failure_resets_contact_and_releases_lock():
     """A non-throttle dial failure (e.g. InvalidParameterException) must reset
     the contact to PENDING and release the agent lock, without raising."""
@@ -215,6 +259,7 @@ def test_permanent_dial_failure_resets_contact_and_releases_lock():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -227,7 +272,8 @@ def test_permanent_dial_failure_resets_contact_and_releases_lock():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             result = lambda_handler(_make_sqs_event(), None)
 
@@ -251,6 +297,7 @@ def test_permanent_dial_failure_logs_but_does_not_raise_when_reset_fails():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -265,7 +312,8 @@ def test_permanent_dial_failure_logs_but_does_not_raise_when_reset_fails():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             result = lambda_handler(_make_sqs_event(), None)
 
@@ -328,6 +376,7 @@ def test_correlation_id_fallback_when_absent_from_message():
         "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
         "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
         "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
     }):
         from connect_caller import DialResult
         mock_caller = MagicMock()
@@ -338,7 +387,8 @@ def test_correlation_id_fallback_when_absent_from_message():
 
         with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
              patch("handler_caller.CampaignQueue", return_value=mock_queue), \
-             patch("handler_caller.AgentLock", return_value=mock_lock):
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             # correlationId=None means key is absent from the SQS body
             result = lambda_handler(_make_sqs_event(correlation_id=None), None)

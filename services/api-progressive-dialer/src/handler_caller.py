@@ -24,6 +24,7 @@ from agent_lock import AgentLock
 from campaign_queue import CampaignQueue
 from connect_caller import ConnectCaller
 from first_orion_client import FirstOrionClient
+from vip_shared.infrastructure.persistence.opt_out import build_from_env as build_opt_out_from_env
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -37,6 +38,7 @@ _queue_store: CampaignQueue | None = None
 _lock_store: AgentLock | None = None
 _fo_client: FirstOrionClient | None = None
 _cw_client = None
+_opt_out_store = None
 
 
 def _get_queue() -> CampaignQueue:
@@ -65,6 +67,13 @@ def _get_cw():
     if _cw_client is None:
         _cw_client = boto3.client("cloudwatch")
     return _cw_client
+
+
+def _get_opt_out():
+    global _opt_out_store
+    if _opt_out_store is None:
+        _opt_out_store = build_opt_out_from_env()
+    return _opt_out_store
 
 
 def _emit_metric(metric_name: str, value: float = 1.0) -> None:
@@ -120,6 +129,34 @@ def _process_message(body: dict) -> None:
         except Exception as e:
             logger.error(
                 "lock_release_failed_on_missing_phone correlation_id=%s error=%s",
+                correlation_id,
+                type(e).__name__,
+            )
+        return
+
+    if _get_opt_out().is_blocked(destination_phone):
+        logger.info(
+            "Skipping dial — number on opt-out list campaign_id=%s correlation_id=%s",
+            campaign_id,
+            correlation_id,
+        )
+        # Terminal state, not a retry candidate — advances status to DONE (not just
+        # outcome) so this contact stops being counted as PENDING/DISPATCHING by
+        # _count_branded_queue, letting the branded campaign reach a real completion
+        # instead of being stuck until the run_duration_minutes force-stop timeout.
+        try:
+            _get_queue().mark_blocked(campaign_id, contact_sk)
+        except Exception as e:
+            logger.error(
+                "mark_blocked_failed_on_opt_out correlation_id=%s error=%s",
+                correlation_id,
+                type(e).__name__,
+            )
+        try:
+            _get_lock().release(agent_arn)
+        except Exception as e:
+            logger.error(
+                "lock_release_failed_on_opt_out correlation_id=%s error=%s",
                 correlation_id,
                 type(e).__name__,
             )

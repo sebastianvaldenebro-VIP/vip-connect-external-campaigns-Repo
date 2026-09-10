@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 
 import boto3
 
+from vip_shared.infrastructure.persistence.opt_out import (
+    build_from_env as build_opt_out_from_env,
+)
 from vip_shared.infrastructure.telemetry.structured_logger import StructuredLogger
 
 _logger = StructuredLogger(service="api-sms-sender")
@@ -32,6 +35,7 @@ _TTL_SECONDS = 30 * 24 * 3600  # 30 days
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
 _cp = boto3.client("customer-profiles")
+_opt_out = build_opt_out_from_env()
 
 # US 10-digit numbers in E.164 format only
 _E164_RE = re.compile(r"^\+1\d{10}$")
@@ -79,6 +83,8 @@ def lambda_handler(event: dict, context: object) -> dict:
             "totalSent": 0,
             "totalFailed": 0,
             "totalOptedOut": 0,
+            "totalSkippedOptOut": 0,
+            "totalSqsSendFailed": 0,
             "createdAt": now_iso,
             "updatedAt": now_iso,
             "pipelineVersion": "v1",
@@ -98,12 +104,16 @@ def lambda_handler(event: dict, context: object) -> dict:
     # invisible, and never retried.
     enqueued = 0
     failed = 0
+    opted_out = 0
     queue_table = _ddb.Table(_QUEUE_TABLE)
     sqs_batch: list[dict] = []
     ddb_items_by_id: dict[str, dict] = {}
 
     for phone in phones:
         if not _E164_RE.match(phone):
+            continue
+        if _opt_out.is_blocked(phone):
+            opted_out += 1
             continue
         item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
         entry_id = uuid.uuid4().hex[:8]
@@ -149,15 +159,38 @@ def lambda_handler(event: dict, context: object) -> dict:
         enqueued += batch_ok
         failed += batch_failed
 
-    # Update enqueued/failed counts
+    # Update enqueued/skipped-opt-out/sqs-send-failed counts.
+    #
+    # NOTE: this writes totalSkippedOptOut and totalSqsSendFailed, NOT totalOptedOut
+    # or totalFailed. Those two are owned by sms_processor_handler.py and mean
+    # "we enqueued this contact, then EUM/DDB rejected it after the fact" — those
+    # contacts ARE inside totalEnqueued. totalSkippedOptOut and totalSqsSendFailed
+    # mean "we never enqueued this contact at all" — skipped before send (our own
+    # opt-out list) or rejected by send_message_batch itself. Writing to
+    # totalOptedOut/totalFailed here would race with the processor's atomic ADD
+    # (SQS-driven sends can start firing while this loop is still running) and would
+    # conflate two different populations in downstream reporting/UI — the exact bug
+    # this split exists to avoid.
     _ddb.Table(_RUNS_TABLE).update_item(
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
-        UpdateExpression="SET totalEnqueued = :n, totalFailed = :f, updatedAt = :t",
-        ExpressionAttributeValues={":n": enqueued, ":f": failed, ":t": now_iso},
+        UpdateExpression=(
+            "SET totalEnqueued = :n, totalSqsSendFailed = :f, "
+            "totalSkippedOptOut = :o, updatedAt = :t"
+        ),
+        ExpressionAttributeValues={
+            ":n": enqueued,
+            ":f": failed,
+            ":o": opted_out,
+            ":t": now_iso,
+        },
     )
 
     _logger.info(
-        "sms_sender_enqueued", campaign_id=campaign_id, enqueued=enqueued, failed=failed
+        "sms_sender_enqueued",
+        campaign_id=campaign_id,
+        enqueued=enqueued,
+        sqs_send_failed=failed,
+        skipped_opt_out=opted_out,
     )
     return {"enqueued": enqueued, "failed": failed}
 
@@ -172,8 +205,9 @@ def _flush_sms_batch(
 
     send_message_batch does not raise on a partial failure — some entries can fail
     while the call itself returns 200. Items whose SQS entry failed are written as
-    SQS_SEND_FAILED (visible in the queue table and counted in totalFailed) instead
-    of PENDING, since no message exists for them to ever be picked up.
+    SQS_SEND_FAILED (visible in the queue table and counted in totalSqsSendFailed,
+    not totalFailed — see the note at the call site) instead of PENDING, since no
+    message exists for them to ever be picked up.
     """
     resp = _sqs.send_message_batch(QueueUrl=_SQS_QUEUE_URL, Entries=sqs_batch)
     failed_entries = resp.get("Failed", [])

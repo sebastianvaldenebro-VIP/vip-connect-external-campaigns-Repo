@@ -13,6 +13,7 @@ _ENV = {
     "SMS_CAMPAIGN_RUNS_TABLE": "VipSmsCampaignRuns",
     "SMS_SQS_QUEUE_URL": "https://sqs.us-east-1.amazonaws.com/123/vip-sms-campaign-queue",
     "PROFILES_DOMAIN_NAME": "amazon-connect-test",
+    "OPT_OUT_TABLE": "VipConnectOptOutList",
 }
 
 
@@ -71,11 +72,49 @@ def test_sender_enqueues_valid_e164_phones():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
     assert result["enqueued"] == 1
     mock_sqs.send_message_batch.assert_called()
+
+
+def test_sender_skips_phone_on_opt_out_list_and_counts_opted_out():
+    handler = _load_handler()
+
+    mock_ddb = MagicMock()
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    mock_sqs = MagicMock()
+    mock_cp = _make_mock_cp(phones=["+15125559999", "+15125558888"])
+
+    mock_opt_out = MagicMock()
+    mock_opt_out.is_blocked.side_effect = lambda p: p == "+15125559999"
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", mock_opt_out),
+    ):
+        result = handler.lambda_handler(_base_event(), None)
+
+    assert result["enqueued"] == 1
+    mock_opt_out.is_blocked.assert_any_call("+15125559999")
+    mock_opt_out.is_blocked.assert_any_call("+15125558888")
+    runs_update = mock_runs_table.update_item.call_args.kwargs
+    assert runs_update["ExpressionAttributeValues"][":o"] == 1
+    # :o must be bound to totalSkippedOptOut (contacts never enqueued at all), not
+    # totalOptedOut (a different counter owned by sms_processor_handler.py for
+    # contacts EUM's own suppression list rejected after enqueue).
+    assert "totalSkippedOptOut" in runs_update["UpdateExpression"]
+    assert "totalOptedOut" not in runs_update["UpdateExpression"]
 
 
 def test_sender_skips_invalid_phone_formats():
@@ -93,6 +132,7 @@ def test_sender_skips_invalid_phone_formats():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -113,6 +153,7 @@ def test_sender_empty_segment_returns_zero():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -147,6 +188,7 @@ def test_sender_sqs_flushes_every_10():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -190,6 +232,7 @@ def test_sender_partial_sqs_failure_marks_item_failed_not_pending():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -204,7 +247,7 @@ def test_sender_partial_sqs_failure_marks_item_failed_not_pending():
     assert put_calls[0]["status"] == "SQS_SEND_FAILED"
 
 
-def test_sender_partial_sqs_failure_updates_run_summary_total_failed():
+def test_sender_partial_sqs_failure_updates_run_summary_total_sqs_send_failed():
     handler = _load_handler()
 
     mock_runs_table = MagicMock()
@@ -225,12 +268,18 @@ def test_sender_partial_sqs_failure_updates_run_summary_total_failed():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         handler.lambda_handler(_base_event(), None)
 
     runs_update_kwargs = mock_runs_table.update_item.call_args.kwargs
     assert runs_update_kwargs["ExpressionAttributeValues"][":f"] == 1
     assert runs_update_kwargs["ExpressionAttributeValues"][":n"] == 0
+    # The SQS-rejected count must land on totalSqsSendFailed, never totalFailed —
+    # totalFailed is exclusively owned by sms_processor_handler.py's atomic ADD for
+    # a different population (enqueued-then-rejected, which IS inside totalEnqueued).
+    assert "totalSqsSendFailed = :f" in runs_update_kwargs["UpdateExpression"]
+    assert "totalFailed" not in runs_update_kwargs["UpdateExpression"]
 
 
 def test_sender_mixed_success_and_failure_in_same_batch():
@@ -260,6 +309,7 @@ def test_sender_mixed_success_and_failure_in_same_batch():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -293,6 +343,7 @@ def test_sender_no_sqs_failures_all_written_pending():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -318,6 +369,7 @@ def test_sender_runs_table_condition_expression_set():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         handler.lambda_handler(_base_event(), None)
 
@@ -362,6 +414,7 @@ def test_sender_skips_profile_with_no_id():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -393,6 +446,7 @@ def test_sender_pagination_follows_next_token():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -421,6 +475,7 @@ def test_sender_get_segment_phones_exception_returns_zero():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
         patch.object(handler, "_logger") as mock_logger,
     ):
         result = handler.lambda_handler(_base_event(), None)
@@ -445,6 +500,7 @@ def test_sender_no_phi_in_print_calls():
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
         patch.object(handler, "_logger") as mock_logger,
     ):
         handler.lambda_handler(_base_event(), None)

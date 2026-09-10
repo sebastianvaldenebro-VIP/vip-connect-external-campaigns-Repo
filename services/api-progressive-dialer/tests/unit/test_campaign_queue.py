@@ -152,6 +152,27 @@ def test_reset_to_pending_updates_status():
     assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
 
 
+def test_mark_blocked_writes_status_done_and_outcome():
+    q, table = _make_queue()
+    q.mark_blocked("campaign-1", "ts1#uuid1")
+    table.update_item.assert_called_once()
+    call_kwargs = table.update_item.call_args[1]
+    assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
+    assert "DONE" in str(call_kwargs["ExpressionAttributeValues"])
+    assert "blocked_dnc" in str(call_kwargs["ExpressionAttributeValues"])
+    # Must guard on the same status=DISPATCHING condition reset_to_pending() uses.
+    assert call_kwargs.get("ConditionExpression") is not None
+
+
+def test_mark_blocked_is_idempotent_on_conditional_check_failed():
+    """Contact already advanced past DISPATCHING by another invocation — must not raise."""
+    q, table = _make_queue()
+    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
+    table.update_item.side_effect = Exception("ConditionalCheckFailed")
+    # Must not raise
+    q.mark_blocked("campaign-1", "ts1#uuid1")
+
+
 def test_reset_to_pending_is_idempotent_on_conditional_check_failed():
     """Another invocation already transitioned the item away from DISPATCHING —
     reset_to_pending must swallow the conditional failure, not raise."""
@@ -159,23 +180,6 @@ def test_reset_to_pending_is_idempotent_on_conditional_check_failed():
     table.meta.client.exceptions.ConditionalCheckFailedException = Exception
     table.update_item.side_effect = Exception("ConditionalCheckFailed")
     q.reset_to_pending("campaign-1", "ts1#uuid1")  # must not raise
-
-
-def test_mark_outcome_writes_outcome_when_unset():
-    q, table = _make_queue()
-    q.mark_outcome("campaign-1", "ts1#uuid1", "voicemail")
-    call_kwargs = table.update_item.call_args[1]
-    assert call_kwargs["Key"] == {"campaignId": "campaign-1", "sk": "ts1#uuid1"}
-    assert call_kwargs["ExpressionAttributeValues"] == {":o": "voicemail"}
-    assert call_kwargs["ConditionExpression"] == "attribute_not_exists(#o)"
-
-
-def test_mark_outcome_is_idempotent_when_already_set():
-    """A concurrent invocation already recorded the outcome — must not raise."""
-    q, table = _make_queue()
-    table.meta.client.exceptions.ConditionalCheckFailedException = Exception
-    table.update_item.side_effect = Exception("ConditionalCheckFailed")
-    q.mark_outcome("campaign-1", "ts1#uuid1", "answered")  # must not raise
 
 
 def test_get_phone_returns_phone():

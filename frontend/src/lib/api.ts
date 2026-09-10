@@ -343,6 +343,9 @@ export type SmsCampaignRunRecord = {
   totalSent: number;
   totalFailed: number;
   totalOptedOut: number;
+  // Optional: absent on runs created before these counters existed.
+  totalSkippedOptOut?: number;
+  totalSqsSendFailed?: number;
   status: 'RUNNING' | 'COMPLETED' | 'ABORTED';
   startedAt: string;
   completedAt?: string;
