@@ -54,18 +54,41 @@ npx cdk deploy VipAdminApiPlansStack --require-approval broadening --profile pro
 CDK deploy order (managed by dependency graph):
 
 1. `VipAdminDataStack` — DynamoDB tables (`VipAdminPlans`, `AdminAuditLog`, `SegmentFilterConfig`) + KMS CMK
-2. `VipAdminAuthStack` — Cognito User Pool + Hosted UI + MFA enforcement
+2. `VipAdminAuthStack` — Cognito User Pool + Hosted UI + MFA enforcement + `Admin`/`Agent` groups
 3. `VipAdminApiSegmentsStack` — api-segments Lambda + S3 snapshot bucket + SharedLayer
 4. `VipAdminApiCampaignsStack` — api-campaigns Lambda
-5. `VipAdminApiMetricsStack` — api-metrics Lambda
-6. `VipAdminApiPlansStack` — api-plans Lambda + `VipAdminPlans` table access
-7. `VipAdminApiProfilesStack` — api-profiles Lambda
-8. `VipAdminApiStack` — API Gateway HTTP API + Cognito JWT Authorizer
-9. `VipAdminHostingStack` — S3 bucket + CloudFront distribution
+5. `ApiProgressiveDialerStack` — Progressive Branded Dialer (Kinesis consumer + seeder Lambda)
+6. `VipAdminApiMetricsStack` — api-metrics Lambda
+7. `VipAdminApiSmsStack` — SMS campaign sender + processor Lambdas
+8. `VipAdminApiPlansStack` — api-plans Lambda + `VipAdminPlans` table access
+9. `VipAdminApiProfilesStack` — api-profiles Lambda
+10. `VipAdminApiDenyListStack` — api-deny-list Lambda (manual blocked-number entry)
+11. `VipAdminApiAuthorizerStack` — custom Lambda authorizer (Cognito Admin/Agent group enforcement)
+12. `VipAdminApiStack` — API Gateway HTTP API, wired to the authorizer above
+13. `VipAdminHostingStack` — S3 bucket + CloudFront distribution
 
 **NOTE:** The MonitoringStack (SNS topic, CloudWatch alarms, dashboard) is NOT managed by CDK.
 The CFN exec role `VipAdminCdkCfnExecPolicy` lacks SNS and cloudwatch:PutDashboard permissions.
 All monitoring resources were created via CLI and persist independently.
+
+### ⚠️ Deploying the Admin/Agent authorizer — never use `cdk deploy --all` for this
+
+`VipAdminApiStack` depends on `VipAdminApiAuthorizerStack`, which depends on `VipAdminAuthStack`'s
+`Admin`/`Agent` Cognito groups. The authorizer denies by design — any user with no group claim on
+their token is denied on every route, with no fallback. `npx cdk deploy --all` deploys the whole
+dependency graph in one invocation, with no pause between "groups now exist" and "the authorizer
+that requires them goes live" — that pause is where you backfill existing users into `Admin`, or
+they lose the entire admin UI, not just one feature.
+
+Correct sequence for any change touching auth-stack.ts, api-authorizer-stack.ts, or api-stack.ts's
+routes:
+
+1. `npx cdk deploy VipAdminAuthStack --profile production` (creates/updates groups only)
+2. Backfill every real user into `Admin` (see "Cognito groups" below) — **verify** the count
+   matches `list-users` before proceeding; a user missed here has no self-healing path.
+3. `npx cdk deploy VipAdminApiAuthorizerStack VipAdminApiStack --profile production`
+
+Never run step 3 before step 2 has been verified complete.
 
 ### Deploy api-plans Lambda (code-only change)
 
@@ -237,6 +260,31 @@ AWS_PROFILE=production aws cognito-idp admin-create-user \
   --temporary-password 'TempPass!23'
 
 # User receives email, logs in, must set permanent password + enroll MFA (TOTP)
+```
+
+### Cognito groups (Admin/Agent authorization)
+
+The custom Lambda authorizer (`VipAdminApiAuthorizerStack`) denies any request whose ID token has
+no `Admin` or `Agent` group claim — there is no default-allow fallback. `Admin` reaches every
+route; `Agent` reaches only `/deny-list`. Group membership is baked into the ID token at
+sign-in/refresh time — a user added to a group doesn't gain access until their token refreshes
+(up to 1 hour if they already have an open session; immediate on next login).
+
+```bash
+POOL_ID=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminAuthStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+
+# Add an operator to Admin (full access) or a call-center agent to Agent (blocked-numbers only)
+AWS_PROFILE=production aws cognito-idp admin-add-user-to-group \
+  --user-pool-id $POOL_ID --username operator.name@medwork.io --group-name Admin
+
+# Verify — every real user MUST appear in exactly one of these before/immediately
+# after deploying VipAdminApiAuthorizerStack, or they lose all admin-UI access
+AWS_PROFILE=production aws cognito-idp list-users-in-group \
+  --user-pool-id $POOL_ID --group-name Admin
+AWS_PROFILE=production aws cognito-idp list-users-in-group \
+  --user-pool-id $POOL_ID --group-name Agent
 ```
 
 ### Disable a user (compromised / offboarded)
