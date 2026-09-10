@@ -16,6 +16,7 @@ export class DataStack extends cdk.Stack {
   public readonly auditTable: dynamodb.Table;
   public readonly adminAuditTable: dynamodb.Table;
   public readonly segmentFilterConfigTable: dynamodb.Table;
+  public readonly optOutTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
@@ -148,6 +149,21 @@ export class DataStack extends cdk.Stack {
       deletionProtection: true,
     });
 
+    // Cross-channel automated opt-out (STOP/QUIT/UNSUBSCRIBE) store. Deliberately
+    // separate from vip-connect-deny-list — that table is voice-only, agent-manual
+    // "Block Number" and predates this app's CDK; mixing the two concepts under one
+    // table/name is exactly the confusion this table avoids.
+    this.optOutTable = new dynamodb.Table(this, 'OptOutTable', {
+      tableName: 'VipConnectOptOutList',
+      partitionKey: { name: 'ContactNumber', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: this.dataKey,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      deletionProtection: true,
+    });
+
     new cdk.CfnOutput(this, 'DataKeyArn', { value: this.dataKey.keyArn });
     new cdk.CfnOutput(this, 'SegmentFilterConfigTableArn', {
       value: this.segmentFilterConfigTable.tableArn,
@@ -156,6 +172,7 @@ export class DataStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'TrackingTableArn', { value: this.trackingTable.tableArn });
     new cdk.CfnOutput(this, 'AuditTableArn', { value: this.auditTable.tableArn });
     new cdk.CfnOutput(this, 'AdminAuditTableArn', { value: this.adminAuditTable.tableArn });
+    new cdk.CfnOutput(this, 'OptOutTableArn', { value: this.optOutTable.tableArn });
     new cdk.CfnOutput(this, 'AuditRetentionYears', { value: String(props.auditRetentionYears) });
   }
 }

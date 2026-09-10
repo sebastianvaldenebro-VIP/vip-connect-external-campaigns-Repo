@@ -222,6 +222,60 @@ def _run_sweep(
     return result, mock_sqs, mock_lock, mock_queue, mock_connect, mock_ddb, mock_cw
 
 
+# ── lazy AWS client singleton getters ────────────────────────────────────────
+
+
+class TestLazyClientGetters:
+    @staticmethod
+    def _fresh_module():
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+        with patch.dict("os.environ", _ENV):
+            import handler_kickstart
+        return handler_kickstart
+
+    def test_get_connect_constructs_and_caches_client(self):
+        handler_kickstart = self._fresh_module()
+        fake_client = MagicMock()
+        with patch("boto3.client", return_value=fake_client) as mock_boto:
+            first = handler_kickstart._get_connect()
+            second = handler_kickstart._get_connect()
+        mock_boto.assert_called_once_with("connect")
+        assert first is fake_client
+        assert second is fake_client
+
+    def test_get_sqs_constructs_and_caches_client(self):
+        handler_kickstart = self._fresh_module()
+        fake_client = MagicMock()
+        with patch("boto3.client", return_value=fake_client) as mock_boto:
+            first = handler_kickstart._get_sqs()
+            second = handler_kickstart._get_sqs()
+        mock_boto.assert_called_once_with("sqs")
+        assert first is fake_client
+        assert second is fake_client
+
+    def test_get_ddb_constructs_and_caches_client(self):
+        handler_kickstart = self._fresh_module()
+        fake_client = MagicMock()
+        with patch("boto3.client", return_value=fake_client) as mock_boto:
+            first = handler_kickstart._get_ddb()
+            second = handler_kickstart._get_ddb()
+        mock_boto.assert_called_once_with("dynamodb")
+        assert first is fake_client
+        assert second is fake_client
+
+    def test_get_cw_constructs_and_caches_client(self):
+        handler_kickstart = self._fresh_module()
+        fake_client = MagicMock()
+        with patch("boto3.client", return_value=fake_client) as mock_boto:
+            first = handler_kickstart._get_cw()
+            second = handler_kickstart._get_cw()
+        mock_boto.assert_called_once_with("cloudwatch")
+        assert first is fake_client
+        assert second is fake_client
+
+
 # ── lambda_handler: record filtering ─────────────────────────────────────────
 
 class TestRecordFiltering:
@@ -567,6 +621,181 @@ class TestSweep:
     # loop propagated out of _process_sweep, so a throttled or malformed
     # campaign silently starved every OTHER campaign sharing that sweep tick.
 
+    def test_agents_with_non_available_status_name_are_skipped(self):
+        """StatusName other than 'Available' (e.g. still On Call) must be
+        skipped outright — distinct from the NextStatus pending-break check."""
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        mock_lock = MagicMock()
+        mock_queue = MagicMock()
+        mock_ddb = MagicMock()
+        mock_ddb.scan.return_value = {"Items": [_CAMPAIGN_ITEM]}
+        mock_connect = MagicMock()
+        mock_connect.get_current_user_data.return_value = {
+            "UserDataList": [
+                {"User": {"Arn": _AGENT_ARN}, "Status": {"StatusName": "On call"}},
+            ]
+        }
+
+        with patch.dict("os.environ", _ENV):
+            with (
+                patch("handler_kickstart.AgentLock", return_value=mock_lock),
+                patch("handler_kickstart.CampaignQueue", return_value=mock_queue),
+                patch("handler_kickstart.FirstOrionClient"),
+                patch("handler_kickstart._get_ddb", return_value=mock_ddb),
+                patch("handler_kickstart._get_connect", return_value=mock_connect),
+            ):
+                import handler_kickstart
+
+                handler_kickstart.lambda_handler(
+                    {"Records": [_insert_record()]}, None
+                )
+
+        mock_lock.acquire.assert_not_called()
+
+    def test_get_available_agents_paginates_through_next_token(self):
+        """A second page of GetCurrentUserData results (NextToken present on
+        the first response) must be followed and its agents included."""
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        agent2 = "arn:aws:connect:us-east-1:123:instance/abc/agent/agent-2"
+        mock_connect = MagicMock()
+        mock_connect.get_current_user_data.side_effect = [
+            {
+                "UserDataList": [
+                    {"User": {"Arn": _AGENT_ARN}, "Status": {"StatusName": "Available"}}
+                ],
+                "NextToken": "page-2",
+            },
+            {
+                "UserDataList": [
+                    {"User": {"Arn": agent2}, "Status": {"StatusName": "Available"}}
+                ]
+            },
+        ]
+
+        with patch.dict("os.environ", _ENV):
+            with patch("handler_kickstart._get_connect", return_value=mock_connect):
+                import handler_kickstart
+
+                agents = handler_kickstart._get_available_agents("q1")
+
+        assert agents == [_AGENT_ARN, agent2]
+        assert mock_connect.get_current_user_data.call_count == 2
+        second_call_kwargs = mock_connect.get_current_user_data.call_args_list[1].kwargs
+        assert second_call_kwargs["NextToken"] == "page-2"
+
+    def test_first_orion_push_failure_still_dispatches_via_sqs(self):
+        """A First Orion push failure is logged but must not block the SQS
+        dispatch — INFORM branding is best-effort, not required for the call
+        itself to proceed."""
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+        mock_queue = MagicMock()
+        mock_queue.dequeue.return_value = _make_contact()
+        mock_fo = MagicMock()
+        mock_fo.push.return_value = False
+        mock_sqs = MagicMock()
+        mock_ddb = MagicMock()
+        mock_ddb.scan.return_value = {"Items": [_CAMPAIGN_ITEM]}
+        mock_connect = MagicMock()
+        mock_connect.get_current_user_data.return_value = {
+            "UserDataList": [
+                {"User": {"Arn": _AGENT_ARN}, "Status": {"StatusName": "Available"}}
+            ]
+        }
+
+        with patch.dict("os.environ", _ENV):
+            with (
+                patch("handler_kickstart.AgentLock", return_value=mock_lock),
+                patch("handler_kickstart.CampaignQueue", return_value=mock_queue),
+                patch("handler_kickstart.FirstOrionClient") as MockFO,
+                patch("handler_kickstart._get_sqs", return_value=mock_sqs),
+                patch("handler_kickstart._get_ddb", return_value=mock_ddb),
+                patch("handler_kickstart._get_connect", return_value=mock_connect),
+            ):
+                MockFO.build_from_secret.return_value = mock_fo
+                import handler_kickstart
+
+                handler_kickstart.lambda_handler({"Records": [_insert_record()]}, None)
+
+        mock_sqs.send_message.assert_called_once()
+
+    def test_process_insert_skips_record_missing_campaign_id(self):
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        mock_ddb = MagicMock()
+        mock_connect = MagicMock()
+
+        with patch.dict("os.environ", _ENV):
+            with (
+                patch("handler_kickstart._get_ddb", return_value=mock_ddb),
+                patch("handler_kickstart._get_connect", return_value=mock_connect),
+            ):
+                import handler_kickstart
+
+                new_image = {
+                    "sk": {"S": "2026-07-22T00:00:00.000Z#uuid-1"},
+                    "status": {"S": "PENDING"},
+                    "phone": {"S": "+15555550100"},
+                }
+                handler_kickstart._process_insert(new_image)
+
+        mock_ddb.scan.assert_not_called()
+        mock_connect.get_current_user_data.assert_not_called()
+
+    def test_scan_active_campaigns_paginates_through_last_evaluated_key(self):
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        camp2 = dict(_CAMPAIGN_ITEM, campaignId={"S": "camp-2"})
+        mock_ddb = MagicMock()
+        mock_ddb.scan.side_effect = [
+            {"Items": [_CAMPAIGN_ITEM], "LastEvaluatedKey": {"campaignId": {"S": "camp-1"}}},
+            {"Items": [camp2]},
+        ]
+
+        with patch.dict("os.environ", _ENV):
+            with patch("handler_kickstart._get_ddb", return_value=mock_ddb):
+                import handler_kickstart
+
+                items = handler_kickstart._scan_active_campaigns()
+
+        assert [i["campaignId"]["S"] for i in items] == ["camp-1", "camp-2"]
+        assert mock_ddb.scan.call_count == 2
+        second_call_kwargs = mock_ddb.scan.call_args_list[1].kwargs
+        assert second_call_kwargs["ExclusiveStartKey"] == {
+            "campaignId": {"S": "camp-1"}
+        }
+
+    def test_emit_sweep_metric_swallows_cloudwatch_errors(self):
+        for mod in list(sys.modules.keys()):
+            if "handler_kickstart" in mod:
+                del sys.modules[mod]
+
+        mock_cw = MagicMock()
+        mock_cw.put_metric_data.side_effect = RuntimeError("CloudWatch unavailable")
+
+        with patch.dict("os.environ", _ENV):
+            with patch("handler_kickstart._get_cw", return_value=mock_cw):
+                import handler_kickstart
+
+                # Must not raise even though put_metric_data blows up.
+                handler_kickstart._emit_sweep_metric("SomeMetric")
+
+        mock_cw.put_metric_data.assert_called_once()
+
     def test_isolates_campaign_dispatch_failure_and_continues_with_others(self):
         """One campaign's dispatch raising must not abort the sweep for other
         active campaigns in the same tick, and must emit a metric instead of
@@ -609,6 +838,23 @@ class TestSweep:
             for m in mock_cw.put_metric_data.call_args.kwargs["MetricData"]
         }
         assert "SweepCampaignDispatchFailed" in metric_names
+
+    def test_sweep_caps_dispatches_per_campaign(self):
+        """One campaign with an effectively unlimited backlog must stop being
+        drained once it hits _MAX_SWEEP_DISPATCHES_PER_CAMPAIGN, exercising the
+        cap-reached `continue` branch instead of looping forever."""
+        import handler_kickstart
+
+        cap = handler_kickstart._MAX_SWEEP_DISPATCHES_PER_CAMPAIGN
+
+        def _always_available(campaign_id):
+            return _make_contact()
+
+        result, mock_sqs, *_ = _run_sweep(
+            ddb_items=[_CAMPAIGN_ITEM], dequeue_side_effect=_always_available
+        )
+        assert result["sweepDispatched"] == cap
+        assert mock_sqs.send_message.call_count == cap
 
     def test_sweep_scan_failure_does_not_crash_lambda_handler(self):
         """A failure scanning VipActiveBrandedCampaigns itself (before any

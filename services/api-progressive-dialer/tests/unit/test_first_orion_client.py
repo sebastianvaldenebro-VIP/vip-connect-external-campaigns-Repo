@@ -50,6 +50,20 @@ def test_push_returns_false_on_4xx():
     assert result is False
 
 
+def test_push_returns_false_when_underlying_request_raises():
+    """A network-level exception (timeout, connection error, auth failure while
+    refreshing the token, etc.) must be swallowed and reported as a failed push,
+    not propagate out and crash the caller's dispatch flow."""
+    client = _make_client()
+    client._token = "tok-xyz"
+    client._token_fetched_at = float("inf")
+    with patch(
+        "first_orion_client.requests.post", side_effect=ConnectionError("network down")
+    ):
+        result = client.push(a_number="+12125550199", b_number="+15551234567")
+    assert result is False
+
+
 def test_push_refreshes_token_when_expired():
     client = _make_client()
     client._token = "old-token"

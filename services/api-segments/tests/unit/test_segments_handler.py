@@ -65,6 +65,35 @@ def test_list_segments_returns_normalized_shape():
     assert body["segments"][0]["displayName"] == "NJ 1st"
 
 
+def test_int_tag_falls_back_to_default_on_malformed_value():
+    from handlers import segments
+
+    assert segments._int_tag({"VipVersion": "not-a-number"}, "VipVersion", default=1) == 1
+    assert segments._int_tag({}, "VipVersion", default=2) == 2
+
+
+def test_get_segment_returns_full_definition_with_segment_groups():
+    from handlers import segments
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "nj-1st",
+        "DisplayName": "NJ 1st",
+        "SegmentDefinitionArn": "arn:aws:profile:...nj-1st",
+        "Tags": {"VipFamily": "nj-1st", "VipVersion": "2"},
+        "SegmentGroups": {"Groups": [{"Type": "ALL", "Dimensions": []}]},
+    }
+
+    with patch("handlers.segments.build_cp", return_value=mock_cp):
+        response = segments.get_segment({}, {"id": "nj-1st"})
+
+    body = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert body["name"] == "nj-1st"
+    assert body["version"] == 2
+    assert body["segmentGroups"] == {"Groups": [{"Type": "ALL", "Dimensions": []}]}
+
+
 def test_create_segment_calls_cp_and_audit():
     from handlers import segments
 
@@ -107,6 +136,59 @@ def test_create_segment_calls_cp_and_audit():
     assert audit_call["actor_email"] == "user@medwork.io"
 
 
+def test_create_segment_persists_filter_config_when_rules_evaluable():
+    from handlers import segments
+
+    mock_cp = MagicMock()
+    mock_cp.create_segment_definition.return_value = {
+        "SegmentDefinitionName": "new-seg",
+        "DisplayName": "New segment",
+        "SegmentDefinitionArn": "arn:aws:profile:...new-seg",
+        "CreatedAt": "2026-04-23T00:00:00Z",
+    }
+    config_store = MagicMock()
+
+    event = _caller_event(
+        {
+            "name": "new-seg",
+            "displayName": "New segment",
+            "segmentGroups": {
+                "Groups": [
+                    {
+                        "Type": "ALL",
+                        "Dimensions": [
+                            {
+                                "ProfileAttributes": {
+                                    "Attributes": {
+                                        "available": {
+                                            "DimensionType": "EQUAL",
+                                            "Values": ["1"],
+                                        }
+                                    }
+                                }
+                            }
+                        ],
+                    }
+                ]
+            },
+            "description": "test segment",
+        }
+    )
+
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=MagicMock()),
+        patch("handlers.segments.build_filter_config_store", return_value=config_store),
+    ):
+        segments.create_segment(event, {})
+
+    config_store.put.assert_called_once()
+    put_kwargs = config_store.put.call_args.kwargs
+    assert put_kwargs["family"] == "new-seg"
+    assert put_kwargs["description"] == "test segment"
+    assert put_kwargs["current_version"] == 1
+
+
 def test_create_segment_rejects_missing_fields():
     from handlers import segments
 
@@ -142,3 +224,73 @@ def test_delete_segment_captures_before_state():
     audit_call = mock_audit.record.call_args.kwargs
     assert audit_call["action"] == "delete"
     assert audit_call["before"]["name"] == "old-seg"
+
+
+def test_delete_segment_removes_filter_config_row_for_manual_sync_segment():
+    from handlers import segments
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "nj-1st",
+        "DisplayName": "NJ 1st",
+        "SegmentGroups": {"Groups": []},
+        "Tags": {"VipFamily": "nj-1st", "VipSyncMode": "manual"},
+    }
+    config_store = MagicMock()
+
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=MagicMock()),
+        patch("handlers.segments.build_filter_config_store", return_value=config_store),
+    ):
+        response = segments.delete_segment(_caller_event(), {"id": "nj-1st"})
+
+    assert response["statusCode"] == 204
+    config_store.delete.assert_called_once_with("nj-1st")
+
+
+def test_delete_segment_skips_filter_config_cleanup_for_live_sync_segment():
+    from handlers import segments
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "live-seg",
+        "DisplayName": "Live segment",
+        "SegmentGroups": {"Groups": []},
+        "Tags": {"VipFamily": "live-seg", "VipSyncMode": "live"},
+    }
+    config_store = MagicMock()
+
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=MagicMock()),
+        patch("handlers.segments.build_filter_config_store", return_value=config_store),
+    ):
+        segments.delete_segment(_caller_event(), {"id": "live-seg"})
+
+    config_store.delete.assert_not_called()
+
+
+def test_delete_segment_swallows_filter_config_delete_failure():
+    """A failure deleting the (possibly already-missing) filter config row
+    must not fail the DELETE /segments/{id} call itself."""
+    from handlers import segments
+
+    mock_cp = MagicMock()
+    mock_cp.get_segment_definition.return_value = {
+        "SegmentDefinitionName": "nj-1st",
+        "DisplayName": "NJ 1st",
+        "SegmentGroups": {"Groups": []},
+        "Tags": {"VipFamily": "nj-1st", "VipSyncMode": "manual"},
+    }
+    config_store = MagicMock()
+    config_store.delete.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.segments.build_cp", return_value=mock_cp),
+        patch("handlers.segments.build_audit", return_value=MagicMock()),
+        patch("handlers.segments.build_filter_config_store", return_value=config_store),
+    ):
+        response = segments.delete_segment(_caller_event(), {"id": "nj-1st"})
+
+    assert response["statusCode"] == 204

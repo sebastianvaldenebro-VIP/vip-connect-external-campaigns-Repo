@@ -33,6 +33,11 @@ def test_routable_available_is_available():
 def test_custom_status_not_available():
     assert is_agent_available(_state_change_event("CUSTOM", "Break")) is False
 
+def test_routable_but_non_available_name_not_available():
+    # Type=ROUTABLE with a Name other than "Available" (e.g. still on a break
+    # status that happens to be routable) must not be treated as available.
+    assert is_agent_available(_state_change_event("ROUTABLE", "Break")) is False
+
 def test_offline_not_available():
     assert is_agent_available(_state_change_event("OFFLINE", "Offline")) is False
 

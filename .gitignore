@@ -22,6 +22,9 @@ htmlcov/
 venv/
 *.egg-info/
 
+# JS/TS coverage reports
+coverage/
+
 # Lambda build artifacts
 services/*/dist/
 services/*/.aws-sam/
@@ -45,6 +48,8 @@ npm-debug.log*
 # CDK TypeScript compilation artifacts (infra/)
 infra/**/*.js
 infra/**/*.d.ts
+# ...except the hand-written Jest config — not a tsc compilation output.
+!infra/jest.config.js
 
 # data-table-tools CSV exports (data lives in DynamoDB, not in the repo)
 services/data-table-tools/*.csv

@@ -36,6 +36,29 @@ def test_dial_passes_correct_params():
     }
 
 
+def test_dial_includes_attributes_and_client_token_when_provided():
+    caller, mock_boto = _make_caller()
+    mock_boto.start_outbound_voice_contact.return_value = {"ContactId": "contact-001"}
+    caller.dial(
+        destination_phone="+15551234567",
+        queue_id="queue-001",
+        attributes={"campaignId": "camp-1"},
+        client_token="contact-sk-abc",
+    )
+    call_kwargs = mock_boto.start_outbound_voice_contact.call_args[1]
+    assert call_kwargs["Attributes"] == {"campaignId": "camp-1"}
+    assert call_kwargs["ClientToken"] == "contact-sk-abc"
+
+
+def test_dial_omits_attributes_and_client_token_when_not_provided():
+    caller, mock_boto = _make_caller()
+    mock_boto.start_outbound_voice_contact.return_value = {"ContactId": "contact-001"}
+    caller.dial(destination_phone="+15551234567", queue_id="queue-001")
+    call_kwargs = mock_boto.start_outbound_voice_contact.call_args[1]
+    assert "Attributes" not in call_kwargs
+    assert "ClientToken" not in call_kwargs
+
+
 def test_dial_returns_failure_on_throttle():
     from botocore.exceptions import ClientError
     caller, mock_boto = _make_caller()

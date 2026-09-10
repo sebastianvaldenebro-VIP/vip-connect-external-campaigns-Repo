@@ -93,6 +93,188 @@ def _definition(name: str, *, version: int, arn: str) -> dict:
     }
 
 
+def test_raises_for_rebuilt_legacy_segment_without_persisted_config():
+    from handlers import reconcile
+
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn="arn:old"
+    )
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_filter_config_store", return_value=_no_config_store()),
+    ):
+        with pytest.raises(ValueError, match="rebuilt before filter persistence"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+
+def test_raises_when_legacy_segment_has_no_evaluable_filters():
+    from handlers import reconcile
+
+    cp = MagicMock()
+    definition = _definition("nj-v1", version=1, arn="arn:old")
+    definition["SegmentGroups"] = {"Groups": []}
+    cp.get_segment_definition.return_value = definition
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_filter_config_store", return_value=_no_config_store()),
+    ):
+        with pytest.raises(ValueError, match="nothing to reconcile"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v1"})
+
+
+def test_raises_when_no_redis_records_match_filter():
+    from handlers import reconcile
+
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn="arn:old"
+    )
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter([])  # nothing matches
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=_config_store_with(
+                [("available", "eq", ["1"])], combinator="ALL", version=3
+            ),
+        ),
+    ):
+        with pytest.raises(ValueError, match="No Redis records match"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+
+def test_raises_when_redis_matches_exceed_cp_hard_limit():
+    from handlers import reconcile
+
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn="arn:old"
+    )
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [
+            {"id": f"cust-{i}", "customerid": f"cust-{i}", "available": "1"}
+            for i in range(3001)
+        ]
+    )
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=_config_store_with(
+                [("available", "eq", ["1"])], combinator="ALL", version=3
+            ),
+        ),
+    ):
+        with pytest.raises(ValueError, match="over the CP hard limit"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+
+def test_rollback_campaign_revert_failure_marks_rollback_incomplete():
+    """If reverting a retargeted campaign back to the old ARN itself fails
+    during rollback, that must be reflected in the annotated RuntimeError —
+    not silently treated as a clean rollback."""
+    from handlers import reconcile
+
+    old_arn = "arn:old"
+    new_arn = "arn:new"
+    cp = MagicMock()
+    cp.get_segment_definition.return_value = _definition(
+        "nj-v3", version=3, arn=old_arn
+    )
+    cp.create_segment_definition.return_value = {"SegmentDefinitionArn": new_arn}
+
+    redis_source = MagicMock()
+    redis_source.iter_records.return_value = iter(
+        [{"id": "cust-a", "customerid": "cust-a", "available": "1"}]
+    )
+
+    oc = MagicMock()
+    oc.list_campaigns.return_value = {
+        "campaignSummaryList": [
+            {"id": "cmp-1", "source": {"customerProfilesSegmentArn": old_arn}},
+        ],
+        "nextToken": None,
+    }
+    # First call retargets to new_arn (succeeds); rollback's revert call fails.
+    oc.update_campaign_source.side_effect = [None, RuntimeError("OC unavailable")]
+
+    config_store = _config_store_with(
+        [("available", "eq", ["1"])], combinator="ALL", version=3
+    )
+    config_store.mark_rebuilt.side_effect = RuntimeError("DDB throttled")
+
+    with (
+        patch("handlers.reconcile.build_cp", return_value=cp),
+        patch("handlers.reconcile.build_oc", return_value=oc),
+        patch("handlers.reconcile.build_redis_source", return_value=redis_source),
+        patch("handlers.reconcile.build_audit", return_value=MagicMock()),
+        patch(
+            "handlers.reconcile.build_filter_config_store",
+            return_value=config_store,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="rollback was incomplete"):
+            reconcile.reconcile_segment(_event(), {"id": "nj-v3"})
+
+
+class TestFamilyFromName:
+    def test_strips_version_suffix(self):
+        from handlers import reconcile
+
+        assert reconcile._family_from_name("nj-available-leads-v3") == "nj-available-leads"
+
+    def test_returns_name_unchanged_when_no_suffix(self):
+        from handlers import reconcile
+
+        assert reconcile._family_from_name("nj-available-leads") == "nj-available-leads"
+
+
+class TestVersionFromTags:
+    def test_reads_version_from_tag(self):
+        from handlers import reconcile
+
+        assert reconcile._version_from_tags({"VipVersion": "5"}, fallback_name="x") == 5
+
+    def test_defaults_to_zero_when_tag_missing(self):
+        """A missing VipVersion tag defaults to "0" (parses cleanly as int 0)
+        rather than falling back to the name-suffix parse — that fallback is
+        reserved for a *present but malformed* tag value (see test below)."""
+        from handlers import reconcile
+
+        assert (
+            reconcile._version_from_tags({}, fallback_name="nj-available-leads-v7") == 0
+        )
+
+    def test_falls_back_to_1_when_tag_malformed_and_no_suffix(self):
+        from handlers import reconcile
+
+        assert (
+            reconcile._version_from_tags(
+                {"VipVersion": "not-a-number"}, fallback_name="nj-available-leads"
+            )
+            == 1
+        )
+
+    def test_falls_back_to_name_suffix_when_tag_malformed(self):
+        from handlers import reconcile
+
+        assert (
+            reconcile._version_from_tags(
+                {"VipVersion": "not-a-number"}, fallback_name="nj-available-leads-v9"
+            )
+            == 9
+        )
+
+
 def test_creates_vNplus1_and_retargets_campaigns():
     from handlers import reconcile
 
