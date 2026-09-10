@@ -5139,6 +5139,15 @@ def _past_daily_cutoff(now: datetime) -> bool:
     return cot_now.hour >= _DAILY_CUTOFF_HOUR
 
 
+# Colombia Time, fixed UTC-5, no DST. This is the CALL-CENTER STAFFING clock:
+# every guard built on it (workingHours, loop.startTime/endTime, the 19:00 daily
+# cutoff at _DAILY_CUTOFF_HOUR) answers "are our Bogota agents on shift?"
+#
+# It is NOT a TCPA quiet-hours gate and must not be used as one. TCPA is a
+# property of the RECIPIENT's local time; see
+# vip_shared.domain.services.quiet_hours, applied per lead by the bulk SMS
+# sender, and communicationTimeConfig.localTimeZoneDetection=AREA_CODE, applied
+# per recipient by Connect Campaigns for the voice path.
 _COT_TZ = timezone(timedelta(hours=-5))
 _DAY_ABBR = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]  # weekday() → 0=MON
 
@@ -5150,7 +5159,8 @@ def _now_cot_hhmm() -> int:
 
 
 def _is_working_day(plan: dict) -> bool:
-    """Return True if today (COT) is an allowed day for the plan.
+    """Return True if today (COT) is an allowed day for the CALL-CENTER STAFFING
+    schedule — this is not a TCPA quiet-hours check (see vip_shared.domain.services.quiet_hours).
 
     If workingHours or workingHours.days is not configured, always returns True (no restriction).
     """
@@ -5165,7 +5175,9 @@ def _is_working_day(plan: dict) -> bool:
 
 
 def _within_working_hours(plan: dict) -> bool:
-    """Return True if current COT time/day is within plan's workingHours window.
+    """Return True if current COT time/day is within plan's workingHours window —
+    the CALL-CENTER STAFFING gate, not a TCPA quiet-hours check (see
+    vip_shared.domain.services.quiet_hours for the recipient-local gate).
 
     If workingHours is not configured, always returns True (no restriction).
     """

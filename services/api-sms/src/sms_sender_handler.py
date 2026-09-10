@@ -19,6 +19,9 @@ from datetime import datetime, timezone
 
 import boto3
 
+from vip_shared.domain.services.quiet_hours import (
+    is_within_quiet_hours as _is_within_quiet_hours,
+)
 from vip_shared.infrastructure.persistence.opt_out import (
     build_from_env as build_opt_out_from_env,
 )
@@ -84,6 +87,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             "totalFailed": 0,
             "totalOptedOut": 0,
             "totalSkippedOptOut": 0,
+            "totalSkippedQuietHours": 0,
             "totalSqsSendFailed": 0,
             "createdAt": now_iso,
             "updatedAt": now_iso,
@@ -105,6 +109,7 @@ def lambda_handler(event: dict, context: object) -> dict:
     enqueued = 0
     failed = 0
     opted_out = 0
+    outside_quiet_hours = 0
     queue_table = _ddb.Table(_QUEUE_TABLE)
     sqs_batch: list[dict] = []
     ddb_items_by_id: dict[str, dict] = {}
@@ -114,6 +119,12 @@ def lambda_handler(event: dict, context: object) -> dict:
             continue
         if _opt_out.is_blocked(phone):
             opted_out += 1
+            continue
+        # TCPA: the recipient's own local time, not the call-center's. This is
+        # the per-patient gate; executor.py's COT workingHours check is about
+        # whether our Bogota staff are on shift and does not answer this.
+        if not _is_within_quiet_hours(phone):
+            outside_quiet_hours += 1
             continue
         item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
         entry_id = uuid.uuid4().hex[:8]
@@ -175,12 +186,13 @@ def lambda_handler(event: dict, context: object) -> dict:
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
         UpdateExpression=(
             "SET totalEnqueued = :n, totalSqsSendFailed = :f, "
-            "totalSkippedOptOut = :o, updatedAt = :t"
+            "totalSkippedOptOut = :o, totalSkippedQuietHours = :q, updatedAt = :t"
         ),
         ExpressionAttributeValues={
             ":n": enqueued,
             ":f": failed,
             ":o": opted_out,
+            ":q": outside_quiet_hours,
             ":t": now_iso,
         },
     )
@@ -191,6 +203,7 @@ def lambda_handler(event: dict, context: object) -> dict:
         enqueued=enqueued,
         sqs_send_failed=failed,
         skipped_opt_out=opted_out,
+        skipped_quiet_hours=outside_quiet_hours,
     )
     return {"enqueued": enqueued, "failed": failed}
 

@@ -165,6 +165,14 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_SQS_QUEUE_URL: this.smsSendQueue.queueUrl,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
         OPT_OUT_TABLE: 'VipConnectOptOutList',
+        // Per-recipient TCPA window: full statutory hours (08:00-21:00 local),
+        // stricter than statute on days (Mon-Sat, no Sunday — a VIP business
+        // choice). Env vars so counsel can narrow either axis without a deploy
+        // of new code. QUIET_HOURS_DAYS is Python weekday(): Monday=0..Sunday=6.
+        QUIET_HOURS_START: '08:00',
+        QUIET_HOURS_END: '21:00',
+        QUIET_HOURS_DAYS: '0,1,2,3,4,5',
+        QUIET_HOURS_DEFAULT_TZ: 'America/New_York',
       },
     });
     skipCheckovChecks(this.smsSenderFunction, [VPC_SKIP]);

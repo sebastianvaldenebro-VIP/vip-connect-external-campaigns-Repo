@@ -73,6 +73,7 @@ def test_sender_enqueues_valid_e164_phones():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -102,6 +103,7 @@ def test_sender_skips_phone_on_opt_out_list_and_counts_opted_out():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", mock_opt_out),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -133,6 +135,7 @@ def test_sender_skips_invalid_phone_formats():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -154,6 +157,7 @@ def test_sender_empty_segment_returns_zero():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -189,6 +193,7 @@ def test_sender_sqs_flushes_every_10():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -233,6 +238,7 @@ def test_sender_partial_sqs_failure_marks_item_failed_not_pending():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -269,6 +275,7 @@ def test_sender_partial_sqs_failure_updates_run_summary_total_sqs_send_failed():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         handler.lambda_handler(_base_event(), None)
 
@@ -310,6 +317,7 @@ def test_sender_mixed_success_and_failure_in_same_batch():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -344,6 +352,7 @@ def test_sender_no_sqs_failures_all_written_pending():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -370,6 +379,7 @@ def test_sender_runs_table_condition_expression_set():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         handler.lambda_handler(_base_event(), None)
 
@@ -415,6 +425,7 @@ def test_sender_skips_profile_with_no_id():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -447,6 +458,7 @@ def test_sender_pagination_follows_next_token():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
         result = handler.lambda_handler(_base_event(), None)
 
@@ -476,6 +488,7 @@ def test_sender_get_segment_phones_exception_returns_zero():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
         patch.object(handler, "_logger") as mock_logger,
     ):
         result = handler.lambda_handler(_base_event(), None)
@@ -484,6 +497,64 @@ def test_sender_get_segment_phones_exception_returns_zero():
     mock_logger.warn.assert_called_once()
     _, kwargs = mock_logger.warn.call_args
     assert kwargs["error"] == "RuntimeError"
+
+
+def test_sender_skips_phone_outside_recipient_local_quiet_hours():
+    handler = _load_handler()
+
+    mock_ddb = MagicMock()
+    mock_runs_table = MagicMock()
+    mock_queue_table = MagicMock()
+    mock_ddb.Table.side_effect = lambda name: (
+        mock_runs_table if "Runs" in name else mock_queue_table
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", MagicMock()),
+        patch.object(handler, "_cp", _make_mock_cp(phones=["+12125551234", "+14155551234"])),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(
+            handler, "_is_within_quiet_hours", lambda p, **_: p == "+12125551234"
+        ),
+    ):
+        result = handler.lambda_handler(_base_event(), None)
+
+    assert result["enqueued"] == 1
+    assert mock_runs_table.update_item.call_args.kwargs[
+        "ExpressionAttributeValues"
+    ][":q"] == 1
+
+
+def test_opt_out_is_checked_before_quiet_hours():
+    """Ordering matters: an opted-out contact must count as opted out, not as
+    quiet-hours-skipped, or the two suppression reasons blur in reporting."""
+    handler = _load_handler()
+    calls: list[str] = []
+
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = MagicMock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_sqs", MagicMock()),
+        patch.object(handler, "_cp", _make_mock_cp(phones=["+12125551234"])),
+        patch.object(
+            handler,
+            "_opt_out",
+            MagicMock(is_blocked=lambda *_: (calls.append("opt_out"), True)[1]),
+        ),
+        patch.object(
+            handler,
+            "_is_within_quiet_hours",
+            lambda *_a, **_k: (calls.append("quiet_hours"), True)[1],
+        ),
+    ):
+        handler.lambda_handler(_base_event(), None)
+
+    assert calls == ["opt_out"]  # quiet_hours never reached
 
 
 def test_sender_no_phi_in_print_calls():
@@ -501,6 +572,7 @@ def test_sender_no_phi_in_print_calls():
         patch.object(handler, "_sqs", mock_sqs),
         patch.object(handler, "_cp", mock_cp),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
         patch.object(handler, "_logger") as mock_logger,
     ):
         handler.lambda_handler(_base_event(), None)
