@@ -111,6 +111,13 @@ def _enter_base_patches(stack: ExitStack) -> None:
     stack.enter_context(patch("executor._dispatch_cross_bucket_ready", return_value=False))
     stack.enter_context(patch("executor._all_campaigns_terminal", return_value=False))
     stack.enter_context(patch("executor._fire_campaign_chains"))
+    # _force_finish_internal (reachable from tick()'s prewarm/force-stop paths in
+    # this file) unconditionally clears pending warmup via a real DynamoDB
+    # UpdateItem — not mocked here previously, so it silently succeeded against
+    # whatever real AWS credentials happened to be on the machine running the
+    # suite and only failed in CI (no credentials at all). Mock it like every
+    # other DynamoDB write in this base patch set.
+    stack.enter_context(patch("executor.update_plan_pending_warmup"))
 
 
 class TestTickNotFoundBranches:
