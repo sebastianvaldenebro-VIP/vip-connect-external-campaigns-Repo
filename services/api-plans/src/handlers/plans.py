@@ -507,7 +507,7 @@ _MAX_SMS_CHARS = 160
 
 # deliveryTypes that actually place a dial — the only ones a pre-call SMS can
 # meaningfully precede. 'sms' has no dial to precede.
-_VOICE_DELIVERY_TYPES = {"campaign", "branded"}
+_VOICE_DELIVERY_TYPES = {"campaign", "branded", "journey"}
 
 
 def _screen_sms_template_content(

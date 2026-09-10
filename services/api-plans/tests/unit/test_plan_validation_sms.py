@@ -491,3 +491,11 @@ def test_specialty_placeholder_is_not_allowlisted():
 
 def test_valid_precall_campaign_has_no_errors():
     assert validate_plan(_plan_with_precall()) == []
+
+
+def test_valid_precall_campaign_has_no_errors_on_journey_delivery_type():
+    """journey places a dial just like campaign/branded (executor.py:4275,
+    4704 resolve_journey_flow_arn and its dedicated dial-flow-resolution
+    logic) — a journey campaign with a valid precallSms block must be
+    ACCEPTED, not rejected as having "no dial for it to precede"."""
+    assert validate_plan(_plan_with_precall(delivery_type="journey")) == []
