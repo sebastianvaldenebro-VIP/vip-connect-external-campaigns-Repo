@@ -7200,7 +7200,10 @@ class TestSmsReconcile:
     """SMS call site (Step 7/8): success wires cs['reconcile']."""
 
     def _sms_campaign(
-        self, campaign_id: str = "sms-rc-1", pinned_segment_arn: str | None = None
+        self,
+        campaign_id: str = "sms-rc-1",
+        pinned_segment_arn: str | None = None,
+        clinic_name: str | None = None,
     ) -> dict:
         campaign = {
             "id": campaign_id,
@@ -7214,6 +7217,8 @@ class TestSmsReconcile:
         }
         if pinned_segment_arn:
             campaign["pinnedSegmentArn"] = pinned_segment_arn
+        if clinic_name is not None:
+            campaign["campaignConfig"]["clinicName"] = clinic_name
         return campaign
 
     def test_sms_success_sets_reconcile(self):
@@ -7252,6 +7257,35 @@ class TestSmsReconcile:
 
         assert cs["status"] == "running"
         assert "reconcile" not in cs
+
+    def test_sms_forwards_clinic_name_to_sender(self):
+        """campaignConfig.clinicName must reach the sender Lambda — required by
+        _validate_sms_campaign whenever smsMessageTemplate references
+        {{ClinicName}}, so a template that passes save-time validation must not
+        render with a blank clinic name at send time (see sms_sender_handler.py
+        docstring: "the patient reads 'This is .'")."""
+        import executor
+
+        pinned_arn = (
+            "arn:aws:profile:us-east-1:123:domains/d/segment-definitions/pinned-seg"
+        )
+        bucket = _bucket_def(
+            "b-sms",
+            campaigns=[
+                self._sms_campaign(
+                    pinned_segment_arn=pinned_arn, clinic_name="VIP Vein Clinic"
+                )
+            ],
+        )
+        plan = _make_plan([bucket])
+        cs = _campaign_state("sms-rc-1", status="queued")
+        run = _make_run(plan, [_bucket_state("b-sms", [cs])])
+
+        with patch("executor._invoke_sms_sender") as invoke:
+            executor._start_one_campaign(run, run["planSnapshot"], 0, 0)
+
+        invoke.assert_called_once()
+        assert invoke.call_args.kwargs["clinicName"] == "VIP Vein Clinic"
 
 
 class TestTelephonyNativeReconcile:

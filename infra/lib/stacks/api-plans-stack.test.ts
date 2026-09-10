@@ -234,6 +234,8 @@ describe('ApiPlansStack', () => {
         'connect-campaigns:DeleteCampaign',
         'connect-campaigns:StartCampaign',
         'connect-campaigns:StopCampaign',
+        'connect-campaigns:PauseCampaign',
+        'connect-campaigns:ResumeCampaign',
         'connect-campaigns:GetCampaignState',
         'connect-campaigns:DescribeCampaign',
         'connect-campaigns:TagResource',

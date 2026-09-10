@@ -4005,6 +4005,7 @@ def _start_one_campaign(
                 messageTemplate=cfg.get("smsMessageTemplate", ""),
                 originationNumberArn=cfg.get("smsOriginationNumberArn", ""),
                 originationNumber=cfg.get("smsOriginationNumber", ""),
+                clinicName=cfg.get("clinicName", ""),
             )
         except Exception as exc:
             logger.error(
