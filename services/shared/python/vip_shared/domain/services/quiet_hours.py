@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Any
 from zoneinfo import ZoneInfo
 
 import phonenumbers
@@ -95,63 +94,3 @@ def is_within_quiet_hours(phone: str, *, now: datetime | None = None) -> bool:
         if not (start <= local.hour * 60 + local.minute < end):
             return False
     return True
-
-
-# ── Connect Campaigns V2 openHours builder ────────────────────────────────────
-#
-# Used by services/api-campaigns and services/api-plans builders.py to build
-# communicationTimeConfig.telephony.openHours for the voice delivery types
-# ("campaign"/"journey"). This is a DIFFERENT consumer shape than the
-# per-recipient gate above (Connect wants "T"-prefixed ISO local times keyed
-# by day NAME; is_within_quiet_hours wants "HH:MM" strings and weekday INTs),
-# so these are added as separate public members rather than reusing/reshaping
-# _START_HHMM/_END_HHMM/_ALLOWED_WEEKDAYS — same TCPA policy, two shapes.
-#
-# TCPA quiet hours are a property of the *recipient's* local time, not of a
-# timezone the operator picks once per campaign. Connect Campaigns V2 resolves
-# the recipient's timezone itself; we only declare the window.
-#
-# AREA_CODE over ZIP_CODE: every phone number has an area code, whereas
-# ZIP_CODE needs a populated Customer Profiles address we have not confirmed.
-#
-# The window is the FULL statutory TCPA span on the hours axis (08:00-21:00
-# recipient-local) and stricter than statute on the day axis: Monday-Saturday
-# only. TCPA does not exempt Sunday; excluding it is a VIP business choice.
-#
-# The "T" prefix is mandatory — Iso8601Time's pattern is T\d{2}:\d{2}. Note
-# that botocore does NOT enforce string patterns: a bare "08:00" validates
-# clean locally and is sent to the service. The unit tests are the only guard.
-#
-# SUNDAY is excluded by OMITTING the key from dailyHours. An empty list
-# ("SUNDAY": []) is equally valid per the model but its semantics are
-# undocumented; see the shape table in this task.
-CONNECT_QUIET_HOURS_START = "T08:00"
-CONNECT_QUIET_HOURS_END = "T21:00"
-CONNECT_CONTACT_DAYS = (
-    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY",
-)
-
-
-def connect_open_hours() -> dict[str, Any]:
-    """A TimeWindow gating one channel to the recipient-local quiet-hours window.
-
-    Used by build_create_campaign_params (api-campaigns) and
-    build_campaign_params (api-plans) to populate
-    communicationTimeConfig.telephony in Connect Campaigns V2's CreateCampaign
-    params for the "campaign"/"journey" voice delivery types. The bulk-SMS
-    delivery type ("sms") never touches Connect Campaigns and uses
-    is_within_quiet_hours() above instead.
-    """
-    return {
-        "openHours": {
-            "dailyHours": {
-                day: [
-                    {
-                        "startTime": CONNECT_QUIET_HOURS_START,
-                        "endTime": CONNECT_QUIET_HOURS_END,
-                    }
-                ]
-                for day in CONNECT_CONTACT_DAYS
-            }
-        }
-    }

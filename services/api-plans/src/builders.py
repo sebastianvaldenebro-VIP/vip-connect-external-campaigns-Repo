@@ -25,7 +25,15 @@ import boto3
 # for the full TCPA/AREA_CODE/T-prefix/Sunday-omission rationale) — centralized
 # so this policy value has exactly one place to change, alongside the
 # per-recipient SMS pipeline's equivalent gate.
-from vip_shared.domain.services.quiet_hours import connect_open_hours as _open_hours
+#
+# Imported from connect_open_hours.py, NOT quiet_hours.py: quiet_hours.py
+# unconditionally imports `phonenumbers` at module scope for the per-recipient
+# SMS gate, but this Lambda's layer is built from plain requirements.txt
+# (no phonenumbers — only api-sms's layer includes it). Importing from
+# quiet_hours.py here would crash every cold start with ModuleNotFoundError.
+from vip_shared.domain.services.connect_open_hours import (
+    connect_open_hours as _open_hours,
+)
 
 # ── State → location values — loaded from DynamoDB VipLocationMapping ─────────
 # Table PK: location (String). Each item also has stateCode, stateName, slug,

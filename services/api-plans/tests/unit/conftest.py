@@ -43,11 +43,17 @@ if _SMS_TEMPLATE_MODULE_NAME not in sys.modules:
 # build_campaign_params/build_create_campaign_params's communicationTimeConfig
 # assertions compare against Mock() attribute-access noise instead of the
 # actual openHours dict the tests pin down byte-for-byte.
-_QUIET_HOURS_MODULE_NAME = "vip_shared.domain.services.quiet_hours"
+#
+# This loads connect_open_hours.py, NOT quiet_hours.py: quiet_hours.py
+# unconditionally imports `phonenumbers` at module scope (for the unrelated
+# per-recipient SMS quiet-hours gate), which builders.py in this Lambda no
+# longer imports and must not depend on transitively (see the phonenumbers/
+# api-plans-cold-start incident this split was made to fix).
+_QUIET_HOURS_MODULE_NAME = "vip_shared.domain.services.connect_open_hours"
 if _QUIET_HOURS_MODULE_NAME not in sys.modules:
     _quiet_hours_path = os.path.join(
         os.path.dirname(__file__),
-        "../../../shared/python/vip_shared/domain/services/quiet_hours.py",
+        "../../../shared/python/vip_shared/domain/services/connect_open_hours.py",
     )
     _spec = importlib.util.spec_from_file_location(
         _QUIET_HOURS_MODULE_NAME, _quiet_hours_path

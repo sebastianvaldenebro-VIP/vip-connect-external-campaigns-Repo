@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from builders import build_create_campaign_params
@@ -244,6 +246,59 @@ def test_open_hours_times_carry_the_iso8601_t_prefix():
         for rng in ranges:
             assert rng["startTime"].startswith("T")
             assert rng["endTime"].startswith("T")
+
+
+def test_builders_module_imports_and_builds_open_hours_with_phonenumbers_blocked():
+    """Regression guard for the api-plans/api-campaigns cold-start outage:
+    builders.py must import (and its openHours builder must still work) even
+    when `phonenumbers` is not importable.
+
+    builders.py imports `connect_open_hours` from
+    vip_shared.domain.services.connect_open_hours, which is intentionally
+    kept free of any phonenumbers dependency — unlike its sibling
+    quiet_hours.py (the per-recipient SMS gate), which unconditionally
+    `import phonenumbers` at module scope. api-campaigns's Lambda layer is
+    built from plain requirements.txt (no phonenumbers; only api-sms's layer
+    has it via requirements-sms.txt — see infra/lib/utils/shared-layer.ts).
+    If builders.py ever re-imports from quiet_hours.py instead, every
+    api-campaigns cold start crashes with ModuleNotFoundError.
+
+    `phonenumbers` is ambiently pip-installed on dev machines, which is
+    exactly how this bug shipped invisibly through a full green pytest run
+    before. This test blocks it for real via `sys.modules['phonenumbers'] =
+    None` and forces a FRESH import of both builders.py and
+    connect_open_hours.py (popping any cached module first — a cached
+    module's already-executed import statements wouldn't be re-run and would
+    hide a regression).
+    """
+    _OPEN_HOURS_MODULE = "vip_shared.domain.services.connect_open_hours"
+    saved_builders = sys.modules.pop("builders", None)
+    saved_open_hours = sys.modules.pop(_OPEN_HOURS_MODULE, None)
+    saved_phonenumbers = sys.modules.get("phonenumbers")
+    sys.modules["phonenumbers"] = None  # type: ignore[assignment]
+    try:
+        import builders as fresh_builders
+
+        params = fresh_builders.build_create_campaign_params(
+            _base_body(),
+            connect_instance_id="instance-1",
+            profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        )
+    finally:
+        del sys.modules["phonenumbers"]
+        if saved_phonenumbers is not None:
+            sys.modules["phonenumbers"] = saved_phonenumbers
+        sys.modules.pop("builders", None)
+        sys.modules.pop(_OPEN_HOURS_MODULE, None)
+        if saved_builders is not None:
+            sys.modules["builders"] = saved_builders
+        if saved_open_hours is not None:
+            sys.modules[_OPEN_HOURS_MODULE] = saved_open_hours
+
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert sorted(daily) == sorted(_CONTACT_DAYS)
+    assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+    assert "SUNDAY" not in daily
 
 
 def test_communication_time_config_emitted_even_without_communication_time_key():

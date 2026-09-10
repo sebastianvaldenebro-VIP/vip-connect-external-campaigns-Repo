@@ -384,6 +384,77 @@ def test_campaign_params_gates_telephony_on_per_lead_local_open_hours():
     assert "SUNDAY" not in daily  # no contact on Sunday
 
 
+def test_builders_module_imports_and_builds_open_hours_with_phonenumbers_blocked():
+    """Regression guard for the api-plans/api-campaigns cold-start outage:
+    builders.py must import (and its openHours builder must still work) even
+    when `phonenumbers` is not importable.
+
+    builders.py imports `connect_open_hours` from
+    vip_shared.domain.services.connect_open_hours, which is intentionally
+    kept free of any phonenumbers dependency — unlike its sibling
+    quiet_hours.py (the per-recipient SMS gate), which unconditionally
+    `import phonenumbers` at module scope. api-plans's Lambda layer is built
+    from plain requirements.txt (no phonenumbers; only api-sms's layer has it
+    via requirements-sms.txt — see infra/lib/utils/shared-layer.ts). If
+    builders.py ever re-imports from quiet_hours.py instead, every api-plans
+    cold start crashes with ModuleNotFoundError.
+
+    `phonenumbers` is ambiently pip-installed on dev machines, which is
+    exactly how this bug shipped invisibly through a full green pytest run
+    before. This test blocks it for real via `sys.modules['phonenumbers'] =
+    None` and forces a FRESH import of both builders.py and
+    connect_open_hours.py (popping any cached module first, then re-loading
+    connect_open_hours.py by file path the same way conftest.py does at
+    collection time — a cached module's already-executed import statements
+    wouldn't be re-run and would hide a regression).
+    """
+    _OPEN_HOURS_MODULE = "vip_shared.domain.services.connect_open_hours"
+    _open_hours_path = os.path.join(
+        os.path.dirname(__file__),
+        "../../../shared/python/vip_shared/domain/services/connect_open_hours.py",
+    )
+
+    saved_builders = sys.modules.pop("builders", None)
+    saved_open_hours = sys.modules.pop(_OPEN_HOURS_MODULE, None)
+    saved_phonenumbers = sys.modules.get("phonenumbers")
+    sys.modules["phonenumbers"] = None  # type: ignore[assignment]
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            _OPEN_HOURS_MODULE, _open_hours_path
+        )
+        fresh_open_hours_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh_open_hours_module)
+        sys.modules[_OPEN_HOURS_MODULE] = fresh_open_hours_module
+
+        import builders as fresh_builders
+
+        params = fresh_builders.build_campaign_params(
+            _campaign_bucket(),
+            segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
+            connect_instance_id="instance-1",
+            profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+            start_time="2026-05-01T13:00:00Z",
+            end_time="2026-05-01T21:00:00Z",
+            campaign_name="test-campaign",
+        )
+    finally:
+        del sys.modules["phonenumbers"]
+        if saved_phonenumbers is not None:
+            sys.modules["phonenumbers"] = saved_phonenumbers
+        sys.modules.pop("builders", None)
+        sys.modules.pop(_OPEN_HOURS_MODULE, None)
+        if saved_builders is not None:
+            sys.modules["builders"] = saved_builders
+        if saved_open_hours is not None:
+            sys.modules[_OPEN_HOURS_MODULE] = saved_open_hours
+
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+    assert "SUNDAY" not in daily
+
+
 def test_campaign_params_includes_flow_arn_via_override():
     # Flow ARN must come through campaign_flow_arn_override (resolver result), not cfg.
     bucket = _campaign_bucket()
