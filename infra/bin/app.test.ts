@@ -127,13 +127,13 @@ describe('bin/app.ts — synthesized templates', () => {
     appModule = loadApp();
   });
 
-  it('wires VipAdminApiStack routes to all 6 backing Lambdas via HttpLambdaIntegration', () => {
+  it('wires VipAdminApiStack routes to all 7 backing Lambdas via HttpLambdaIntegration', () => {
     const stack = appModule.apiStack;
     const template = Template.fromStack(stack);
-    template.resourceCountIs('AWS::ApiGatewayV2::Integration', 6);
+    template.resourceCountIs('AWS::ApiGatewayV2::Integration', 7);
   });
 
-  it('creates exactly the 11 stacks app.ts wires up', () => {
+  it('creates exactly the 13 stacks app.ts wires up', () => {
     const app = appModule.app;
     const stackIds = app.node
       .findAll()
@@ -143,6 +143,8 @@ describe('bin/app.ts — synthesized templates', () => {
       new Set([
         'VipAdminDataStack',
         'VipAdminAuthStack',
+        'VipAdminApiAuthorizerStack',
+        'VipAdminApiDenyListStack',
         'VipAdminApiSegmentsStack',
         'VipAdminApiCampaignsStack',
         'ApiProgressiveDialerStack',

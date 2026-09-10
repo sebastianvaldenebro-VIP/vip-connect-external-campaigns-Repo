@@ -11,7 +11,7 @@ HIPAA-regulated system. All controls below are live in production unless marked 
 | Identity provider | Amazon Cognito User Pool (`VipAdminUserPool`) |
 | MFA | TOTP enforced (`mfa_configuration = "ON"`, no opt-out) |
 | Password policy | Min 12 chars · uppercase · lowercase · digit · special char |
-| Session token | Cognito access token — 1 h expiry |
+| Session token | Cognito ID token (carries `cognito:groups`) — 1 h expiry |
 | Refresh token | 24 h; revoked on sign-out or admin disable |
 | Idle timeout | Frontend tracks `lastActivity`; forces re-login after 900 s inactivity |
 | Token storage | In-memory (React state + Amplify session); never localStorage / sessionStorage |
@@ -20,11 +20,17 @@ HIPAA-regulated system. All controls below are live in production unless marked 
 
 ## 2. Authorization
 
-All API Gateway routes are protected by a **JWT Authorizer** that validates the Cognito access token against the User Pool JWKS endpoint before the request reaches any Lambda.
+All API Gateway routes are protected by a **custom Lambda authorizer** (`vip-admin-ui-api-authorizer`) that independently verifies the Cognito ID token (signature via JWKS, issuer, audience, `token_use`, expiry) and additionally enforces **Cognito User Pool Group** membership per route:
 
-Lambdas extract `sub` and `email` from the JWT claims via `vip_shared.application.http.extract_caller`. Every mutating operation writes an audit row with the actor's `sub` and `email` before returning.
+| Group | Access |
+| --- | --- |
+| `Admin` | Every route |
+| `Agent` | `/deny-list` only (call-center agents manually blocking a caller number) |
+| *(none)* | Denied on every route — no default-allow fallback |
 
-Current model: single admin group. Multi-role RBAC is a planned post-MVP enhancement.
+The authorizer's result cache is keyed on `($request.header.Authorization, $context.routeKey)` — both the token *and* the route — so a cached decision for one route is never replayed on a different route with a different access rule.
+
+Lambdas extract `sub` and `email` — from the authorizer's returned context (`requestContext.authorizer.lambda`) — via `vip_shared.application.http.extract_caller`. Every mutating operation writes an audit row with the actor's `sub` and `email` before returning.
 
 ---
 

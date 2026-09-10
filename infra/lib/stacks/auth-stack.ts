@@ -97,6 +97,21 @@ export class AuthStack extends cdk.Stack {
       cognitoDomain: { domainPrefix: props.cognitoDomainPrefix },
     });
 
+    // Groups enforced by api-authorizer (see api-stack.ts): Admin reaches every
+    // route, Agent reaches only /deny-list. Every pre-existing user must be
+    // added to Admin as part of shipping the authorizer switch, or they lose
+    // access — CDK creates the group but does not manage membership.
+    new cognito.CfnUserPoolGroup(this, 'AdminGroup', {
+      userPoolId: this.userPool.userPoolId,
+      groupName: 'Admin',
+      description: 'Full access to every vip-admin-ui-api route.',
+    });
+    new cognito.CfnUserPoolGroup(this, 'AgentGroup', {
+      userPoolId: this.userPool.userPoolId,
+      groupName: 'Agent',
+      description: 'Call-center agents — access limited to /deny-list only.',
+    });
+
     new cdk.CfnOutput(this, 'UserPoolId', { value: this.userPool.userPoolId });
     new cdk.CfnOutput(this, 'UserPoolArn', { value: this.userPool.userPoolArn });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: this.userPoolClient.userPoolClientId });

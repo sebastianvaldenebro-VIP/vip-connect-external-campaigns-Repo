@@ -1,6 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
-import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { ApiStack, ApiStackProps } from './api-stack';
@@ -8,13 +8,28 @@ import { ApiStack, ApiStackProps } from './api-stack';
 const ENV = { account: '165505826690', region: 'us-east-1' };
 
 /**
- * ApiStack takes IFunction/IUserPool/IUserPoolClient/IKey props. All the
- * routing/authorizer/CORS/access-log logic under test only reads plain
- * string attributes (functionArn, userPoolId, userPoolClientId) off these
- * objects, so lightweight `fromXxx` imports with fixed literal ARNs/ids are
- * used instead of real cross-stack resources — this keeps IntegrationUri /
- * issuer URL / jwtAudience assertions on literal strings instead of
- * cross-stack Fn::ImportValue tokens.
+ * ApiStack no longer creates its own authorizer — that moved to
+ * ApiAuthorizerStack (a custom Lambda authorizer enforcing per-route Cognito
+ * group membership), and ApiStack just applies whatever IHttpRouteAuthorizer
+ * it's handed to every route. This fixture stands in for that authorizer with
+ * a minimal `bind()` implementation, so these tests exercise ApiStack's own
+ * routing/integration/CORS/access-log logic without depending on
+ * ApiAuthorizerStack's Lambda/JWKS internals (covered separately in that
+ * stack's own test file).
+ */
+class FixtureAuthorizer implements apigatewayv2.IHttpRouteAuthorizer {
+  public bind(): apigatewayv2.HttpRouteAuthorizerConfig {
+    return { authorizerId: 'fixture-authorizer-id', authorizationType: 'CUSTOM' };
+  }
+}
+
+/**
+ * ApiStack takes IFunction/IHttpRouteAuthorizer/IKey props. All the
+ * routing/CORS/access-log logic under test only reads plain string
+ * attributes (functionArn) off these objects, so lightweight `fromXxx`
+ * imports with fixed literal ARNs are used instead of real cross-stack
+ * resources — this keeps IntegrationUri assertions on literal strings
+ * instead of cross-stack Fn::ImportValue tokens.
  *
  * The one exception is `dataKey`: ApiStack calls `dataKey.addToResourcePolicy(...)`
  * directly on the construct, which is a no-op on an imported key (CDK's
@@ -28,13 +43,6 @@ function buildStack(propsOverride: Partial<ApiStackProps> = {}) {
   const fixtures = new cdk.Stack(app, 'ApiStackFixtures', { env: ENV });
   const dataKey = new kms.Key(fixtures, 'FixtureDataKey', { enableKeyRotation: true });
 
-  const userPool = cognito.UserPool.fromUserPoolId(fixtures, 'FixtureUserPool', 'us-east-1_TESTPOOL1');
-  const userPoolClient = cognito.UserPoolClient.fromUserPoolClientId(
-    fixtures,
-    'FixtureUserPoolClient',
-    'testclientid123',
-  );
-
   const makeFn = (id: string, name: string) =>
     lambda.Function.fromFunctionAttributes(fixtures, id, {
       functionArn: `arn:aws:lambda:us-east-1:165505826690:function:${name}`,
@@ -44,28 +52,28 @@ function buildStack(propsOverride: Partial<ApiStackProps> = {}) {
   return new ApiStack(app, 'TestApiStack', {
     env: ENV,
     dataKey,
-    userPool,
-    userPoolClient,
+    authorizer: new FixtureAuthorizer(),
     segmentsFunction: makeFn('SegmentsFn', 'vip-admin-ui-api-segments'),
     campaignsFunction: makeFn('CampaignsFn', 'vip-admin-ui-api-campaigns'),
     metricsFunction: makeFn('MetricsFn', 'vip-admin-ui-api-metrics'),
     profilesFunction: makeFn('ProfilesFn', 'vip-admin-ui-api-profiles'),
     plansFunction: makeFn('PlansFn', 'vip-admin-ui-api-plans'),
     progressiveDialerSeedFunction: makeFn('DialerFn', 'vip-admin-ui-progressive-dialer-seed'),
+    denyListFunction: makeFn('DenyListFn', 'vip-admin-ui-api-deny-list'),
     corsAllowOrigins: ['https://example.com'],
     ...propsOverride,
   });
 }
 
 describe('ApiStack', () => {
-  it('creates exactly 61 ApiGatewayV2 routes (one per method across every addRoutes call)', () => {
+  it('creates exactly 63 ApiGatewayV2 routes (one per method across every addRoutes call)', () => {
     const template = Template.fromStack(buildStack());
-    template.resourceCountIs('AWS::ApiGatewayV2::Route', 61);
+    template.resourceCountIs('AWS::ApiGatewayV2::Route', 63);
   });
 
-  it('creates exactly 6 Lambda integrations, one per backing Lambda', () => {
+  it('creates exactly 7 Lambda integrations, one per backing Lambda', () => {
     const template = Template.fromStack(buildStack());
-    template.resourceCountIs('AWS::ApiGatewayV2::Integration', 6);
+    template.resourceCountIs('AWS::ApiGatewayV2::Integration', 7);
   });
 
   it('wires each integration to the correct Lambda function ARN', () => {
@@ -77,6 +85,7 @@ describe('ApiStack', () => {
       'vip-admin-ui-api-profiles',
       'vip-admin-ui-api-plans',
       'vip-admin-ui-progressive-dialer-seed',
+      'vip-admin-ui-api-deny-list',
     ];
     for (const fnName of expectedUris) {
       template.hasResourceProperties('AWS::ApiGatewayV2::Integration', {
@@ -113,6 +122,14 @@ describe('ApiStack', () => {
     expect(Object.keys(dialerRoutes)).toHaveLength(1);
   });
 
+  it('scopes both deny-list routes to the deny-list function integration', () => {
+    const template = Template.fromStack(buildStack());
+    const denyListRoutes = template.findResources('AWS::ApiGatewayV2::Route', {
+      Properties: { RouteKey: Match.stringLikeRegexp('.*deny-list$') },
+    });
+    expect(Object.keys(denyListRoutes)).toHaveLength(2);
+  });
+
   it('configures CORS preflight with the provided allow-origins and the full method set', () => {
     const template = Template.fromStack(buildStack({ corsAllowOrigins: ['https://a.example', 'https://b.example'] }));
     template.hasResourceProperties('AWS::ApiGatewayV2::Api', {
@@ -126,26 +143,18 @@ describe('ApiStack', () => {
     });
   });
 
-  it('creates a JWT authorizer scoped to the Cognito user pool issuer and audience', () => {
-    const template = Template.fromStack(buildStack());
-    template.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
-      AuthorizerType: 'JWT',
-      IdentitySource: ['$request.header.Authorization'],
-      JwtConfiguration: {
-        Issuer: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TESTPOOL1',
-        Audience: ['testclientid123'],
-      },
-    });
-  });
-
-  it('every route uses the same JWT authorizer', () => {
+  it('creates exactly one authorizer resource for the whole API', () => {
     const template = Template.fromStack(buildStack());
     const authorizers = template.findResources('AWS::ApiGatewayV2::Authorizer');
-    expect(Object.keys(authorizers)).toHaveLength(1);
-    const [authorizerId] = Object.keys(authorizers);
+    expect(Object.keys(authorizers)).toHaveLength(0);
+  });
+
+  it('every route uses the same authorizer ApiStack was handed', () => {
+    const template = Template.fromStack(buildStack());
     const routes = template.findResources('AWS::ApiGatewayV2::Route');
     for (const [, route] of Object.entries(routes)) {
-      expect(route.Properties.AuthorizerId).toEqual({ Ref: authorizerId });
+      expect(route.Properties.AuthorizerId).toEqual('fixture-authorizer-id');
+      expect(route.Properties.AuthorizationType).toEqual('CUSTOM');
     }
   });
 
@@ -186,8 +195,6 @@ describe('ApiStack', () => {
         const app = new cdk.App();
         const fixtures = new cdk.Stack(app, 'FixturesOnly', { env: ENV });
         const dataKey = new kms.Key(fixtures, 'FixtureDataKey', { enableKeyRotation: true });
-        const userPool = cognito.UserPool.fromUserPoolId(fixtures, 'UP', 'us-east-1_TESTPOOL1');
-        const userPoolClient = cognito.UserPoolClient.fromUserPoolClientId(fixtures, 'UPC', 'testclientid123');
         const makeFn = (id: string, name: string) =>
           lambda.Function.fromFunctionAttributes(fixtures, id, {
             functionArn: `arn:aws:lambda:us-east-1:165505826690:function:${name}`,
@@ -196,14 +203,14 @@ describe('ApiStack', () => {
         new ApiStack(app, 'ApiUnderTest', {
           env: ENV,
           dataKey,
-          userPool,
-          userPoolClient,
+          authorizer: new FixtureAuthorizer(),
           segmentsFunction: makeFn('S', 'segments'),
           campaignsFunction: makeFn('C', 'campaigns'),
           metricsFunction: makeFn('M', 'metrics'),
           profilesFunction: makeFn('P', 'profiles'),
           plansFunction: makeFn('PL', 'plans'),
           progressiveDialerSeedFunction: makeFn('D', 'dialer'),
+          denyListFunction: makeFn('DL', 'deny-list'),
           corsAllowOrigins: ['https://example.com'],
         });
         return fixtures;

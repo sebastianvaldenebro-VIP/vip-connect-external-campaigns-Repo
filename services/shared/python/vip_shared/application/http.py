@@ -16,18 +16,28 @@ class Caller:
 
 
 def extract_caller(event: dict) -> Caller:
-    """Extract Cognito identity + request metadata from an API Gateway v2 event."""
+    """Extract Cognito identity + request metadata from an API Gateway v2 event.
+
+    Supports two authorizer shapes because vip-admin-ui-api moved from a
+    plain HttpJwtAuthorizer (which populates authorizer.jwt.claims) to a
+    custom Lambda authorizer that also enforces per-route Cognito group
+    membership (which can only populate authorizer.lambda, API Gateway's
+    fixed key for a Lambda-authorizer's returned context — see
+    api-authorizer/src/handler.py). Without this fallback every audit record
+    written since that switch would silently log actor_sub/actor_email as
+    "unknown".
+    """
     ctx = event.get("requestContext", {})
     authorizer = ctx.get("authorizer", {}) or {}
-    jwt = authorizer.get("jwt", {}) or {}
-    claims = jwt.get("claims", {}) or {}
+    jwt_claims = (authorizer.get("jwt", {}) or {}).get("claims", {}) or {}
+    lambda_context = authorizer.get("lambda", {}) or {}
 
     identity = ctx.get("identity", {}) or {}
     http = ctx.get("http", {}) or {}
 
     return Caller(
-        sub=str(claims.get("sub", "unknown")),
-        email=str(claims.get("email", "unknown")),
+        sub=str(jwt_claims.get("sub") or lambda_context.get("sub") or "unknown"),
+        email=str(jwt_claims.get("email") or lambda_context.get("email") or "unknown"),
         ip_address=http.get("sourceIp") or identity.get("sourceIp"),
         user_agent=http.get("userAgent") or event.get("headers", {}).get("user-agent"),
     )

@@ -232,6 +232,14 @@ export type Queue = { id: string; arn: string; name: string; queueType?: string 
 export type ContactFlow = { id: string; arn: string; name: string; contactFlowType?: string };
 export type PhoneNumber = { arn: string; number: string; type?: string; country?: string };
 
+export type BlockedNumber = {
+  phoneNumber: string;
+  addedAt: string;
+  addedBy?: string | null;
+  reason?: string | null;
+  source: 'manual-ui' | 'quick-connect' | 'legacy';
+};
+
 export type AuditEntry = {
   entityId: string;
   entityType?: string;
@@ -938,6 +946,15 @@ const realApi = {
   contacts: {
     getArtifacts: (contactId: string) =>
       request<ContactArtifacts>(`/contacts/${encodeURIComponent(contactId)}/artifacts`),
+  },
+  denyList: {
+    list: () =>
+      request<{ blockedNumbers: BlockedNumber[]; count: number }>('/deny-list'),
+    add: (body: { phoneNumber: string; reason?: string }) =>
+      request<{ phoneNumber: string; alreadyBlocked: boolean }>('/deny-list', {
+        method: 'POST',
+        body,
+      }),
   },
 };
 
