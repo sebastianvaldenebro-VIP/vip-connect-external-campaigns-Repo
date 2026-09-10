@@ -316,6 +316,19 @@ export type BucketCampaignConfig = {
   smsMessageTemplate?: string;
   /** Staff acknowledgment that template contains no PHI — required for deliveryType='sms' */
   phiAcknowledged?: boolean;
+  /**
+   * Pre-call SMS: texted to this campaign's own segment at bucket activation,
+   * immediately before the first dial. Ordering is guaranteed by the executor's
+   * bucket lifecycle, not by a timer — do NOT model this with dependsOn, which
+   * would disable the voice campaign's pre-warming.
+   * messageTemplate may use only {{FirstName}} and {{ClinicName}}.
+   */
+  precallSms?: {
+    enabled: boolean;
+    messageTemplate: string;
+    originationNumberArn: string;
+    clinicName: string;
+  };
 };
 
 export type SmsOriginationNumber = {

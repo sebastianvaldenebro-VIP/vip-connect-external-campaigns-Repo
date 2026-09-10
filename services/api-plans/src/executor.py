@@ -380,6 +380,106 @@ def _invoke_sms_sender(**kwargs: object) -> None:
         )
 
 
+def _precall_sms_campaign_id(run: dict, bucket_index: int, campaign_index: int) -> str:
+    """Deterministic smsCampaignId for a pre-call send, so retries reuse one
+    VipSmsCampaignRuns row.
+
+    Same uuid5 namespace as the deliveryType='sms' path (executor.py:3685-3690),
+    but the name is prefixed "precall#". Without that prefix a pre-call send in
+    the same bucket/campaign slot as a real SMS campaign would derive an
+    identical id and the two would collide on one runs row.
+    """
+    return str(
+        uuid.uuid5(
+            uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+            f"precall#{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
+        )
+    )
+
+
+def _fire_precall_sms(run: dict, plan: dict, bucket_index: int) -> None:
+    """Send each configured campaign's pre-call SMS, just before the bucket dials.
+
+    WHY HERE AND NOT VIA dependsOn:
+
+      Ordering is structural. A bucket moves queued -> warming -> running, and
+      this runs inside that final transition, before any campaign is started.
+      "SMS strictly before the first dial" is therefore an invariant of the
+      lifecycle rather than the result of timer arithmetic.
+
+      The dependsOn alternative was rejected on three counts: (1) a campaign
+      with dependsOn is never pre-warmed (_prestart_plan / _prestart_next_bucket
+      both filter on `not campaign.get("dependsOn")`), so it would silently cost
+      the voice campaign its warmup; (2) a long queued-with-terminal-parents
+      wait trips NoActiveCampaign after _NO_ACTIVE_CAMPAIGN_MINUTES and StuckRun
+      after _STUCK_RUN_HOURS; (3) it needed a new cross-campaign
+      segment-sharing field to guarantee both channels hit the same list.
+
+      Here, all three vanish: no dependsOn, no wait state, and the segment the
+      warm step already built is read directly — there is only ever ONE segment,
+      so same-list is guaranteed by construction rather than by a resolver.
+
+    Failure is non-fatal by design: a pre-call text that does not go out must
+    degrade to "no text", never to "no call".
+    """
+    bucket = plan["buckets"][bucket_index]
+    bucket_state = run["bucketStates"][bucket_index]
+
+    for ci, campaign in enumerate(bucket.get("campaigns", [])):
+        precall = (campaign.get("campaignConfig") or {}).get("precallSms") or {}
+        if not precall.get("enabled"):
+            continue
+
+        cs = bucket_state["campaignStates"][ci]
+        if cs.get("precallSmsSentAt"):
+            continue  # already sent — _prestart_plan retries and re-activation
+        # Only text a cohort we are actually about to call. This mirrors the
+        # activation loop's own predicate exactly (status == "warming" AND a real
+        # connectCampaignId): the warm step has four failure paths
+        # (_RedisRebuildingError, _EmptySegmentError, _CutoffTooCloseError,
+        # generic) and a campaign left warming without a connectCampaignId is
+        # skipped by that loop and never dialed.
+        if (
+            cs.get("status") != "warming"
+            or not cs.get("connectCampaignId")
+            or not cs.get("segmentArn")
+        ):
+            continue
+
+        sms_campaign_id = _precall_sms_campaign_id(run, bucket_index, ci)
+        try:
+            _invoke_sms_sender(
+                campaignId=sms_campaign_id,
+                planId=run["planId"],
+                runId=run["runId"],
+                segmentArn=cs["segmentArn"],
+                segmentName=cs["segmentName"],
+                messageTemplate=precall.get("messageTemplate", ""),
+                originationNumberArn=precall.get("originationNumberArn", ""),
+                clinicName=precall.get("clinicName", ""),
+            )
+            cs["precallSmsSentAt"] = _now_iso()
+            _slog.info(
+                "precall_sms_fired",
+                plan_id=run["planId"],
+                run_id=run["runId"],
+                bucket_index=bucket_index,
+                campaign_index=ci,
+                sms_campaign_id=sms_campaign_id,
+                segment_name=cs["segmentName"],
+            )
+        except Exception as exc:
+            # Non-fatal: never let a failed pre-call text stop the dial.
+            _slog.error(
+                "precall_sms_failed",
+                plan_id=run["planId"],
+                run_id=run["runId"],
+                bucket_index=bucket_index,
+                campaign_index=ci,
+                error_type=type(exc).__name__,
+            )
+
+
 def get_branded_queue_counts(branded_campaign_id: str) -> tuple[int, int]:
     """Return (pending_count, dialed_count) for a branded campaign queue.
 
@@ -843,6 +943,11 @@ def start_run(
                 cs["leadCount"] = match.get("leadCount")
                 cs["warmupStarted"] = match.get("warmupStarted", False)
                 cs["status"] = "warming"
+        # Pre-call SMS, strictly before the first dial — see _fire_precall_sms for why
+        # this is a bucket-lifecycle hook and not a dependsOn/timer design. Fired here
+        # (not in _prestart_plan) because the run — and its planId/runId — must exist
+        # first; the pendingWarmup segment/connectCampaignId are already real by now.
+        _fire_precall_sms(run, plan, 0)
         save_run(run)
         update_plan_pending_warmup(plan_id, None)  # clear so next run doesn't re-use
         _activate_warming_bucket(run, plan, 0)
@@ -2022,6 +2127,12 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
             "_activate_warming_bucket[%d]: scheduler failed: %s", bucket_index, exc
         )
         raise
+
+    # Pre-call SMS, strictly before the first dial. Placed after _schedule_tick
+    # (above) succeeds — texting a cohort whose bucket then never activates would
+    # be a false promise — and before the start loop below, which is what makes
+    # the ordering structural. See _fire_precall_sms for the full rationale.
+    _fire_precall_sms(run, plan, bucket_index)
 
     # Start all warming campaigns
     bucket = plan["buckets"][bucket_index]

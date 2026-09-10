@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import os
+import uuid
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -7552,3 +7553,333 @@ class TestPrestartNextBucketReconcile:
 
         cs = run["bucketStates"][1]["campaignStates"][0]
         assert cs["reconcile"] == {"expected": 20, "actual": 18, "retries": 2}
+
+
+# ── Task 4: pre-call SMS fires at bucket activation ──────────────────────────
+# Fixtures below build an already-"warming" voice campaign (real connectCampaignId,
+# segmentArn, segmentName) — that's what a genuinely warmed campaign state looks
+# like right before the activation loop dials it. Tests that need a different
+# state (failed-to-warm, missing segment, missing connectCampaignId) mutate the
+# fixture explicitly.
+
+
+def _find_cs(run: dict, campaign_id: str) -> dict:
+    for bucket_state in run["bucketStates"]:
+        for cs in bucket_state.get("campaignStates", []):
+            if cs.get("campaignId") == campaign_id:
+                return cs
+    raise AssertionError(f"no campaign state found for campaignId={campaign_id!r}")
+
+
+def _precall_campaign_def(cid: str, name: str, precall_overrides: dict | None = None) -> dict:
+    campaign = _campaign_def(cid, name)
+    campaign["campaignConfig"] = {
+        "precallSms": {
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, this is {{ClinicName}} — your call is coming up soon.",
+            "originationNumberArn": "arn:aws:sns:us-east-1:111122223333:phone-number/PN123",
+            "clinicName": "VIP Vein Clinic",
+            **(precall_overrides or {}),
+        }
+    }
+    return campaign
+
+
+def _make_run_with_precall_voice() -> tuple[dict, dict]:
+    """A single warming voice campaign with precallSms configured — the baseline
+    'about to be dialed' state the activation loop and _fire_precall_sms both act on."""
+    campaign = _precall_campaign_def("voice-vein", "voice-vein")
+    bucket = _bucket_def("b0", [campaign])
+    plan = _make_plan([bucket])
+
+    cs = _campaign_state("voice-vein", status="warming", connect_id="cc-vein-1")
+    cs["segmentArn"] = "arn:cp:seg/vein-abc"
+    cs["segmentName"] = "vein-abc"
+
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="warming")])
+    return run, plan
+
+
+def _make_run_with_two_specialties() -> tuple[dict, dict]:
+    """Two warming campaigns in the same bucket, each with its own precallSms
+    copy and its own segment — verifies per-campaign config, not a lookup table."""
+    campaign_a = _precall_campaign_def(
+        "voice-vein",
+        "voice-vein",
+        {
+            "messageTemplate": "Hi {{FirstName}}, your vein consult with {{ClinicName}} is coming up.",
+            "clinicName": "VIP Vein Clinic",
+        },
+    )
+    campaign_b = _precall_campaign_def(
+        "voice-derm",
+        "voice-derm",
+        {
+            "messageTemplate": "Hi {{FirstName}}, your dermatology visit with {{ClinicName}} is coming up.",
+            "clinicName": "VIP Derm Clinic",
+            "originationNumberArn": "arn:aws:sns:us-east-1:111122223333:phone-number/PN456",
+        },
+    )
+    bucket = _bucket_def("b0", [campaign_a, campaign_b])
+    plan = _make_plan([bucket])
+
+    cs_a = _campaign_state("voice-vein", status="warming", connect_id="cc-vein-1")
+    cs_a["segmentArn"] = "arn:cp:seg/vein-abc"
+    cs_a["segmentName"] = "vein-abc"
+
+    cs_b = _campaign_state("voice-derm", status="warming", connect_id="cc-derm-1")
+    cs_b["segmentArn"] = "arn:cp:seg/derm-xyz"
+    cs_b["segmentName"] = "derm-xyz"
+
+    run = _make_run(plan, [_bucket_state("b0", [cs_a, cs_b], status="warming")])
+    return run, plan
+
+
+class TestFirePrecallSms:
+    """The pre-call SMS fires at bucket activation, strictly before any dial."""
+
+    def test_fires_for_a_warmed_campaign_with_precall_config(self, mocker):
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        cs["segmentName"] = "vein-abc"
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        assert invoke.call_count == 1
+        kwargs = invoke.call_args.kwargs
+        assert kwargs["segmentArn"] == "arn:cp:seg/vein-abc"
+        assert "{{FirstName}}" in kwargs["messageTemplate"]  # rendered by the sender
+        assert cs["precallSmsSentAt"]
+
+    def test_uses_the_same_segment_as_the_voice_campaign(self, mocker):
+        """Same-list is the core guarantee. There is only ever ONE segment —
+        the one the warm step built — so this must read it, never rebuild."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        cs["segmentName"] = "vein-abc"
+        create_seg = mocker.patch("executor._create_segment")
+        mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        create_seg.assert_not_called()
+
+    def test_is_idempotent_across_retries(self, mocker):
+        """_prestart_plan is retry-aware and _activate_warming_bucket can re-run
+        after a failed save — a second pass must not re-text the cohort."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        cs["segmentName"] = "vein-abc"
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+        executor._fire_precall_sms(run, plan, 0)
+
+        assert invoke.call_count == 1
+
+    @pytest.mark.parametrize("status", ["error", "cancelled", "queued"])
+    def test_does_not_fire_for_a_campaign_that_failed_to_warm(self, mocker, status):
+        """Texting 'we're about to call you' to people we will never call is
+        worse than sending nothing."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = status
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        invoke.assert_not_called()
+
+    def test_does_not_fire_without_a_segment_arn(self, mocker):
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = None
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        invoke.assert_not_called()
+
+    def test_does_not_fire_without_a_connect_campaign_id(self, mocker):
+        """Mirrors the activation loop's own predicate (executor.py:2028-2029).
+        A campaign left 'warming' with no connectCampaignId is skipped by that
+        loop and never dialed, so texting it would promise a call we never make."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        cs["connectCampaignId"] = None
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        invoke.assert_not_called()
+
+    def test_sms_campaign_id_does_not_collide_with_a_real_sms_campaign(self):
+        """The existing SMS path derives its id from the same uuid5 namespace over
+        planId#runId#bucketIndex#campaignIndex (executor.py:3685-3690). Without the
+        'precall#' prefix, a pre-call send in the same slot as a real sms-delivery
+        campaign would share one VipSmsCampaignRuns row."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        assert executor._precall_sms_campaign_id(run, 0, 0) != str(
+            uuid.uuid5(
+                uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0"),
+                f"{run['planId']}#{run['runId']}#0#0",
+            )
+        )
+
+    def test_skips_campaigns_without_precall_config(self, mocker):
+        """Every existing plan must be completely unaffected."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        plan["buckets"][0]["campaigns"][0]["campaignConfig"].pop("precallSms")
+        _find_cs(run, "voice-vein")["status"] = "warming"
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        invoke.assert_not_called()
+
+    def test_sms_send_failure_does_not_block_the_voice_campaign(self, mocker):
+        """A failed pre-call text must degrade to 'no text', never to 'no call'."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        cs["status"] = "warming"
+        cs["segmentArn"] = "arn:cp:seg/vein-abc"
+        cs["segmentName"] = "vein-abc"
+        mocker.patch("executor._invoke_sms_sender", side_effect=RuntimeError("boom"))
+
+        executor._fire_precall_sms(run, plan, 0)  # must not raise
+
+    def test_each_specialty_campaign_gets_its_own_copy_and_segment(self, mocker):
+        """Specialty copy comes from per-campaign config, not a lookup table."""
+        import executor
+
+        run, plan = _make_run_with_two_specialties()
+        invoke = mocker.patch("executor._invoke_sms_sender")
+
+        executor._fire_precall_sms(run, plan, 0)
+
+        assert invoke.call_count == 2
+        pairs = {
+            (c.kwargs["segmentArn"], c.kwargs["messageTemplate"])
+            for c in invoke.call_args_list
+        }
+        assert len(pairs) == 2
+
+
+class TestPrecallSmsOrdering:
+    """Ordering is structural: the SMS is enqueued before any campaign starts."""
+
+    def test_activate_warming_bucket_fires_sms_before_starting_campaigns(self, mocker):
+        """executor.oc is never a module attribute — every call site builds it via a
+        function-local `from vip_shared...outbound_campaigns_client import build as
+        build_oc; oc = build_oc()` (see the identical sys.modules-stub workaround
+        already used by test_activate_warming_bucket_campaign_failure_records_creation_failed
+        above). mocker.patch("executor.oc", ...) would raise AttributeError, so the
+        cold-start Connect client is stubbed via sys.modules instead."""
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        order: list[str] = []
+        mocker.patch(
+            "executor._fire_precall_sms",
+            side_effect=lambda *a, **k: order.append("sms"),
+        )
+        mocker.patch("executor._schedule_tick", return_value="sched")
+        mocker.patch("executor.save_run")
+        mocker.patch("executor._dispatch_ready_campaigns", return_value=False)
+
+        oc_mock = MagicMock()
+        oc_mock.start_campaign = lambda *a, **k: order.append("dial")
+        oc_mock.update_campaign_schedule = MagicMock()
+
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        vip_stub = MagicMock()
+        vip_stub.build = MagicMock(return_value=oc_mock)
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+        try:
+            executor._activate_warming_bucket(run, plan, 0)
+        finally:
+            for m, orig in originals.items():
+                if orig is None:
+                    sys.modules.pop(m, None)
+                else:
+                    sys.modules[m] = orig
+
+        assert order and order[0] == "sms"
+
+    def test_start_run_fires_sms_before_starting_bucket_zero(self, mocker):
+        """Isolates call site #1 (inside start_run's pendingWarmup branch) by mocking
+        _activate_warming_bucket wholesale as the 'dial' marker — its own internal
+        call to _fire_precall_sms is covered by the test above, not this one."""
+        import executor
+
+        plan = _make_plan([_bucket_def("b0", [_campaign_def("voice-vein")])])
+        plan["pendingWarmup"] = {
+            "campaigns": [
+                {
+                    "campaignId": "voice-vein",
+                    "connectCampaignId": "cc-vein-1",
+                    "segmentArn": "arn:cp:seg/vein-abc",
+                    "segmentName": "vein-abc",
+                    "leadCount": 42,
+                    "warmupStarted": True,
+                }
+            ],
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+        run = _make_run(plan, [_bucket_state("b0", [_campaign_state("voice-vein")])])
+
+        order: list[str] = []
+        mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor.get_latest_run", return_value=None)
+        mocker.patch("executor.lock_plan_run")
+        mocker.patch("executor.create_run", return_value=run)
+        mocker.patch("executor.save_run")
+        mocker.patch("executor.update_plan_pending_warmup")
+        mocker.patch(
+            "executor._fire_precall_sms",
+            side_effect=lambda *a, **k: order.append("sms"),
+        )
+        mocker.patch(
+            "executor._activate_warming_bucket",
+            side_effect=lambda *a, **k: order.append("dial"),
+        )
+
+        executor.start_run("plan-1")
+
+        assert order == ["sms", "dial"]
