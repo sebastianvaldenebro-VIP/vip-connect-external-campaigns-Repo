@@ -834,7 +834,7 @@ def test_tick_advances_when_all_campaigns_terminal():
         ],
     )
 
-    def poll_to_completed(campaign_state):
+    def poll_to_completed(campaign_state, **_kwargs):
         campaign_state["status"] = "completed"
         campaign_state["exitReason"] = "completed"
 
@@ -1049,7 +1049,7 @@ def test_prestart_sets_next_bucket_to_warming():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None),
+            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None, None),
         ),
         patch("executor.save_run"),
     ):
@@ -1085,7 +1085,7 @@ def test_prestart_only_creates_stage1_campaigns():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn-w", True, None, None),
+            return_value=("conn-w", "seg-w", "arn-w", True, None, None, None),
         ) as create,
         patch("executor.save_run"),
     ):
@@ -1150,7 +1150,7 @@ def test_prestart_claim_save_persists_warming_before_campaigns():
 
     def track_create(*_args, **_kwargs):
         call_order.append(("create",))
-        return ("conn-w", "seg-w", "arn-w", True, None, None)
+        return ("conn-w", "seg-w", "arn-w", True, None, None, None)
 
     with (
         patch("executor.save_run", side_effect=track_save),
@@ -1196,7 +1196,7 @@ def test_prestart_mid_flight_save_persists_connect_id():
         patch("executor.save_run", side_effect=track_save),
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-warm", "seg-w", "arn-w", True, None, None),
+            return_value=("conn-warm", "seg-w", "arn-w", True, None, None, None),
         ),
     ):
         executor._prestart_next_bucket(run, plan, 0)
@@ -3897,7 +3897,7 @@ def test_prestart_plan_does_not_emit_metric_when_warmup_succeeds():
     with (
         patch(
             "executor._create_campaign_only",
-            return_value=("conn-1", "seg-1", "arn:seg-1", True, None, None),
+            return_value=("conn-1", "seg-1", "arn:seg-1", True, None, None, None),
         ),
         patch("executor.get_plan", return_value=plan),
         patch("executor.get_latest_run", return_value=None),
@@ -5506,7 +5506,7 @@ class TestPrestartSkipsBranded:
 
         create = mocker.patch(
             "executor._create_campaign_only",
-            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None),
+            return_value=("conn-w", "seg-w", "arn:seg-w", True, None, None, None),
         )
         mocker.patch("executor.save_run")
 
@@ -5540,7 +5540,7 @@ class TestPrestartSkipsBranded:
 
         create = mocker.patch(
             "executor._create_campaign_only",
-            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False, None, None),
+            return_value=("conn-w2", "seg-w2", "arn:seg-w2", False, None, None, None),
         )
         mocker.patch("executor.get_plan", return_value=plan)
         mocker.patch("executor.get_latest_run", return_value=None)
@@ -7421,7 +7421,7 @@ class TestCreateCampaignOnlyReconcileCounts:
                 ),
                 patch("executor._account_id", return_value="123456789012"),
             ):
-                connect_id, seg_name, seg_arn, _warmup_started, expected, actual = (
+                connect_id, seg_name, seg_arn, _warmup_started, expected, actual, _paused_at = (
                     executor._create_campaign_only(bucket, campaign, run)
                 )
         finally:
@@ -7468,7 +7468,7 @@ class TestCreateCampaignOnlyReconcileCounts:
                 ),
                 patch("executor._account_id", return_value="123456789012"),
             ):
-                _connect_id, seg_name, seg_arn, _warmup_started, expected, actual = (
+                _connect_id, seg_name, seg_arn, _warmup_started, expected, actual, _paused_at = (
                     executor._create_campaign_only(bucket, campaign, run)
                 )
         finally:
@@ -7506,7 +7506,7 @@ class TestPrestartNextBucketReconcile:
         with (
             patch(
                 "executor._create_campaign_only",
-                return_value=("connect-1", "seg", "arn", True, 20, 18),
+                return_value=("connect-1", "seg", "arn", True, 20, 18, None),
             ),
             patch("executor.save_run"),
         ):
@@ -7545,7 +7545,7 @@ class TestPrestartNextBucketReconcile:
         with (
             patch(
                 "executor._create_campaign_only",
-                return_value=("connect-1", "seg", "arn", True, 20, 18),
+                return_value=("connect-1", "seg", "arn", True, 20, 18, None),
             ),
             patch("executor.save_run"),
         ):
@@ -7595,6 +7595,11 @@ def _make_run_with_precall_voice() -> tuple[dict, dict]:
     cs = _campaign_state("voice-vein", status="warming", connect_id="cc-vein-1")
     cs["segmentArn"] = "arn:cp:seg/vein-abc"
     cs["segmentName"] = "vein-abc"
+    # Since the 2026-09 adversarial-review resume-retry fix, resume is only
+    # ever attempted when precallGatePausedAt is set (never merely because
+    # connectCampaignId is present) — this fixture represents a campaign
+    # that was genuinely paused by _create_campaign_only/_create_and_start_campaign.
+    cs["precallGatePausedAt"] = "2026-05-08T09:59:00+00:00"
 
     run = _make_run(plan, [_bucket_state("b0", [cs], status="warming")])
     return run, plan
@@ -7626,10 +7631,12 @@ def _make_run_with_two_specialties() -> tuple[dict, dict]:
     cs_a = _campaign_state("voice-vein", status="warming", connect_id="cc-vein-1")
     cs_a["segmentArn"] = "arn:cp:seg/vein-abc"
     cs_a["segmentName"] = "vein-abc"
+    cs_a["precallGatePausedAt"] = "2026-05-08T09:59:00+00:00"
 
     cs_b = _campaign_state("voice-derm", status="warming", connect_id="cc-derm-1")
     cs_b["segmentArn"] = "arn:cp:seg/derm-xyz"
     cs_b["segmentName"] = "derm-xyz"
+    cs_b["precallGatePausedAt"] = "2026-05-08T09:59:00+00:00"
 
     run = _make_run(plan, [_bucket_state("b0", [cs_a, cs_b], status="warming")])
     return run, plan
@@ -7978,3 +7985,66 @@ class TestPrecallSmsOrdering:
             executor._activate_warming_bucket(run, plan, 0)
 
         invoke.assert_not_called()
+
+
+class TestPrecallGateResumeNoiseReduction:
+    """Noise case #1 of the 2026-09 adversarial-review resume-retry fix:
+    _activate_warming_bucket's "cold_started" sub-case (a campaign that
+    warmed but whose StartCampaign never actually succeeded during pre-warm,
+    so warmupStarted=False, so _create_campaign_only never called
+    pause_campaign on it) used to still get a resume *attempted* against it
+    by _fire_precall_sms_for_campaign, because that helper's old trigger was
+    just "has a connectCampaignId" — too broad. That predictably fails (you
+    cannot resume a campaign that was never paused) and pollutes the same
+    precall_gate_resume_failed log event that's supposed to signal the real,
+    alarm-worthy stranded-pause Critical case."""
+
+    def test_cold_started_campaign_with_precall_never_gets_resume_attempted(self):
+        import sys
+
+        import executor
+
+        run, plan = _make_run_with_precall_voice()
+        cs = _find_cs(run, "voice-vein")
+        # This fixture normally sets precallGatePausedAt (a genuinely-paused
+        # campaign) — remove it here to reproduce the cold_started shape:
+        # warmupStarted was never True, so _create_campaign_only never
+        # reached its pause_campaign call in the first place.
+        cs.pop("precallGatePausedAt", None)
+        assert "warmupStarted" not in cs
+
+        oc_mock = MagicMock()
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        vip_stub = MagicMock()
+        vip_stub.build = MagicMock(return_value=oc_mock)
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+
+        try:
+            with (
+                patch("executor._schedule_tick", return_value="sched-1"),
+                patch("executor.save_run"),
+                patch("executor._dispatch_ready_campaigns", return_value=False),
+                patch("executor._invoke_sms_sender"),
+            ):
+                executor._activate_warming_bucket(run, plan, 0)
+        finally:
+            for m, orig in originals.items():
+                if orig is None:
+                    sys.modules.pop(m, None)
+                else:
+                    sys.modules[m] = orig
+
+        # The cold_started branch itself never pauses (unchanged, pre-existing
+        # behavior) — the fix under test is that resume is likewise never
+        # attempted, since this campaign was never actually paused by us.
+        oc_mock.pause_campaign.assert_not_called()
+        oc_mock.resume_campaign.assert_not_called()
+        assert cs["status"] == "running"
+        assert "precallGatePausedAt" not in cs

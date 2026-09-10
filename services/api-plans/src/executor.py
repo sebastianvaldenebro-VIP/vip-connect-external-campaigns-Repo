@@ -502,12 +502,24 @@ def _fire_precall_sms_for_campaign(
             sms_campaign_id=sms_campaign_id,
         )
     finally:
-        # ALWAYS attempt resume if this campaign has a connectCampaignId —
-        # decoupled from whether the send above succeeded or raised, and
-        # retryable on a subsequent call if resume itself failed last time
-        # (tracked via precallGateResumedAt, separate from precallSmsSentAt, so
-        # a resume failure is never masked by the SMS-already-sent early return).
-        if connect_campaign_id and not cs.get("precallGateResumedAt"):
+        # ALWAYS attempt resume if this campaign was actually paused by us for
+        # the precall gate — decoupled from whether the send above succeeded
+        # or raised, and retryable on a subsequent call if resume itself
+        # failed last time (tracked via precallGateResumedAt, separate from
+        # precallSmsSentAt, so a resume failure is never masked by the
+        # SMS-already-sent early return).
+        #
+        # Trigger is precallGatePausedAt (set only when oc.pause_campaign()
+        # actually succeeded — see _create_campaign_only /
+        # _create_and_start_campaign / _start_one_campaign), NOT merely "has a
+        # connectCampaignId" (2026-09 adversarial review, findings #2/#3): a
+        # campaign that warmed but whose StartCampaign never actually
+        # succeeded (_activate_warming_bucket's cold_started sub-case) or
+        # whose pause call itself failed was never paused, so resuming it is
+        # guaranteed to fail — polluting the precall_gate_resume_failed alarm
+        # signal with noise that isn't the real stranded-pause risk that
+        # signal exists to catch.
+        if cs.get("precallGatePausedAt") and not cs.get("precallGateResumedAt"):
             try:
                 from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
                     build as build_oc,
@@ -1055,6 +1067,8 @@ def start_run(
                 cs["segmentName"] = match.get("segmentName")
                 cs["leadCount"] = match.get("leadCount")
                 cs["warmupStarted"] = match.get("warmupStarted", False)
+                if match.get("precallGatePausedAt"):
+                    cs["precallGatePausedAt"] = match["precallGatePausedAt"]
                 cs["status"] = "warming"
         # No pre-call SMS fire here (finding #4, 2026-09 adversarial review): this
         # branch used to fire it before _activate_warming_bucket's _schedule_tick
@@ -1249,7 +1263,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
 
     for cs in bucket_state["campaignStates"]:
         if cs["status"] == "running" and cs.get("connectCampaignId"):
-            _poll_campaign_state(cs)
+            _poll_campaign_state(cs, plan_id=plan_id, run_id=run_id)
             if cs["status"] == "running":
                 _campaign_def = next(
                     (
@@ -2407,14 +2421,22 @@ def _prestart_next_bucket(run: dict, plan: dict, current_index: int) -> None:
             camp_name = campaign.get("name") or campaign.get("id", "?")
             if cs["status"] == "queued":
                 try:
-                    connect_id, seg_name, seg_arn, warmup_started, expected, actual = (
-                        _create_campaign_only(next_bucket, campaign, run)
-                    )
+                    (
+                        connect_id,
+                        seg_name,
+                        seg_arn,
+                        warmup_started,
+                        expected,
+                        actual,
+                        precall_gate_paused_at,
+                    ) = _create_campaign_only(next_bucket, campaign, run)
                     cs["status"] = "warming"
                     cs["connectCampaignId"] = connect_id
                     cs["segmentName"] = seg_name
                     cs["segmentArn"] = seg_arn
                     cs["warmupStarted"] = warmup_started
+                    if precall_gate_paused_at:
+                        cs["precallGatePausedAt"] = precall_gate_paused_at
                     if expected is not None:
                         cs["reconcile"] = {
                             "expected": expected,
@@ -2822,9 +2844,15 @@ def _prestart_plan(target_plan_id: str) -> None:
         attempted += 1
         camp_name = campaign.get("name") or camp_id or "?"
         try:
-            connect_id, seg_name, seg_arn, warmup_started, _, _ = _create_campaign_only(
-                bucket, campaign, {}
-            )
+            (
+                connect_id,
+                seg_name,
+                seg_arn,
+                warmup_started,
+                _,
+                _,
+                precall_gate_paused_at,
+            ) = _create_campaign_only(bucket, campaign, {})
             warmed.append(
                 {
                     "campaignId": camp_id,
@@ -2832,6 +2860,7 @@ def _prestart_plan(target_plan_id: str) -> None:
                     "segmentName": seg_name,
                     "segmentArn": seg_arn,
                     "warmupStarted": warmup_started,
+                    "precallGatePausedAt": precall_gate_paused_at,
                 }
             )
             _slog.info(
@@ -4020,6 +4049,7 @@ def _start_one_campaign(
             if precall.get("enabled"):
                 try:
                     oc.pause_campaign(cs["connectCampaignId"])
+                    cs["precallGatePausedAt"] = _now_iso()
                 except Exception as pause_exc:
                     _slog.warn(
                         "precall_gate_pause_failed",
@@ -4209,7 +4239,7 @@ def _start_one_campaign(
     # Phase 2: create + start Connect campaign
     try:
         connect_id, campaign_name = _create_and_start_campaign(
-            bucket, campaign, segment_arn, segment_name, now
+            bucket, campaign, segment_arn, segment_name, now, cs=cs
         )
         cs["connectCampaignId"] = connect_id
         # Mid-flight save: persist {creating, connectCampaignId} so Phase-1 recovery in
@@ -4389,11 +4419,16 @@ def _create_campaign_only(
     bucket: dict,
     campaign: dict,
     run: dict,
-) -> tuple[str, str, str, bool, int | None, int | None]:
+) -> tuple[str, str, str, bool, int | None, int | None, str | None]:
     """Create Connect campaign without starting it (for pre-start warming).
 
-    Returns (connectCampaignId, segmentName, segmentArn, warmupStarted, expected, actual).
-    `expected`/`actual` are None when a pinned segment is used (no `_create_segment` call).
+    Returns (connectCampaignId, segmentName, segmentArn, warmupStarted, expected,
+    actual, precallGatePausedAt). `expected`/`actual` are None when a pinned
+    segment is used (no `_create_segment` call). `precallGatePausedAt` is an
+    ISO timestamp set ONLY when oc.pause_campaign() actually succeeded — None
+    otherwise (pause not attempted, or attempted and failed) — see the two
+    callers (_prestart_next_bucket / _prestart_plan) for how they thread it
+    onto a real campaign state dict.
     """
     from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
         build as build_oc,
@@ -4502,11 +4537,13 @@ def _create_campaign_only(
     # nothing to gate on for this campaign, which degrades to the pre-existing
     # timer race rather than a new failure mode — an accepted residual risk, not
     # worth failing the whole pre-warm over.
+    precall_gate_paused_at: str | None = None
     if warmup_started:
         precall = (campaign.get("campaignConfig") or {}).get("precallSms") or {}
         if precall.get("enabled"):
             try:
                 oc.pause_campaign(campaign_id)
+                precall_gate_paused_at = _now_iso()
             except Exception as exc:
                 _slog.warn(
                     "precall_gate_pause_failed",
@@ -4516,11 +4553,39 @@ def _create_campaign_only(
                     error_type=type(exc).__name__,
                 )
 
-    return campaign_id, segment_name, segment_arn, warmup_started, expected, actual
+    return (
+        campaign_id,
+        segment_name,
+        segment_arn,
+        warmup_started,
+        expected,
+        actual,
+        precall_gate_paused_at,
+    )
 
 
-def _poll_campaign_state(cs: dict) -> None:
-    """Update a running campaign state from Connect."""
+def _poll_campaign_state(
+    cs: dict, plan_id: str | None = None, run_id: str | None = None
+) -> None:
+    """Update a running campaign state from Connect.
+
+    Also self-heals a stranded precall-gate pause: precallGatePausedAt is set
+    only when oc.pause_campaign() actually succeeded (see
+    _create_campaign_only / _create_and_start_campaign / _start_one_campaign),
+    and _fire_precall_sms_for_campaign's resume is normally the only thing
+    that releases it — but if that single resume attempt itself fails
+    (throttling, a transient AWS error), nothing else ever retries it, and the
+    campaign would sit paused — never dialing — for the rest of its run
+    (2026-09 adversarial review, Critical finding). "Paused" is not one of
+    _CONNECT_TERMINAL's states, so without this check that stranding would go
+    unnoticed here. Fetches Connect's state exactly once and reuses it for
+    both checks below.
+
+    `plan_id`/`run_id` are optional and used only to enrich the retry log
+    lines — tick() (this function's only production caller) has them in
+    scope; direct unit tests calling this function with just `cs` are
+    unaffected.
+    """
     state = _get_campaign_state(cs["connectCampaignId"])
     if state in _CONNECT_TERMINAL:
         exit_reason = _CONNECT_TERMINAL[state]
@@ -4545,6 +4610,34 @@ def _poll_campaign_state(cs: dict) -> None:
                     "alertType": "connect_deleted",
                     "campaignId": cs["campaignId"],
                 },
+            )
+    elif (
+        state == "Paused"
+        and cs.get("precallGatePausedAt")
+        and not cs.get("precallGateResumedAt")
+    ):
+        try:
+            from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
+                build as build_oc,
+            )
+
+            build_oc().resume_campaign(cs["connectCampaignId"])
+            cs["precallGateResumedAt"] = _now_iso()
+            _slog.info(
+                "precall_gate_resume_retried",
+                plan_id=plan_id,
+                run_id=run_id,
+                campaign_id=cs.get("campaignId"),
+                connect_campaign_id=cs["connectCampaignId"],
+            )
+        except Exception as exc:
+            _slog.error(
+                "precall_gate_resume_retry_failed",
+                plan_id=plan_id,
+                run_id=run_id,
+                campaign_id=cs.get("campaignId"),
+                connect_campaign_id=cs["connectCampaignId"],
+                error_type=type(exc).__name__,
             )
 
 
@@ -4851,7 +4944,19 @@ def _create_and_start_campaign(
     segment_arn: str,
     segment_name: str,
     now: datetime,
+    cs: dict | None = None,
 ) -> tuple[str, str]:
+    """Create + start a Connect campaign (cold-start fresh path).
+
+    `cs` is optional and mutated directly (not threaded through the return
+    tuple) rather than adding a 3rd return value — its only production caller
+    (_start_one_campaign) already owns `cs` directly, and the return arity is
+    unpacked by name at several existing call sites/tests; adding a value
+    there for zero benefit (the one caller that cares already has `cs`) would
+    just churn those. See _create_campaign_only's docstring for why THAT
+    function instead threads the marker through its return tuple — one of
+    its two callers (_prestart_plan) has no `cs` of its own to mutate.
+    """
     from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
         build as build_oc,
     )
@@ -4950,6 +5055,8 @@ def _create_and_start_campaign(
     if precall.get("enabled"):
         try:
             oc.pause_campaign(campaign_id)
+            if cs is not None:
+                cs["precallGatePausedAt"] = _now_iso()
         except Exception as exc:
             _slog.warn(
                 "precall_gate_pause_failed",

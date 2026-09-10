@@ -552,6 +552,7 @@ class TestPrewarmedFreshStartPausesWhenPrecallEnabled:
         assert order == [("start", "conn-1"), ("pause", "conn-1"), "fire"]
         assert cs["status"] == "running"
         mock_fire.assert_called_once_with(run, plan, 0, 0)
+        assert cs["precallGatePausedAt"]  # marker set immediately after pause succeeds
 
     def test_precall_disabled_never_pauses_but_still_calls_real_fire_helper(self):
         """_fire_precall_sms_for_campaign is always called unconditionally here —
@@ -570,6 +571,7 @@ class TestPrewarmedFreshStartPausesWhenPrecallEnabled:
         mock_oc.pause_campaign.assert_not_called()
         mock_oc.resume_campaign.assert_not_called()
         assert cs["status"] == "running"
+        assert "precallGatePausedAt" not in cs
 
     def test_pause_campaign_failure_is_logged_and_does_not_raise(self):
         campaign = {
@@ -590,6 +592,7 @@ class TestPrewarmedFreshStartPausesWhenPrecallEnabled:
 
         assert cs["status"] == "running"
         mock_fire.assert_called_once_with(run, plan, 0, 0)
+        assert "precallGatePausedAt" not in cs  # pause failed — never set on failure
 
 
 class TestFreshStartCallsFirePrecallGate:
@@ -670,6 +673,16 @@ class TestFreshStartCallsFirePrecallGate:
         cs = _campaign_state("c0", status="queued")
         run, plan = _run_plan(campaign, cs)
 
+        def _fake_create_and_start(*_args, cs=None, **_kwargs):
+            # Simulates the real _create_and_start_campaign's contract: it
+            # mutates cs["precallGatePausedAt"] directly on a successful
+            # pause rather than returning it (see its docstring) — this test
+            # mocks the function wholesale, so that side effect must be
+            # reproduced here for the downstream resume gate to trigger.
+            if cs is not None:
+                cs["precallGatePausedAt"] = "2026-01-01T00:00:00+00:00"
+            return "conn-new", "seg-1"
+
         mock_oc, originals = _stub_oc()
         try:
             with (
@@ -679,7 +692,7 @@ class TestFreshStartCallsFirePrecallGate:
                 ),
                 patch(
                     "executor._create_and_start_campaign",
-                    return_value=("conn-new", "seg-1"),
+                    side_effect=_fake_create_and_start,
                 ),
                 patch("executor.save_run"),
                 patch("executor._invoke_sms_sender") as invoke_sms,

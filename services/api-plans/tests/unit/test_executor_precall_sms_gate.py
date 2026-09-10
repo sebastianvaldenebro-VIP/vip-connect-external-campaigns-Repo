@@ -81,12 +81,20 @@ def _campaign(precall_enabled: bool = True, **precall_overrides) -> dict:
 
 
 def _cs(**overrides) -> dict:
+    """Defaults to a genuinely-paused campaign (precallGatePausedAt set) —
+    the baseline "about to be resumed" shape most tests in this file act on.
+    Since the 2026-09 adversarial-review resume-retry fix, resume is only
+    ever attempted when precallGatePausedAt is set (never merely because
+    connectCampaignId is present) — see
+    test_resume_not_attempted_when_no_connect_campaign_id below for the
+    explicit override that removes it."""
     cs = {
         "campaignId": "c0",
         "status": "warming",
         "connectCampaignId": "conn-1",
         "segmentArn": "arn:cp:seg1",
         "segmentName": "seg1",
+        "precallGatePausedAt": "2026-09-09T00:00:00+00:00",
     }
     cs.update(overrides)
     return cs
@@ -167,10 +175,31 @@ class TestFirePrecallSmsForCampaignResumeOrdering:
         mock_oc.resume_campaign.assert_called_once_with("conn-1")
 
     def test_resume_not_attempted_when_no_connect_campaign_id(self):
-        """Branded's shape — connectCampaignId is always falsy/absent at the
-        point this would be called; resume must be a structural no-op."""
+        """Branded's shape — connectCampaignId is always falsy/absent, and a
+        campaign with no connectCampaignId can never have been paused either
+        (precallGatePausedAt=None reflects that realistic combination);
+        resume must be a structural no-op."""
         campaign = _campaign()
-        cs = _cs(connectCampaignId=None)
+        cs = _cs(connectCampaignId=None, precallGatePausedAt=None)
+        run, plan = _run_plan(campaign, cs)
+        mock_oc, originals = _stub_oc()
+        try:
+            with patch("executor._invoke_sms_sender"):
+                executor._fire_precall_sms_for_campaign(run, plan, 0, 0)
+        finally:
+            _unstub_oc(originals)
+
+        mock_oc.resume_campaign.assert_not_called()
+        assert "precallGateResumedAt" not in cs
+
+    def test_resume_not_attempted_when_never_actually_paused_by_us(self):
+        """Narrowed trigger (2026-09 adversarial-review resume-retry fix):
+        having a connectCampaignId is no longer sufficient — covers both the
+        cold_started noise case (warmupStarted=False, so
+        _create_campaign_only never paused it) and the pause-failed noise
+        case. Both leave precallGatePausedAt unset."""
+        campaign = _campaign()
+        cs = _cs(precallGatePausedAt=None)  # has connectCampaignId, never paused
         run, plan = _run_plan(campaign, cs)
         mock_oc, originals = _stub_oc()
         try:

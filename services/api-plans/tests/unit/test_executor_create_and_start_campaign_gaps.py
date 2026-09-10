@@ -241,6 +241,69 @@ class TestCreateAndStartCampaignPrecallSmsGate:
 
         assert connect_id == "connect-13"
 
+    def test_precall_enabled_pause_success_sets_marker_on_cs(self):
+        """precallGatePausedAt is set on the caller's cs dict, not returned —
+        see the function's docstring for why (its one production caller
+        already owns cs directly)."""
+        bucket = {"id": "B1", "name": "B1", "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        cs: dict = {}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-14"}
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                executor._create_and_start_campaign(
+                    bucket, campaign, "arn:seg", "seg-name", _NOW_UTC, cs=cs
+                )
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.pause_campaign.assert_called_once_with("connect-14")
+        assert cs["precallGatePausedAt"]
+
+    def test_precall_enabled_pause_failure_does_not_set_marker_on_cs(self):
+        bucket = {"id": "B1", "name": "B1", "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        cs: dict = {}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-15"}
+        mock_oc.pause_campaign.side_effect = RuntimeError("pause failed")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                executor._create_and_start_campaign(
+                    bucket, campaign, "arn:seg", "seg-name", _NOW_UTC, cs=cs
+                )  # must not raise despite pause_campaign failing
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert "precallGatePausedAt" not in cs
+
 
 class TestCreateAndStartCampaignMissingFlowArn:
     def test_raises_value_error_for_missing_journey_flow(self):
