@@ -805,7 +805,15 @@ function CampaignCard({
                       campaignConfig: { ...cfg, ...(autoQueueArn ? { queueArn: autoQueueArn } : {}) },
                     });
                   } else {
-                    onChange({ ...campaign, deliveryType: newType });
+                    // An SMS-delivery campaign has no call for a pre-call text to
+                    // precede, so a stale enabled precallSms would fail server-side
+                    // validation with a confusing error at save time.
+                    const clearPrecall = newType === 'sms' && cfg.precallSms?.enabled;
+                    onChange({
+                      ...campaign,
+                      deliveryType: newType,
+                      ...(clearPrecall ? { campaignConfig: { ...cfg, precallSms: undefined } } : {}),
+                    });
                   }
                 }}
                 className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
