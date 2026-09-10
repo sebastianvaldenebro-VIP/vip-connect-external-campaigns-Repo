@@ -18,6 +18,7 @@ import {
   type SmsOriginationNumber,
 } from '@/lib/api';
 import { STATE_DEFAULT_PHONES } from '@/lib/areaCodeMap';
+import { MAX_SMS_CHARS, precallSmsAvailability, renderedWorstCaseLength, validatePrecallSms } from '@/lib/precallSms';
 import { useLocationMapping } from '@/lib/stateLocationMap';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -47,6 +48,16 @@ const DEFAULT_CAMPAIGN_CONFIG: BucketCampaignConfig = {
 };
 
 const CANONICAL_PHONES = new Set(Object.values(STATE_DEFAULT_PHONES));
+
+// Not part of DEFAULT_CAMPAIGN_CONFIG on purpose (see patchPrecall below) —
+// only the merge base for the shallow-spread helper, never seeded onto a
+// campaign that hasn't opted in.
+const EMPTY_PRECALL: NonNullable<BucketCampaignConfig['precallSms']> = {
+  enabled: false,
+  messageTemplate: '',
+  originationNumberArn: '',
+  clinicName: '',
+};
 
 function pickPhoneForCampaign(states: string[]): string {
   for (const state of states) {
@@ -622,11 +633,24 @@ function CampaignCard({
   const updateCfg = (patch: Partial<BucketCampaignConfig>) =>
     onChange({ ...campaign, campaignConfig: { ...cfg, ...patch } });
 
+  // precallSms is an object, so updateCfg({ precallSms: {...} }) would discard
+  // the other three fields via updateCfg's shallow spread. Always merge explicitly.
+  const patchPrecall = (patch: Partial<NonNullable<BucketCampaignConfig['precallSms']>>) =>
+    updateCfg({ precallSms: { ...(cfg.precallSms ?? EMPTY_PRECALL), ...patch } });
+
   const toggleDep = (depId: string) => {
-    const deps = campaign.dependsOn.includes(depId)
-      ? campaign.dependsOn.filter((d) => d !== depId)
-      : [...campaign.dependsOn, depId];
-    onChange({ ...campaign, dependsOn: deps });
+    const isAdding = !campaign.dependsOn.includes(depId);
+    const deps = isAdding
+      ? [...campaign.dependsOn, depId]
+      : campaign.dependsOn.filter((d) => d !== depId);
+    // A dependent campaign is never pre-warmed, so a stale enabled precallSms
+    // would fail server-side validation with a confusing error at save time.
+    const clearPrecall = isAdding && cfg.precallSms?.enabled;
+    onChange({
+      ...campaign,
+      dependsOn: deps,
+      ...(clearPrecall ? { campaignConfig: { ...cfg, precallSms: undefined } } : {}),
+    });
   };
 
   return (
@@ -899,6 +923,97 @@ function CampaignCard({
                 </label>
               </div>
             )}
+
+            {/* Pre-Call SMS — always rendered; availability gates whether it's usable.
+                Hiding it entirely for an unavailable campaign would leave the operator
+                guessing why a colleague's screenshot has a panel they don't see. */}
+            {(() => {
+              const availability = precallSmsAvailability({
+                deliveryType: campaign.deliveryType,
+                dependsOn: campaign.dependsOn,
+              });
+              const precall = cfg.precallSms;
+              const precallEnabled = precall?.enabled ?? false;
+              const rendered = renderedWorstCaseLength(
+                precall?.messageTemplate ?? '',
+                precall?.clinicName ?? '',
+              );
+              return (
+                <div className="mt-2 rounded-lg border border-blue-200 bg-blue-50 p-3 space-y-3">
+                  <label className="flex items-start gap-2 text-xs font-semibold text-blue-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={precallEnabled}
+                      disabled={!availability.available}
+                      onChange={(e) => patchPrecall({ enabled: e.target.checked })}
+                      className="mt-0.5 accent-blue-500 disabled:cursor-not-allowed"
+                    />
+                    <span>Pre-Call SMS — text the lead just before dialing</span>
+                  </label>
+                  {!availability.available && (
+                    <p className="text-xs text-gray-500">{availability.reason}</p>
+                  )}
+                  {availability.available && precallEnabled && (
+                    <>
+                      <div className="space-y-1">
+                        <label className="block text-xs font-medium text-gray-600">
+                          Message Template{' '}
+                          <span className={rendered > MAX_SMS_CHARS ? 'text-red-600 font-semibold' : 'text-gray-400'}>
+                            ({rendered}/{MAX_SMS_CHARS})
+                          </span>
+                        </label>
+                        <textarea
+                          value={precall?.messageTemplate ?? ''}
+                          onChange={(e) => patchPrecall({ messageTemplate: e.target.value })}
+                          placeholder="Hi {{FirstName}}! {{ClinicName}} here…"
+                          className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <p className="text-[10px] text-gray-500">
+                          Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.
+                        </p>
+                        <p className="text-[10px] text-amber-600">
+                          Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
+                        </p>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="block text-xs font-medium text-gray-600">
+                          Clinic name{' '}
+                          <span className="text-gray-400">(interpolated into {'{{ClinicName}}'})</span>
+                        </label>
+                        <input
+                          value={precall?.clinicName ?? ''}
+                          onChange={(e) => patchPrecall({ clinicName: e.target.value })}
+                          placeholder="e.g. VIP Medical Group"
+                          className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="block text-xs font-medium text-gray-600">Origination Number</label>
+                        <select
+                          value={precall?.originationNumberArn ?? ''}
+                          onChange={(e) => patchPrecall({ originationNumberArn: e.target.value })}
+                          className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        >
+                          <option value="">— Select origination number —</option>
+                          {smsNumbers.map((n) => (
+                            <option key={n.arn} value={n.arn}>
+                              {n.phoneNumber} ({n.numberType})
+                            </option>
+                          ))}
+                        </select>
+                        <p className="text-[10px] text-gray-400">
+                          Phase I default: +16106009752. If it&apos;s not in this list, the number isn&apos;t ACTIVE yet.
+                        </p>
+                      </div>
+                      <p className="text-[10px] text-gray-500">
+                        Use approved copy only — Vein and Pain Management are the two shipped specialties. Check the
+                        pre-call SMS runbook before sending anything else.
+                      </p>
+                    </>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Per-campaign Connect config — hidden for SMS */}
             {campaign.deliveryType !== 'sms' && <div>
@@ -1417,6 +1532,13 @@ export function PlanNew() {
           if (!cfg?.smsMessageTemplate) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: SMS message template is required.`); return; }
           if (!cfg?.phiAcknowledged) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: confirm the message contains no PHI before saving.`); return; }
         }
+        if (c.campaignConfig?.precallSms?.enabled) {
+          const [first] = validatePrecallSms(c.campaignConfig.precallSms);
+          if (first) {
+            setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: ${first}`);
+            return;
+          }
+        }
       }
     }
     if (trigger.type === 'on_plan_complete' && !trigger.planId) {
@@ -1529,7 +1651,7 @@ export function PlanNew() {
       {(saveError || saveMutation.isError) && (
         <div ref={errorBannerRef} className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl p-3 flex items-start gap-2">
           <span className="text-red-500 mt-0.5 shrink-0">⚠</span>
-          <span>{saveError ?? String((saveMutation.error as Error)?.message ?? 'Save failed')}</span>
+          <span className="whitespace-pre-line">{saveError ?? String((saveMutation.error as Error)?.message ?? 'Save failed')}</span>
         </div>
       )}
 

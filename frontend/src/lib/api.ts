@@ -73,10 +73,20 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     const err = typeof payload.error === 'object' && payload.error !== null
       ? (payload.error as Record<string, unknown>)
       : payload;
+    // The plans API returns validation failures as { messages: string[] }
+    // (plural, a list) rather than the singular `message` this client
+    // otherwise expects. Without this, every plan validation error — branded,
+    // bulk-SMS, and pre-call SMS alike — surfaced in the UI as a bare
+    // "HTTP 400" with all specifics discarded.
+    const messages = Array.isArray((err as { messages?: unknown }).messages)
+      ? ((err as { messages: unknown[] }).messages.filter((m) => typeof m === 'string') as string[])
+      : [];
     const message =
       typeof err.message === 'string' && err.message
         ? err.message
-        : `HTTP ${res.status}`;
+        : messages.length
+          ? messages.join('\n')
+          : `HTTP ${res.status}`;
     throw new ApiRequestError({
       status: res.status,
       code: typeof err.code === 'string' ? err.code : undefined,
