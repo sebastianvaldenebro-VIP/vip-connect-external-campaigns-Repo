@@ -63,7 +63,7 @@ class TokenError(Exception):
 
 
 def _fetch_jwks() -> list[dict]:
-    with urllib.request.urlopen(JWKS_URL, timeout=5) as resp:  # noqa: S310 — fixed AWS-owned HTTPS URL, not user input
+    with urllib.request.urlopen(JWKS_URL, timeout=5) as resp:  # fixed AWS-owned HTTPS URL, not user input  # noqa: S310  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.loads(resp.read())["keys"]
 
 

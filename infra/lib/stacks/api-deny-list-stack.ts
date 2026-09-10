@@ -17,6 +17,14 @@ const VPC_SKIP = {
     'secured by TLS+IAM, not to any private-VPC-only resource.',
 };
 
+const DLQ_SKIP = {
+  id: 'CKV_AWS_116',
+  comment:
+    'No DLQ — this Lambda is invoked only synchronously via the API Gateway ' +
+    'integration; Lambda DLQs apply exclusively to async invocations, so one ' +
+    'here would provision dead, unreachable infra.',
+};
+
 // vip-connect-deny-list already exists — created by Connect-batch-redis-refactor's
 // deny-list Lambdas (connectcampaign_denylist_check/write), not by this app's CDK.
 // This stack only grants access to it; it does not own or manage its lifecycle
@@ -96,7 +104,7 @@ export class ApiDenyListStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-deny-list',
       },
     });
-    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
+    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP, DLQ_SKIP]);
 
     new cdk.CfnOutput(this, 'FunctionArn', { value: this.lambdaFunction.functionArn });
   }

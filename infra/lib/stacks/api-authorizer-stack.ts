@@ -18,6 +18,14 @@ const VPC_SKIP = {
     'endpoint over TLS, not to any private-VPC-only resource.',
 };
 
+const DLQ_SKIP = {
+  id: 'CKV_AWS_116',
+  comment:
+    'No DLQ — this Lambda is invoked only synchronously by API Gateway as a ' +
+    'Lambda authorizer; Lambda DLQs apply exclusively to async invocations, so ' +
+    'one here would provision dead, unreachable infra.',
+};
+
 // EngineeringPermissionBoundary explicitly denies iam:CreateRole AND
 // iam:PutRolePolicy/AttachRolePolicy for the CDK CFN exec role itself — not
 // a scoping gap fixable from CDK, an org-level lockdown on the deploy
@@ -120,7 +128,7 @@ export class ApiAuthorizerStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: 'api-authorizer',
       },
     });
-    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
+    skipCheckovChecks(this.lambdaFunction, [VPC_SKIP, DLQ_SKIP]);
 
     this.authorizer = new authorizers.HttpLambdaAuthorizer(
       'ApiAuthorizer',

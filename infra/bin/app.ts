@@ -15,7 +15,7 @@ import { AuthStack } from '../lib/stacks/auth-stack';
 import { DataStack } from '../lib/stacks/data-stack';
 import { HostingStack } from '../lib/stacks/hosting-stack';
 
-const app = new cdk.App();
+export const app = new cdk.App();
 
 const permissionsBoundaryName = app.node.tryGetContext('permissionsBoundaryName') as string | undefined;
 
@@ -39,7 +39,7 @@ const connectInstanceId =
   app.node.tryGetContext('connectInstanceId') ?? '6b3f17ba-68a4-472a-9b20-db1991507009';
 
 // 1. Data stack — KMS + DynamoDB tables (including AdminAuditLog)
-const data = new DataStack(app, 'VipAdminDataStack', {
+export const data = new DataStack(app, 'VipAdminDataStack', {
   env,
   description: 'DynamoDB tables + KMS CMK for VIP Admin UI',
   auditRetentionYears: Number(app.node.tryGetContext('auditRetentionYears') ?? 6),
@@ -55,7 +55,7 @@ const logoutUrls = (app.node.tryGetContext('cognitoLogoutUrls') as string[]) ?? 
   'http://localhost:5173/',
 ];
 
-const auth = new AuthStack(app, 'VipAdminAuthStack', {
+export const auth = new AuthStack(app, 'VipAdminAuthStack', {
   env,
   description: 'Cognito User Pool for VIP Admin UI',
   permissionsBoundaryName,
@@ -93,7 +93,7 @@ const redisVpcConfig = {
     'sg-01d54d29c2a4785f1',
 };
 
-const segments = new ApiSegmentsStack(app, 'VipAdminApiSegmentsStack', {
+export const segments = new ApiSegmentsStack(app, 'VipAdminApiSegmentsStack', {
   env,
   description: 'api-segments Lambda + snapshot bucket + shared layer',
   adminAuditTable: data.adminAuditTable,
@@ -106,7 +106,7 @@ const segments = new ApiSegmentsStack(app, 'VipAdminApiSegmentsStack', {
 });
 
 // 4. api-campaigns Lambda (builds its own copy of the shared layer)
-const campaigns = new ApiCampaignsStack(app, 'VipAdminApiCampaignsStack', {
+export const campaigns = new ApiCampaignsStack(app, 'VipAdminApiCampaignsStack', {
   env,
   description: 'api-campaigns Lambda — Outbound Campaigns V2 CRUD + lifecycle',
   adminAuditTable: data.adminAuditTable,
@@ -132,7 +132,7 @@ function requireContext(key: string): string {
 const progressiveDialerDataKeyArn = requireContext('progressiveDialerDataKeyArn');
 const firstOrionSecretArn         = requireContext('firstOrionSecretArn');
 
-const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
+export const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDialerStack', {
   env,
   description: 'Progressive Branded Dialer — Kinesis consumer + SQS caller + seeder Lambda',
   dataKeyArn: progressiveDialerDataKeyArn,
@@ -145,7 +145,7 @@ const progressiveDialer = new ApiProgressiveDialerStack(app, 'ApiProgressiveDial
 });
 
 // 5. api-metrics Lambda (instantiated after progressiveDialer to reference branded tables)
-const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
+export const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
   env,
   description: 'api-metrics Lambda — CloudWatch + audit log queries + branded campaign monitor',
   adminAuditTable: data.adminAuditTable,
@@ -167,7 +167,7 @@ const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
 //   - SQS queues: vip-sms-campaign-queue + vip-sms-campaign-queue-dlq (pre-created via CLI)
 //   - IAM roles: vip-sms-sender-role, vip-sms-processor-role (pre-created via CLI)
 //   - Log groups: /aws/lambda/vip-admin-sms-sender, /aws/lambda/vip-admin-sms-processor
-const smsStack = new ApiSmsStack(app, 'VipAdminApiSmsStack', {
+export const smsStack = new ApiSmsStack(app, 'VipAdminApiSmsStack', {
   env,
   description: 'SMS Campaign — bulk SMS via EUM SMS, SQS-driven processor',
   dataKeyArn: progressiveDialerDataKeyArn,
@@ -178,7 +178,7 @@ const smsStack = new ApiSmsStack(app, 'VipAdminApiSmsStack', {
 });
 
 // 6. api-plans Lambda + DynamoDB plans table
-const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
+export const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   env,
   description: 'api-plans Lambda — Daily Plans sequential campaign orchestration',
   adminAuditTable: data.adminAuditTable,
@@ -202,7 +202,7 @@ const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
 });
 
 // 7. api-profiles Lambda
-const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
+export const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
   env,
   description: 'api-profiles Lambda — Customer Profiles read-only operations',
   dataKey: data.dataKey,
@@ -214,7 +214,7 @@ const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
 // 9. api-deny-list Lambda — manual "block this number" entry, backs the
 // existing vip-connect-deny-list table (owned by Connect-batch-redis-refactor's
 // Quick Connect Lambdas, not by this app).
-const denyList = new ApiDenyListStack(app, 'VipAdminApiDenyListStack', {
+export const denyList = new ApiDenyListStack(app, 'VipAdminApiDenyListStack', {
   env,
   description: 'api-deny-list Lambda — manual blocked-number entry portal',
   adminAuditTable: data.adminAuditTable,
@@ -225,7 +225,7 @@ const denyList = new ApiDenyListStack(app, 'VipAdminApiDenyListStack', {
 // 9b. Custom Lambda authorizer — Cognito-group-based per-route authorization.
 // Deployed separately from ApiStack so an authorizer-only change (or a
 // rollback) doesn't touch the HTTP API / route resources at all.
-const apiAuthorizer = new ApiAuthorizerStack(app, 'VipAdminApiAuthorizerStack', {
+export const apiAuthorizer = new ApiAuthorizerStack(app, 'VipAdminApiAuthorizerStack', {
   env,
   description: 'Custom Lambda authorizer — Cognito Admin/Agent group enforcement per route',
   dataKey: data.dataKey,
@@ -239,7 +239,7 @@ const corsAllowOrigins = (app.node.tryGetContext('corsAllowOrigins') as string[]
   'http://localhost:5173',
 ];
 
-new ApiStack(app, 'VipAdminApiStack', {
+export const apiStack = new ApiStack(app, 'VipAdminApiStack', {
   env,
   description: 'API Gateway HTTP API + custom Lambda authorizer (Cognito group-based) fronting admin Lambdas',
   dataKey: data.dataKey,
@@ -256,7 +256,7 @@ new ApiStack(app, 'VipAdminApiStack', {
 });
 
 // 11. S3 + CloudFront hosting for the SPA
-new HostingStack(app, 'VipAdminHostingStack', {
+export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
   env,
   description: 'CloudFront + S3 bucket that host the admin UI SPA',
   permissionsBoundaryName,

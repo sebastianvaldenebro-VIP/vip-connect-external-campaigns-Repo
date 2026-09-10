@@ -31,10 +31,19 @@ export function buildBundledPythonCode(
   const requirementsFile = opts.requirementsFile ?? 'requirements.txt';
   const extraPipArgs = opts.extraPipArgs ?? [];
 
+  // opts.assetRoot/srcSubdir/requirementsFile come from BundlePythonCodeOptions,
+  // a literal construct-time config object each stack's own code passes at
+  // `cdk synth`/`deploy` time — build-time tooling, not a request-handling
+  // path. No external or attacker-controlled input reaches either join below.
+  // nosemgrep gets its own trailing comment on each flagged line, not a block
+  // above, because a suppression more than one line away from its finding is
+  // silently ignored (confirmed 2026-09-10: that's exactly why the pre-existing
+  // suppression a few lines down stopped covering its own path.join once this
+  // function was extracted from shared-layer.ts with a line in between).
   const srcPath = srcSubdir
-    ? path.join(opts.assetRoot, srcSubdir)
+    ? path.join(opts.assetRoot, srcSubdir) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
     : opts.assetRoot;
-  const requirementsPath = path.join(opts.assetRoot, requirementsFile);
+  const requirementsPath = path.join(opts.assetRoot, requirementsFile); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
 
   const dockerSrc = srcSubdir ? `/asset-input/${srcSubdir}` : '/asset-input';
   const dockerOut = outputSubdir
@@ -67,9 +76,8 @@ export function buildBundledPythonCode(
           // creates and passes to this callback at synth/deploy time —
           // build-time tooling, not a request-handling path. No external or
           // attacker-controlled input reaches this join.
-          // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
           const localOut = outputSubdir
-            ? path.join(outputDir, outputSubdir)
+            ? path.join(outputDir, outputSubdir) // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
             : outputDir;
           const steps: Array<[string, string[]]> = [
             ['mkdir', ['-p', localOut]],
