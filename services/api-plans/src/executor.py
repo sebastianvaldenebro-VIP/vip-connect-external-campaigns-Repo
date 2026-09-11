@@ -1965,6 +1965,20 @@ def force_start_campaign(
     cs["brandedCampaignId"] = None
     cs["queueArn"] = None
     cs["reconcileRetries"] = 0
+    # Clear the precall-SMS dial gate so this restart gets a genuinely fresh cycle.
+    # Without this, a campaign that already completed one full lifecycle (sent its
+    # precall text, been paused+resumed) carries those markers into the restart:
+    # precallSmsSentAt short-circuits _fire_precall_sms_for_campaign's send (no text
+    # fires), and the stale precallGateResumedAt makes its resume-trigger condition
+    # (precallGatePausedAt and not precallGateResumedAt) false even though
+    # _create_and_start_campaign pauses the campaign again for THIS cycle — so the
+    # resume never fires either. _poll_campaign_state's stranded-pause self-heal
+    # checks that identical condition, so it can't catch this either. Net effect
+    # without this reset: the restarted campaign pauses but never resumes — a
+    # permanent, silent stall with zero calls dialed (2026-09 adversarial review).
+    cs["precallSmsSentAt"] = None
+    cs["precallGatePausedAt"] = None
+    cs["precallGateResumedAt"] = None
     try:
         save_run(run)
     except ConcurrentWriteError:
