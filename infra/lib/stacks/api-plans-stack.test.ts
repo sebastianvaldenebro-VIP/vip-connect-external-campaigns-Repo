@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import { Template } from 'aws-cdk-lib/assertions';
+import precallSmsPlansPolicy from '../../config/precall-sms-plans-policy.json';
 
 // buildSharedLayer's real implementation shells out to `pip install` (or Docker)
 // against services/shared/requirements.txt during CDK asset bundling, which
@@ -235,8 +236,6 @@ describe('ApiPlansStack', () => {
         'connect-campaigns:DeleteCampaign',
         'connect-campaigns:StartCampaign',
         'connect-campaigns:StopCampaign',
-        'connect-campaigns:PauseCampaign',
-        'connect-campaigns:ResumeCampaign',
         'connect-campaigns:GetCampaignState',
         'connect-campaigns:DescribeCampaign',
         'connect-campaigns:TagResource',
@@ -800,26 +799,55 @@ describe('ApiPlansStack', () => {
       expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBeUndefined();
     });
 
-    it('grants lambda:InvokeFunction and injects SMS_RETRY_FUNCTION_ARN when present', () => {
+    it('injects SMS_RETRY_FUNCTION_ARN without modifying the CloudFormation policy', () => {
       const { stack } = buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN });
       const template = Template.fromStack(stack);
-      const stmt = findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours');
-      expect(stmt).toBeDefined();
-      expect(toArray(stmt!.Action as string | string[])).toEqual(['lambda:InvokeFunction']);
-      expect(toArray(stmt!.Resource as string | string[])).toEqual([SMS_RETRY_ARN]);
+      expect(findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours')).toBeUndefined();
       expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBe(SMS_RETRY_ARN);
     });
 
-    it('is a distinct ARN/grant from smsSenderFunctionArn when both are present', () => {
+    it('preserves every CloudFormation IAM resource when adding retry to an existing sender', () => {
+      const baseline = Template.fromStack(buildStack({ smsSenderFunctionArn: SMS_SENDER_ARN }).stack);
       const { stack } = buildStack({
         smsSenderFunctionArn: SMS_SENDER_ARN,
         smsRetryFunctionArn: SMS_RETRY_ARN,
       });
       const template = Template.fromStack(stack);
       const senderStmt = findStatement(policyStatements(template), 'InvokeSmsSender');
-      const retryStmt = findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours');
       expect(toArray(senderStmt!.Resource as string | string[])).toEqual([SMS_SENDER_ARN]);
-      expect(toArray(retryStmt!.Resource as string | string[])).toEqual([SMS_RETRY_ARN]);
+      for (const resourceType of ['AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy']) {
+        expect(template.findResources(resourceType)).toEqual(baseline.findResources(resourceType));
+      }
+      expect(functionEnv(template, 'vip-admin-ui-api-plans')).toMatchObject({
+        SMS_SENDER_FUNCTION_ARN: SMS_SENDER_ARN,
+        SMS_RETRY_FUNCTION_ARN: SMS_RETRY_ARN,
+      });
+    });
+
+    it('keeps only the approved, resource-scoped pre-call delta in the separate manual policy', () => {
+      expect(precallSmsPlansPolicy).toEqual({
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Sid: 'PrecallCampaignPauseResume',
+            Effect: 'Allow',
+            Action: ['connect-campaigns:PauseCampaign', 'connect-campaigns:ResumeCampaign'],
+            Resource: `arn:aws:connect-campaigns:${REGION}:${ACCOUNT}:campaign/*`,
+          },
+          {
+            Sid: 'InvokeSmsRetryQuietHours',
+            Effect: 'Allow',
+            Action: 'lambda:InvokeFunction',
+            Resource: SMS_RETRY_ARN,
+          },
+        ],
+      });
+      const template = Template.fromStack(buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN }).stack);
+      const statements = policyStatements(template);
+      const actions = statements.flatMap((s) => toArray(s.Action as string | string[]));
+      expect(actions).not.toContain('connect-campaigns:PauseCampaign');
+      expect(actions).not.toContain('connect-campaigns:ResumeCampaign');
+      expect(actionsForResource(statements, SMS_RETRY_ARN)).toEqual([]);
     });
   });
 

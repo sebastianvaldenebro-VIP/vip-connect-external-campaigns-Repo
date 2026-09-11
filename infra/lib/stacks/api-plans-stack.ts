@@ -154,7 +154,9 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
-    // Connect Campaigns V2 — campaign lifecycle
+    // Connect Campaigns V2 — existing CloudFormation-managed lifecycle grants.
+    // PauseCampaign/ResumeCampaign are managed separately; see the pre-call
+    // policy note below. Adding them here blocks both update and rollback.
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ConnectCampaignsV2',
@@ -163,8 +165,6 @@ export class ApiPlansStack extends cdk.Stack {
           'connect-campaigns:DeleteCampaign',
           'connect-campaigns:StartCampaign',
           'connect-campaigns:StopCampaign',
-          'connect-campaigns:PauseCampaign',
-          'connect-campaigns:ResumeCampaign',
           'connect-campaigns:GetCampaignState',
           'connect-campaigns:DescribeCampaign',
           'connect-campaigns:TagResource',
@@ -390,15 +390,16 @@ export class ApiPlansStack extends cdk.Stack {
       );
     }
 
-    if (props.smsRetryFunctionArn) {
-      role.addToPolicy(
-        new iam.PolicyStatement({
-          sid: 'InvokeSmsRetryQuietHours',
-          actions: ['lambda:InvokeFunction'],
-          resources: [props.smsRetryFunctionArn],
-        }),
-      );
-    }
+    // Pre-call PauseCampaign/ResumeCampaign and retry InvokeFunction must be
+    // granted through infra/config/precall-sms-plans-policy.json, inline policy
+    // PrecallSmsPlansAdditionalPerms on the existing execution role
+    // VipAdminApiPlansStack-FunctionRole111A5701-mSfFlCntjbO0, by an authorized
+    // IAM operator. EngineeringPermissionBoundary denies the CFN execution
+    // role iam:PutRolePolicy here (confirmed again on 2026-09-11), including
+    // rollback. Keep FunctionRoleDefaultPolicy unchanged, following the
+    // events-list-rules-cli precedent above. Preserve the execution role, its
+    // boundary, and the CloudFormation service role. SMS_RETRY_FUNCTION_ARN
+    // remains CDK-managed.
 
     // EUM SMS — list origination numbers (GET /sms/numbers endpoint)
     role.addToPolicy(
