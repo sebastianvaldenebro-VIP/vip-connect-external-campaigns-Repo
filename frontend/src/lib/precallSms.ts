@@ -107,3 +107,49 @@ export function validatePrecallSms(
 
   return errors;
 }
+
+/**
+ * Client-side mirror of the bulk-SMS rules enforced by
+ * services/api-plans/src/handlers/plans.py (_validate_sms_campaign), which
+ * shares _screen_sms_template_content with _validate_precall_sms above.
+ *
+ * SCOPE, deliberately narrow — same principle as validatePrecallSms: this
+ * duplicates only the cheap, stable rules (required template, the placeholder
+ * allowlist, the rendered-length ceiling, and the conditional clinicName
+ * requirement). It does NOT reimplement the PHI regexes in _PHI_PATTERNS —
+ * the server stays the single source of truth for those.
+ */
+export function validateBulkSms(
+  cfg: Record<string, unknown> | undefined,
+): string[] {
+  const errors: string[] = [];
+  const template = String(cfg?.smsMessageTemplate ?? '');
+  const clinicName = String(cfg?.clinicName ?? '');
+
+  if (!template.trim()) errors.push('SMS: message template is required');
+
+  const placeholders = extractPlaceholders(template);
+  // Mirrors the backend's conditional guard exactly (_validate_sms_campaign):
+  // requires clinicName only if the template actually references
+  // {{ClinicName}} — not unconditionally, same fix already applied to
+  // validatePrecallSms's own clinicName check for the identical reason.
+  if (placeholders.has('ClinicName') && !clinicName.trim())
+    errors.push('SMS: clinicName is required (it is interpolated into the message)');
+
+  const unknown = [...placeholders].filter(
+    (f) => !PRECALL_ALLOWED_PLACEHOLDERS.has(f),
+  );
+  if (unknown.length)
+    errors.push(
+      `SMS: placeholder(s) not allowed: ${unknown.sort().join(', ')}. ` +
+        `Only {{FirstName}} and {{ClinicName}} may be used.`,
+    );
+
+  const rendered = renderedWorstCaseLength(template, clinicName);
+  if (rendered > MAX_SMS_CHARS)
+    errors.push(
+      `SMS: renders to ${rendered} characters with a long first name, over the ${MAX_SMS_CHARS} limit`,
+    );
+
+  return errors;
+}

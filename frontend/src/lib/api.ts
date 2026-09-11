@@ -327,6 +327,12 @@ export type BucketCampaignConfig = {
   /** Staff acknowledgment that template contains no PHI — required for deliveryType='sms' */
   phiAcknowledged?: boolean;
   /**
+   * Bulk SMS: interpolated into {{ClinicName}} if smsMessageTemplate uses it.
+   * Distinct from precallSms.clinicName — the two channels may use different
+   * clinic names for different specialties/contexts.
+   */
+  clinicName?: string;
+  /**
    * Pre-call SMS: texted to this campaign's own segment at bucket activation,
    * immediately before the first dial. Ordering is guaranteed by the executor's
    * bucket lifecycle, not by a timer — do NOT model this with dependsOn, which

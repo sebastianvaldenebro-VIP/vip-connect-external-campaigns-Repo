@@ -18,7 +18,7 @@ import {
   type SmsOriginationNumber,
 } from '@/lib/api';
 import { STATE_DEFAULT_PHONES } from '@/lib/areaCodeMap';
-import { MAX_SMS_CHARS, precallSmsAvailability, renderedWorstCaseLength, validatePrecallSms } from '@/lib/precallSms';
+import { MAX_SMS_CHARS, precallSmsAvailability, renderedWorstCaseLength, validateBulkSms, validatePrecallSms } from '@/lib/precallSms';
 import { useLocationMapping } from '@/lib/stateLocationMap';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -547,6 +547,10 @@ function CampaignCard({
   smsNumbers: SmsOriginationNumber[];
 }) {
   const cfg = campaign.campaignConfig ?? { ...DEFAULT_CAMPAIGN_CONFIG };
+  // Rendered worst-case length, not raw template length — the rendered length
+  // can run longer than the raw template because of placeholder substitution
+  // (same reasoning as the pre-call SMS panel's own counter below).
+  const smsRendered = renderedWorstCaseLength(cfg.smsMessageTemplate ?? '', cfg.clinicName ?? '');
   const [configOpen, setConfigOpen] = useState(false);
   const { locationMap } = useLocationMapping();
   const stateCodes = locationMap.map((g) => g.code);
@@ -910,18 +914,34 @@ function CampaignCard({
                 <div className="space-y-1">
                   <label className="block text-xs font-medium text-gray-600">
                     Message Template{' '}
-                    <span className="text-gray-400">({(cfg.smsMessageTemplate ?? '').length}/160)</span>
+                    <span className={smsRendered > MAX_SMS_CHARS ? 'text-red-600 font-semibold' : 'text-gray-400'}>
+                      ({smsRendered}/{MAX_SMS_CHARS})
+                    </span>
                   </label>
                   <textarea
-                    maxLength={160}
                     value={cfg.smsMessageTemplate ?? ''}
                     onChange={(e) => updateCfg({ smsMessageTemplate: e.target.value })}
                     placeholder="Your appointment is confirmed. Reply STOP to opt out."
                     className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-amber-400"
                   />
+                  <p className="text-[10px] text-gray-500">
+                    Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.
+                  </p>
                   <p className="text-[10px] text-amber-600">
                     Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
                   </p>
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-xs font-medium text-gray-600">
+                    Clinic name{' '}
+                    <span className="text-gray-400">(interpolated into {'{{ClinicName}}'} if used above)</span>
+                  </label>
+                  <input
+                    value={cfg.clinicName ?? ''}
+                    onChange={(e) => updateCfg({ clinicName: e.target.value })}
+                    placeholder="e.g. VIP Medical Group"
+                    className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  />
                 </div>
                 <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
                   <input
@@ -1545,6 +1565,11 @@ export function PlanNew() {
           if (!cfg?.smsOriginationNumberArn) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: select an SMS origination number.`); return; }
           if (!cfg?.smsMessageTemplate) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: SMS message template is required.`); return; }
           if (!cfg?.phiAcknowledged) { setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: confirm the message contains no PHI before saving.`); return; }
+          const [firstSmsError] = validateBulkSms(cfg);
+          if (firstSmsError) {
+            setErrorAndScroll(`"${c.name || `Campaign ${ci + 1}`}" in bucket ${bi + 1}: ${firstSmsError}`);
+            return;
+          }
         }
         if (c.campaignConfig?.precallSms?.enabled) {
           const [first] = validatePrecallSms(c.campaignConfig.precallSms);

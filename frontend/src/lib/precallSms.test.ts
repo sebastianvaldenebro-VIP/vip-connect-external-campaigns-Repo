@@ -4,6 +4,7 @@ import {
   extractPlaceholders,
   renderedWorstCaseLength,
   validatePrecallSms,
+  validateBulkSms,
   precallSmsAvailability,
 } from './precallSms';
 
@@ -187,5 +188,67 @@ describe('availability — the UI must not offer a config the API rejects', () =
     const a = precallSmsAvailability({ deliveryType: 'email', dependsOn: [] });
     expect(a.available).toBe(false);
     expect(a.reason).toMatch(/email/i);
+  });
+});
+
+describe('validateBulkSms — bulk-SMS panel parity with pre-call SMS', () => {
+  // These mirror _validate_sms_campaign in handlers/plans.py, which shares
+  // _screen_sms_template_content with _validate_precall_sms above — so the
+  // same fixtures and expectations apply, just against the bulk-SMS field
+  // names (smsMessageTemplate/clinicName, not messageTemplate/precall's shape).
+
+  it('rejects a non-allowlisted placeholder', () => {
+    const errs = validateBulkSms({
+      smsMessageTemplate: 'Hi {{FirstName}}, your {{Diagnosis}} is ready.',
+      clinicName: CLINIC,
+      smsOriginationNumberArn: 'arn:x',
+    });
+    expect(errs.some((e) => e.includes('Diagnosis'))).toBe(true);
+  });
+
+  it('requires clinicName when the template uses {{ClinicName}}, and accepts it once set', () => {
+    const withoutClinic = validateBulkSms({
+      smsMessageTemplate: PAIN,
+      smsOriginationNumberArn: 'arn:x',
+    });
+    expect(withoutClinic.some((e) => e.includes('clinicName'))).toBe(true);
+
+    const withClinic = validateBulkSms({
+      smsMessageTemplate: PAIN,
+      clinicName: CLINIC,
+      smsOriginationNumberArn: 'arn:x',
+    });
+    expect(withClinic.some((e) => e.includes('clinicName'))).toBe(false);
+  });
+
+  it('does not require clinicName when the template only uses {{FirstName}}', () => {
+    // Conditional, not unconditional — mirrors the identical fix already
+    // applied to validatePrecallSms for the same reason: a template that
+    // never references {{ClinicName}} has nothing to interpolate.
+    const errs = validateBulkSms({
+      smsMessageTemplate: 'Hi {{FirstName}}, quick reminder about your visit.',
+      smsOriginationNumberArn: 'arn:x',
+    });
+    expect(errs.some((e) => e.includes('clinicName'))).toBe(false);
+  });
+
+  it('rejects a template whose rendered worst-case length exceeds MAX_SMS_CHARS', () => {
+    // 158 raw / 168 rendered — under the ceiling raw, over it rendered.
+    const errs = validateBulkSms({
+      smsMessageTemplate: VEIN_REJECTED_DRAFT,
+      clinicName: CLINIC,
+      smsOriginationNumberArn: 'arn:x',
+    });
+    expect(errs.some((e) => e.includes('160'))).toBe(true);
+  });
+
+  it('accepts a valid template — allowlisted placeholders, under the ceiling, clinicName set', () => {
+    expect(
+      validateBulkSms({
+        smsMessageTemplate: PAIN,
+        clinicName: CLINIC,
+        smsOriginationNumberArn: 'arn:x',
+      }),
+    ).toEqual([]);
   });
 });
