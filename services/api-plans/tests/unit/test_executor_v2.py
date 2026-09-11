@@ -2689,6 +2689,79 @@ def test_dispatch_recovery_adopts_running_connect_campaign():
     )
 
 
+def test_dispatch_recovery_fires_precall_sms_for_precall_enabled_campaign(mocker):
+    """Adversarial-review finding: a campaign crashed in the exact window between
+    Connect confirming it (and pausing it for the precall gate) and the prior
+    invocation's own _fire_precall_sms_for_campaign call resolving that gate. Phase 1
+    recovery adopts it as "running" via _get_campaign_state's non-terminal branch —
+    it must ALSO fire the pre-call SMS and resume the Connect pause here, not just
+    flip the status bit and leave the text (and the gate) unresolved indefinitely.
+    """
+    import executor
+
+    campaign = _precall_campaign_def("voice-vein", "voice-vein")
+    plan = _make_plan([_bucket_def("b0", [campaign])])
+
+    cs = _campaign_state("voice-vein", "creating", connect_id="conn-orphan")
+    # Set by _create_campaign_only/_create_and_start_campaign before the crash —
+    # this campaign really was paused, so the gate is genuinely stranded.
+    cs["precallGatePausedAt"] = "2026-05-08T09:59:00+00:00"
+    cs["segmentArn"] = "arn:cp:seg/vein-abc"
+    cs["segmentName"] = "vein-abc"
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    invoke = mocker.patch("executor._invoke_sms_sender")
+    mock_oc, originals = _stub_precall_oc()
+    try:
+        with (
+            patch("executor._get_campaign_state", return_value="Running"),
+            patch("executor.save_run"),
+            patch("executor._schedule_tick", return_value="sched-1"),
+        ):
+            executor._dispatch_ready_campaigns(run, plan, 0)
+    finally:
+        _unstub_precall_oc(originals)
+
+    assert cs["status"] == "running", (
+        "Recovery must still adopt the running Connect campaign"
+    )
+    assert invoke.call_count == 1, (
+        "The pre-call SMS must fire during this recovery, not only on the "
+        "original (crashed) invocation"
+    )
+    assert cs["precallSmsSentAt"]
+    mock_oc.resume_campaign.assert_called_once_with("conn-orphan")
+    assert cs["precallGateResumedAt"], "The stranded Connect pause must be resolved"
+
+
+def test_dispatch_recovery_skips_precall_sms_for_unconfigured_campaign():
+    """Backward-compatibility regression: a campaign with no precallSms config
+    (the overwhelming majority of campaigns, pre-existing and non-precall) must
+    recover through this exact path exactly as before — no SMS attempt, no new
+    precall-related fields, status still flips to 'running'.
+    """
+    import executor
+
+    plan = _make_plan([_bucket_def("b0", [_campaign_def("c0")])])
+    cs = _campaign_state("c0", "creating")
+    cs["connectCampaignId"] = "conn-orphan"
+    run = _make_run(plan, [_bucket_state("b0", [cs], status="running")])
+
+    with (
+        patch("executor._get_campaign_state", return_value="Running"),
+        patch("executor.save_run"),
+        patch("executor._schedule_tick", return_value="sched-1"),
+        patch("executor._invoke_sms_sender") as invoke,
+    ):
+        executor._dispatch_ready_campaigns(run, plan, 0)
+
+    assert cs["status"] == "running"
+    assert cs["connectCampaignId"] == "conn-orphan"
+    invoke.assert_not_called()
+    assert "precallSmsSentAt" not in cs
+    assert "precallGateResumedAt" not in cs
+
+
 def test_dispatch_recovery_resets_to_queued_when_connect_terminated():
     """Phase 1 recovery must reset to queued if the Connect campaign already terminated."""
     import executor

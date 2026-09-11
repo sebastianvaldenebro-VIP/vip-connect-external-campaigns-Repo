@@ -3540,7 +3540,7 @@ def _dispatch_ready_campaigns(
     bucket_state = run["bucketStates"][bucket_index]
 
     # Phase 1 — Recovery
-    for cs in bucket_state["campaignStates"]:
+    for ci, cs in enumerate(bucket_state["campaignStates"]):
         if cs["status"] == "creating":
             existing_id = cs.get("connectCampaignId")
             if existing_id:
@@ -3557,6 +3557,15 @@ def _dispatch_ready_campaigns(
                         cs["reconcileRetries"] = 0
                     else:
                         cs["status"] = "running"
+                        # The crash that stranded this campaign in "creating" may have
+                        # landed between the prior invocation's mid-flight save and its
+                        # _fire_precall_sms_for_campaign call — i.e. after Connect
+                        # confirmed the campaign (and possibly paused it for the precall
+                        # gate) but before the SMS fired and the pause resolved. Firing
+                        # here is safe on every other recovery too: it's a no-op without
+                        # precallSms.enabled, and both the send and the resume are
+                        # independently idempotent (precallSmsSentAt/precallGateResumedAt).
+                        _fire_precall_sms_for_campaign(run, plan, bucket_index, ci)
                         logger.info(
                             "_dispatch_ready_campaigns: recovered %s from creating → running (Connect state: %s)",
                             existing_id,
