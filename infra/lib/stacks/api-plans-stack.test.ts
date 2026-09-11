@@ -38,6 +38,7 @@ const SMS_QUEUE_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/VipSmsCampaig
 const SMS_RUNS_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/VipSmsCampaignRuns`;
 const REDIS_SECRET_ARN = `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:vip/redis/auth-abc123`;
 const SMS_SENDER_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-sms-sender`;
+const SMS_RETRY_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-sms-retry-quiet-hours`;
 const SEEDER_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-progressive-dialer-seeder`;
 const PROGRESSIVE_DIALER_KEY_ARN = `arn:aws:kms:${REGION}:${ACCOUNT}:key/progressive-dialer-key`;
 const LOCATION_MAPPING_STREAM_ARN =
@@ -790,6 +791,38 @@ describe('ApiPlansStack', () => {
     });
   });
 
+  // ── smsRetryFunctionArn ────────────────────────────────────────────────
+  describe('smsRetryFunctionArn', () => {
+    it('does not grant invoke access or inject the env var when absent', () => {
+      const { stack } = buildStack();
+      const template = Template.fromStack(stack);
+      expect(findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours')).toBeUndefined();
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBeUndefined();
+    });
+
+    it('grants lambda:InvokeFunction and injects SMS_RETRY_FUNCTION_ARN when present', () => {
+      const { stack } = buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN });
+      const template = Template.fromStack(stack);
+      const stmt = findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours');
+      expect(stmt).toBeDefined();
+      expect(toArray(stmt!.Action as string | string[])).toEqual(['lambda:InvokeFunction']);
+      expect(toArray(stmt!.Resource as string | string[])).toEqual([SMS_RETRY_ARN]);
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBe(SMS_RETRY_ARN);
+    });
+
+    it('is a distinct ARN/grant from smsSenderFunctionArn when both are present', () => {
+      const { stack } = buildStack({
+        smsSenderFunctionArn: SMS_SENDER_ARN,
+        smsRetryFunctionArn: SMS_RETRY_ARN,
+      });
+      const template = Template.fromStack(stack);
+      const senderStmt = findStatement(policyStatements(template), 'InvokeSmsSender');
+      const retryStmt = findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours');
+      expect(toArray(senderStmt!.Resource as string | string[])).toEqual([SMS_SENDER_ARN]);
+      expect(toArray(retryStmt!.Resource as string | string[])).toEqual([SMS_RETRY_ARN]);
+    });
+  });
+
   // ── locationMappingStreamArn — the big conditional block ─────────────
   describe('locationMappingStreamArn', () => {
     it('creates no guard Lambda and no EventSourceMapping when absent', () => {
@@ -890,6 +923,7 @@ describe('ApiPlansStack', () => {
       progressiveDialerSeederArn: SEEDER_ARN,
       progressiveDialerDataKeyArn: PROGRESSIVE_DIALER_KEY_ARN,
       smsSenderFunctionArn: SMS_SENDER_ARN,
+      smsRetryFunctionArn: SMS_RETRY_ARN,
       locationMappingStreamArn: LOCATION_MAPPING_STREAM_ARN,
     });
     const template = Template.fromStack(stack);
@@ -907,6 +941,7 @@ describe('ApiPlansStack', () => {
       SMS_CAMPAIGN_QUEUE_TABLE: 'VipSmsCampaignQueue',
       SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
       SMS_SENDER_FUNCTION_ARN: SMS_SENDER_ARN,
+      SMS_RETRY_FUNCTION_ARN: SMS_RETRY_ARN,
     });
   });
 });

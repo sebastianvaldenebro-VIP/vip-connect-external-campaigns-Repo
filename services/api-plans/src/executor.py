@@ -387,6 +387,32 @@ def _invoke_sms_sender(**kwargs: object) -> None:
         )
 
 
+def _invoke_sms_retry_quiet_hours(
+    *, campaign_id: str, plan_id: str, run_id: str
+) -> None:
+    """Invoke the SMS Sender Lambda's retry_quiet_hours_skipped entry point
+    synchronously (mirrors _invoke_sms_sender).
+
+    Called from tick()'s poll loop for every still-"running", precall-SMS-
+    enabled campaign — see the call site for why that bound alone is enough
+    to mirror Connect's own continuous AREA_CODE quiet-hours re-evaluation on
+    the dial side. Callers must swallow exceptions from this: a retry failure
+    must never disrupt anything else in tick().
+    """
+    import json as _json
+
+    response = _get_lambda_client().invoke(
+        FunctionName=os.environ["SMS_RETRY_FUNCTION_ARN"],
+        InvocationType="RequestResponse",
+        Payload=_json.dumps(
+            {"campaignId": campaign_id, "planId": plan_id, "runId": run_id}
+        ).encode(),
+    )
+    if response.get("FunctionError"):
+        payload_bytes = response["Payload"].read()
+        raise RuntimeError(f"SMS Retry Lambda error: {payload_bytes[:200]!r}")
+
+
 def _precall_sms_campaign_id(run: dict, bucket_index: int, campaign_index: int) -> str:
     """Deterministic smsCampaignId for a pre-call send, so retries reuse one
     VipSmsCampaignRuns row.
@@ -1268,7 +1294,7 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
         if cs["status"] == "completed"
     }
 
-    for cs in bucket_state["campaignStates"]:
+    for ci, cs in enumerate(bucket_state["campaignStates"]):
         if cs["status"] == "running" and cs.get("connectCampaignId"):
             _poll_campaign_state(cs, plan_id=plan_id, run_id=run_id)
             if cs["status"] == "running":
@@ -1313,6 +1339,39 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
                             _dur,
                         )
                         _safe_stop_campaign(cs["connectCampaignId"])
+
+                # Precall-SMS quiet-hours retry (2026-09 adversarial review
+                # finding: the pre-call SMS quiet-hours check is one-shot,
+                # while Connect's own localTimeZoneDetection=AREA_CODE +
+                # openHours quiet-hours check is re-evaluated CONTINUOUSLY by
+                # Connect's campaign engine for as long as this campaign stays
+                # "running" — so a recipient outside their window at
+                # activation could still get dialed hours later, having never
+                # received the text). Bounded naturally by this branch's own
+                # "status == running" guard above: retries stop the instant
+                # this campaign leaves "running" (completed/cancelled/error),
+                # mirroring the voice side's own active window with zero extra
+                # bookkeeping. Only applies to campaign/journey — branded uses
+                # a separate dialer with no Connect V2/openHours involvement.
+                _precall_cfg = (_campaign_def.get("campaignConfig") or {}).get(
+                    "precallSms"
+                ) or {}
+                if _precall_cfg.get("enabled") and cs.get("precallSmsSentAt"):
+                    try:
+                        _invoke_sms_retry_quiet_hours(
+                            campaign_id=_precall_sms_campaign_id(run, bucket_index, ci),
+                            plan_id=plan_id,
+                            run_id=run_id,
+                        )
+                    except Exception as _retry_exc:
+                        # Never disrupt anything else in tick() — matches this
+                        # feature's "an SMS problem degrades to no-text, never
+                        # to a bigger failure" principle throughout.
+                        logger.warning(
+                            "tick: precall SMS quiet-hours retry failed for campaign %s: %s",
+                            cs["campaignId"],
+                            type(_retry_exc).__name__,
+                        )
 
         elif cs.get("brandedCampaignId") and cs["status"] == "running":
             # Poll VipProgressiveCampaignQueue instead of Connect. Poll BEFORE

@@ -51,6 +51,12 @@ export interface ApiPlansStackProps extends cdk.StackProps {
   readonly smsCampaignQueueTable?: dynamodb.ITable;
   readonly smsRunsTable?: dynamodb.ITable;
   readonly smsSenderFunctionArn?: string;
+  // Quiet-hours retry Lambda (separate Function, same code asset as the
+  // sender) — invoked from tick()'s poll loop for as long as a precall-SMS-
+  // enabled voice campaign stays "running". See api-sms-stack.ts's
+  // SmsRetryQuietHoursFunction for why this is a distinct ARN, not the same
+  // one as smsSenderFunctionArn.
+  readonly smsRetryFunctionArn?: string;
   // Location Onboarding Guard — DynamoDB stream ARN for VipLocationMapping.
   // Enable with: aws dynamodb update-table --table-name VipLocationMapping
   //   --stream-specification StreamEnabled=true,StreamViewType=NEW_IMAGE
@@ -384,6 +390,16 @@ export class ApiPlansStack extends cdk.Stack {
       );
     }
 
+    if (props.smsRetryFunctionArn) {
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'InvokeSmsRetryQuietHours',
+          actions: ['lambda:InvokeFunction'],
+          resources: [props.smsRetryFunctionArn],
+        }),
+      );
+    }
+
     // EUM SMS — list origination numbers (GET /sms/numbers endpoint)
     role.addToPolicy(
       new iam.PolicyStatement({
@@ -556,6 +572,13 @@ export class ApiPlansStack extends cdk.Stack {
       this.lambdaFunction.addEnvironment(
         'SMS_SENDER_FUNCTION_ARN',
         props.smsSenderFunctionArn,
+      );
+    }
+
+    if (props.smsRetryFunctionArn) {
+      this.lambdaFunction.addEnvironment(
+        'SMS_RETRY_FUNCTION_ARN',
+        props.smsRetryFunctionArn,
       );
     }
 

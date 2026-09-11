@@ -34,6 +34,7 @@ export interface ApiSmsStackProps extends cdk.StackProps {
 
 export class ApiSmsStack extends cdk.Stack {
   public readonly smsSenderFunction: lambda.Function;
+  public readonly smsRetryQuietHoursFunction: lambda.Function;
   public readonly smsProcessorFunction: lambda.Function;
   public readonly smsCampaignQueueTable: dynamodb.ITable;
   public readonly smsRunsTable: dynamodb.ITable;
@@ -180,6 +181,80 @@ export class ApiSmsStack extends cdk.Stack {
     });
     skipCheckovChecks(this.smsSenderFunction, [VPC_SKIP]);
 
+    // ── Lambda: SMS Retry (quiet-hours) ────────────────────────────────
+    // Closes a 2026-09 adversarial-review finding: the pre-call SMS
+    // quiet-hours check in sms_sender_handler.py runs once, at bucket
+    // activation, while Connect Campaigns V2's own localTimeZoneDetection=
+    // AREA_CODE + openHours check is re-evaluated continuously by Connect's
+    // campaign engine for as long as the voice campaign runs — a recipient
+    // outside their window at activation could get dialed hours later having
+    // never received the text. This function re-attempts those sends,
+    // invoked repeatedly from api-plans's tick() poll loop for as long as the
+    // paired voice campaign stays "running" (see executor.py:
+    // _invoke_sms_retry_quiet_hours).
+    //
+    // A second Function construct — not an `action` field dispatched inside
+    // the existing, already-working lambda_handler — reusing the SAME code
+    // asset (`sms_sender_handler.retry_quiet_hours_skipped`, no new
+    // deployment package), the SAME layer, and the SAME senderRole (imported
+    // above, mutable:false): its exact permission set (VipSmsCampaignQueue +
+    // VipSmsCampaignRuns read/write, SQS SendMessage, KMS decrypt, Customer
+    // Profiles read) is already exactly what this function needs too, since
+    // it calls the same _get_segment_recipients / _process_recipients /
+    // VipSmsCampaignQueue-query code paths as the sender. Zero new IAM
+    // policy work as a result.
+    //
+    // imported — same cfn-exec-role limitation as senderLogGroup above.
+    // Pre-create before deploying this stack:
+    //   CMK_ARN=$(aws kms describe-key --key-id alias/vip-data-key \
+    //     --query 'KeyMetadata.Arn' --output text --region us-east-1 --profile production)
+    //   aws logs create-log-group --log-group-name /aws/lambda/vip-admin-sms-retry-quiet-hours \
+    //     --kms-key-id "$CMK_ARN" --region us-east-1 --profile production
+    //   aws logs put-retention-policy --log-group-name /aws/lambda/vip-admin-sms-retry-quiet-hours \
+    //     --retention-in-days 365 --region us-east-1 --profile production
+    const retryLogGroup = logs.LogGroup.fromLogGroupName(
+      this, 'SmsRetryQuietHoursLogs', '/aws/lambda/vip-admin-sms-retry-quiet-hours',
+    );
+
+    this.smsRetryQuietHoursFunction = new lambda.Function(this, 'SmsRetryQuietHoursFunction', {
+      functionName: 'vip-admin-sms-retry-quiet-hours',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'sms_sender_handler.retry_quiet_hours_skipped',
+      // Same source directory as SmsSenderFunction above (and SmsProcessorFunction
+      // below, which already follows this same pattern) — CDK asset-hashes by
+      // content, so this is the same underlying asset, not a new deployment
+      // package.
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '../../../services/api-sms/src'),
+      ),
+      layers: [sharedLayer],
+      role: senderRole,
+      logGroup: retryLogGroup,
+      timeout: cdk.Duration.minutes(5),
+      memorySize: 512,
+      environmentEncryption: dataKey,
+      deadLetterQueue: dlq,
+      // Invoked once per precall-SMS-enabled, still-"running" campaign, per
+      // tick — same near-zero-traffic profile as SmsSenderFunction, and the
+      // vast majority of invocations are the cheap no-op path (nothing left
+      // to retry). No rate-limited API called directly.
+      reservedConcurrentExecutions: 5,
+      environment: {
+        SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
+        SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,
+        SMS_SQS_QUEUE_URL: this.smsSendQueue.queueUrl,
+        PROFILES_DOMAIN_NAME: props.profilesDomainName,
+        OPT_OUT_TABLE: 'VipConnectOptOutList',
+        // Must match SmsSenderFunction's values exactly — this is a second
+        // entry point into the same quiet-hours logic, not a second policy.
+        QUIET_HOURS_START: '08:00',
+        QUIET_HOURS_END: '21:00',
+        QUIET_HOURS_DAYS: '0,1,2,3,4,5',
+        QUIET_HOURS_DEFAULT_TZ: 'America/New_York',
+      },
+    });
+    skipCheckovChecks(this.smsRetryQuietHoursFunction, [VPC_SKIP]);
+
     // ── Lambda: SMS Processor ─────────────────────────────────────────
     // imported — cfn-exec-role lacks logs:DescribeIndexPolicies; log group pre-created via CLI
     const processorLogGroup = logs.LogGroup.fromLogGroupName(
@@ -231,6 +306,7 @@ export class ApiSmsStack extends cdk.Stack {
 
     // ── Outputs ───────────────────────────────────────────────────────
     new cdk.CfnOutput(this, 'SmsSenderFunctionArn', { value: this.smsSenderFunction.functionArn });
+    new cdk.CfnOutput(this, 'SmsRetryQuietHoursFunctionArn', { value: this.smsRetryQuietHoursFunction.functionArn });
     new cdk.CfnOutput(this, 'SmsProcessorFunctionArn', { value: this.smsProcessorFunction.functionArn });
     new cdk.CfnOutput(this, 'SmsCampaignQueueTableName', { value: this.smsCampaignQueueTable.tableName });
     new cdk.CfnOutput(this, 'SmsRunsTableName', { value: this.smsRunsTable.tableName });

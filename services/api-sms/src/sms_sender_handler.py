@@ -96,6 +96,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             "segmentName": segment_name,
             "segmentArn": segment_arn,
             "messageTemplate": message_tmpl,
+            "clinicName": event.get("clinicName", ""),
             "originationNumberArn": origination_arn,
             "originationNumber": event.get("originationNumber", ""),
             "status": "RUNNING",
@@ -117,103 +118,22 @@ def lambda_handler(event: dict, context: object) -> dict:
     # Extract recipients (phone + allowlisted render fields) from CP segment
     recipients = _get_segment_recipients(segment_name)
 
-    # Batch-write to DDB and SQS. Both batches are flushed together at the same
-    # size (10, SQS's own hard cap) and keyed by the SQS entry Id, so a partial
-    # send_message_batch failure can be mapped back to its exact DDB item —
-    # previously the two batches flushed independently (10 vs 25) with the SQS
-    # response discarded entirely, so a partially-failed send left its DDB row
-    # written as PENDING with no message ever in the queue: permanently stuck,
-    # invisible, and never retried.
-    enqueued = 0
-    failed = 0
-    opted_out = 0
-    outside_quiet_hours = 0
     queue_table = _ddb.Table(_QUEUE_TABLE)
-    sqs_batch: list[dict] = []
-    ddb_items_by_id: dict[str, dict] = {}
-
-    # Set only if rendering rejects the template (see the `except ValueError`
-    # below) — a template-level problem, not a per-recipient one, since every
-    # recipient renders the same template.
-    rejected_fields: set[str] | None = None
-
-    for recipient in recipients:
-        phone = recipient["phone"]
-        if not _E164_RE.match(phone):
-            continue
-        if _opt_out.is_blocked(phone):
-            opted_out += 1
-            continue
-        # TCPA: the recipient's own local time, not the call-center's. This is
-        # the per-patient gate; executor.py's COT workingHours check is about
-        # whether our Bogota staff are on shift and does not answer this.
-        if not _is_within_quiet_hours(phone):
-            outside_quiet_hours += 1
-            continue
-        try:
-            body = _render(
-                message_tmpl,
-                recipient=recipient,
-                campaign={"clinicName": event.get("clinicName", "")},
-            )
-        except ValueError:
-            # Defense in depth: _validate_sms_campaign (api-plans) should already
-            # have rejected any template with a non-allowlisted placeholder. If
-            # one slipped through anyway, sending it would deliver literal
-            # `{{...}}` braces to a patient — worse than sending nothing. The
-            # template (not this recipient) is what's broken, so every remaining
-            # recipient would fail identically — abandon the whole campaign
-            # rather than skip just this one.
-            rejected_fields = extract_placeholders(message_tmpl) - ALLOWED_FIELDS
-            break
-        item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
-        entry_id = uuid.uuid4().hex[:8]
-        sqs_batch.append(
-            {
-                "Id": entry_id,
-                "MessageBody": json.dumps(
-                    {
-                        "campaignId": campaign_id,
-                        "sk": item_sk,
-                        "phone": phone,
-                        # Key name retained deliberately: it now carries the
-                        # rendered message, not the raw template. Renaming it
-                        # (e.g. to "messageBody") would strand every in-flight
-                        # message across the deploy boundary — the processor
-                        # would KeyError on messages enqueued by an older sender.
-                        "messageTemplate": body,
-                        "originationNumberArn": origination_arn,
-                        "planId": event["planId"],
-                        "runId": event["runId"],
-                    }
-                ),
-            }
+    enqueued, failed, opted_out, outside_quiet_hours, rejected_fields = (
+        _process_recipients(
+            recipients,
+            campaign_id=campaign_id,
+            plan_id=event["planId"],
+            run_id=event["runId"],
+            message_tmpl=message_tmpl,
+            clinic_name=event.get("clinicName", ""),
+            origination_arn=origination_arn,
+            already_sent_phones=set(),  # first pass — nothing sent yet
+            now_iso=now_iso,
+            ttl=ttl,
+            queue_table=queue_table,
         )
-        ddb_items_by_id[entry_id] = {
-            "campaignId": campaign_id,
-            "sk": item_sk,
-            "phone": phone,
-            "status": "PENDING",
-            "createdAt": now_iso,
-            "updatedAt": now_iso,
-            "ttl": ttl,
-        }
-
-        if len(sqs_batch) == 10:
-            batch_ok, batch_failed = _flush_sms_batch(
-                sqs_batch, ddb_items_by_id, queue_table, campaign_id
-            )
-            enqueued += batch_ok
-            failed += batch_failed
-            sqs_batch = []
-            ddb_items_by_id = {}
-
-    if sqs_batch:
-        batch_ok, batch_failed = _flush_sms_batch(
-            sqs_batch, ddb_items_by_id, queue_table, campaign_id
-        )
-        enqueued += batch_ok
-        failed += batch_failed
+    )
 
     if rejected_fields is not None:
         # PHI rule: log the offending field NAMES only — never the template body
@@ -262,6 +182,132 @@ def lambda_handler(event: dict, context: object) -> dict:
     return {"enqueued": enqueued, "failed": failed}
 
 
+def _process_recipients(
+    recipients: list[dict],
+    *,
+    campaign_id: str,
+    plan_id: str,
+    run_id: str,
+    message_tmpl: str,
+    clinic_name: str,
+    origination_arn: str,
+    already_sent_phones: set[str],
+    now_iso: str,
+    ttl: int,
+    queue_table,
+) -> tuple[int, int, int, int, set[str] | None]:
+    """Per-recipient opt-out/quiet-hours/render/enqueue loop, shared by the
+    first-pass send (lambda_handler, already_sent_phones=set()) and the
+    quiet-hours retry pass (retry_quiet_hours_skipped, already_sent_phones
+    populated from a live VipSmsCampaignQueue query).
+
+    The ONE behavior beyond the original inline loop: a phone already in
+    already_sent_phones is skipped silently (not counted as opted-out or
+    quiet-hours-skipped) — this is what prevents a retry from double-sending
+    a recipient who already went out on an earlier pass.
+
+    Returns (enqueued, failed, opted_out, skipped_quiet_hours, rejected_fields).
+    rejected_fields is None unless the template itself was rejected (a
+    campaign-level, not per-recipient, problem — see the `except ValueError`
+    below), in which case the loop aborts early.
+    """
+    enqueued = 0
+    failed = 0
+    opted_out = 0
+    outside_quiet_hours = 0
+    sqs_batch: list[dict] = []
+    ddb_items_by_id: dict[str, dict] = {}
+
+    # Set only if rendering rejects the template (see the `except ValueError`
+    # below) — a template-level problem, not a per-recipient one, since every
+    # recipient renders the same template.
+    rejected_fields: set[str] | None = None
+
+    for recipient in recipients:
+        phone = recipient["phone"]
+        if not _E164_RE.match(phone):
+            continue
+        if phone in already_sent_phones:
+            # Already sent on a prior pass (the original send or an earlier
+            # retry) — skip silently, no counting either way.
+            continue
+        if _opt_out.is_blocked(phone):
+            opted_out += 1
+            continue
+        # TCPA: the recipient's own local time, not the call-center's. This is
+        # the per-patient gate; executor.py's COT workingHours check is about
+        # whether our Bogota staff are on shift and does not answer this.
+        if not _is_within_quiet_hours(phone):
+            outside_quiet_hours += 1
+            continue
+        try:
+            body = _render(
+                message_tmpl,
+                recipient=recipient,
+                campaign={"clinicName": clinic_name},
+            )
+        except ValueError:
+            # Defense in depth: _validate_sms_campaign (api-plans) should already
+            # have rejected any template with a non-allowlisted placeholder. If
+            # one slipped through anyway, sending it would deliver literal
+            # `{{...}}` braces to a patient — worse than sending nothing. The
+            # template (not this recipient) is what's broken, so every remaining
+            # recipient would fail identically — abandon the whole campaign
+            # rather than skip just this one.
+            rejected_fields = extract_placeholders(message_tmpl) - ALLOWED_FIELDS
+            break
+        item_sk = f"{now_iso}#{uuid.uuid4().hex[:8]}"
+        entry_id = uuid.uuid4().hex[:8]
+        sqs_batch.append(
+            {
+                "Id": entry_id,
+                "MessageBody": json.dumps(
+                    {
+                        "campaignId": campaign_id,
+                        "sk": item_sk,
+                        "phone": phone,
+                        # Key name retained deliberately: it now carries the
+                        # rendered message, not the raw template. Renaming it
+                        # (e.g. to "messageBody") would strand every in-flight
+                        # message across the deploy boundary — the processor
+                        # would KeyError on messages enqueued by an older sender.
+                        "messageTemplate": body,
+                        "originationNumberArn": origination_arn,
+                        "planId": plan_id,
+                        "runId": run_id,
+                    }
+                ),
+            }
+        )
+        ddb_items_by_id[entry_id] = {
+            "campaignId": campaign_id,
+            "sk": item_sk,
+            "phone": phone,
+            "status": "PENDING",
+            "createdAt": now_iso,
+            "updatedAt": now_iso,
+            "ttl": ttl,
+        }
+
+        if len(sqs_batch) == 10:
+            batch_ok, batch_failed = _flush_sms_batch(
+                sqs_batch, ddb_items_by_id, queue_table, campaign_id
+            )
+            enqueued += batch_ok
+            failed += batch_failed
+            sqs_batch = []
+            ddb_items_by_id = {}
+
+    if sqs_batch:
+        batch_ok, batch_failed = _flush_sms_batch(
+            sqs_batch, ddb_items_by_id, queue_table, campaign_id
+        )
+        enqueued += batch_ok
+        failed += batch_failed
+
+    return enqueued, failed, opted_out, outside_quiet_hours, rejected_fields
+
+
 def _flush_sms_batch(
     sqs_batch: list[dict],
     ddb_items_by_id: dict[str, dict],
@@ -294,6 +340,140 @@ def _flush_sms_batch(
                 item["status"] = "SQS_SEND_FAILED"
             bw.put_item(Item=item)
     return len(ddb_items_by_id) - len(failed_ids), len(failed_ids)
+
+
+# ── Quiet-hours retry entry point ─────────────────────────────────────────────
+# Closes a finding from the 2026-09 adversarial code review: the pre-call SMS
+# quiet-hours check above (in _process_recipients, via lambda_handler) runs
+# exactly once, at bucket activation. The paired Connect Campaigns V2 voice
+# campaign, by contrast, uses localTimeZoneDetection=AREA_CODE + openHours,
+# which Connect's own campaign engine re-evaluates CONTINUOUSLY for as long as
+# the campaign stays "running" — so a recipient outside their local quiet-hours
+# window at activation could still get dialed hours later (once their window
+# opens) having never received the pre-call text.
+#
+# retry_quiet_hours_skipped closes that gap by giving the SMS side the same
+# continuous re-evaluation, invoked repeatedly from executor.py's tick() poll
+# loop for as long as the paired voice campaign remains "running" (see
+# executor._invoke_sms_retry_quiet_hours) — the same active window Connect's
+# own AREA_CODE detection uses, so retries stop the instant the voice campaign
+# does, with no separate bookkeeping needed for that bound.
+_TERMINAL_RUN_STATUSES = frozenset({"COMPLETED", "ABORTED"})
+
+
+def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
+    """
+    Re-attempt sends for recipients skipped for quiet hours on an earlier pass
+    (the original send, or a prior retry) of this precall SMS campaign.
+
+    event = {"campaignId": str, "planId": str, "runId": str}  # smsCampaignId
+
+    Deliberately cheap when there's nothing to do — this is invoked on every
+    tick of an active precall-SMS-enabled campaign, and most ticks will have
+    zero recipients newly eligible. No-ops (zero DDB/CP calls beyond the one
+    get_item) when: the run record doesn't exist, its status is already
+    terminal (COMPLETED/ABORTED), or totalSkippedQuietHours is already 0.
+
+    Returns: {"retried": int, "stillSkipped": int}
+    """
+    campaign_id = event["campaignId"]
+    plan_id = event["planId"]
+    run_id = event["runId"]
+    runs_table = _ddb.Table(_RUNS_TABLE)
+
+    resp = runs_table.get_item(Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"})
+    record = resp.get("Item")
+    if not record:
+        return {"retried": 0, "stillSkipped": 0}
+    if record.get("status") in _TERMINAL_RUN_STATUSES:
+        return {"retried": 0, "stillSkipped": 0}
+    if int(record.get("totalSkippedQuietHours") or 0) == 0:
+        return {"retried": 0, "stillSkipped": 0}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ttl = int(time.time()) + _TTL_SECONDS
+
+    recipients = _get_segment_recipients(record.get("segmentName", ""))
+    already_sent_phones = _get_already_sent_phones(campaign_id)
+    queue_table = _ddb.Table(_QUEUE_TABLE)
+
+    enqueued, failed, _opted_out, outside_quiet_hours, rejected_fields = (
+        _process_recipients(
+            recipients,
+            campaign_id=campaign_id,
+            plan_id=plan_id,
+            run_id=run_id,
+            message_tmpl=record.get("messageTemplate", ""),
+            clinic_name=record.get("clinicName", ""),
+            origination_arn=record.get("originationNumberArn", ""),
+            already_sent_phones=already_sent_phones,
+            now_iso=now_iso,
+            ttl=ttl,
+            queue_table=queue_table,
+        )
+    )
+
+    if rejected_fields is not None:
+        # PHI rule: log the offending field NAMES only — never the template body.
+        _logger.warn(
+            "sms_sender_template_rejected_non_allowlisted_placeholder",
+            campaign_id=campaign_id,
+            fields=sorted(rejected_fields),
+        )
+
+    # totalEnqueued is cumulative across every pass (ADD) — this call's
+    # `enqueued` is only the NEW sends from this pass. totalSkippedQuietHours
+    # is NOT cumulative (SET) — it is recomputed fresh every pass and means
+    # "how many are still stuck outside quiet hours right now", not "how many
+    # have ever been skipped" (a recipient counted here on one pass and then
+    # sent on the next must disappear from this count, not accumulate in it).
+    runs_table.update_item(
+        Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
+        UpdateExpression=(
+            "ADD totalEnqueued :n SET totalSkippedQuietHours = :q, updatedAt = :t"
+        ),
+        ExpressionAttributeValues={
+            ":n": enqueued,
+            ":q": outside_quiet_hours,
+            ":t": now_iso,
+        },
+    )
+
+    _logger.info(
+        "precall_sms_quiet_hours_retry",
+        campaign_id=campaign_id,
+        newly_enqueued=enqueued,
+        sqs_send_failed=failed,
+        still_skipped_quiet_hours=outside_quiet_hours,
+    )
+    return {"retried": enqueued, "stillSkipped": outside_quiet_hours}
+
+
+def _get_already_sent_phones(campaign_id: str) -> set[str]:
+    """Every phone that already has a VipSmsCampaignQueue item for this
+    campaignId (any status) — i.e. was already attempted on a prior pass, so
+    a retry must not send to it again.
+
+    Mirrors the campaignId-keyed Query pattern used elsewhere for this table
+    (see executor.py's _count_sms_queue), selecting the phone attribute via
+    ProjectionExpression instead of Select=COUNT.
+    """
+    table = _ddb.Table(_QUEUE_TABLE)
+    kwargs: dict = {
+        "KeyConditionExpression": "campaignId = :cid",
+        "ExpressionAttributeValues": {":cid": campaign_id},
+        "ProjectionExpression": "#p",
+        "ExpressionAttributeNames": {"#p": "phone"},
+    }
+    phones: set[str] = set()
+    while True:
+        resp = table.query(**kwargs)
+        phones.update(item["phone"] for item in resp.get("Items", []))
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    return phones
 
 
 _BATCH_GET_PROFILE_MAX = 100  # CP API limit per BatchGetProfile call

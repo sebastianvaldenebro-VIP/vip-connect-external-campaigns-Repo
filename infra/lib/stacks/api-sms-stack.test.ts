@@ -85,6 +85,41 @@ describe('ApiSmsStack', () => {
     template.resourceCountIs('AWS::Lambda::LayerVersion', 1);
   });
 
+  it('creates the SmsRetryQuietHoursFunction reusing the sender role/layer/tables, with its own function name/handler/log group', () => {
+    const template = Template.fromStack(buildStack());
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      FunctionName: 'vip-admin-sms-retry-quiet-hours',
+      Handler: 'sms_sender_handler.retry_quiet_hours_skipped',
+      Runtime: 'python3.12',
+      // Same imported, mutable:false role as SmsSenderFunction — its exact
+      // permission set already covers everything this function needs
+      // (VipSmsCampaignQueue/Runs read-write, SQS SendMessage, KMS decrypt,
+      // Customer Profiles read), so no new IAM policy is required.
+      Role: `arn:aws:iam::${ACCOUNT}:role/vip-sms-sender-role`,
+      Timeout: 300,
+      MemorySize: 512,
+      ReservedConcurrentExecutions: 5,
+      KmsKeyArn: DATA_KEY_ARN,
+      Environment: {
+        Variables: {
+          SMS_CAMPAIGN_QUEUE_TABLE: 'VipSmsCampaignQueue',
+          SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
+          SMS_SQS_QUEUE_URL: `https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/vip-sms-campaign-queue`,
+          PROFILES_DOMAIN_NAME: 'amazon-connect-vipmedicalgroup',
+          QUIET_HOURS_START: '08:00',
+          QUIET_HOURS_END: '21:00',
+          QUIET_HOURS_DAYS: '0,1,2,3,4,5',
+          QUIET_HOURS_DEFAULT_TZ: 'America/New_York',
+        },
+      },
+    });
+    const retryResources = template.findResources('AWS::Lambda::Function', {
+      Properties: { FunctionName: 'vip-admin-sms-retry-quiet-hours' },
+    });
+    const [retryProps] = Object.values(retryResources).map((r) => r.Properties);
+    expect(retryProps.Layers).toHaveLength(1);
+  });
+
   it('creates the SmsProcessorFunction with the imported role, no shared layer, and a distinct memory/timeout/concurrency profile', () => {
     const template = Template.fromStack(buildStack());
     template.hasResourceProperties('AWS::Lambda::Function', {
@@ -133,7 +168,7 @@ describe('ApiSmsStack', () => {
     });
   });
 
-  it('wires DeadLetterConfig on both Lambdas to the single DLQ resource', () => {
+  it('wires DeadLetterConfig on all 3 Lambdas to the single DLQ resource', () => {
     const template = Template.fromStack(buildStack());
     const dlqs = template.findResources('AWS::SQS::Queue', {
       Properties: { QueueName: 'vip-admin-sms-dlq' },
@@ -152,12 +187,16 @@ describe('ApiSmsStack', () => {
       ...expectedDeadLetterConfig,
     });
     template.hasResourceProperties('AWS::Lambda::Function', {
+      FunctionName: 'vip-admin-sms-retry-quiet-hours',
+      ...expectedDeadLetterConfig,
+    });
+    template.hasResourceProperties('AWS::Lambda::Function', {
       FunctionName: 'vip-admin-sms-processor',
       ...expectedDeadLetterConfig,
     });
   });
 
-  it('applies the CKV_AWS_117 checkov suppression to both Lambda functions', () => {
+  it('applies the CKV_AWS_117 checkov suppression to all 3 Lambda functions', () => {
     const template = Template.fromStack(buildStack());
     const expectedSkip = Match.arrayWith([
       Match.objectLike({
@@ -170,12 +209,16 @@ describe('ApiSmsStack', () => {
       Metadata: Match.objectLike({ checkov: { skip: expectedSkip } }),
     });
     template.hasResource('AWS::Lambda::Function', {
+      Properties: Match.objectLike({ FunctionName: 'vip-admin-sms-retry-quiet-hours' }),
+      Metadata: Match.objectLike({ checkov: { skip: expectedSkip } }),
+    });
+    template.hasResource('AWS::Lambda::Function', {
       Properties: Match.objectLike({ FunctionName: 'vip-admin-sms-processor' }),
       Metadata: Match.objectLike({ checkov: { skip: expectedSkip } }),
     });
   });
 
-  it('creates no AWS::IAM::Role resources — both Lambda roles are imported with mutable:false', () => {
+  it('creates no AWS::IAM::Role resources — all 3 Lambdas use imported, mutable:false roles (SmsRetryQuietHoursFunction reuses vip-sms-sender-role)', () => {
     const template = Template.fromStack(buildStack());
     template.resourceCountIs('AWS::IAM::Role', 0);
   });
@@ -189,10 +232,11 @@ describe('ApiSmsStack', () => {
     });
   });
 
-  it('emits the 5 documented CfnOutputs with the expected values', () => {
+  it('emits the 6 documented CfnOutputs with the expected values', () => {
     const stack = buildStack();
     const template = Template.fromStack(stack);
     template.hasOutput('SmsSenderFunctionArn', {});
+    template.hasOutput('SmsRetryQuietHoursFunctionArn', {});
     template.hasOutput('SmsProcessorFunctionArn', {});
     template.hasOutput('SmsCampaignQueueTableName', { Value: 'VipSmsCampaignQueue' });
     template.hasOutput('SmsRunsTableName', { Value: 'VipSmsCampaignRuns' });
@@ -201,8 +245,8 @@ describe('ApiSmsStack', () => {
     });
   });
 
-  it('exposes exactly 2 Lambda functions', () => {
+  it('exposes exactly 3 Lambda functions', () => {
     const template = Template.fromStack(buildStack());
-    template.resourceCountIs('AWS::Lambda::Function', 2);
+    template.resourceCountIs('AWS::Lambda::Function', 3);
   });
 });
