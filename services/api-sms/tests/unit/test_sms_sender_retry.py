@@ -17,6 +17,21 @@ Covers:
 lambda_handler's own existing behavior (unchanged by the _process_recipients
 extraction) is covered by test_sms_sender.py, which passes unmodified against
 the refactored code.
+
+Also covers a follow-up 2026-09 adversarial review of THIS retry mechanism
+itself (see the "Claim gate" section below):
+  - Finding (Critical): already_sent_phones is a read-then-decide in-memory
+    check with no DB-level uniqueness guard — two overlapping tick-driven
+    retry invocations (this Lambda's 5-minute timeout outlives the ~1-minute
+    tick cadence) could both read an empty/stale already_sent_phones for the
+    same phone and both send. Fixed with an atomic conditional put_item claim
+    in _process_recipients, mirroring executor.py's own claim-before-act idiom.
+  - Finding (Important): _get_already_sent_phones treated ANY existing queue
+    item — including a genuinely-failed SQS_SEND_FAILED one — as "already
+    sent," permanently and silently excluding a failed send from every future
+    retry. Fixed by excluding SQS_SEND_FAILED-only phones from that query, and
+    by releasing (deleting) the phone's claim record in _flush_sms_batch when
+    its send fails, so a later pass can genuinely re-claim and retry it.
 """
 
 from __future__ import annotations
@@ -25,6 +40,8 @@ import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
+
+from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
@@ -456,3 +473,415 @@ def test_retry_renders_clinic_name_read_back_from_runs_record():
         )
 
     assert sent_bodies[0]["messageTemplate"] == "Hi Maria! This is VIP Medical Group."
+
+
+# ── Claim gate: Finding 1 (Critical) — DB-level dedup under concurrent ticks ──
+# already_sent_phones alone is a read-then-decide in-memory check with no
+# DB-level uniqueness guard. These tests exercise the atomic conditional
+# put_item claim in _process_recipients directly, without relying on
+# already_sent_phones to have observed anything.
+
+
+def _conditional_check_failed(message: str = "claim already taken") -> ClientError:
+    """Build the exact ClientError shape DynamoDB raises for a failed
+    ConditionExpression, so _process_recipients' `exc.response["Error"]["Code"]`
+    check exercises the real code path rather than a stand-in."""
+    return ClientError(
+        error_response={
+            "Error": {"Code": "ConditionalCheckFailedException", "Message": message}
+        },
+        operation_name="PutItem",
+    )
+
+
+def _make_claim_aware_queue_table() -> MagicMock:
+    """A queue_table mock that enforces the same attribute_not_exists(sk)
+    semantics DynamoDB's real ConditionExpression would for claim records: the
+    first put_item for a given (campaignId, sk) succeeds, every subsequent one
+    for the same key raises ConditionalCheckFailedException. This lets a test
+    simulate two "concurrent" executions racing for the same phone's claim
+    without a real DynamoDB table."""
+    claimed: set[tuple[str, str]] = set()
+    table = MagicMock()
+
+    def _put_item(Item, ConditionExpression=None, **_kwargs):
+        key = (Item["campaignId"], Item["sk"])
+        if ConditionExpression and key in claimed:
+            raise _conditional_check_failed()
+        claimed.add(key)
+
+    table.put_item.side_effect = _put_item
+    return table
+
+
+def test_concurrent_process_recipients_calls_for_same_phone_only_send_once():
+    """Direct regression test for Finding 1: two calls to _process_recipients
+    for the SAME phone, both with already_sent_phones=set() (simulating both
+    concurrent tick invocations reading an empty/stale pre-check — the exact
+    race described in the finding), must not both enqueue an SQS message. The
+    claim gate, not already_sent_phones, is what prevents the second one."""
+    handler = _load_handler()
+    queue_table = _make_claim_aware_queue_table()
+    recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
+
+    mock_sqs_first = MagicMock()
+    mock_sqs_first.send_message_batch.return_value = {"Failed": []}
+    mock_sqs_second = MagicMock()
+    mock_sqs_second.send_message_batch.return_value = {"Failed": []}
+
+    common_kwargs = dict(
+        campaign_id="cmp-1",
+        plan_id="plan-1",
+        run_id="run-1",
+        message_tmpl="Hi {{FirstName}}!",
+        clinic_name="Clinic",
+        origination_arn="arn:pn",
+        already_sent_phones=set(),
+        ttl=1234567890,
+        queue_table=queue_table,
+    )
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        with patch.object(handler, "_sqs", mock_sqs_first):
+            enqueued_1, failed_1, *_rest_1 = handler._process_recipients(
+                recipients, now_iso="2026-09-09T00:00:00+00:00", **common_kwargs
+            )
+        # "Concurrent": a second execution processing the same recipient list
+        # moments later, its own pre-check having observed the same stale
+        # (empty) already_sent_phones as the first.
+        with patch.object(handler, "_sqs", mock_sqs_second):
+            enqueued_2, failed_2, *_rest_2 = handler._process_recipients(
+                recipients, now_iso="2026-09-09T00:00:05+00:00", **common_kwargs
+            )
+
+    assert enqueued_1 == 1
+    assert enqueued_2 == 0
+    assert failed_2 == 0  # skipped via the claim gate, not counted as a failure
+    mock_sqs_first.send_message_batch.assert_called_once()
+    mock_sqs_second.send_message_batch.assert_not_called()
+
+
+def test_process_recipients_claim_conflict_skipped_silently_not_counted():
+    """A claim conflict must not be miscounted as opted_out or
+    outside_quiet_hours — it is its own, silent, no-count skip category, same
+    treatment as already_sent_phones."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.put_item.side_effect = _conditional_check_failed()
+
+    recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
+    mock_sqs = MagicMock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        enqueued, failed, opted_out, outside_qh, rejected = handler._process_recipients(
+            recipients,
+            campaign_id="cmp-1",
+            plan_id="plan-1",
+            run_id="run-1",
+            message_tmpl="Hi {{FirstName}}!",
+            clinic_name="Clinic",
+            origination_arn="arn:pn",
+            already_sent_phones=set(),
+            now_iso="2026-09-09T00:00:00+00:00",
+            ttl=1234567890,
+            queue_table=queue_table,
+        )
+
+    assert (enqueued, failed, opted_out, outside_qh, rejected) == (0, 0, 0, 0, None)
+    mock_sqs.send_message_batch.assert_not_called()
+
+
+def test_process_recipients_claim_put_item_uses_distinguishable_sk_prefix():
+    """The claim's sk must be CLAIM#-prefixed so it can never collide with a
+    real message item's f"{iso_timestamp}#{random_hex}" sk, and must carry no
+    "phone" attribute (so it's naturally excluded from _get_already_sent_phones'
+    ProjectionExpression-based scan without special-casing)."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
+    mock_sqs = MagicMock()
+    mock_sqs.send_message_batch.return_value = {"Failed": []}
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        handler._process_recipients(
+            recipients,
+            campaign_id="cmp-1",
+            plan_id="plan-1",
+            run_id="run-1",
+            message_tmpl="Hi {{FirstName}}!",
+            clinic_name="Clinic",
+            origination_arn="arn:pn",
+            already_sent_phones=set(),
+            now_iso="2026-09-09T00:00:00+00:00",
+            ttl=1234567890,
+            queue_table=queue_table,
+        )
+
+    claim_call = queue_table.put_item.call_args
+    item = claim_call.kwargs["Item"]
+    assert item["sk"] == "CLAIM#+12125551111"
+    assert "phone" not in item
+    assert claim_call.kwargs["ConditionExpression"] == "attribute_not_exists(sk)"
+
+
+# ── Claim gate: Finding 2 (Important) — SQS_SEND_FAILED must not permanently
+# exclude a phone from retry ───────────────────────────────────────────────────
+
+
+def test_get_already_sent_phones_excludes_sqs_send_failed_only_phone():
+    """Part 1: a phone whose only queue item is SQS_SEND_FAILED must NOT be
+    treated as already-sent — nothing was ever actually delivered to it."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.query.return_value = {
+        "Items": [
+            {"phone": "+12125551111", "status": "SQS_SEND_FAILED"},
+            {"phone": "+12125552222", "status": "PENDING"},
+        ]
+    }
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = queue_table
+
+    with patch.dict(os.environ, _ENV), patch.object(handler, "_ddb", mock_ddb):
+        result = handler._get_already_sent_phones("cmp-1")
+
+    assert result == {"+12125552222"}
+
+
+def test_get_already_sent_phones_still_includes_phone_with_a_later_successful_item():
+    """A phone with BOTH a failed item (from one pass) and a non-failed item
+    (from a later, successful pass) must still count as already-sent — the
+    exclusion is only for phones with NO non-failed item at all."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.query.return_value = {
+        "Items": [
+            {"phone": "+12125551111", "status": "SQS_SEND_FAILED"},
+            {"phone": "+12125551111", "status": "PENDING"},
+        ]
+    }
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = queue_table
+
+    with patch.dict(os.environ, _ENV), patch.object(handler, "_ddb", mock_ddb):
+        result = handler._get_already_sent_phones("cmp-1")
+
+    assert result == {"+12125551111"}
+
+
+def test_get_already_sent_phones_ignores_claim_records_with_no_phone_attribute():
+    """CLAIM# records (no "phone" attribute) must not crash the scan or pollute
+    the returned set."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.query.return_value = {
+        "Items": [
+            {"sk": "CLAIM#+12125551111", "claimedAt": "2026-09-09T00:00:00+00:00"},
+            {"phone": "+12125552222", "status": "PENDING"},
+        ]
+    }
+    mock_ddb = MagicMock()
+    mock_ddb.Table.return_value = queue_table
+
+    with patch.dict(os.environ, _ENV), patch.object(handler, "_ddb", mock_ddb):
+        result = handler._get_already_sent_phones("cmp-1")
+
+    assert result == {"+12125552222"}
+
+
+def test_flush_sms_batch_deletes_claim_for_failed_phone_not_for_sent_phone():
+    """Part 2: _flush_sms_batch must release (delete) the CLAIM# record for a
+    phone whose entry came back SQS_SEND_FAILED, and must NOT touch the claim
+    for a phone whose entry was written PENDING (successfully sent to SQS)."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    mock_sqs = MagicMock()
+
+    sqs_batch = [
+        {"Id": "id-ok", "MessageBody": json.dumps({"phone": "+12125551111"})},
+        {"Id": "id-fail", "MessageBody": json.dumps({"phone": "+12125552222"})},
+    ]
+    ddb_items_by_id = {
+        "id-ok": {
+            "campaignId": "cmp-1",
+            "sk": "2026-09-09T00:00:00+00:00#aaaaaaaa",
+            "phone": "+12125551111",
+            "status": "PENDING",
+            "createdAt": "2026-09-09T00:00:00+00:00",
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+            "ttl": 1234567890,
+        },
+        "id-fail": {
+            "campaignId": "cmp-1",
+            "sk": "2026-09-09T00:00:00+00:00#bbbbbbbb",
+            "phone": "+12125552222",
+            "status": "PENDING",
+            "createdAt": "2026-09-09T00:00:00+00:00",
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+            "ttl": 1234567890,
+        },
+    }
+    mock_sqs.send_message_batch.return_value = {
+        "Failed": [{"Id": "id-fail", "Code": "ThrottlingException"}]
+    }
+
+    with patch.object(handler, "_sqs", mock_sqs):
+        handler._flush_sms_batch(sqs_batch, ddb_items_by_id, queue_table, "cmp-1")
+
+    delete_calls = [c.kwargs["Key"] for c in queue_table.delete_item.call_args_list]
+    assert delete_calls == [{"campaignId": "cmp-1", "sk": "CLAIM#+12125552222"}]
+
+
+def test_flush_sms_batch_claim_release_failure_logs_warning_not_raises():
+    """A delete_item failure while releasing a claim must not crash the batch
+    flush — it's a backstop-covered, non-fatal condition (Finding 2's own
+    design: worst case is a stale claim that self-heals via TTL)."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.delete_item.side_effect = _conditional_check_failed("boom")
+    mock_sqs = MagicMock()
+
+    sqs_batch = [
+        {"Id": "id-fail", "MessageBody": json.dumps({"phone": "+12125552222"})}
+    ]
+    ddb_items_by_id = {
+        "id-fail": {
+            "campaignId": "cmp-1",
+            "sk": "2026-09-09T00:00:00+00:00#bbbbbbbb",
+            "phone": "+12125552222",
+            "status": "PENDING",
+            "createdAt": "2026-09-09T00:00:00+00:00",
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+            "ttl": 1234567890,
+        },
+    }
+    mock_sqs.send_message_batch.return_value = {
+        "Failed": [{"Id": "id-fail", "Code": "ThrottlingException"}]
+    }
+
+    with (
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_logger") as mock_logger,
+    ):
+        # Must not raise.
+        enqueued, failed = handler._flush_sms_batch(
+            sqs_batch, ddb_items_by_id, queue_table, "cmp-1"
+        )
+
+    assert (enqueued, failed) == (0, 1)
+    mock_logger.warn.assert_any_call(
+        "sms_sender_claim_release_failed",
+        campaign_id="cmp-1",
+        error="ClientError",
+    )
+
+
+def test_flush_sms_batch_claim_release_catches_non_client_errors_too():
+    """The release-cleanup catch is deliberately broader than ClientError —
+    ANY failure releasing the claim (network hiccup, etc.) must degrade to a
+    logged warning, never a crashed/re-raised batch flush."""
+    handler = _load_handler()
+    queue_table = MagicMock()
+    queue_table.delete_item.side_effect = RuntimeError("network blip")
+    mock_sqs = MagicMock()
+
+    sqs_batch = [
+        {"Id": "id-fail", "MessageBody": json.dumps({"phone": "+12125552222"})}
+    ]
+    ddb_items_by_id = {
+        "id-fail": {
+            "campaignId": "cmp-1",
+            "sk": "2026-09-09T00:00:00+00:00#bbbbbbbb",
+            "phone": "+12125552222",
+            "status": "PENDING",
+            "createdAt": "2026-09-09T00:00:00+00:00",
+            "updatedAt": "2026-09-09T00:00:00+00:00",
+            "ttl": 1234567890,
+        },
+    }
+    mock_sqs.send_message_batch.return_value = {
+        "Failed": [{"Id": "id-fail", "Code": "ThrottlingException"}]
+    }
+
+    with (
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_logger") as mock_logger,
+    ):
+        # Must not raise, even for a non-ClientError exception.
+        enqueued, failed = handler._flush_sms_batch(
+            sqs_batch, ddb_items_by_id, queue_table, "cmp-1"
+        )
+
+    assert (enqueued, failed) == (0, 1)
+    mock_logger.warn.assert_any_call(
+        "sms_sender_claim_release_failed",
+        campaign_id="cmp-1",
+        error="RuntimeError",
+    )
+
+
+# ── End-to-end: Findings 1 and 2 working together ─────────────────────────────
+
+
+def test_retry_resends_after_prior_sqs_send_failed_and_claim_release():
+    """End-to-end proof that parts 1 and 2 of Finding 2 work together with
+    Finding 1's claim gate, not just in isolation: a phone whose earlier
+    attempt ended SQS_SEND_FAILED (its claim already released by
+    _flush_sms_batch) is NOT excluded by _get_already_sent_phones and has no
+    live claim blocking it — so a genuine retry send goes out for it on the
+    very next retry_quiet_hours_skipped call."""
+    handler = _load_handler()
+    record = _retry_record(totalSkippedQuietHours=2)
+    ddb, runs_table, queue_table = _mock_ddb_with_runs_record(record)
+
+    # Queue table state reflects the outcome of a PRIOR pass: Maria's send
+    # failed and, per Finding 2 part 2, her CLAIM# record was already deleted
+    # by that prior _flush_sms_batch call — so no CLAIM# item exists for her
+    # here. Jose has no queue item at all (still awaiting his first attempt).
+    queue_table.query.return_value = {
+        "Items": [{"phone": "+12125551111", "status": "SQS_SEND_FAILED"}]
+    }
+    queue_table.put_item.return_value = None  # every claim attempt succeeds
+
+    recipients = [
+        {"phone": "+12125551111", "FirstName": "Maria"},  # now retry-eligible
+        {"phone": "+13105552222", "FirstName": "Jose"},  # window still closed
+    ]
+    mock_sqs = MagicMock()
+    mock_sqs.send_message_batch.return_value = {"Failed": []}
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_ddb", ddb),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_get_segment_recipients", return_value=recipients),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(
+            handler, "_is_within_quiet_hours", lambda p, **_: p == "+12125551111"
+        ),
+    ):
+        result = handler.retry_quiet_hours_skipped(
+            {"campaignId": "c1", "planId": "p1", "runId": "r1"}, None
+        )
+
+    assert result == {"retried": 1, "stillSkipped": 1}
+    sent_phones = [
+        json.loads(e["MessageBody"])["phone"]
+        for call in mock_sqs.send_message_batch.call_args_list
+        for e in call.kwargs["Entries"]
+    ]
+    assert sent_phones == ["+12125551111"]

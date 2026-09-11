@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, timezone
 
 import boto3
+from botocore.exceptions import ClientError
 
 from vip_shared.domain.services.quiet_hours import (
     is_within_quiet_hours as _is_within_quiet_hours,
@@ -44,6 +45,13 @@ _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
 _SQS_QUEUE_URL = os.environ["SMS_SQS_QUEUE_URL"]
 _DOMAIN = os.environ["PROFILES_DOMAIN_NAME"]
 _TTL_SECONDS = 30 * 24 * 3600  # 30 days
+# Claim records (see _process_recipients' claim gate) are a short-lived DB-level
+# dedup guard, not a long-lived audit record — 15 minutes is comfortably longer
+# than this Lambda's own timeout (5 min) plus margin, so a claim from a crashed
+# invocation self-heals reasonably promptly even without the explicit release
+# in _flush_sms_batch. Deliberately NOT _TTL_SECONDS (30 days) — that lifetime
+# is wrong for a claim, whose only purpose is to survive one overlapping tick.
+_CLAIM_TTL_SECONDS = 15 * 60
 
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
@@ -201,10 +209,17 @@ def _process_recipients(
     quiet-hours retry pass (retry_quiet_hours_skipped, already_sent_phones
     populated from a live VipSmsCampaignQueue query).
 
-    The ONE behavior beyond the original inline loop: a phone already in
-    already_sent_phones is skipped silently (not counted as opted-out or
-    quiet-hours-skipped) — this is what prevents a retry from double-sending
-    a recipient who already went out on an earlier pass.
+    Two behaviors beyond the original inline loop:
+      - A phone already in already_sent_phones is skipped silently (not
+        counted as opted-out or quiet-hours-skipped) — a cheap optimization
+        for the common case of a retry re-scanning mostly-already-sent
+        recipients.
+      - Immediately before rendering+enqueueing, every recipient must win an
+        atomic DB-level claim (conditional put_item on queue_table) for their
+        phone. This — not already_sent_phones — is what actually prevents two
+        overlapping executions (e.g. two concurrent tick-driven retry
+        invocations for the same campaign) from both sending to the same
+        phone.
 
     Returns (enqueued, failed, opted_out, skipped_quiet_hours, rejected_fields).
     rejected_fields is None unless the template itself was rejected (a
@@ -240,6 +255,42 @@ def _process_recipients(
         if not _is_within_quiet_hours(phone):
             outside_quiet_hours += 1
             continue
+
+        # DB-level claim gate (2026-09 adversarial-review Finding, Critical):
+        # already_sent_phones above is a read-then-decide in-memory check, not a
+        # correctness guarantee — this Lambda's 5-minute timeout outlives the
+        # ~1-minute tick cadence that invokes retry_quiet_hours_skipped, so two
+        # overlapping executions can both read an empty/stale already_sent_phones
+        # for the same phone and both reach this point. This conditional put_item
+        # is what actually prevents a duplicate send: only one execution can ever
+        # win the claim for a given (campaignId, phone). Mirrors the "claim before
+        # act" idiom executor.py already uses for Connect campaign creation
+        # (_dispatch_ready_campaigns's Phase 3 — claim, then act).
+        #
+        # sk uses a CLAIM# prefix, never colliding with a real message item's
+        # f"{iso_timestamp}#{random_hex}" sk. _normalize_phone is idempotent on
+        # an already-E.164 phone, so the same phone always maps to the same key.
+        try:
+            queue_table.put_item(
+                Item={
+                    "campaignId": campaign_id,
+                    "sk": f"CLAIM#{_normalize_phone(phone)}",
+                    "claimedAt": now_iso,
+                    "ttl": int(time.time()) + _CLAIM_TTL_SECONDS,
+                },
+                ConditionExpression="attribute_not_exists(sk)",
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # Another concurrent execution (or a duplicate profile within
+                # this same pass) already claimed this phone — skip silently,
+                # same treatment as already_sent_phones. This is the actual
+                # race-closing guarantee; the already_sent_phones pre-check
+                # above is only a cheap optimization to avoid attempting a
+                # claim at all for someone almost certainly already sent.
+                continue
+            raise
+
         try:
             body = _render(
                 message_tmpl,
@@ -339,6 +390,37 @@ def _flush_sms_batch(
             if entry_id in failed_ids:
                 item["status"] = "SQS_SEND_FAILED"
             bw.put_item(Item=item)
+
+    # Release the claim for every genuinely-failed send (2026-09
+    # adversarial-review Finding, Important, part 2): no message was ever
+    # actually delivered for these phones, so the claim gate in
+    # _process_recipients must not go on blocking a later retry from
+    # re-attempting them. A delete failure here is not fatal — worst case is a
+    # stale claim that self-heals via _CLAIM_TTL_SECONDS, one fewer retry
+    # attempt until it expires, not a correctness issue — so log and continue
+    # rather than raising.
+    for entry_id in failed_ids:
+        item = ddb_items_by_id.get(entry_id)
+        if not item:
+            continue
+        try:
+            queue_table.delete_item(
+                Key={
+                    "campaignId": campaign_id,
+                    "sk": f"CLAIM#{_normalize_phone(item['phone'])}",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup, see comment above
+            # Deliberately broad: ANY failure releasing the claim (throttling,
+            # network, IAM, whatever) must degrade to "one fewer retry attempt
+            # until TTL expiry," never to a crashed/retried batch flush that
+            # could itself risk re-processing this same batch.
+            _logger.warn(
+                "sms_sender_claim_release_failed",
+                campaign_id=campaign_id,
+                error=type(exc).__name__,
+            )
+
     return len(ddb_items_by_id) - len(failed_ids), len(failed_ids)
 
 
@@ -450,25 +532,48 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
 
 
 def _get_already_sent_phones(campaign_id: str) -> set[str]:
-    """Every phone that already has a VipSmsCampaignQueue item for this
-    campaignId (any status) — i.e. was already attempted on a prior pass, so
-    a retry must not send to it again.
+    """Every phone with a genuinely-attempted VipSmsCampaignQueue message item
+    for this campaignId — i.e. was already sent (or enqueued) on a prior pass,
+    so a retry must not send to it again.
+
+    Excludes two things a naive "any item for this phone" check would wrongly
+    fold in:
+      - CLAIM# records (written by _process_recipients' claim gate) — these
+        carry no "phone" attribute and must never be mistaken for a sent
+        message.
+      - Phones whose ONLY queue item is status SQS_SEND_FAILED (2026-09
+        adversarial-review Finding, Important, part 1): send_message_batch
+        rejected them before any message ever reached SQS, so nothing was
+        actually delivered. Treating that as "already sent" would silently
+        and permanently exclude the phone from every future retry, even
+        though the retry feature's whole purpose is to eventually deliver to
+        it. A phone with at least one non-failed item IS still treated as
+        sent, even if it also has an unrelated failed item from another pass.
+
+    This is purely a cheap pre-check optimization to avoid attempting a claim
+    at all for someone almost certainly already sent — the actual
+    correctness guarantee against a duplicate send is the claim gate in
+    _process_recipients, not this query.
 
     Mirrors the campaignId-keyed Query pattern used elsewhere for this table
-    (see executor.py's _count_sms_queue), selecting the phone attribute via
+    (see executor.py's _count_sms_queue), selecting phone + status via
     ProjectionExpression instead of Select=COUNT.
     """
     table = _ddb.Table(_QUEUE_TABLE)
     kwargs: dict = {
         "KeyConditionExpression": "campaignId = :cid",
         "ExpressionAttributeValues": {":cid": campaign_id},
-        "ProjectionExpression": "#p",
-        "ExpressionAttributeNames": {"#p": "phone"},
+        "ProjectionExpression": "#p, #s",
+        "ExpressionAttributeNames": {"#p": "phone", "#s": "status"},
     }
     phones: set[str] = set()
     while True:
         resp = table.query(**kwargs)
-        phones.update(item["phone"] for item in resp.get("Items", []))
+        for item in resp.get("Items", []):
+            phone = item.get("phone")
+            if not phone or item.get("status") == "SQS_SEND_FAILED":
+                continue
+            phones.add(phone)
         lek = resp.get("LastEvaluatedKey")
         if not lek:
             break
