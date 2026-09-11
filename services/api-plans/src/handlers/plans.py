@@ -594,7 +594,17 @@ def _screen_sms_template_content(
     # only well-formed tokens here ensures anything shaped like {{...}} but
     # not a valid placeholder stays in `scannable` for the PHI patterns below
     # to catch.
-    scannable = strip_placeholders(tmpl)
+    #
+    # Also append the RESOLVED clinicName value (the same source render()
+    # substitutes {{ClinicName}} with — see max_rendered_length's `campaign=`
+    # kwarg above). clinicName is free text with no character-class
+    # restriction (unlike FirstName, which _clean_first_name/_NAME_OK_RE
+    # constrain defensively), so it is the one substitution value that could
+    # itself carry PHI-shaped content straight into the outbound SMS. The
+    # template-with-placeholders-stripped text alone never reveals this —
+    # only the resolved value does, so it must be scanned too.
+    clinic_name = str(render_campaign.get("clinicName") or "")
+    scannable = f"{strip_placeholders(tmpl)} {clinic_name}"
     violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(scannable)]
     if violations:
         errors.append(

@@ -390,6 +390,95 @@ def test_length_is_measured_on_the_rendered_worst_case():
     assert any("160" in e for e in errors)
 
 
+# ── PHI guard also screens the RESOLVED clinicName value, not just the raw ──
+# ── template with placeholders stripped ──────────────────────────────────────
+
+
+def test_bulk_sms_clinicname_containing_ssn_is_rejected_even_with_clean_template():
+    """_screen_sms_template_content must scan the resolved clinicName VALUE,
+    not just the template with placeholders stripped. clinicName is free text
+    with no character-class restriction (unlike FirstName, which
+    _clean_first_name/_NAME_OK_RE constrain), so an operator could put an SSN
+    directly into campaignConfig.clinicName and it would never appear in the
+    raw template text — only in the value substituted at send time."""
+    errors = _validate(
+        _campaign(
+            template="Reminder: your appointment is confirmed. Reply STOP to opt out.",
+            clinic_name="123-45-6789",
+        ),
+        "b",
+        0,
+    )
+    assert any("PHI" in e or "SSN" in e for e in errors)
+
+
+def test_bulk_sms_clinicname_containing_email_is_rejected():
+    errors = _validate(
+        _campaign(
+            template="Reminder: your appointment is confirmed. Reply STOP to opt out.",
+            clinic_name="jane@example.com",
+        ),
+        "b",
+        0,
+    )
+    assert any("PHI" in e or "email" in e for e in errors)
+
+
+def test_bulk_sms_legitimate_clinicname_still_passes_cleanly():
+    """No false positive: a real clinic name must not itself trip the PHI scan
+    just because it is now included in what gets screened."""
+    errors = _validate(
+        _campaign(
+            template="Reminder: your appointment is confirmed. Reply STOP to opt out.",
+            clinic_name="VIP Medical Group",
+        ),
+        "b",
+        0,
+    )
+    assert errors == []
+
+
+def test_precall_clinicname_containing_ssn_is_rejected_even_with_clean_template():
+    """Same guard via _validate_precall_sms's shared _screen_sms_template_content
+    call — precallSms.clinicName is the pre-call channel's own equivalent
+    free-text field and must not be a PHI side-channel either."""
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, calling shortly.",
+            "clinicName": "123-45-6789",
+            "originationNumberArn": "arn:x",
+        }
+    )
+    assert any("PHI" in e or "SSN" in e for e in validate_plan(plan))
+
+
+def test_precall_clinicname_containing_email_is_rejected():
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, calling shortly.",
+            "clinicName": "jane@example.com",
+            "originationNumberArn": "arn:x",
+        }
+    )
+    assert any("PHI" in e or "email" in e for e in validate_plan(plan))
+
+
+def test_precall_legitimate_clinicname_still_passes_cleanly():
+    """No false positive on the precall path either — mirrors
+    test_bulk_sms_legitimate_clinicname_still_passes_cleanly."""
+    plan = _plan_with_precall(
+        precall={
+            "enabled": True,
+            "messageTemplate": "Hi {{FirstName}}, calling shortly.",
+            "clinicName": "VIP Medical Group",
+            "originationNumberArn": "arn:x",
+        }
+    )
+    assert validate_plan(plan) == []
+
+
 # ── Task 5: precall SMS config validation (_validate_precall_sms) ────────────
 
 
