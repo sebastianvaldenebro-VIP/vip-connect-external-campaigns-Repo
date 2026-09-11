@@ -366,7 +366,15 @@ def test_campaign_params_structure():
     assert "connectCampaignFlowArn" not in params  # empty string → omitted
 
 
-def test_campaign_params_gates_telephony_on_per_lead_local_open_hours():
+@pytest.mark.parametrize("delivery_type", ["campaign", "journey"])
+@pytest.mark.parametrize(
+    "campaign_config",
+    [None, {}, {"precallSms": {"enabled": False}}, {"precallSms": {"enabled": True}}],
+    ids=["legacy-bucket", "without-precall", "precall-disabled", "precall-enabled"],
+)
+def test_campaign_params_gates_telephony_on_per_lead_local_open_hours(
+    delivery_type, campaign_config
+):
     params = build_campaign_params(
         _campaign_bucket(),
         segment_arn="arn:aws:profile:us-east-1:123:domains/d/segment-definitions/s",
@@ -375,13 +383,20 @@ def test_campaign_params_gates_telephony_on_per_lead_local_open_hours():
         start_time="2026-05-01T13:00:00Z",
         end_time="2026-05-01T21:00:00Z",
         campaign_name="test-campaign",
+        delivery_type=delivery_type,
+        campaign=(
+            {"campaignConfig": campaign_config} if campaign_config is not None else None
+        ),
     )
     ctc = params["communicationTimeConfig"]
-    assert ctc["localTimeZoneConfig"]["localTimeZoneDetection"] == ["AREA_CODE"]
-    assert ctc["localTimeZoneConfig"]["defaultTimeZone"] == "America/New_York"
+    # AWS rejects defaultTimeZone together with localTimeZoneDetection;
+    # the botocore structural validator does not enforce that service rule.
+    assert ctc["localTimeZoneConfig"] == {"localTimeZoneDetection": ["AREA_CODE"]}
     daily = ctc["telephony"]["openHours"]["dailyHours"]
-    assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
-    assert "SUNDAY" not in daily  # no contact on Sunday
+    assert daily == {
+        day: [{"startTime": "T08:00", "endTime": "T21:00"}]
+        for day in ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY")
+    }
 
 
 def test_builders_module_imports_and_builds_open_hours_with_phonenumbers_blocked():

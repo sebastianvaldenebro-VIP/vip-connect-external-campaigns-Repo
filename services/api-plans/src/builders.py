@@ -568,8 +568,8 @@ def build_campaign_params(
         "schedule": {"startTime": start_time, "endTime": end_time},
         "communicationTimeConfig": {
             "localTimeZoneConfig": {
-                # Fallback only, for area codes Connect cannot resolve.
-                "defaultTimeZone": "America/New_York",
+                # Connect accepts local detection or a fixed default timezone,
+                # never both; defaultTimeZone is not a detection fallback.
                 "localTimeZoneDetection": ["AREA_CODE"],
             },
             "telephony": _open_hours(),

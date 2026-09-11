@@ -4,6 +4,8 @@ This guide describes the 2026-09-11 continuation of the `feature/precall-sms-pha
 
 ## What changed
 
+- The postdeployment audit found `CreateCampaign` rejected the combination of `defaultTimeZone` and `localTimeZoneDetection`. Both builders now select only `AREA_CODE` detection, preserving the configured Monday–Saturday local contact hours. Legacy `communicationTime.timezone` does not override that policy. AWS can exclude recipients whose timezone cannot be determined; the fixed timezone field is not a fallback. The [audit and affected runs](/home/devaju/projects/_audit-reports/connect-precall-sms-review-2026-09-11/deployment/postdeploy-logs-2026-09-11/REVISION-LOGS.md) record the incident; the hotfix deployment and service validation are recorded separately.
+
 - Force Start persists a new `precallSmsGeneration` before external work. Retries within that generation reuse the same SMS identity; optimistic-concurrency recovery retains the completed/pending initialization evidence and does not overwrite a newer restart.
 - SMS retries remain active even after the current quiet-hours count reaches zero. Fresh claims, SQS partial failures and incomplete profile reads remain recoverable; initial sender invocations reuse their persisted configuration and do not recreate stopped runs.
 - Segment enumeration uses supported Customer Profiles operations. Exact small canonical phone/customer-ID lists use `SearchProfiles` and authoritative `GetSegmentMembership(ProfileIds=...)`; all other definitions, including larger lists, use an asynchronous encrypted snapshot. The previous membership API call could not enumerate a segment.

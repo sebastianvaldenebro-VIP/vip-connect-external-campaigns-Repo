@@ -45,7 +45,7 @@ def build_create_campaign_params(
       "dialer": {"type": "progressive"|"predictive"|"agentless", "bandwidthAllocation": float, "dialingCapacity": float},
       "answerMachineDetection": {"enabled": bool, "awaitPrompt": bool},
       "schedule": {"startTime": "...Z", "endTime": "...Z"},
-      "communicationTime": {"timezone": "..."},  # ambiguous-area-code fallback only
+      "communicationTime": {"timezone": "..."},  # legacy input; fixed timezone ignored
       "communicationLimits": {"perDay": int, "perWeek": int, "perMonth": int} (optional),
       "tags": {...} (optional)
     }
@@ -107,11 +107,10 @@ def build_create_campaign_params(
 
     # communicationTimeConfig only valid for segment-source campaigns, not event-trigger
     if "segmentArn" in body:
-        comm_time = body.get("communicationTime") or {}
         params["communicationTimeConfig"] = {
             "localTimeZoneConfig": {
-                # Fallback only — used when Connect cannot resolve the area code.
-                "defaultTimeZone": comm_time.get("timezone", "America/New_York"),
+                # AWS makes recipient detection exclusive with defaultTimeZone.
+                # Connect drops recipients whose timezone cannot be resolved.
                 "localTimeZoneDetection": ["AREA_CODE"],
             },
             "telephony": _open_hours(),

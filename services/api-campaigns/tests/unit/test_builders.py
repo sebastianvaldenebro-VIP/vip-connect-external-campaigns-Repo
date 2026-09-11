@@ -58,10 +58,9 @@ def test_segment_source_produces_expected_nested_structure():
     assert amd["awaitAnswerMachinePrompt"] is True
 
     assert params["schedule"]["startTime"] == "2026-04-23T14:00:00Z"
-    assert (
-        params["communicationTimeConfig"]["localTimeZoneConfig"]["defaultTimeZone"]
-        == "America/New_York"
-    )
+    assert params["communicationTimeConfig"]["localTimeZoneConfig"] == {
+        "localTimeZoneDetection": ["AREA_CODE"]
+    }
 
 
 def test_owner_tag_is_added_when_instance_arn_provided():
@@ -119,9 +118,16 @@ def test_create_without_campaign_flow_arn_omits_field():
     assert "connectCampaignFlowArn" not in params_blank
 
 
-def test_event_trigger_source_strips_communication_time_config():
+@pytest.mark.parametrize(
+    "communication_time", [None, {"timezone": "America/Los_Angeles"}]
+)
+def test_event_trigger_source_strips_communication_time_config(communication_time):
     body = _base_body()
     del body["segmentArn"]  # no segment → falls back to event trigger
+    if communication_time is None:
+        body.pop("communicationTime")
+    else:
+        body["communicationTime"] = communication_time
 
     params = build_create_campaign_params(
         body,
@@ -187,18 +193,25 @@ def test_communication_limits_translation():
 _CONTACT_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"]
 
 
-def test_communication_time_config_uses_per_recipient_area_code_detection():
-    """One operator-picked timezone per campaign is the wrong axis — TCPA quiet
-    hours are per-recipient-local, so Connect must resolve each recipient's own
-    timezone from their area code."""
+@pytest.mark.parametrize("legacy_timezone", ["America/New_York", "America/Los_Angeles"])
+def test_communication_time_config_uses_per_recipient_area_code_detection(
+    legacy_timezone,
+):
+    """AWS rejects defaultTimeZone together with localTimeZoneDetection.
+
+    Legacy UI timezone values must not reintroduce a fixed zone when recipient
+    detection is selected; botocore's shape validation does not catch this.
+    """
+    body = _base_body()
+    body["communicationTime"] = {"timezone": legacy_timezone}
     params = build_create_campaign_params(
-        _base_body(),
+        body,
         connect_instance_id="instance-1",
         profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
     )
     ltz = params["communicationTimeConfig"]["localTimeZoneConfig"]
     assert ltz["localTimeZoneDetection"] == ["AREA_CODE"]
-    assert ltz["defaultTimeZone"] == "America/New_York"  # fallback only
+    assert "defaultTimeZone" not in ltz
 
 
 def test_communication_time_config_sets_telephony_open_hours_monday_to_saturday():
@@ -313,3 +326,8 @@ def test_communication_time_config_emitted_even_without_communication_time_key()
         profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
     )
     assert "communicationTimeConfig" in params
+    ctc = params["communicationTimeConfig"]
+    assert ctc["localTimeZoneConfig"] == {"localTimeZoneDetection": ["AREA_CODE"]}
+    assert ctc["telephony"]["openHours"]["dailyHours"] == {
+        day: [{"startTime": "T08:00", "endTime": "T21:00"}] for day in _CONTACT_DAYS
+    }
