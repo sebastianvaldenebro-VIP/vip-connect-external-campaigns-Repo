@@ -7279,6 +7279,11 @@ class TestBrandedReconcile:
 class TestSmsReconcile:
     """SMS call site (Step 7/8): success wires cs['reconcile']."""
 
+    @pytest.fixture(autouse=True)
+    def _persist_initialization(self):
+        with patch("executor.save_run"):
+            yield
+
     def _sms_campaign(
         self,
         campaign_id: str = "sms-rc-1",

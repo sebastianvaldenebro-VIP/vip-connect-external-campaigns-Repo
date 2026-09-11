@@ -137,6 +137,16 @@ _ACTIVE_CAMPAIGN_STATUSES: Final = frozenset({"creating", "warming", "running"})
 # colliding by the "precall#" name prefix instead, not by a different
 # namespace. Arbitrary, fixed UUID; changing it would change every derived id.
 _SMS_UUID_NAMESPACE: Final[uuid.UUID] = uuid.UUID("a3e4b7c1-1234-5678-9012-d5e6f7a8b9c0")
+_SMS_INITIALIZATION_TIMEOUT_SECONDS: Final = 300
+_SMS_INITIALIZATION_TERMINAL: Final = frozenset({"complete", "failed", "aborted"})
+_PRECALL_INITIALIZATION_FIELDS: Final = (
+    "precallSmsState", "precallSmsPendingAt", "precallSmsSegmentArn",
+    "precallSmsSegmentName", "precallSmsCampaignId", "_precallSmsRunsPlanId",
+    "_precallSmsRunsSk", "brandedPrecallPreparing", "precallStartDeferred",
+)
+_SMS_INITIALIZATION_FIELDS: Final = (
+    *_PRECALL_INITIALIZATION_FIELDS, "smsInitializationState", "smsInitializationPendingAt"
+)
 
 # ── Campaign exit reasons ─────────────────────────────────────────────────────
 
@@ -371,8 +381,8 @@ def _complete_sms_campaign(cs: dict) -> None:
         logger.warning("_complete_sms_campaign error: %s", type(exc).__name__)
 
 
-def _invoke_sms_sender(**kwargs: object) -> None:
-    """Invoke the SMS Sender Lambda synchronously (mirrors _invoke_seeder pattern)."""
+def _invoke_sms_sender(**kwargs: object) -> dict:
+    """Invoke the sender and distinguish an unfinished snapshot from an empty send."""
     import json as _json
 
     response = _get_lambda_client().invoke(
@@ -381,10 +391,23 @@ def _invoke_sms_sender(**kwargs: object) -> None:
         Payload=_json.dumps(kwargs).encode(),
     )
     if response.get("FunctionError"):
-        payload_bytes = response["Payload"].read()
-        raise RuntimeError(
-            f"SMS Sender Lambda error: {payload_bytes[:200]!r}"
-        )
+        raise RuntimeError("SMS Sender Lambda error")
+    try:
+        result = _json.loads(response["Payload"].read())
+    except (KeyError, ValueError, TypeError) as exc:
+        raise RuntimeError("Invalid SMS Sender Lambda response") from exc
+    if (
+        not isinstance(result, dict)
+        or type(result.get("enqueued")) is not int
+        or result["enqueued"] < 0
+        or type(result.get("failed", 0)) is not int
+        or result.get("failed", 0) < 0
+        or type(result.get("pending", False)) is not bool
+        or type(result.get("terminal", False)) is not bool
+        or (result.get("pending") and result.get("terminal"))
+    ):
+        raise RuntimeError("Invalid SMS Sender Lambda response")
+    return result
 
 
 def _invoke_sms_retry_quiet_hours(
@@ -413,7 +436,9 @@ def _invoke_sms_retry_quiet_hours(
         raise RuntimeError(f"SMS Retry Lambda error: {payload_bytes[:200]!r}")
 
 
-def _precall_sms_campaign_id(run: dict, bucket_index: int, campaign_index: int) -> str:
+def _precall_sms_campaign_id(
+    run: dict, bucket_index: int, campaign_index: int, *, campaign_state: dict | None = None
+) -> str:
     """Deterministic smsCampaignId for a pre-call send, so retries reuse one
     VipSmsCampaignRuns row.
 
@@ -422,12 +447,20 @@ def _precall_sms_campaign_id(run: dict, bucket_index: int, campaign_index: int) 
     the same bucket/campaign slot as a real SMS campaign would derive an
     identical id and the two would collide on one runs row.
     """
-    return str(
-        uuid.uuid5(
-            _SMS_UUID_NAMESPACE,
-            f"precall#{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}",
-        )
-    )
+    name = f"precall#{run['planId']}#{run['runId']}#{bucket_index}#{campaign_index}"
+    # Keep the original UUID for existing runs. Only an explicit Force Start
+    # advances this persisted generation; normal retries and crash recovery
+    # must continue using the same SMS runs row and per-recipient dedup keys.
+    if campaign_state is None:
+        bucket_states = run.get("bucketStates") or []
+        if bucket_index < len(bucket_states):
+            campaign_states = bucket_states[bucket_index].get("campaignStates") or []
+            if campaign_index < len(campaign_states):
+                campaign_state = campaign_states[campaign_index]
+    generation = int((campaign_state or {}).get("precallSmsGeneration") or 0)
+    if generation:
+        name += f"#generation#{generation}"
+    return str(uuid.uuid5(_SMS_UUID_NAMESPACE, name))
 
 
 def _attempt_precall_sms_send(
@@ -441,7 +474,7 @@ def _attempt_precall_sms_send(
     campaign_index: int,
     sms_campaign_id: str,
 ) -> None:
-    """Send one campaign's pre-call SMS exactly once and record the outcome.
+    """Initialize one campaign's pre-call SMS and record pending/success/failure.
 
     Shared by the Connect-gated per-campaign helper (_fire_precall_sms_for_campaign)
     and the branded fire-only call site in _start_one_campaign — branded has no
@@ -451,20 +484,47 @@ def _attempt_precall_sms_send(
     Never raises: a pre-call text that does not go out must degrade to "no text",
     never to "no call" (or, for the Connect-gated path, to a stuck-paused campaign).
     """
-    if cs.get("precallSmsSentAt"):
+    if cs.get("precallSmsSentAt") or cs.get("precallSmsState") in _SMS_INITIALIZATION_TERMINAL:
         return  # already sent — idempotent across retries/re-activation
 
+    cs.setdefault("precallSmsSegmentArn", segment_arn)
+    cs.setdefault("precallSmsSegmentName", segment_name)
+    cs["precallSmsCampaignId"] = sms_campaign_id
+    cs["_precallSmsRunsPlanId"] = run["planId"]
+    cs["_precallSmsRunsSk"] = f"{run['runId']}#{sms_campaign_id}"
     try:
-        _invoke_sms_sender(
+        if _sms_initialization_timed_out(cs.get("precallSmsPendingAt")):
+            _slog.error("precall_sms_initialization_timeout", plan_id=run["planId"],
+                       run_id=run["runId"], sms_campaign_id=sms_campaign_id)
+            _abort_precall_sms(cs, "sms_initialization_timeout")
+            cs["precallSmsState"] = "failed"
+            return
+        result = _invoke_sms_sender(
             campaignId=sms_campaign_id,
             planId=run["planId"],
             runId=run["runId"],
-            segmentArn=segment_arn,
-            segmentName=segment_name,
+            segmentArn=cs["precallSmsSegmentArn"],
+            segmentName=cs["precallSmsSegmentName"],
             messageTemplate=precall.get("messageTemplate", ""),
             originationNumberArn=precall.get("originationNumberArn", ""),
             clinicName=precall.get("clinicName", ""),
         )
+        # Existing callers/tests may still provide a None/no-op stub. The real
+        # Lambda boundary above validates an actual dictionary response.
+        if isinstance(result, dict) and result.get("pending") is True:
+            cs["precallSmsState"] = "pending"
+            cs.setdefault("precallSmsPendingAt", _now_iso())
+            return
+        if isinstance(result, dict) and result.get("terminal") is True:
+            cs["precallSmsState"] = (
+                "failed" if result.get("exitReason") in {
+                    "sms_initialization_timeout", "sms_initialization_failed"
+                } else "aborted"
+            )
+            cs.pop("precallSmsPendingAt", None)
+            return
+        cs["precallSmsState"] = "complete"
+        cs.pop("precallSmsPendingAt", None)
         cs["precallSmsSentAt"] = _now_iso()
         _slog.info(
             "precall_sms_fired",
@@ -477,6 +537,9 @@ def _attempt_precall_sms_send(
         )
     except Exception as exc:
         # Non-fatal: never let a failed pre-call text stop the dial.
+        _abort_precall_sms(cs, "sms_initialization_failed")
+        cs["precallSmsState"] = "failed"
+        cs.pop("precallSmsPendingAt", None)
         _slog.error(
             "precall_sms_failed",
             plan_id=run["planId"],
@@ -487,6 +550,100 @@ def _attempt_precall_sms_send(
         )
 
 
+def _sms_initialization_timed_out(started_at: str | None) -> bool:
+    return bool(started_at) and (
+        _now_utc() - datetime.fromisoformat(started_at)
+    ).total_seconds() >= _SMS_INITIALIZATION_TIMEOUT_SECONDS
+
+
+def _abort_precall_sms(cs: dict, reason: str, *, run: dict | None = None) -> None:
+    """Cancel only this voice lifecycle's SMS row; never changes the voice status."""
+    if not cs.get("precallSmsCampaignId") and run:
+        # A stop can read the midflight image before the first sender call has
+        # saved its identity fields. Derive the same key and write an ABORTED
+        # tombstone: an overlapping sender must observe cancellation even if
+        # it has not initialized its own runs row yet.
+        buckets = (run.get("planSnapshot") or {}).get("buckets") or []
+        for bi, bs in enumerate(run.get("bucketStates") or []):
+            for ci, candidate in enumerate(bs.get("campaignStates") or []):
+                if candidate.get("campaignId") != cs.get("campaignId") or bi >= len(buckets):
+                    continue
+                campaigns = buckets[bi].get("campaigns") or []
+                precall = ((campaigns[ci].get("campaignConfig") or {}).get("precallSms") or {}) if ci < len(campaigns) else {}
+                if precall.get("enabled"):
+                    sms_id = _precall_sms_campaign_id(run, bi, ci, campaign_state=cs)
+                    cs.update(precallSmsCampaignId=sms_id, _precallSmsRunsPlanId=run["planId"],
+                              _precallSmsRunsSk=f"{run['runId']}#{sms_id}")
+                break
+    if not cs.get("precallSmsCampaignId"):
+        return
+    _stop_sms_campaign({
+        "smsCampaignId": cs["precallSmsCampaignId"],
+        "_smsRunsPlanId": cs.get("_precallSmsRunsPlanId"),
+        "_smsRunsSk": cs.get("_precallSmsRunsSk"),
+        "exitReason": reason,
+    })
+    cs["precallSmsState"] = "aborted"
+    cs.pop("precallSmsPendingAt", None)
+
+
+def _merge_sms_initialization_state(current: dict, snapshot: dict) -> dict:
+    """Merge one lifecycle's preparation without reviving a settled attempt."""
+    merged = {key: current[key] for key in _SMS_INITIALIZATION_FIELDS if key in current}
+    for key in _SMS_INITIALIZATION_FIELDS:
+        if key not in merged and key in snapshot:
+            merged[key] = snapshot[key]
+    for state_key, pending_key in (
+        ("precallSmsState", "precallSmsPendingAt"),
+        ("smsInitializationState", "smsInitializationPendingAt"),
+    ):
+        if current.get(state_key) not in _SMS_INITIALIZATION_TERMINAL and snapshot.get(state_key) in _SMS_INITIALIZATION_TERMINAL:
+            merged[state_key] = snapshot[state_key]
+        if merged.get(state_key) in _SMS_INITIALIZATION_TERMINAL:
+            merged[pending_key] = None
+    for flag in ("brandedPrecallPreparing", "precallStartDeferred"):
+        if current.get(flag) is False or snapshot.get(flag) is False:
+            merged[flag] = False
+    return merged
+
+
+def _continue_bulk_sms_initialization(run: dict, plan: dict, bi: int, ci: int) -> None:
+    cs = run["bucketStates"][bi]["campaignStates"][ci]
+    cfg = plan["buckets"][bi]["campaigns"][ci].get("campaignConfig") or {}
+    try:
+        if _sms_initialization_timed_out(cs.get("smsInitializationPendingAt")):
+            _slog.error("sms_initialization_timeout", plan_id=run["planId"],
+                       run_id=run["runId"], sms_campaign_id=cs["smsCampaignId"])
+            raise TimeoutError("SMS segment initialization exceeded five minutes")
+        result = _invoke_sms_sender(
+            campaignId=cs["smsCampaignId"], planId=run["planId"], runId=run["runId"],
+            planName=plan.get("name", ""), segmentArn=cs["segmentArn"],
+            segmentName=cs["segmentName"], messageTemplate=cfg.get("smsMessageTemplate", ""),
+            originationNumberArn=cfg.get("smsOriginationNumberArn", ""),
+            originationNumber=cfg.get("smsOriginationNumber", ""), clinicName=cfg.get("clinicName", ""),
+        )
+        if isinstance(result, dict) and result.get("pending") is True:
+            cs["smsInitializationState"] = "pending"
+            cs.setdefault("smsInitializationPendingAt", _now_iso())
+        elif isinstance(result, dict) and result.get("terminal") is True:
+            cs["smsInitializationState"] = "aborted"
+            cs["status"] = "cancelled"
+            cs["exitReason"] = result.get("exitReason") or REASON_ABORTED
+            cs["completedAt"] = _now_iso()
+            cs.pop("smsInitializationPendingAt", None)
+        else:
+            cs["smsInitializationState"] = "complete"
+            cs.pop("smsInitializationPendingAt", None)
+    except Exception as exc:
+        cs["smsInitializationState"] = "failed"
+        cs.pop("smsInitializationPendingAt", None)
+        cs["status"] = "error"
+        cs["exitReason"] = "sms_initialization_timeout" if isinstance(exc, TimeoutError) else REASON_ERROR
+        cs["errorDetail"] = type(exc).__name__
+        cs["completedAt"] = _now_iso()
+        _stop_sms_campaign(cs)
+
+
 def _fire_precall_sms_for_campaign(
     run: dict, plan: dict, bucket_index: int, campaign_index: int
 ) -> None:
@@ -495,12 +652,11 @@ def _fire_precall_sms_for_campaign(
     This is the per-campaign unit the dial-gating state machine hinges on: a
     Connect campaign with precallSms.enabled is paused immediately after
     StartCampaign succeeds (see _create_campaign_only / _create_and_start_campaign)
-    so it structurally cannot dial while paused, regardless of its armed
-    startTime. This function is what resumes it — unconditionally, once called,
-    decoupled from whether the SMS send above succeeded, because a text failure
-    must degrade to "no text", never to "no call" (a stuck-paused campaign would
-    be exactly that). The resume is wrapped so it always runs even if the send
-    raises unexpectedly.
+    so it cannot dial while paused, regardless of its armed startTime. A pending
+    segment snapshot retains that gate for at most five minutes. Completion,
+    definitive failure, or that deadline releases it; explicit cancellation
+    never does. Text failure still degrades to "no text", never to "no call".
+    The finally block releases the gate even if the helper raises unexpectedly.
 
     Unlike the bucket-level _fire_precall_sms, this function has no
     "status == warming" predicate of its own. Every call site (Phase-2 fresh
@@ -535,8 +691,8 @@ def _fire_precall_sms_for_campaign(
             sms_campaign_id=sms_campaign_id,
         )
     finally:
-        # ALWAYS attempt resume if this campaign was actually paused by us for
-        # the precall gate — decoupled from whether the send above succeeded
+        # Once initialization resolves, attempt resume if we paused this campaign
+        # for the precall gate — decoupled from whether the send above succeeded
         # or raised, and retryable on a subsequent call if resume itself
         # failed last time (tracked via precallGateResumedAt, separate from
         # precallSmsSentAt, so a resume failure is never masked by the
@@ -552,7 +708,10 @@ def _fire_precall_sms_for_campaign(
         # guaranteed to fail — polluting the precall_gate_resume_failed alarm
         # signal with noise that isn't the real stranded-pause risk that
         # signal exists to catch.
-        if cs.get("precallGatePausedAt") and not cs.get("precallGateResumedAt"):
+        if (
+            cs.get("precallGatePausedAt") and not cs.get("precallGateResumedAt")
+            and cs.get("precallSmsState") not in {"pending", "aborted"}
+        ):
             try:
                 from vip_shared.infrastructure.persistence.outbound_campaigns_client import (
                     build as build_oc,
@@ -573,6 +732,10 @@ def _fire_precall_sms_for_campaign(
                     connect_campaign_id=connect_campaign_id,
                     error_type=type(exc).__name__,
                 )
+    if cs.get("precallSmsState") == "aborted":
+        if connect_campaign_id:
+            _safe_stop_campaign(connect_campaign_id)
+        cs.update(status="cancelled", exitReason=REASON_ABORTED, completedAt=_now_iso())
 
 
 def _fire_precall_sms(run: dict, plan: dict, bucket_index: int) -> None:
@@ -1208,6 +1371,66 @@ def scheduled_run(plan_id: str) -> dict:
     return {"ok": True, "runId": run["runId"]}
 
 
+def _continue_pending_campaign(run: dict, plan: dict, bi: int, ci: int) -> bool:
+    """Advance initial SMS preparation before voice self-heal or queue-drained polling."""
+    bs = run["bucketStates"][bi]
+    cs = bs["campaignStates"][ci]
+    if cs["status"] not in {"running", "warming", "creating"} or not (
+        cs.get("precallSmsState") == "pending" or cs.get("brandedPrecallPreparing")
+        or cs.get("smsInitializationState") == "pending"
+    ):
+        return False
+    bucket = plan["buckets"][bi]
+    campaign = bucket["campaigns"][ci]
+    now = _now_utc()
+    duration = int(campaign.get("run_duration_minutes") or campaign.get("duration_minutes") or 0)
+    started = cs.get("startedAt") or bs.get("startedAt")
+    expired = bool(duration and started and (
+        now - datetime.fromisoformat(started)
+    ).total_seconds() >= duration * 60)
+    if (bucket.get("run_mode") or bucket.get("type")) in {"time_based", "time-based"}:
+        bucket_duration = int(bucket.get("duration_minutes") or bucket.get("durationMinutes") or 30)
+        bucket_started = bs.get("startedAt") or run.get("startedAt")
+        expired = expired or bool(bucket_started and (
+            now - datetime.fromisoformat(bucket_started)
+        ).total_seconds() >= bucket_duration * 60)
+    if expired:
+        _abort_precall_sms(cs, "initialization_campaign_expired", run=run)
+        if cs.get("connectCampaignId"):
+            _safe_stop_campaign(cs["connectCampaignId"])
+        if cs.get("brandedCampaignId"):
+            _stop_branded_campaign(cs)
+        if cs.get("smsCampaignId"):
+            _stop_sms_campaign(cs)
+        cs.update(status="expired", exitReason=REASON_EXPIRED, completedAt=_now_iso())
+        return True
+    if cs.get("brandedPrecallPreparing"):
+        _start_one_campaign(run, plan, bi, ci)
+    elif cs.get("smsInitializationState") == "pending":
+        _continue_bulk_sms_initialization(run, plan, bi, ci)
+    elif cs.get("connectCampaignId"):
+        needs_start = cs.get("precallStartDeferred") or (
+            cs["status"] == "warming" and not cs.get("warmupStarted")
+        )
+        # Poll terminal state first, but the pending guard in the poller suppresses
+        # its pause self-heal until the SMS attempt has actually resolved.
+        _poll_campaign_state(cs, plan_id=run["planId"], run_id=run["runId"])
+        if cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
+            _abort_precall_sms(cs, cs.get("exitReason") or "campaign_terminal", run=run)
+            return True
+        _fire_precall_sms_for_campaign(run, plan, bi, ci)
+        if cs.get("precallSmsState") == "aborted":
+            return True  # the fire helper already stopped this cancelled campaign
+        elif cs.get("precallSmsState") != "pending":
+            if needs_start:
+                cs["precallStartDeferred"] = False
+                _start_one_campaign(run, plan, bi, ci)
+            else:
+                cs["status"] = "running"
+                cs.pop("warmupStarted", None)
+    return True
+
+
 def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     run = get_run(plan_id, run_id)
     if not run:
@@ -1295,8 +1518,12 @@ def tick(plan_id: str, run_id: str, bucket_index: int) -> dict:
     }
 
     for ci, cs in enumerate(bucket_state["campaignStates"]):
+        if _continue_pending_campaign(run, plan, bucket_index, ci):
+            continue
         if cs["status"] == "running" and cs.get("connectCampaignId"):
             _poll_campaign_state(cs, plan_id=plan_id, run_id=run_id)
+            if cs["status"] in _CAMPAIGN_TERMINAL_STATUSES:
+                _abort_precall_sms(cs, cs.get("exitReason") or "campaign_terminal", run=run)
             if cs["status"] == "running":
                 _campaign_def = next(
                     (
@@ -1662,6 +1889,7 @@ def abort_run(plan_id: str, run_id: str) -> dict:
                     _stop_sms_campaign(cs)
                 # ────────────────────
                 if cs["status"] in ("running", "warming", "queued", "creating"):
+                    _abort_precall_sms(cs, REASON_ABORTED, run=run)
                     cs["status"] = "cancelled"
                     cs["exitReason"] = REASON_ABORTED
                     cs["completedAt"] = now
@@ -1715,6 +1943,7 @@ def _force_finish_internal(run: dict, plan: dict) -> None:
                 _stop_sms_campaign(cs)
             # ────────────────────
             if cs["status"] in ("running", "warming", "queued", "creating"):
+                _abort_precall_sms(cs, "force_finished", run=run)
                 cs["status"] = "completed"
                 cs["exitReason"] = "force_finished"
                 cs["completedAt"] = now
@@ -1953,6 +2182,7 @@ def force_start_campaign(
     old_connect_id = cs.get("connectCampaignId")
     old_branded_id = cs.get("brandedCampaignId")
     old_queue_arn = cs.get("queueArn")
+    old_precall_state = dict(cs)
     cs["status"] = "creating"
     cs["creatingAt"] = _now_iso()
     cs["exitReason"] = None
@@ -1979,6 +2209,15 @@ def force_start_campaign(
     cs["precallSmsSentAt"] = None
     cs["precallGatePausedAt"] = None
     cs["precallGateResumedAt"] = None
+    for field in _SMS_INITIALIZATION_FIELDS:
+        cs.pop(field, None)
+    campaign = plan["buckets"][bucket_index]["campaigns"][campaign_index]
+    precall = (campaign.get("campaignConfig") or {}).get("precallSms") or {}
+    if precall.get("enabled"):
+        # The sender initializes a runs row with attribute_not_exists(sk).
+        # A new voice lifecycle therefore needs a new SMS ID, persisted in
+        # this claim BEFORE external calls and reused by every later retry.
+        cs["precallSmsGeneration"] = int(cs.get("precallSmsGeneration") or 0) + 1
     try:
         save_run(run)
     except ConcurrentWriteError:
@@ -1996,6 +2235,7 @@ def force_start_campaign(
         raise
 
     # Phase 2: clean up stale Connect campaign AFTER claim is persisted.
+    _abort_precall_sms(old_precall_state, "restarted", run=run)
     if old_connect_id:
         _safe_stop_campaign(old_connect_id)
         _safe_delete_campaign(old_connect_id)
@@ -2024,6 +2264,14 @@ def force_start_campaign(
             "queueArn",
         )
     }
+    _precall_markers = (
+        "precallSmsSentAt", "precallGatePausedAt", "precallGateResumedAt"
+    )
+    _snap.update({
+        key: cs[key]
+        for key in (*_precall_markers, "precallSmsGeneration", *_SMS_INITIALIZATION_FIELDS)
+        if key in cs
+    })
 
     _FINAL_SAVE_RETRIES = 3
     for _attempt in range(_FINAL_SAVE_RETRIES):
@@ -2044,12 +2292,54 @@ def force_start_campaign(
                 )
             bs = run["bucketStates"][bucket_index]
             cs = bs["campaignStates"][campaign_index]
-            if (
-                cs["status"] == "running"
-                and cs.get("connectCampaignId") == _snap["connectCampaignId"]
+            if int(cs.get("precallSmsGeneration") or 0) > int(
+                _snap.get("precallSmsGeneration") or 0
             ):
-                return run  # concurrent tick already adopted this Connect campaign
+                return run  # a later explicit restart superseded this lifecycle
+            same_campaign = (
+                cs.get("connectCampaignId") == _snap["connectCampaignId"]
+                and cs.get("brandedCampaignId") == _snap["brandedCampaignId"]
+                and int(cs.get("precallSmsGeneration") or 0) == int(
+                    _snap.get("precallSmsGeneration") or 0
+                )
+            )
+            initialization = _merge_sms_initialization_state(cs, _snap) if same_campaign else {
+                key: _snap[key] for key in _SMS_INITIALIZATION_FIELDS if key in _snap
+            }
+            if (
+                same_campaign
+                and (
+                    cs["status"] == "running"
+                    or (
+                        _snap.get("precallSmsGeneration")
+                        and (
+                            cs["status"] in _CAMPAIGN_TERMINAL_STATUSES
+                            or run["status"] != "running"
+                        )
+                    )
+                )
+            ):
+                # A tick may have adopted the midflight image, which predates
+                # our successful SMS/resume. Preserve its status and newer
+                # fields, but persist any missing evidence from this lifecycle.
+                missing_markers = {
+                    key: _snap[key]
+                    for key in _precall_markers
+                    if _snap.get(key) and not cs.get(key)
+                }
+                missing_markers.update({key: value for key, value in initialization.items()
+                                        if cs.get(key) != value})
+                if not missing_markers:
+                    return run
+                cs.update(missing_markers)
+                continue
+            concurrent_markers = {
+                key: cs[key] for key in _precall_markers
+                if same_campaign and cs.get(key)
+            }
             cs.update(_snap)
+            cs.update(concurrent_markers)
+            cs.update(initialization)
             if _snap["status"] != "creating":
                 cs.pop("creatingAt", None)
 
@@ -2132,6 +2422,7 @@ def skip_campaign(
         elif cs.get("smsCampaignId") and cs["status"] == "running":
             _stop_sms_campaign(cs)
 
+        _abort_precall_sms(cs, "skipped", run=run)
         cs["status"] = "cancelled"
         cs["exitReason"] = "skipped"
         cs["completedAt"] = _now_iso()
@@ -2200,6 +2491,7 @@ def force_stop_campaign(
             cs["exitReason"] = "manually_stopped"
             cs["completedAt"] = _now_iso()
             _stop_sms_campaign(cs)
+        _abort_precall_sms(cs, "manually_stopped", run=run)
         cs["status"] = "expired"
         cs["exitReason"] = "manually_stopped"
         cs["completedAt"] = _now_iso()
@@ -2346,6 +2638,9 @@ def _activate_warming_bucket(run: dict, plan: dict, bucket_index: int) -> None:
     bucket = plan["buckets"][bucket_index]
     for ci, cs in enumerate(bucket_state["campaignStates"]):
         if cs["status"] == "warming" and cs.get("connectCampaignId"):
+            if cs.get("precallSmsState") == "pending" and not cs.get("warmupStarted"):
+                cs["precallStartDeferred"] = True
+                continue
             seg_name = cs.get("segmentName", "?")
             if cs.get("warmupStarted"):
                 # StartCampaign was already called during warmup — campaign is Running in Connect,
@@ -2660,6 +2955,10 @@ def _expire_bucket(
     bucket_state = run["bucketStates"][bucket_index]
 
     for cs in bucket_state["campaignStates"]:
+        if cs["status"] in {"running", "queued", "warming", "creating"}:
+            _abort_precall_sms(cs, REASON_BUCKET_EXPIRED, run=run)
+            if cs.get("smsCampaignId") and cs.get("smsInitializationState") == "pending":
+                _stop_sms_campaign(cs)
         if cs["status"] == "running":
             if cs.get("connectCampaignId"):
                 _safe_stop_campaign(cs["connectCampaignId"])
@@ -3871,7 +4170,8 @@ def _start_one_campaign(
     now = _now_utc()
     now_iso = now.isoformat()
 
-    cs["startedAt"] = now_iso
+    if not cs.get("brandedPrecallPreparing"):
+        cs["startedAt"] = now_iso
 
     # ── Branded path — bypass Connect V2 entirely ─────────────────────────────
     if _is_branded(campaign):
@@ -3901,6 +4201,49 @@ def _start_one_campaign(
             cs["errorDetail"] = "missing_env_vars"
             cs["completedAt"] = now_iso
             return
+
+        precall = cfg.get("precallSms") or {}
+        if precall.get("enabled"):
+            # Freeze the segment before any SMS call. The run's optimistic claim
+            # makes competing preparations select one shared SMS/voice cohort.
+            # Registration is deliberately deferred until SMS resolves: its
+            # existing conditional put remains the sole gate to the non-idempotent
+            # seeder, so pending snapshots cannot create duplicate seed invocations.
+            try:
+                if not cs.get("precallSmsSegmentArn"):
+                    pinned_arn = campaign.get("pinnedSegmentArn")
+                    if pinned_arn:
+                        seg_name, seg_arn = pinned_arn.rsplit("/", 1)[-1], pinned_arn
+                        expected = actual = None
+                    else:
+                        seg_name, seg_arn, expected, actual = _create_segment(bucket, campaign)
+                    cs.update(segmentArn=seg_arn, segmentName=seg_name,
+                              precallSmsSegmentArn=seg_arn, precallSmsSegmentName=seg_name,
+                              brandedPrecallPreparing=True, status="creating")
+                    if expected is not None:
+                        cs["reconcile"] = {"expected": expected, "actual": actual,
+                                           "retries": cs.get("reconcileRetries", 0)}
+                    save_run(run)
+                _attempt_precall_sms_send(
+                    run=run, cs=cs, precall=precall,
+                    segment_arn=cs["precallSmsSegmentArn"], segment_name=cs["precallSmsSegmentName"],
+                    bucket_index=bucket_index, campaign_index=campaign_index,
+                    sms_campaign_id=_precall_sms_campaign_id(run, bucket_index, campaign_index),
+                )
+                if cs.get("precallSmsState") == "pending":
+                    cs["status"] = "running"
+                    return
+                if cs.get("precallSmsState") == "aborted":
+                    cs.update(status="cancelled", exitReason=REASON_ABORTED, completedAt=_now_iso(),
+                              brandedPrecallPreparing=False)
+                    return
+                save_run(run)  # abort/restart races must win before registration
+            except ConcurrentWriteError:
+                raise
+            except Exception as exc:
+                cs.update(status="error", exitReason=REASON_ERROR,
+                          errorDetail=type(exc).__name__, completedAt=_now_iso())
+                return
 
         # ── Step 1: Claim the slot via atomic put_item — distributed lock ────────
         # This MUST happen before _invoke_seeder. A ConditionalCheckFailedException
@@ -3936,6 +4279,8 @@ def _start_one_campaign(
                     bucket_index, campaign_index, campaign_id,
                 )
                 cs["status"] = "running"
+                if precall.get("enabled"):
+                    cs["brandedPrecallPreparing"] = False
                 return
             logger.error(
                 "_start_one_campaign[%d/%d]: branded DDB lock failed: %s",
@@ -3965,33 +4310,16 @@ def _start_one_campaign(
         try:
             pinned_arn = campaign.get("pinnedSegmentArn")
             expected = actual = None
-            if pinned_arn:
+            if precall.get("enabled"):
+                seg_name, seg_arn = cs["precallSmsSegmentName"], cs["precallSmsSegmentArn"]
+                reconcile = cs.get("reconcile") or {}
+                expected, actual = reconcile.get("expected"), reconcile.get("actual")
+                cs["brandedPrecallPreparing"] = False
+            elif pinned_arn:
                 seg_name = pinned_arn.rsplit("/", 1)[-1]
                 seg_arn = pinned_arn
             else:
                 seg_name, seg_arn, expected, actual = _create_segment(bucket, campaign)
-
-            # Pre-call SMS, before the dial trigger. Branded bypasses Connect V2's
-            # StartCampaign entirely — its actual "start dialing" trigger is
-            # _invoke_seeder just below, which is OUR OWN code, not an externally-
-            # armed AWS timer. No pause/resume gate is needed (or possible: this cs
-            # has no connectCampaignId): pure sequencing is sufficient here (finding
-            # #2, 2026-09 adversarial review — branded validated as precall-SMS-
-            # eligible but could structurally never fire it before this fix).
-            precall = (campaign.get("campaignConfig") or {}).get("precallSms") or {}
-            if precall.get("enabled"):
-                _attempt_precall_sms_send(
-                    run=run,
-                    cs=cs,
-                    precall=precall,
-                    segment_arn=pinned_arn or seg_arn,
-                    segment_name=seg_name,
-                    bucket_index=bucket_index,
-                    campaign_index=campaign_index,
-                    sms_campaign_id=_precall_sms_campaign_id(
-                        run, bucket_index, campaign_index
-                    ),
-                )
 
             seeded = _invoke_seeder(
                 campaign_id=campaign_id,
@@ -4077,18 +4405,12 @@ def _start_one_campaign(
                     "actual": actual,
                     "retries": cs.get("reconcileRetries", 0),
                 }
-            _invoke_sms_sender(
-                campaignId=sms_campaign_id,
-                planId=run["planId"],
-                runId=run["runId"],
-                planName=plan.get("name", ""),
-                segmentArn=seg_arn,
-                segmentName=seg_name,
-                messageTemplate=cfg.get("smsMessageTemplate", ""),
-                originationNumberArn=cfg.get("smsOriginationNumberArn", ""),
-                originationNumber=cfg.get("smsOriginationNumber", ""),
-                clinicName=cfg.get("clinicName", ""),
-            )
+            cs["smsInitializationState"] = "pending"
+            cs.setdefault("smsInitializationPendingAt", now_iso)
+            save_run(run)  # freeze segment/ID before an asynchronous initialization
+            _continue_bulk_sms_initialization(run, plan, bucket_index, campaign_index)
+        except ConcurrentWriteError:
+            raise
         except Exception as exc:
             logger.error(
                 "_start_one_campaign[%d/%d]: SMS sender failed: %s",
@@ -4705,6 +5027,7 @@ def _poll_campaign_state(
         state == "Paused"
         and cs.get("precallGatePausedAt")
         and not cs.get("precallGateResumedAt")
+        and cs.get("precallSmsState") not in {"pending", "aborted"}
     ):
         try:
             from vip_shared.infrastructure.persistence.outbound_campaigns_client import (

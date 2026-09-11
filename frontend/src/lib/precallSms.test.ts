@@ -252,3 +252,28 @@ describe('validateBulkSms — bulk-SMS panel parity with pre-call SMS', () => {
     ).toEqual([]);
   });
 });
+
+describe.each(['precall', 'bulk'] as const)('%s placeholder syntax', (channel) => {
+  const validate = (template: string, clinicName = 'VIP') => channel === 'precall'
+    ? validatePrecallSms({ enabled: true, messageTemplate: template, clinicName, originationNumberArn: 'arn:x' })
+    : validateBulkSms({ smsMessageTemplate: template, clinicName });
+
+  it.each([
+    '{{First Name}}', '{{First-Name}}', '{{}}', '{{   }}',
+    '{{FirstName', 'FirstName}}', '{{FirstName}', '{FirstName}}',
+    '{{{FirstName}}}', '{{FirstName}}}', '{{{FirstName}}',
+    '{{outer {{FirstName}} }}', '{{FirstName}}{{}}', '{{Unknown}}',
+  ])('rejects unresolved expression %s', (template) => {
+    expect(validate(template).some((e) => e.includes('placeholder'))).toBe(true);
+  });
+
+  it.each(['{{FirstName}}', '{{Unknown}}', '{{First Name}}', '{{', '}}'])(
+    'rejects unresolved expression inserted by clinic %s', (clinic) => {
+      expect(validate('Hi {{ClinicName}}', clinic).some((e) => e.includes('placeholder'))).toBe(true);
+    },
+  );
+
+  it('preserves supported whitespace, adjacent tokens and literal single braces', () => {
+    expect(validate('{ Hi {{ FirstName }}{{ ClinicName }} }')).toEqual([]);
+  });
+});

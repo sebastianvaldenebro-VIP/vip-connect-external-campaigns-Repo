@@ -28,14 +28,34 @@ export function extractPlaceholders(template: string): Set<string> {
   );
 }
 
+function hasMalformedPlaceholders(template: string): boolean {
+  for (const match of template.matchAll(PLACEHOLDER_RE)) {
+    const start = match.index!;
+    if (template[start - 1] === '{' || template[start + match[0].length] === '}')
+      return true;
+  }
+  return /\{\{|\}\}/.test(template.replace(PLACEHOLDER_RE, ''));
+}
+
+function renderWorstCase(template: string, clinicName: string): string {
+  return (template ?? '').replace(PLACEHOLDER_RE, (token, field: string) => {
+    if (field === 'FirstName') return 'A'.repeat(NAME_BUDGET);
+    if (field === 'ClinicName') return (clinicName ?? '').trim();
+    return token;
+  });
+}
+
+function hasUnresolvedPlaceholders(template: string, clinicName: string): boolean {
+  return hasMalformedPlaceholders(template)
+    || /\{\{|\}\}/.test(renderWorstCase(template, clinicName));
+}
+
 /** Worst-case rendered length: the longest name the server would ever render. */
 export function renderedWorstCaseLength(
   template: string,
   clinicName: string,
 ): number {
-  return (template ?? '')
-    .replace(/\{\{\s*FirstName\s*\}\}/g, 'A'.repeat(NAME_BUDGET))
-    .replace(/\{\{\s*ClinicName\s*\}\}/g, clinicName ?? '').length;
+  return renderWorstCase(template, clinicName).length;
 }
 
 /**
@@ -98,6 +118,8 @@ export function validatePrecallSms(
       `Pre-call SMS: placeholder(s) not allowed: ${unknown.sort().join(', ')}. ` +
         `Only {{FirstName}} and {{ClinicName}} may be used.`,
     );
+  else if (hasUnresolvedPlaceholders(template, clinicName))
+    errors.push('Pre-call SMS: malformed or unresolved placeholder syntax. Use only {{FirstName}} and {{ClinicName}}.');
 
   const rendered = renderedWorstCaseLength(template, clinicName);
   if (rendered > MAX_SMS_CHARS)
@@ -144,6 +166,8 @@ export function validateBulkSms(
       `SMS: placeholder(s) not allowed: ${unknown.sort().join(', ')}. ` +
         `Only {{FirstName}} and {{ClinicName}} may be used.`,
     );
+  else if (hasUnresolvedPlaceholders(template, clinicName))
+    errors.push('SMS: malformed or unresolved placeholder syntax. Use only {{FirstName}} and {{ClinicName}}.');
 
   const rendered = renderedWorstCaseLength(template, clinicName);
   if (rendered > MAX_SMS_CHARS)

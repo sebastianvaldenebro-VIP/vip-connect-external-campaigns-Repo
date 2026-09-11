@@ -25,6 +25,10 @@ export interface ApiSmsStackProps extends cdk.StackProps {
   readonly dataKeyArn: string;
   /** Customer Profiles domain name */
   readonly profilesDomainName: string;
+  /** Existing encrypted Customer Profiles snapshot infrastructure. */
+  readonly snapshotBucketName: string;
+  readonly snapshotRoleArn: string;
+  readonly snapshotKeyArn: string;
   /** EUM SMS Config Set name (created via CLI) */
   readonly smsConfigSetName: string;
   /** EUM SMS Opt-Out List name (created via CLI) */
@@ -111,6 +115,11 @@ export class ApiSmsStack extends cdk.Stack {
     // only this stack's layer copy carries the extra ~48 MB.
     const sharedLayer = buildSharedLayer(this, 'SharedLayer', 'requirements-sms.txt');
     const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
+    const snapshotEnvironment = {
+      SMS_SNAPSHOT_BUCKET: props.snapshotBucketName,
+      SMS_SNAPSHOT_ROLE_ARN: props.snapshotRoleArn,
+      SMS_SNAPSHOT_KEY_ARN: props.snapshotKeyArn,
+    };
 
     // Both sender and processor roles below are imported with mutable:false —
     // every grant CDK would normally add for environmentEncryption /
@@ -158,10 +167,10 @@ export class ApiSmsStack extends cdk.Stack {
       environmentEncryption: dataKey,
       deadLetterQueue: dlq,
       // CloudWatch, 2026-09-09 (90d window): only 1 invocation total, max observed
-      // ConcurrentExecutions = 1, 0 throttles — invoked once per SMS campaign run,
-      // not per message (fans out via SQS to SmsProcessorFunction, which already
-      // caps at 10). 5 is a generous margin given the near-zero real traffic and
-      // the fact this function only enqueues, never calls a rate-limited API itself.
+      // ConcurrentExecutions = 1, 0 throttles. Initialization now also polls
+      // pending snapshots and reads Customer Profiles; those APIs can throttle.
+      // Keep the existing cap of 5. Delivery fans out through SQS to the
+      // processor, whose concurrency cap is 10.
       reservedConcurrentExecutions: 5,
       environment: {
         SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
@@ -169,6 +178,7 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_SQS_QUEUE_URL: this.smsSendQueue.queueUrl,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
         OPT_OUT_TABLE: 'VipConnectOptOutList',
+        ...snapshotEnvironment,
         // Per-recipient TCPA window: full statutory hours (08:00-21:00 local),
         // stricter than statute on days (Mon-Sat, no Sunday — a VIP business
         // choice). Env vars so counsel can narrow either axis without a deploy
@@ -197,12 +207,11 @@ export class ApiSmsStack extends cdk.Stack {
     // the existing, already-working lambda_handler — reusing the SAME code
     // asset (`sms_sender_handler.retry_quiet_hours_skipped`, no new
     // deployment package), the SAME layer, and the SAME senderRole (imported
-    // above, mutable:false): its exact permission set (VipSmsCampaignQueue +
-    // VipSmsCampaignRuns read/write, SQS SendMessage, KMS decrypt, Customer
-    // Profiles read) is already exactly what this function needs too, since
-    // it calls the same _get_segment_recipients / _process_recipients /
-    // VipSmsCampaignQueue-query code paths as the sender. Zero new IAM
-    // policy work as a result.
+    // above, mutable:false). Both entry points use the same recipient loader
+    // and queue processing code. The imported role needs the permissions in
+    // infra/config/precall-sms-sender-policy.json before deployment. In
+    // particular, retries require Query/DeleteItem and their own log group;
+    // membership resolution also needs profile reads and snapshot access.
     //
     // imported — same cfn-exec-role limitation as senderLogGroup above.
     // Pre-create before deploying this stack:
@@ -235,9 +244,8 @@ export class ApiSmsStack extends cdk.Stack {
       environmentEncryption: dataKey,
       deadLetterQueue: dlq,
       // Invoked once per precall-SMS-enabled, still-"running" campaign, per
-      // tick — same near-zero-traffic profile as SmsSenderFunction, and the
-      // vast majority of invocations are the cheap no-op path (nothing left
-      // to retry). No rate-limited API called directly.
+      // tick. Active runs re-check unresolved recipients and the delivery
+      // ledger; a zero quiet-hours count alone cannot prove completion.
       reservedConcurrentExecutions: 5,
       environment: {
         SMS_CAMPAIGN_QUEUE_TABLE: this.smsCampaignQueueTable.tableName,
@@ -245,6 +253,7 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_SQS_QUEUE_URL: this.smsSendQueue.queueUrl,
         PROFILES_DOMAIN_NAME: props.profilesDomainName,
         OPT_OUT_TABLE: 'VipConnectOptOutList',
+        ...snapshotEnvironment,
         // Must match SmsSenderFunction's values exactly — this is a second
         // entry point into the same quiet-hours logic, not a second policy.
         QUIET_HOURS_START: '08:00',

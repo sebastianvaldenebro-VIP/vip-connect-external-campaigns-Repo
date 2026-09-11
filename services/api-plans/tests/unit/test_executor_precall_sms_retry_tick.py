@@ -20,6 +20,8 @@ import sys
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
 sys.modules.setdefault("vip_shared", MagicMock())
@@ -140,9 +142,13 @@ def _enter_base_patches(stack: ExitStack) -> None:
 
 
 class TestPrecallSmsQuietHoursRetryTriggered:
-    def test_triggers_for_running_precall_enabled_campaign_with_sms_already_sent(self):
+    @pytest.mark.parametrize("generation", [0, 2])
+    def test_triggers_for_running_precall_enabled_campaign_with_sms_already_sent(self, generation):
         campaign = _precall_campaign_def()
-        cs = _campaign_state("c0", precallSmsSentAt="2026-09-09T00:00:00+00:00")
+        cs = _campaign_state(
+            "c0", precallSmsSentAt="2026-09-09T00:00:00+00:00",
+            precallSmsGeneration=generation,
+        )
         bucket = _bucket_def("b0", [campaign])
         bucket_state = _bucket_state("b0", [cs])
         plan = _plan([bucket])

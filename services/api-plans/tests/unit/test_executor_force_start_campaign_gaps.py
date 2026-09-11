@@ -420,3 +420,4 @@ class TestForceStartClearsStalePrecallMarkers:
         assert cs["precallSmsSentAt"] is None
         assert cs["precallGatePausedAt"] is None
         assert cs["precallGateResumedAt"] is None
+        assert "precallSmsGeneration" not in cs

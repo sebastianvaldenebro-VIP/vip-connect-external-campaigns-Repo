@@ -109,7 +109,7 @@ class TestSmsSenderFailure:
         cs = _campaign_state("c0", status="queued")
         run, plan = _run_plan(campaign, cs)
 
-        with patch("executor._invoke_sms_sender", side_effect=RuntimeError("SQS down")):
+        with patch("executor._invoke_sms_sender", side_effect=RuntimeError("SQS down")), patch("executor.save_run"), patch("executor._stop_sms_campaign"):
             executor._start_one_campaign(run, plan, 0, 0)
 
         assert cs["status"] == "error"
@@ -367,6 +367,7 @@ class TestBrandedPrecallSmsFiresBeforeSeeder:
     @pytest.fixture(autouse=True)
     def _branded_env(self):
         with (
+            patch("executor.save_run"),
             patch("executor._ACTIVE_BRANDED_CAMPAIGNS_TABLE", "VipActiveBrandedCampaigns"),
             patch("executor._CAMPAIGN_QUEUE_TABLE_BRANDED", "VipProgressiveCampaignQueue"),
         ):

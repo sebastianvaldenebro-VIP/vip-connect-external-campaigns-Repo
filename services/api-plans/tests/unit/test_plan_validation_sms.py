@@ -6,6 +6,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../src"))
 
 _stub_modules = {
@@ -668,3 +670,61 @@ def test_valid_precall_campaign_has_no_errors_on_journey_delivery_type():
     logic) — a journey campaign with a valid precallSms block must be
     ACCEPTED, not rejected as having "no dial for it to precede"."""
     assert validate_plan(_plan_with_precall(delivery_type="journey")) == []
+
+
+def _content_plan(template: str, clinic: str, channel: str) -> dict:
+    if channel == "precall":
+        return _plan_with_precall(precall={
+            "enabled": True, "messageTemplate": template,
+            "clinicName": clinic, "originationNumberArn": "arn:x",
+        })
+    return {"buckets": [{"name": "B", "campaigns": [_campaign(template, clinic_name=clinic)]}]}
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+@pytest.mark.parametrize("template,clinic", [
+    ("Your identifier is 123-{{ClinicName}}-6789.", "45"),
+    ("Contact jane@{{ClinicName}}.", "example.com"),
+    ("Your visit {{ClinicName}}/2000", "01/15"),
+    ("Visit {{ClinicName}}s://example.com", "http"),
+    ("Account 123{{ClinicName}}", "4567"),
+])
+def test_rejects_phi_assembled_across_clinic_placeholder_boundary(channel, template, clinic):
+    errors = validate_plan(_content_plan(template, clinic, channel))
+    assert any("PHI" in error for error in errors)
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+@pytest.mark.parametrize("template", [
+    "{{First Name}}", "{{First-Name}}", "{{}}", "{{   }}",
+    "{{FirstName", "FirstName}}", "{{FirstName}", "{FirstName}}",
+    "{{{FirstName}}}", "{{FirstName}}}", "{{{FirstName}}",
+    "{{outer {{FirstName}} }}", "{{FirstName}}{{}}", "{{Unknown}}",
+])
+def test_plan_rejects_unresolved_placeholder_expressions(channel, template):
+    errors = validate_plan(_content_plan(template, "VIP", channel))
+    assert any("placeholder" in error for error in errors)
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+@pytest.mark.parametrize("clinic", ["{{FirstName}}", "{{Unknown}}", "{{First Name}}", "{{", "}}"])
+def test_plan_rejects_placeholder_expressions_inserted_by_clinic(channel, clinic):
+    errors = validate_plan(_content_plan("Hi {{ClinicName}}", clinic, channel))
+    assert any("placeholder" in error for error in errors)
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+def test_plan_keeps_supported_spacing_adjacent_tokens_and_single_braces(channel):
+    assert validate_plan(_content_plan("{ Hi {{ FirstName }}{{ ClinicName }} }", "VIP", channel)) == []
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+@pytest.mark.parametrize("clinic", ["   ", "\t\n"])
+def test_whitespace_clinic_is_rejected_when_interpolated(channel, clinic):
+    errors = validate_plan(_content_plan("Hi from {{ClinicName}}.", clinic, channel))
+    assert any("clinicName" in error for error in errors)
+
+
+@pytest.mark.parametrize("channel", ["precall", "bulk"])
+def test_unused_whitespace_clinic_does_not_block_a_valid_template(channel):
+    assert validate_plan(_content_plan("Hi {{FirstName}}!", "   ", channel)) == []

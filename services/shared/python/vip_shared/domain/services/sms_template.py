@@ -73,6 +73,20 @@ def strip_placeholders(template: str) -> str:
     return _PLACEHOLDER_RE.sub("", template or "")
 
 
+def has_malformed_placeholders(template: str) -> bool:
+    """Reject incomplete, empty or nested double braces; single braces are literal."""
+    text = template or ""
+    for match in _PLACEHOLDER_RE.finditer(text):
+        # A recognized token inside triple/nested braces is not a valid token
+        # surrounded by literal text (e.g. {{{FirstName}}}).
+        if (match.start() > 0 and text[match.start() - 1] == "{") or (
+            match.end() < len(text) and text[match.end()] == "}"
+        ):
+            return True
+    remaining = strip_placeholders(text)
+    return "{{" in remaining or "}}" in remaining
+
+
 def _clean_first_name(raw: object) -> str:
     if not isinstance(raw, str):
         return _FIRST_NAME_FALLBACK
@@ -85,10 +99,11 @@ def _clean_first_name(raw: object) -> str:
 def render(template: str, *, recipient: dict, campaign: dict) -> str:
     """Interpolate allowlisted placeholders in `template`.
 
-    Raises ValueError for any placeholder outside ALLOWED_FIELDS — validation
-    should already have rejected such a template, so reaching here means the
-    guard was bypassed and sending would be worse than failing.
+    Raises ValueError for malformed or unknown placeholders, including tokens
+    introduced by a substitution. Values are never recursively interpolated.
     """
+    if has_malformed_placeholders(template):
+        raise ValueError("template contains malformed placeholder syntax")
     unknown = extract_placeholders(template) - ALLOWED_FIELDS
     if unknown:
         raise ValueError(
@@ -99,7 +114,10 @@ def render(template: str, *, recipient: dict, campaign: dict) -> str:
         "FirstName": _clean_first_name(recipient.get("FirstName")),
         "ClinicName": str(campaign.get("clinicName") or "").strip(),
     }
-    return _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template)
+    rendered = _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template)
+    if "{{" in rendered or "}}" in rendered:
+        raise ValueError("rendered message contains unresolved placeholder syntax")
+    return rendered
 
 
 def max_rendered_length(

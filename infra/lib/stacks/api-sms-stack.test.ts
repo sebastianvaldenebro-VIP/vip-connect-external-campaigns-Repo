@@ -12,6 +12,9 @@ function buildStack(overrides: Partial<ApiSmsStackProps> = {}) {
     env: { account: ACCOUNT, region: REGION },
     dataKeyArn: DATA_KEY_ARN,
     profilesDomainName: 'amazon-connect-vipmedicalgroup',
+    snapshotBucketName: `vip-admin-segment-snapshots-${ACCOUNT}`,
+    snapshotRoleArn: `arn:aws:iam::${ACCOUNT}:role/VipAdminSnapshotRole-${REGION}`,
+    snapshotKeyArn: DATA_KEY_ARN,
     smsConfigSetName: 'vip-sms-config-set',
     smsOptOutListName: 'vip-sms-opt-out',
     ...overrides,
@@ -72,6 +75,9 @@ describe('ApiSmsStack', () => {
           SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
           SMS_SQS_QUEUE_URL: `https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/vip-sms-campaign-queue`,
           PROFILES_DOMAIN_NAME: 'amazon-connect-vipmedicalgroup',
+          SMS_SNAPSHOT_BUCKET: `vip-admin-segment-snapshots-${ACCOUNT}`,
+          SMS_SNAPSHOT_ROLE_ARN: `arn:aws:iam::${ACCOUNT}:role/VipAdminSnapshotRole-${REGION}`,
+          SMS_SNAPSHOT_KEY_ARN: DATA_KEY_ARN,
         },
       },
     });
@@ -91,10 +97,8 @@ describe('ApiSmsStack', () => {
       FunctionName: 'vip-admin-sms-retry-quiet-hours',
       Handler: 'sms_sender_handler.retry_quiet_hours_skipped',
       Runtime: 'python3.12',
-      // Same imported, mutable:false role as SmsSenderFunction — its exact
-      // permission set already covers everything this function needs
-      // (VipSmsCampaignQueue/Runs read-write, SQS SendMessage, KMS decrypt,
-      // Customer Profiles read), so no new IAM policy is required.
+      // Imported, mutable:false: its additional permissions are a separately
+      // reviewed deployment prerequisite, not implicitly granted by CDK.
       Role: `arn:aws:iam::${ACCOUNT}:role/vip-sms-sender-role`,
       Timeout: 300,
       MemorySize: 512,
@@ -106,6 +110,9 @@ describe('ApiSmsStack', () => {
           SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
           SMS_SQS_QUEUE_URL: `https://sqs.${REGION}.amazonaws.com/${ACCOUNT}/vip-sms-campaign-queue`,
           PROFILES_DOMAIN_NAME: 'amazon-connect-vipmedicalgroup',
+          SMS_SNAPSHOT_BUCKET: `vip-admin-segment-snapshots-${ACCOUNT}`,
+          SMS_SNAPSHOT_ROLE_ARN: `arn:aws:iam::${ACCOUNT}:role/VipAdminSnapshotRole-${REGION}`,
+          SMS_SNAPSHOT_KEY_ARN: DATA_KEY_ARN,
           QUIET_HOURS_START: '08:00',
           QUIET_HOURS_END: '21:00',
           QUIET_HOURS_DAYS: '0,1,2,3,4,5',

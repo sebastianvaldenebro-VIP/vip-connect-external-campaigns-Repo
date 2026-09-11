@@ -113,3 +113,30 @@ def test_strip_placeholders_matches_extract_placeholders_exactly():
 def test_strip_placeholders_handles_empty_and_none():
     assert strip_placeholders("") == ""
     assert strip_placeholders(None) == ""
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{First Name}}", "{{First-Name}}", "{{}}", "{{   }}",
+        "{{FirstName", "FirstName}}", "{{FirstName}", "{FirstName}}",
+        "{{{FirstName}}}", "{{FirstName}}}", "{{{FirstName}}",
+        "{{outer {{FirstName}} }}", "{{FirstName}}{{}}", "{{Unknown}}",
+    ],
+)
+def test_render_rejects_unresolved_placeholder_expressions(template):
+    with pytest.raises(ValueError, match="placeholder"):
+        render(template, recipient={"FirstName": "Jane"}, campaign=_CAMPAIGN)
+
+
+@pytest.mark.parametrize("clinic", ["{{FirstName}}", "{{Unknown}}", "{{First Name}}", "{{", "}}"])
+def test_render_rejects_placeholder_expressions_inserted_by_clinic(clinic):
+    with pytest.raises(ValueError, match="placeholder"):
+        render("Hi {{ClinicName}}", recipient={}, campaign={"clinicName": clinic})
+
+
+def test_render_preserves_supported_spacing_adjacent_tokens_and_literal_single_braces():
+    assert render(
+        "{ Hi {{ FirstName }}{{ ClinicName }} }",
+        recipient={"FirstName": "Jane"}, campaign={"clinicName": " VIP "},
+    ) == "{ Hi JaneVIP }"

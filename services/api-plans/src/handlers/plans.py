@@ -533,6 +533,7 @@ def _screen_sms_template_content(
         ALLOWED_FIELDS,
         extract_placeholders,
         max_rendered_length,
+        render,
         strip_placeholders,
     )
 
@@ -545,6 +546,7 @@ def _screen_sms_template_content(
     # exists (vip_shared.domain.services.sms_template), so the ban narrows to
     # "only these fields". Everything else stays blocked, and ${...} stays
     # banned outright because no renderer supports it.
+    rendered_for_screen = None
     unknown = extract_placeholders(tmpl) - ALLOWED_FIELDS
     if unknown:
         errors.append(
@@ -552,17 +554,23 @@ def _screen_sms_template_content(
             f"{sorted(unknown)}. Allowed: {sorted(ALLOWED_FIELDS)}."
         )
     else:
-        # Only computable once every placeholder is allowlisted —
-        # max_rendered_length (via render()) raises ValueError on an unknown
-        # placeholder, so this must run after the allowlist check above, not
-        # before it, or a rejected template would crash validation instead
-        # of reporting cleanly.
-        rendered_len = max_rendered_length(tmpl, campaign=render_campaign)
-        if rendered_len > _MAX_SMS_CHARS:
+        try:
+            rendered_len = max_rendered_length(tmpl, campaign=render_campaign)
+            # No recipient data is needed: the renderer uses its neutral name
+            # fallback and the actual clinic value, preserving substitution
+            # boundaries that can assemble a prohibited value.
+            rendered_for_screen = render(tmpl, recipient={}, campaign=render_campaign)
+        except ValueError:
             errors.append(
-                f"{prefix}: {field_name} must render to ≤{_MAX_SMS_CHARS} chars "
-                f"(worst case {rendered_len})"
+                f"{prefix}: {field_name} contains malformed or unresolved placeholder "
+                "syntax. Use only {{FirstName}} and {{ClinicName}}."
             )
+        else:
+            if rendered_len > _MAX_SMS_CHARS:
+                errors.append(
+                    f"{prefix}: {field_name} must render to ≤{_MAX_SMS_CHARS} chars "
+                    f"(worst case {rendered_len})"
+                )
 
     # Active PHI detection — block templates with identifiable information
     _PHI_PATTERNS = [
@@ -595,17 +603,17 @@ def _screen_sms_template_content(
     # not a valid placeholder stays in `scannable` for the PHI patterns below
     # to catch.
     #
-    # Also append the RESOLVED clinicName value (the same source render()
-    # substitutes {{ClinicName}} with — see max_rendered_length's `campaign=`
-    # kwarg above). clinicName is free text with no character-class
-    # restriction (unlike FirstName, which _clean_first_name/_NAME_OK_RE
-    # constrain defensively), so it is the one substitution value that could
-    # itself carry PHI-shaped content straight into the outbound SMS. The
-    # template-with-placeholders-stripped text alone never reveals this —
-    # only the resolved value does, so it must be scanned too.
+    # Keep scanning the clinic value independently, and also screen the real
+    # substitution boundaries: "123-{{ClinicName}}-6789" with clinicName "45"
+    # assembles an SSN even though neither input matches the pattern alone.
     clinic_name = str(render_campaign.get("clinicName") or "")
-    scannable = f"{strip_placeholders(tmpl)} {clinic_name}"
-    violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(scannable)]
+    scannable = [strip_placeholders(tmpl), clinic_name]
+    if rendered_for_screen is not None:
+        scannable.append(rendered_for_screen)
+    violations = [
+        label for pattern, label in _PHI_PATTERNS
+        if any(pattern.search(text) for text in scannable)
+    ]
     if violations:
         errors.append(
             f"{prefix}: {field_name} may contain PHI — detected: "
@@ -634,7 +642,7 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
         # "This is ." shipped to a patient — so require the value whenever
         # the template actually references the placeholder. Mirrors the
         # identical guard in _validate_precall_sms below.
-        if "ClinicName" in extract_placeholders(tmpl) and not cfg.get("clinicName"):
+        if "ClinicName" in extract_placeholders(tmpl) and not str(cfg.get("clinicName") or "").strip():
             errors.append(
                 f"{prefix}: smsMessageTemplate uses {{{{ClinicName}}}} but "
                 f"campaignConfig.clinicName is not set"
@@ -714,7 +722,7 @@ def _validate_precall_sms(campaign: dict, bucket_name: str, ci: int) -> list[str
         # An unset clinicName renders {{ClinicName}} as an empty string —
         # "This is ." shipped to a patient — so require the value whenever
         # the template actually references the placeholder.
-        if "ClinicName" in extract_placeholders(tmpl) and not precall.get("clinicName"):
+        if "ClinicName" in extract_placeholders(tmpl) and not str(precall.get("clinicName") or "").strip():
             errors.append(
                 f"{prefix}: precallSms.messageTemplate uses {{{{ClinicName}}}} "
                 f"but precallSms.clinicName is not set"

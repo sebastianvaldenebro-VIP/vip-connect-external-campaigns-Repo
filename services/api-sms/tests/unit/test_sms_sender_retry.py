@@ -65,16 +65,10 @@ def _load_handler():
             return sms_sender_handler
 
 
-def _make_mock_cp(phones: list[str] | None = None):
-    phones = phones if phones is not None else []
-    cp = MagicMock()
-    cp.get_segment_membership.return_value = {
-        "Profiles": [f"profile-{i}" for i in range(len(phones))]
-    }
-    cp.batch_get_profile.return_value = {
-        "Profiles": [{"PhoneNumber": p} for p in phones]
-    }
-    return cp
+def _make_recipient_reader(phones: list[str] | None = None):
+    return MagicMock(
+        return_value=[{"phone": phone, "FirstName": ""} for phone in phones or []]
+    )
 
 
 def _base_event(clinic_name: str | None = None) -> dict:
@@ -203,19 +197,24 @@ def test_retry_noop_when_run_record_missing():
     queue_table.query.assert_not_called()
 
 
-def test_retry_noop_when_nothing_skipped():
+def test_retry_rechecks_active_run_even_when_quiet_hours_count_is_zero():
     handler = _load_handler()
     record = {"status": "RUNNING", "totalSkippedQuietHours": 0}
     ddb, runs_table, queue_table = _mock_ddb_with_runs_record(record)
+    queue_table.query.return_value = {"Items": []}
 
-    with patch.dict(os.environ, _ENV), patch.object(handler, "_ddb", ddb):
+    with (
+        patch.object(handler, "_ddb", ddb),
+        patch.object(handler, "_get_segment_recipients", return_value=[]) as read,
+    ):
         result = handler.retry_quiet_hours_skipped(
             {"campaignId": "c1", "planId": "p1", "runId": "r1"}, None
         )
 
     assert result == {"retried": 0, "stillSkipped": 0}
-    runs_table.update_item.assert_not_called()
-    queue_table.query.assert_not_called()
+    read.assert_called_once()
+    queue_table.query.assert_called_once()
+    runs_table.update_item.assert_called_once()
 
 
 def test_retry_noop_when_status_completed():
@@ -402,13 +401,13 @@ def test_lambda_handler_persists_clinic_name_on_start_record():
         mock_runs_table if "Runs" in name else mock_queue_table
     )
     mock_sqs = MagicMock()
-    mock_cp = _make_mock_cp(phones=[])
+    reader = _make_recipient_reader(phones=[])
 
     with (
         patch.dict(os.environ, _ENV),
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
-        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_get_segment_recipients", reader),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
         patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):
@@ -427,13 +426,13 @@ def test_lambda_handler_persists_empty_clinic_name_when_omitted():
         mock_runs_table if "Runs" in name else mock_queue_table
     )
     mock_sqs = MagicMock()
-    mock_cp = _make_mock_cp(phones=[])
+    reader = _make_recipient_reader(phones=[])
 
     with (
         patch.dict(os.environ, _ENV),
         patch.object(handler, "_ddb", mock_ddb),
         patch.object(handler, "_sqs", mock_sqs),
-        patch.object(handler, "_cp", mock_cp),
+        patch.object(handler, "_get_segment_recipients", reader),
         patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
         patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
     ):

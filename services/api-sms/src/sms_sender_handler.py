@@ -25,6 +25,11 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 
+from segment_recipients import (
+    SegmentRecipientsPending,
+    load_segment_recipients as _load_segment_recipients,
+)
+
 from vip_shared.domain.services.quiet_hours import (
     is_within_quiet_hours as _is_within_quiet_hours,
 )
@@ -44,6 +49,9 @@ _QUEUE_TABLE = os.environ["SMS_CAMPAIGN_QUEUE_TABLE"]
 _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
 _SQS_QUEUE_URL = os.environ["SMS_SQS_QUEUE_URL"]
 _DOMAIN = os.environ["PROFILES_DOMAIN_NAME"]
+_SNAPSHOT_BUCKET = os.environ.get("SMS_SNAPSHOT_BUCKET", "")
+_SNAPSHOT_ROLE_ARN = os.environ.get("SMS_SNAPSHOT_ROLE_ARN", "")
+_SNAPSHOT_KEY_ARN = os.environ.get("SMS_SNAPSHOT_KEY_ARN", "")
 _TTL_SECONDS = 30 * 24 * 3600  # 30 days
 # Claim records (see _process_recipients' claim gate) are a short-lived DB-level
 # dedup guard, not a long-lived audit record. This ttl attribute is now ONLY a
@@ -73,6 +81,7 @@ _CLAIM_STALE_SECONDS = 10 * 60
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
 _cp = boto3.client("customer-profiles")
+_s3 = boto3.client("s3")
 _opt_out = build_opt_out_from_env()
 
 # US 10-digit numbers in E.164 format only
@@ -100,7 +109,8 @@ def lambda_handler(event: dict, context: object) -> dict:
       "originationNumberArn": str,     # EUM SMS phone number ARN
       "originationNumber": str,        # friendly E.164 (e.g. +15125551234)
     }
-    Returns: {"enqueued": int}
+    Returns enqueue/failure counts. A snapshot still being generated adds
+    "pending": true; a run that has ended adds "terminal": true and exitReason.
     """
     campaign_id = event["campaignId"]
     segment_arn = event["segmentArn"]
@@ -111,37 +121,75 @@ def lambda_handler(event: dict, context: object) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     ttl = now_epoch + _TTL_SECONDS
 
-    # Write start record to VipSmsCampaignRuns
-    _ddb.Table(_RUNS_TABLE).put_item(
-        Item={
-            "planId": event["planId"],
-            "sk": f"{event['runId']}#{campaign_id}",
-            "smsCampaignId": campaign_id,
-            "planName": event.get("planName", ""),
-            "segmentName": segment_name,
-            "segmentArn": segment_arn,
-            "messageTemplate": message_tmpl,
-            "clinicName": event.get("clinicName", ""),
-            "originationNumberArn": origination_arn,
-            "originationNumber": event.get("originationNumber", ""),
-            "status": "RUNNING",
-            "startedAt": now_iso,
-            "totalEnqueued": 0,
-            "totalSent": 0,
-            "totalFailed": 0,
-            "totalOptedOut": 0,
-            "totalSkippedOptOut": 0,
-            "totalSkippedQuietHours": 0,
-            "totalSqsSendFailed": 0,
-            "createdAt": now_iso,
-            "updatedAt": now_iso,
-            "pipelineVersion": "v1",
-        },
-        ConditionExpression="attribute_not_exists(sk)",
-    )
+    # The runs row is an immutable campaign identity, not a completion claim.
+    # A prior invocation may have created it and then failed before enqueueing.
+    runs_table = _ddb.Table(_RUNS_TABLE)
+    record = {
+        "planId": event["planId"],
+        "sk": f"{event['runId']}#{campaign_id}",
+        "smsCampaignId": campaign_id,
+        "planName": event.get("planName", ""),
+        "segmentName": segment_name,
+        "segmentArn": segment_arn,
+        "messageTemplate": message_tmpl,
+        "clinicName": event.get("clinicName", ""),
+        "originationNumberArn": origination_arn,
+        "originationNumber": event.get("originationNumber", ""),
+        "status": "RUNNING",
+        "startedAt": now_iso,
+        "totalEnqueued": 0,
+        "totalSent": 0,
+        "totalFailed": 0,
+        "totalOptedOut": 0,
+        "totalSkippedOptOut": 0,
+        "totalSkippedQuietHours": 0,
+        "totalSqsSendFailed": 0,
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+        "pipelineVersion": "v1",
+    }
+    already_sent_phones: set[str] = set()
+    try:
+        runs_table.put_item(Item=record, ConditionExpression="attribute_not_exists(sk)")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        record = runs_table.get_item(
+            Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
+            ConsistentRead=True,
+        ).get("Item")
+        if not record:
+            raise RuntimeError("SMS run disappeared during sender recovery") from None
+        if record.get("status") in _TERMINAL_RUN_STATUSES:
+            return {
+                "terminal": True,
+                "exitReason": record.get("exitReason", ""),
+                "enqueued": 0,
+                "failed": 0,
+            }
+        # A caller replay cannot replace the original audience or message.
+        segment_name = record["segmentName"]
+        message_tmpl = record["messageTemplate"]
+        origination_arn = record["originationNumberArn"]
+        already_sent_phones = _get_already_sent_phones(campaign_id)
 
     # Extract recipients (phone + allowlisted render fields) from CP segment
-    recipients = _get_segment_recipients(segment_name)
+    try:
+        recipients = _get_segment_recipients(
+            segment_name,
+            plan_id=event["planId"],
+            run_id=event["runId"],
+            campaign_id=campaign_id,
+        )
+    except SegmentRecipientsPending:
+        return {"pending": True, "enqueued": 0, "failed": 0}
+    except _SmsRunInactive as exc:
+        return {
+            "terminal": True,
+            "exitReason": exc.record.get("exitReason", ""),
+            "enqueued": 0,
+            "failed": 0,
+        }
 
     queue_table = _ddb.Table(_QUEUE_TABLE)
     enqueued, failed, opted_out, outside_quiet_hours, rejected_fields = (
@@ -151,9 +199,9 @@ def lambda_handler(event: dict, context: object) -> dict:
             plan_id=event["planId"],
             run_id=event["runId"],
             message_tmpl=message_tmpl,
-            clinic_name=event.get("clinicName", ""),
+            clinic_name=record.get("clinicName", ""),
             origination_arn=origination_arn,
-            already_sent_phones=set(),  # first pass — nothing sent yet
+            already_sent_phones=already_sent_phones,
             now_iso=now_iso,
             ttl=ttl,
             queue_table=queue_table,
@@ -169,7 +217,9 @@ def lambda_handler(event: dict, context: object) -> dict:
             fields=sorted(rejected_fields),
         )
 
-    # Update enqueued/skipped-opt-out/sqs-send-failed counts.
+    # ADD preserves prior attempts and concurrent retry/processor increments;
+    # suppression counters describe the current pass rather than accumulating
+    # the same blocked recipient on every retry.
     #
     # NOTE: this writes totalSkippedOptOut and totalSqsSendFailed, NOT totalOptedOut
     # or totalFailed. Those two are owned by sms_processor_handler.py and mean
@@ -184,8 +234,8 @@ def lambda_handler(event: dict, context: object) -> dict:
     _ddb.Table(_RUNS_TABLE).update_item(
         Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
         UpdateExpression=(
-            "SET totalEnqueued = :n, totalSqsSendFailed = :f, "
-            "totalSkippedOptOut = :o, totalSkippedQuietHours = :q, updatedAt = :t"
+            "ADD totalEnqueued :n, totalSqsSendFailed :f "
+            "SET totalSkippedOptOut = :o, totalSkippedQuietHours = :q, updatedAt = :t"
         ),
         ExpressionAttributeValues={
             ":n": enqueued,
@@ -222,7 +272,7 @@ def _process_recipients(
     queue_table,
 ) -> tuple[int, int, int, int, set[str] | None]:
     """Per-recipient opt-out/quiet-hours/render/enqueue loop, shared by the
-    first-pass send (lambda_handler, already_sent_phones=set()) and the
+    initial/resumed send (lambda_handler) and the
     quiet-hours retry pass (retry_quiet_hours_skipped, already_sent_phones
     populated from a live VipSmsCampaignQueue query).
 
@@ -434,9 +484,8 @@ def _flush_sms_batch(
     # actually delivered for these phones, so the claim gate in
     # _process_recipients must not go on blocking a later retry from
     # re-attempting them. A delete failure here is not fatal — worst case is a
-    # stale claim that self-heals via _CLAIM_TTL_SECONDS, one fewer retry
-    # attempt until it expires, not a correctness issue — so log and continue
-    # rather than raising.
+    # stale claim recoverable after _CLAIM_STALE_SECONDS, a delayed retry
+    # until its timestamp is old enough — so log and continue rather than raising.
     for entry_id in failed_ids:
         item = ddb_items_by_id.get(entry_id)
         if not item:
@@ -451,7 +500,7 @@ def _flush_sms_batch(
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup, see comment above
             # Deliberately broad: ANY failure releasing the claim (throttling,
             # network, IAM, whatever) must degrade to "one fewer retry attempt
-            # until TTL expiry," never to a crashed/retried batch flush that
+            # until stale-claim recovery," never to a crashed/retried batch flush that
             # could itself risk re-processing this same batch.
             _logger.warn(
                 "sms_sender_claim_release_failed",
@@ -488,11 +537,10 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
 
     event = {"campaignId": str, "planId": str, "runId": str}  # smsCampaignId
 
-    Deliberately cheap when there's nothing to do — this is invoked on every
-    tick of an active precall-SMS-enabled campaign, and most ticks will have
-    zero recipients newly eligible. No-ops (zero DDB/CP calls beyond the one
-    get_item) when: the run record doesn't exist, its status is already
-    terminal (COMPLETED/ABORTED), or totalSkippedQuietHours is already 0.
+    Invoked while the paired campaign is active. Missing or terminal runs
+    are no-ops. Quiet-hours counts are reporting only: a zero value does not
+    mean that unfinished claims, failed enqueues, or incomplete reads are done.
+    Every active pass rechecks the audience and deduplicates actual queue items.
 
     Returns: {"retried": int, "stillSkipped": int}
     """
@@ -501,23 +549,38 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
     run_id = event["runId"]
     runs_table = _ddb.Table(_RUNS_TABLE)
 
-    resp = runs_table.get_item(Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"})
+    resp = runs_table.get_item(
+        Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
+        ConsistentRead=True,
+    )
     record = resp.get("Item")
     if not record:
         return {"retried": 0, "stillSkipped": 0}
     if record.get("status") in _TERMINAL_RUN_STATUSES:
         return {"retried": 0, "stillSkipped": 0}
-    if int(record.get("totalSkippedQuietHours") or 0) == 0:
-        return {"retried": 0, "stillSkipped": 0}
 
     now_iso = datetime.now(timezone.utc).isoformat()
     ttl = int(time.time()) + _TTL_SECONDS
 
-    recipients = _get_segment_recipients(record.get("segmentName", ""))
+    try:
+        recipients = _get_segment_recipients(
+            record.get("segmentName", ""),
+            plan_id=plan_id,
+            run_id=run_id,
+            campaign_id=campaign_id,
+        )
+    except SegmentRecipientsPending:
+        return {
+            "pending": True,
+            "retried": 0,
+            "stillSkipped": int(record.get("totalSkippedQuietHours") or 0),
+        }
+    except _SmsRunInactive:
+        return {"retried": 0, "stillSkipped": 0}
     already_sent_phones = _get_already_sent_phones(campaign_id)
     queue_table = _ddb.Table(_QUEUE_TABLE)
 
-    enqueued, failed, _opted_out, outside_quiet_hours, rejected_fields = (
+    enqueued, failed, opted_out, outside_quiet_hours, rejected_fields = (
         _process_recipients(
             recipients,
             campaign_id=campaign_id,
@@ -550,10 +613,13 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
     runs_table.update_item(
         Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
         UpdateExpression=(
-            "ADD totalEnqueued :n SET totalSkippedQuietHours = :q, updatedAt = :t"
+            "ADD totalEnqueued :n, totalSqsSendFailed :f "
+            "SET totalSkippedQuietHours = :q, totalSkippedOptOut = :o, updatedAt = :t"
         ),
         ExpressionAttributeValues={
             ":n": enqueued,
+            ":f": failed,
+            ":o": opted_out,
             ":q": outside_quiet_hours,
             ":t": now_iso,
         },
@@ -564,6 +630,7 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
         campaign_id=campaign_id,
         newly_enqueued=enqueued,
         sqs_send_failed=failed,
+        skipped_opt_out=opted_out,
         still_skipped_quiet_hours=outside_quiet_hours,
     )
     return {"retried": enqueued, "stillSkipped": outside_quiet_hours}
@@ -588,10 +655,9 @@ def _get_already_sent_phones(campaign_id: str) -> set[str]:
         it. A phone with at least one non-failed item IS still treated as
         sent, even if it also has an unrelated failed item from another pass.
 
-    This is purely a cheap pre-check optimization to avoid attempting a claim
-    at all for someone almost certainly already sent — the actual
-    correctness guarantee against a duplicate send is the claim gate in
-    _process_recipients, not this query.
+    This strongly consistent history check prevents resending after a claim
+    has aged out. The conditional claim gate in _process_recipients closes
+    the remaining race between two overlapping passes reading the same history.
 
     Mirrors the campaignId-keyed Query pattern used elsewhere for this table
     (see executor.py's _count_sms_queue), selecting phone + status via
@@ -602,6 +668,7 @@ def _get_already_sent_phones(campaign_id: str) -> set[str]:
         "KeyConditionExpression": "campaignId = :cid",
         "ExpressionAttributeValues": {":cid": campaign_id},
         "ProjectionExpression": "#p, #s",
+        "ConsistentRead": True,
         "ExpressionAttributeNames": {"#p": "phone", "#s": "status"},
     }
     phones: set[str] = set()
@@ -619,56 +686,93 @@ def _get_already_sent_phones(campaign_id: str) -> set[str]:
     return phones
 
 
-_BATCH_GET_PROFILE_MAX = 100  # CP API limit per BatchGetProfile call
+class _SmsRunInactive(RuntimeError):
+    """The campaign ended while its asynchronous audience was being prepared."""
+
+    def __init__(self, record: dict | None = None):
+        super().__init__("SMS run is no longer active")
+        self.record = record or {}
 
 
-def _get_segment_recipients(segment_name: str) -> list[dict]:
-    """Read recipients (phone + allowlisted render fields) from a CP segment via
-    GetSegmentMembership.
+def _get_segment_recipients(
+    segment_name: str, *, plan_id: str, run_id: str, campaign_id: str
+) -> list[dict]:
+    """Load a complete audience using this run's immutable snapshot metadata.
 
-    Collects all profile IDs per membership page, then calls BatchGetProfile
-    in groups of up to 100 — reducing API calls from O(n) to O(n/100).
+    Only the snapshot identifier/location are stored in the runs table. The
+    reader retrieves recipient data from the encrypted export and Profiles.
+    Snapshot creation can outlive one invocation; a pending snapshot is work
+    in progress and must not be counted as an empty audience.
     """
-    recipients: list[dict] = []
+    runs_table = _ddb.Table(_RUNS_TABLE)
+    key = {"planId": plan_id, "sk": f"{run_id}#{campaign_id}"}
+
+    def active_record() -> dict:
+        record = runs_table.get_item(Key=key, ConsistentRead=True).get("Item")
+        if not record or record.get("status") != "RUNNING":
+            raise _SmsRunInactive(record)
+        if record.get("segmentName") != segment_name:
+            raise RuntimeError("SMS run audience changed during recipient read")
+        return record
+
+    def load_snapshot() -> dict | None:
+        return active_record().get("recipientSnapshot")
+
+    def publish_snapshot(candidate: dict) -> dict:
+        # Concurrent callers can create separate exports, but only one becomes
+        # this run's source. Never replace its winner or revive a terminal run.
+        try:
+            runs_table.update_item(
+                Key=key,
+                UpdateExpression="SET recipientSnapshot = :snapshot",
+                ConditionExpression=(
+                    "attribute_exists(sk) AND #status = :running "
+                    "AND segmentName = :segment "
+                    "AND attribute_not_exists(recipientSnapshot)"
+                ),
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":snapshot": candidate,
+                    ":running": "RUNNING",
+                    ":segment": segment_name,
+                },
+            )
+            return candidate
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            winner = active_record().get("recipientSnapshot")
+            if not winner:
+                raise RuntimeError("SMS snapshot publication lost its run") from None
+            return winner
+
     try:
-        kwargs: dict = {
-            "DomainName": _DOMAIN,
-            "SegmentDefinitionName": segment_name,
-            "MaxResults": 250,
-        }
-        while True:
-            resp = _cp.get_segment_membership(**kwargs)
-            # Collect all profile IDs from this page
-            profile_ids = [
-                (e if isinstance(e, str) else e.get("ProfileId", ""))
-                for e in resp.get("Profiles", [])
-            ]
-            profile_ids = [pid for pid in profile_ids if pid]
-            # BatchGetProfile in groups of up to 100
-            for i in range(0, len(profile_ids), _BATCH_GET_PROFILE_MAX):
-                batch_ids = profile_ids[i : i + _BATCH_GET_PROFILE_MAX]
-                batch_resp = _cp.batch_get_profile(
-                    DomainName=_DOMAIN,
-                    ProfileIds=batch_ids,
-                )
-                for profile in batch_resp.get("Profiles", []):
-                    raw = profile.get("PhoneNumber") or profile.get("MobilePhoneNumber") or ""
-                    if raw:
-                        # Minimum necessary: carry ONLY the allowlisted render
-                        # fields out of the profile, never the whole record.
-                        recipients.append(
-                            {
-                                "phone": _normalize_phone(raw),
-                                "FirstName": profile.get("FirstName") or "",
-                            }
-                        )
-            next_token = resp.get("NextToken")
-            if not next_token:
-                break
-            kwargs["NextToken"] = next_token
+        recipients = _load_segment_recipients(
+            cp=_cp,
+            s3=_s3,
+            domain=_DOMAIN,
+            segment_name=segment_name,
+            snapshot_bucket=_SNAPSHOT_BUCKET,
+            snapshot_role_arn=_SNAPSHOT_ROLE_ARN,
+            encryption_key_arn=_SNAPSHOT_KEY_ARN,
+            load_snapshot=load_snapshot,
+            publish_snapshot=publish_snapshot,
+        )
+        # The run may have been aborted while waiting for a completed export.
+        # Check again before any claim, SQS message, or counter update is made.
+        active_record()
+        return [
+            {
+                "phone": _normalize_phone(recipient["phone"]),
+                "FirstName": recipient.get("FirstName") or "",
+            }
+            for recipient in recipients
+        ]
+    except (SegmentRecipientsPending, _SmsRunInactive):
+        raise
     except Exception as exc:
         _logger.warn("sms_sender_get_segment_phones_failed", error=type(exc).__name__)
-    return recipients
+        raise RuntimeError("SMS recipient read failed") from None
 
 
 def _normalize_phone(raw: str) -> str:
