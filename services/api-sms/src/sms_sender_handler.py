@@ -46,12 +46,29 @@ _SQS_QUEUE_URL = os.environ["SMS_SQS_QUEUE_URL"]
 _DOMAIN = os.environ["PROFILES_DOMAIN_NAME"]
 _TTL_SECONDS = 30 * 24 * 3600  # 30 days
 # Claim records (see _process_recipients' claim gate) are a short-lived DB-level
-# dedup guard, not a long-lived audit record — 15 minutes is comfortably longer
-# than this Lambda's own timeout (5 min) plus margin, so a claim from a crashed
-# invocation self-heals reasonably promptly even without the explicit release
-# in _flush_sms_batch. Deliberately NOT _TTL_SECONDS (30 days) — that lifetime
-# is wrong for a claim, whose only purpose is to survive one overlapping tick.
+# dedup guard, not a long-lived audit record. This ttl attribute is now ONLY a
+# distant backstop for eventual physical cleanup of very old, no-longer-relevant
+# claim rows — it is NOT what determines when a stale claim can be safely
+# reclaimed (see _CLAIM_STALE_SECONDS below for that). A prior version of this
+# comment assumed a claim from a crashed invocation would "self-heal" once this
+# ttl expired; that was wrong — DynamoDB's TTL deletion is a background sweep
+# with no delivery-time guarantee (AWS documents "typically within 48 hours" of
+# expiry, not 15 minutes), so relying on it to unblock a retry could strand a
+# phone for far longer than intended. Deliberately NOT _TTL_SECONDS (30 days) —
+# that lifetime is wrong even for a backstop on a record whose only purpose is
+# to survive one overlapping tick.
 _CLAIM_TTL_SECONDS = 15 * 60
+# Threshold for atomically "stealing" a stale claim (2026-09 adversarial-review
+# Finding, Important — see _CLAIM_TTL_SECONDS above for the debunked TTL-based
+# assumption this replaces). A claim's OWN recorded age (claimedAtEpoch) — not
+# whether DynamoDB has gotten around to deleting the row — is what determines
+# reclaimability. Same idiom as sms_processor_handler.py's
+# _STALE_SENDING_SECONDS and executor.py's _dispatch_ready_campaigns 5-minute
+# stale-"creating"-claim reset. SmsRetryQuietHoursFunction (api-sms-stack.ts),
+# the Lambda that invokes retry_quiet_hours_skipped, has a real timeout of 5
+# minutes — 10 minutes gives 2x margin above that, comfortably ruling out
+# mistaking a still-running invocation's fresh claim for an orphan.
+_CLAIM_STALE_SECONDS = 10 * 60
 
 _ddb = boto3.resource("dynamodb")
 _sqs = boto3.client("sqs")
@@ -267,27 +284,48 @@ def _process_recipients(
         # act" idiom executor.py already uses for Connect campaign creation
         # (_dispatch_ready_campaigns's Phase 3 — claim, then act).
         #
+        # A follow-up finding (Important) identified that an orphaned claim —
+        # left behind by a crashed invocation, or written just before a
+        # template-rejection `break` (see the `except ValueError` below) aborts
+        # the rest of this loop — was wrongly assumed to self-heal once ttl
+        # expired. It doesn't: DynamoDB TTL deletion has no delivery-time
+        # guarantee, so the row can outlive ttl by far longer than any retry
+        # cadence, permanently blocking that phone. The ConditionExpression
+        # below therefore also allows atomically RECLAIMING a claim whose own
+        # recorded age (claimedAtEpoch) exceeds _CLAIM_STALE_SECONDS — the same
+        # "reclaim by recorded timestamp, not TTL sweep timing" idiom as
+        # sms_processor_handler.py's SENDING-claim recovery and executor.py's
+        # stale-"creating"-claim reset in _dispatch_ready_campaigns.
+        #
         # sk uses a CLAIM# prefix, never colliding with a real message item's
         # f"{iso_timestamp}#{random_hex}" sk. _normalize_phone is idempotent on
         # an already-E.164 phone, so the same phone always maps to the same key.
+        now_epoch = int(time.time())
         try:
             queue_table.put_item(
                 Item={
                     "campaignId": campaign_id,
                     "sk": f"CLAIM#{_normalize_phone(phone)}",
                     "claimedAt": now_iso,
-                    "ttl": int(time.time()) + _CLAIM_TTL_SECONDS,
+                    "claimedAtEpoch": now_epoch,
+                    "ttl": now_epoch + _CLAIM_TTL_SECONDS,
                 },
-                ConditionExpression="attribute_not_exists(sk)",
+                ConditionExpression=(
+                    "attribute_not_exists(sk) OR claimedAtEpoch < :stale_before"
+                ),
+                ExpressionAttributeValues={
+                    ":stale_before": now_epoch - _CLAIM_STALE_SECONDS,
+                },
             )
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 # Another concurrent execution (or a duplicate profile within
-                # this same pass) already claimed this phone — skip silently,
-                # same treatment as already_sent_phones. This is the actual
-                # race-closing guarantee; the already_sent_phones pre-check
-                # above is only a cheap optimization to avoid attempting a
-                # claim at all for someone almost certainly already sent.
+                # this same pass) holds a still-fresh claim on this phone — skip
+                # silently, same treatment as already_sent_phones. This is the
+                # actual race-closing guarantee; the already_sent_phones
+                # pre-check above is only a cheap optimization to avoid
+                # attempting a claim at all for someone almost certainly
+                # already sent.
                 continue
             raise
 

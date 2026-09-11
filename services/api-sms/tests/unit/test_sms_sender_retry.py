@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 from botocore.exceptions import ClientError
@@ -495,20 +496,33 @@ def _conditional_check_failed(message: str = "claim already taken") -> ClientErr
 
 
 def _make_claim_aware_queue_table() -> MagicMock:
-    """A queue_table mock that enforces the same attribute_not_exists(sk)
-    semantics DynamoDB's real ConditionExpression would for claim records: the
-    first put_item for a given (campaignId, sk) succeeds, every subsequent one
-    for the same key raises ConditionalCheckFailedException. This lets a test
-    simulate two "concurrent" executions racing for the same phone's claim
-    without a real DynamoDB table."""
-    claimed: set[tuple[str, str]] = set()
+    """A queue_table mock that enforces the same claim semantics DynamoDB's real
+    ConditionExpression provides post stale-claim-reclaim fix:
+    "attribute_not_exists(sk) OR claimedAtEpoch < :stale_before". The first
+    put_item for a given (campaignId, sk) always succeeds. A later put_item for
+    the SAME key succeeds only if the stored item's claimedAtEpoch is older
+    than the given :stale_before value (i.e. the existing claim is stale) —
+    otherwise it raises ConditionalCheckFailedException, exactly like a real
+    DynamoDB table would. This lets a test simulate two "concurrent" executions
+    racing for the same phone's claim (Finding 1's original race), and,
+    separately, a later execution legitimately reclaiming an orphaned one
+    (the staleness-gap fix) — without a real DynamoDB table.
+
+    A put_item call with ConditionExpression=None (used by tests to seed a
+    pre-existing claim) bypasses the check entirely, same as a real
+    unconditional put_item would."""
+    claimed_epoch: dict[tuple[str, str], int] = {}
     table = MagicMock()
 
-    def _put_item(Item, ConditionExpression=None, **_kwargs):
+    def _put_item(
+        Item, ConditionExpression=None, ExpressionAttributeValues=None, **_kwargs
+    ):
         key = (Item["campaignId"], Item["sk"])
-        if ConditionExpression and key in claimed:
-            raise _conditional_check_failed()
-        claimed.add(key)
+        if ConditionExpression and key in claimed_epoch:
+            stale_before = (ExpressionAttributeValues or {}).get(":stale_before")
+            if stale_before is None or claimed_epoch[key] >= stale_before:
+                raise _conditional_check_failed()
+        claimed_epoch[key] = Item.get("claimedAtEpoch", 0)
 
     table.put_item.side_effect = _put_item
     return table
@@ -604,7 +618,10 @@ def test_process_recipients_claim_put_item_uses_distinguishable_sk_prefix():
     """The claim's sk must be CLAIM#-prefixed so it can never collide with a
     real message item's f"{iso_timestamp}#{random_hex}" sk, and must carry no
     "phone" attribute (so it's naturally excluded from _get_already_sent_phones'
-    ProjectionExpression-based scan without special-casing)."""
+    ProjectionExpression-based scan without special-casing). The
+    ConditionExpression must allow BOTH a brand-new claim (attribute_not_exists)
+    AND reclaiming one whose own recorded age exceeds _CLAIM_STALE_SECONDS —
+    not item non-existence alone (the staleness-gap fix)."""
     handler = _load_handler()
     queue_table = MagicMock()
     recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
@@ -635,7 +652,111 @@ def test_process_recipients_claim_put_item_uses_distinguishable_sk_prefix():
     item = claim_call.kwargs["Item"]
     assert item["sk"] == "CLAIM#+12125551111"
     assert "phone" not in item
-    assert claim_call.kwargs["ConditionExpression"] == "attribute_not_exists(sk)"
+    assert isinstance(item["claimedAtEpoch"], int)
+    assert claim_call.kwargs["ConditionExpression"] == (
+        "attribute_not_exists(sk) OR claimedAtEpoch < :stale_before"
+    )
+    stale_before = claim_call.kwargs["ExpressionAttributeValues"][":stale_before"]
+    assert stale_before == item["claimedAtEpoch"] - handler._CLAIM_STALE_SECONDS
+
+
+def test_process_recipients_reclaims_stale_claim_and_sends():
+    """Finding (Important): a claim whose OWN recorded age (claimedAtEpoch)
+    exceeds _CLAIM_STALE_SECONDS must be atomically reclaimable. Without this,
+    an orphaned claim — left behind by a crashed invocation, or written just
+    before a template-rejection `break` aborts the rest of the loop — would
+    block ALL future retries for that phone until DynamoDB's TTL sweep
+    physically deletes the row, which has no delivery-time guarantee (AWS:
+    "typically within 48 hours") and could far outlive any real retry
+    cadence."""
+    handler = _load_handler()
+    queue_table = _make_claim_aware_queue_table()
+    stale_epoch = int(time.time()) - handler._CLAIM_STALE_SECONDS - 60
+    # Seed a pre-existing, now-stale claim for this phone. ConditionExpression
+    # is omitted so the fake's own check is bypassed while seeding state
+    # directly — equivalent to an unconditional put_item.
+    queue_table.put_item(
+        Item={
+            "campaignId": "cmp-1",
+            "sk": "CLAIM#+12125551111",
+            "claimedAt": "irrelevant",
+            "claimedAtEpoch": stale_epoch,
+            "ttl": stale_epoch + handler._CLAIM_TTL_SECONDS,
+        }
+    )
+
+    recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
+    mock_sqs = MagicMock()
+    mock_sqs.send_message_batch.return_value = {"Failed": []}
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        enqueued, failed, opted_out, outside_qh, rejected = handler._process_recipients(
+            recipients,
+            campaign_id="cmp-1",
+            plan_id="plan-1",
+            run_id="run-1",
+            message_tmpl="Hi {{FirstName}}!",
+            clinic_name="Clinic",
+            origination_arn="arn:pn",
+            already_sent_phones=set(),
+            now_iso="2026-09-09T00:10:00+00:00",
+            ttl=1234567890,
+            queue_table=queue_table,
+        )
+
+    assert (enqueued, failed, opted_out, outside_qh, rejected) == (1, 0, 0, 0, None)
+    mock_sqs.send_message_batch.assert_called_once()
+
+
+def test_process_recipients_does_not_reclaim_recent_claim():
+    """Regression guard: a claim whose recorded age is WITHIN
+    _CLAIM_STALE_SECONDS must still block a reclaim attempt exactly like
+    18f3ceb's original attribute_not_exists(sk)-only condition did for a
+    genuinely active claim — the new staleness OR-clause must never widen who
+    can steal a fresh, still-relevant claim."""
+    handler = _load_handler()
+    queue_table = _make_claim_aware_queue_table()
+    recent_epoch = int(time.time()) - 30  # well within _CLAIM_STALE_SECONDS
+    queue_table.put_item(
+        Item={
+            "campaignId": "cmp-1",
+            "sk": "CLAIM#+12125551111",
+            "claimedAt": "irrelevant",
+            "claimedAtEpoch": recent_epoch,
+            "ttl": recent_epoch + handler._CLAIM_TTL_SECONDS,
+        }
+    )
+
+    recipients = [{"phone": "+12125551111", "FirstName": "Maria"}]
+    mock_sqs = MagicMock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sqs", mock_sqs),
+        patch.object(handler, "_opt_out", MagicMock(is_blocked=lambda *_: False)),
+        patch.object(handler, "_is_within_quiet_hours", lambda *_a, **_k: True),
+    ):
+        enqueued, failed, opted_out, outside_qh, rejected = handler._process_recipients(
+            recipients,
+            campaign_id="cmp-1",
+            plan_id="plan-1",
+            run_id="run-1",
+            message_tmpl="Hi {{FirstName}}!",
+            clinic_name="Clinic",
+            origination_arn="arn:pn",
+            already_sent_phones=set(),
+            now_iso="2026-09-09T00:00:30+00:00",
+            ttl=1234567890,
+            queue_table=queue_table,
+        )
+
+    assert (enqueued, failed, opted_out, outside_qh, rejected) == (0, 0, 0, 0, None)
+    mock_sqs.send_message_batch.assert_not_called()
 
 
 # ── Claim gate: Finding 2 (Important) — SQS_SEND_FAILED must not permanently
@@ -685,12 +806,20 @@ def test_get_already_sent_phones_still_includes_phone_with_a_later_successful_it
 
 def test_get_already_sent_phones_ignores_claim_records_with_no_phone_attribute():
     """CLAIM# records (no "phone" attribute) must not crash the scan or pollute
-    the returned set."""
+    the returned set — including now that they also carry the claimedAtEpoch
+    attribute added by the stale-claim-reclaim fix, which
+    _get_already_sent_phones never reads (its ProjectionExpression only ever
+    fetches phone + status, so this is also true at the DynamoDB level, not
+    just in this mock)."""
     handler = _load_handler()
     queue_table = MagicMock()
     queue_table.query.return_value = {
         "Items": [
-            {"sk": "CLAIM#+12125551111", "claimedAt": "2026-09-09T00:00:00+00:00"},
+            {
+                "sk": "CLAIM#+12125551111",
+                "claimedAt": "2026-09-09T00:00:00+00:00",
+                "claimedAtEpoch": 1234567890,
+            },
             {"phone": "+12125552222", "status": "PENDING"},
         ]
     }
