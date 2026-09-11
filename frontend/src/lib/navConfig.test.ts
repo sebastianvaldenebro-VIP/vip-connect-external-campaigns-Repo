@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { breadcrumbGroupForPath, breadcrumbLabelForPath } from './navConfig';
+import {
+  breadcrumbGroupForPath,
+  breadcrumbLabelForPath,
+  isNavItemVisible,
+  visibleNavGroups,
+} from './navConfig';
 
 describe('breadcrumbLabelForPath', () => {
   it('matches an exact top-level nav route', () => {
@@ -44,5 +49,52 @@ describe('breadcrumbGroupForPath', () => {
 
   it('falls back to Contact center for an unmatched path', () => {
     expect(breadcrumbGroupForPath('/some-unknown-route')).toBe('Contact center');
+  });
+});
+
+describe('isNavItemVisible', () => {
+  it('shows every item to an Admin, extraRoles or not', () => {
+    expect(isNavItemVisible({ to: '/campaigns', label: 'Campaigns' }, ['Admin'])).toBe(true);
+    expect(
+      isNavItemVisible(
+        { to: '/blocked-numbers', label: 'Blocked numbers', extraRoles: ['Agent'] },
+        ['Admin'],
+      ),
+    ).toBe(true);
+  });
+
+  it('shows an item to Agent only when extraRoles includes Agent', () => {
+    expect(
+      isNavItemVisible(
+        { to: '/blocked-numbers', label: 'Blocked numbers', extraRoles: ['Agent'] },
+        ['Agent'],
+      ),
+    ).toBe(true);
+    expect(isNavItemVisible({ to: '/campaigns', label: 'Campaigns' }, ['Agent'])).toBe(false);
+  });
+
+  it('hides everything from a user with no matching group', () => {
+    expect(isNavItemVisible({ to: '/campaigns', label: 'Campaigns' }, [])).toBe(false);
+  });
+});
+
+describe('visibleNavGroups', () => {
+  it('returns every group unfiltered for Admin', () => {
+    const groups = visibleNavGroups(['Admin']);
+    const totalItems = groups.flatMap((g) => g.items).length;
+    expect(totalItems).toBeGreaterThan(1);
+    expect(groups.some((g) => g.label === 'Contact center')).toBe(true);
+  });
+
+  it('drops the entire Contact center group for Agent, keeping only Blocked numbers', () => {
+    const groups = visibleNavGroups(['Agent']);
+    expect(groups.some((g) => g.label === 'Contact center')).toBe(false);
+    const allItems = groups.flatMap((g) => g.items);
+    expect(allItems).toHaveLength(1);
+    expect(allItems[0]!.to).toBe('/blocked-numbers');
+  });
+
+  it('drops every group for a user with no matching role', () => {
+    expect(visibleNavGroups([])).toHaveLength(0);
   });
 });

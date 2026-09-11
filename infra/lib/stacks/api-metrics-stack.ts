@@ -154,7 +154,6 @@ export class ApiMetricsStack extends cdk.Stack {
       logGroup,
       reservedConcurrentExecutions: 10,
       environmentEncryption: props.dataKey,
-      deadLetterQueue: dlq,
       environment: {
         CONNECT_INSTANCE_ID: props.connectInstanceId,
         AUDIT_TABLE: props.adminAuditTable.tableName,
@@ -164,6 +163,17 @@ export class ApiMetricsStack extends cdk.Stack {
       },
     });
     skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);
+
+    // deadLetterQueue prop intentionally omitted above — see api-segments-stack.ts
+    // for the full explanation. Granted manually via a separate inline policy:
+    //   aws iam put-role-policy --role-name <FunctionRole physical name> \
+    //     --policy-name dlq-send-message --policy-document '{"Version":
+    //     "2012-10-17","Statement":[{"Sid":"DlqSendMessage","Effect":"Allow",
+    //     "Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:165505826690:
+    //     vip-admin-ui-api-metrics-dlq"}]}'
+    (this.lambdaFunction.node.defaultChild as lambda.CfnFunction).deadLetterConfig = {
+      targetArn: dlq.queueArn,
+    };
 
     if (props.brandedRunSummaryTable) {
       this.lambdaFunction.addEnvironment(
@@ -267,7 +277,6 @@ export class ApiMetricsStack extends cdk.Stack {
         role: collectorRole,
         logGroup: collectorLogGroup,
         environmentEncryption: props.dataKey,
-        deadLetterQueue: dlq,
         // CloudWatch, 2026-09-09 (14d window): ~20,160 invocations (rate(1 minute)
         // schedule), max observed ConcurrentExecutions = 1, 0 throttles. 2 gives a
         // small margin over the observed ceiling without opening this up unbounded.
@@ -284,6 +293,17 @@ export class ApiMetricsStack extends cdk.Stack {
         },
       });
       skipCheckovChecks(collectorFn, [VPC_SKIP]);
+
+      // deadLetterQueue prop intentionally omitted above — see api-segments-stack.ts
+      // for the full explanation. Granted manually via a separate inline policy:
+      //   aws iam put-role-policy --role-name <CollectorRole physical name> \
+      //     --policy-name dlq-send-message --policy-document '{"Version":
+      //     "2012-10-17","Statement":[{"Sid":"DlqSendMessage","Effect":"Allow",
+      //     "Action":"sqs:SendMessage","Resource":"arn:aws:sqs:us-east-1:165505826690:
+      //     vip-admin-ui-api-metrics-dlq"}]}'
+      (collectorFn.node.defaultChild as lambda.CfnFunction).deadLetterConfig = {
+        targetArn: dlq.queueArn,
+      };
 
       // EventBridge rule created via CLI (cfn-exec-role lacks events:DescribeRule).
       // Rule name: vip-branded-metrics-collector-1min — rate(1 minute) → this Lambda.

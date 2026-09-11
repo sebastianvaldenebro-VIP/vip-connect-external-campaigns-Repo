@@ -1,4 +1,13 @@
-export type NavItem = { to: string; label: string };
+export type NavItem = {
+  to: string;
+  label: string;
+  /** Cognito groups that can see this item, beyond Admin (who always can).
+   * Omit for Admin-only items — the vast majority of this app. The actual
+   * security boundary is server-side (the Lambda authorizer); this only
+   * keeps the sidebar honest about what an Agent user can actually reach,
+   * so they don't see a full admin nav and 403 on everything but one page. */
+  extraRoles?: string[];
+};
 export type NavGroup = { label: string; items: NavItem[] };
 
 export const NAV_GROUPS: NavGroup[] = [
@@ -19,9 +28,25 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/profiles', label: 'Profiles' },
       { to: '/audit', label: 'Audit' },
       { to: '/contact-artifacts', label: 'Artifacts' },
+      { to: '/blocked-numbers', label: 'Blocked numbers', extraRoles: ['Agent'] },
     ],
   },
 ];
+
+/** Whether a nav item should render for a user with these Cognito groups. */
+export function isNavItemVisible(item: NavItem, groups: string[]): boolean {
+  if (groups.includes('Admin')) return true;
+  return (item.extraRoles ?? []).some((role) => groups.includes(role));
+}
+
+/** NAV_GROUPS filtered to items visible for these Cognito groups, with any
+ * group left with zero visible items dropped entirely. */
+export function visibleNavGroups(groups: string[]): NavGroup[] {
+  return NAV_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => isNavItemVisible(item, groups)),
+  })).filter((group) => group.items.length > 0);
+}
 
 /**
  * The active top-level nav item's label for a given pathname — used by the

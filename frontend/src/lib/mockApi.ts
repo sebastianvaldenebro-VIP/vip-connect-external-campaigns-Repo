@@ -397,4 +397,39 @@ export const mockApi: typeof RealApi = {
       throw new Error('Not implemented in mock');
     },
   },
+  denyList: {
+    list: async () => {
+      await delay(200);
+      return {
+        blockedNumbers: [
+          {
+            phoneNumber: '+19145551234',
+            addedAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+            addedBy: 'agent.preview@vip.com',
+            reason: 'Repeated harassment',
+            source: 'manual-ui' as const,
+          },
+          {
+            phoneNumber: '+12125559876',
+            addedAt: new Date(Date.now() - 26 * 3600_000).toISOString(),
+            addedBy: 'arn:aws:connect:us-east-1:165505826690:instance/preview/agent/preview',
+            reason: null,
+            source: 'quick-connect' as const,
+          },
+          {
+            phoneNumber: '+13475550000',
+            addedAt: new Date(Date.now() - 90 * 24 * 3600_000).toISOString(),
+            addedBy: 'bulk-import-2026-06-03',
+            reason: null,
+            source: 'legacy' as const,
+          },
+        ],
+        count: 3,
+      };
+    },
+    add: async (body: { phoneNumber: string; reason?: string }) => {
+      await delay(300);
+      return { phoneNumber: body.phoneNumber, alreadyBlocked: false };
+    },
+  },
 };

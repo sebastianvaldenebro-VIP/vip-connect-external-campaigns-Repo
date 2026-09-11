@@ -5649,6 +5649,7 @@ class TestTickBrandedPoll:
 
     def test_completes_branded_when_queue_empty(self, mocker):
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         mocker.patch("executor._count_branded_queue", return_value=0)
         stop = mocker.patch("executor._stop_branded_campaign")
         mocker.patch("executor.save_run")
@@ -5667,6 +5668,7 @@ class TestTickBrandedPoll:
 
     def test_does_not_poll_connect_v2_for_branded(self, mocker):
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         mocker.patch("executor._count_branded_queue", return_value=5)
         poll = mocker.patch("executor._poll_campaign_state")
         mocker.patch("executor.save_run")
@@ -5681,6 +5683,7 @@ class TestTickBrandedPoll:
 
     def test_count_error_does_not_transition_status(self, mocker):
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         mocker.patch("executor._count_branded_queue", side_effect=Exception("DDB error"))
         mocker.patch("executor.save_run")
         mocker.patch("executor.get_run", return_value=run)
@@ -5700,6 +5703,7 @@ class TestTickBrandedPoll:
 
     def test_force_stops_branded_when_duration_exceeded(self, mocker):
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
         cs["startedAt"] = (
             datetime.now(timezone.utc) - timedelta(minutes=50)
@@ -5722,6 +5726,7 @@ class TestTickBrandedPoll:
 
     def test_branded_within_duration_does_not_force_stop(self, mocker):
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
         cs["startedAt"] = (
             datetime.now(timezone.utc) - timedelta(minutes=10)
@@ -5749,6 +5754,7 @@ class TestTickBrandedPoll:
         """count==0 must win over an exceeded duration — the campaign finished
         on its own; it must not be misreported as force-stopped/ABORTED."""
         run, plan, cs = self._run_with_running_branded()
+        mocker.patch("executor.update_plan_pending_warmup")
         plan["buckets"][0]["campaigns"][0]["run_duration_minutes"] = 45
         cs["startedAt"] = (
             datetime.now(timezone.utc) - timedelta(minutes=50)
@@ -6377,6 +6383,7 @@ class TestH5ConsecutivePollFailures:
         stop = mocker.patch("executor._stop_branded_campaign")
         mocker.patch("executor.save_run")
         mocker.patch("executor.get_plan", return_value=plan)
+        mocker.patch("executor.update_plan_pending_warmup")
         # After the 5th failure the campaign is terminal → tick advances the
         # bucket → run completion fans out to unlock/loop/SNS. That orchestration
         # has its own tests; isolate this test to the poll-failure transition.

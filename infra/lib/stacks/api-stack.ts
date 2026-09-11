@@ -1,9 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
-import * as authorizers from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
-import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -11,14 +9,14 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 
 export interface ApiStackProps extends cdk.StackProps {
   readonly dataKey: kms.IKey;
-  readonly userPool: cognito.IUserPool;
-  readonly userPoolClient: cognito.IUserPoolClient;
+  readonly authorizer: apigatewayv2.IHttpRouteAuthorizer;
   readonly segmentsFunction: lambda.IFunction;
   readonly campaignsFunction: lambda.IFunction;
   readonly metricsFunction: lambda.IFunction;
   readonly profilesFunction: lambda.IFunction;
   readonly plansFunction: lambda.IFunction;
   readonly progressiveDialerSeedFunction: lambda.IFunction;
+  readonly denyListFunction: lambda.IFunction;
   readonly corsAllowOrigins: string[];
   readonly permissionsBoundaryName?: string;
 }
@@ -58,14 +56,7 @@ export class ApiStack extends cdk.Stack {
       },
     });
 
-    const authorizer = new authorizers.HttpJwtAuthorizer(
-      'CognitoJwtAuthorizer',
-      `https://cognito-idp.${this.region}.amazonaws.com/${props.userPool.userPoolId}`,
-      {
-        jwtAudience: [props.userPoolClient.userPoolClientId],
-        identitySource: ['$request.header.Authorization'],
-      },
-    );
+    const authorizer = props.authorizer;
 
     const segmentsIntegration = new integrations.HttpLambdaIntegration(
       'SegmentsIntegration',
@@ -90,6 +81,10 @@ export class ApiStack extends cdk.Stack {
     const progressiveDialerIntegration = new integrations.HttpLambdaIntegration(
       'ProgressiveDialerIntegration',
       props.progressiveDialerSeedFunction,
+    );
+    const denyListIntegration = new integrations.HttpLambdaIntegration(
+      'DenyListIntegration',
+      props.denyListFunction,
     );
 
     // ── Segments routes ─────────────────────────────────────────────
@@ -133,6 +128,16 @@ export class ApiStack extends cdk.Stack {
       integration: segmentsIntegration,
       authorizer,
     });
+    // POST /segments/{id}/diagnose is intentionally NOT declared here.
+    // It already exists live (RouteId v0n6m69, api me1idvufo6) but was
+    // created out-of-band, outside CDK. Adding it via addRoutes() makes
+    // CloudFormation try to CREATE a new Route with the same RouteKey,
+    // which API Gateway v2 rejects as a conflict — that would fail this
+    // whole stack's deployment. Until it's imported into this stack (or
+    // the live route is removed) via a deliberate, separate operation, it
+    // must be re-pointed to the new authorizer with a direct
+    // `aws apigatewayv2 update-route` call BEFORE the old JWT authorizer
+    // is deleted, or it breaks when that authorizer goes away.
     this.httpApi.addRoutes({
       path: '/segments/preview-count',
       methods: [apigatewayv2.HttpMethod.POST],
@@ -330,6 +335,14 @@ export class ApiStack extends cdk.Stack {
       path: '/dialer/{id}/seed',
       methods: [apigatewayv2.HttpMethod.POST],
       integration: progressiveDialerIntegration,
+      authorizer,
+    });
+
+    // ── Deny list (blocked numbers) routes ───────────────────────────
+    this.httpApi.addRoutes({
+      path: '/deny-list',
+      methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.POST],
+      integration: denyListIntegration,
       authorizer,
     });
 

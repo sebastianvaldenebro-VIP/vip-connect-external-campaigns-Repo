@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
 
+import { useAuth } from '@/hooks/useAuth';
 import { usePersistedState } from '@/hooks/usePersistedState';
-import { NAV_GROUPS } from '@/lib/navConfig';
+import { NAV_GROUPS, visibleNavGroups } from '@/lib/navConfig';
 import { cn } from '@/lib/utils';
 
 // Keyed by route (`to`), not by label — routes are guaranteed unique across
@@ -64,10 +65,22 @@ const NAV_ICONS: Record<string, ReactNode> = {
       <path d="M12 4v4h4" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   ),
+  '/blocked-numbers': (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0">
+      <circle cx="10" cy="10" r="7" />
+      <path d="M5.5 5.5l9 9" strokeLinecap="round" />
+    </svg>
+  ),
 };
 
 export function Sidebar(): ReactNode {
   const [collapsed, setCollapsed] = usePersistedState('sidebar-collapsed', false);
+  const { groups, loading: authLoading } = useAuth();
+  // Show everything while groups are still loading rather than flashing an
+  // empty/wrong sidebar — this is cosmetic only, the real boundary is
+  // server-side, so briefly over-showing nav items costs nothing but a
+  // moment of UI accuracy.
+  const navGroups = authLoading ? NAV_GROUPS : visibleNavGroups(groups);
 
   return (
     <aside className={cn('flex flex-col border-r border-border bg-card transition-all', collapsed ? 'w-16' : 'w-56')}>
@@ -79,7 +92,7 @@ export function Sidebar(): ReactNode {
       </div>
 
       <nav className="flex-1 space-y-5 overflow-y-auto px-2 py-4">
-        {NAV_GROUPS.map((group) => (
+        {navGroups.map((group) => (
           <div key={group.label} className="flex flex-col gap-1">
             {!collapsed && (
               <div className="px-2 pb-1 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground">

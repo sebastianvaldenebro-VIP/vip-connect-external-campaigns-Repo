@@ -24,6 +24,7 @@ import { PlansToday } from '@/pages/PlansToday';
 import { PlansGuide } from '@/pages/PlansGuide';
 import { BrandedMonitor } from '@/pages/BrandedMonitor';
 import { ContactArtifacts } from '@/pages/ContactArtifacts';
+import { BlockedNumbers } from '@/pages/BlockedNumbers';
 import { Segments } from '@/pages/Segments';
 
 export default function App(): ReactNode {
@@ -61,6 +62,7 @@ export default function App(): ReactNode {
         <Route path="/profiles" element={<Profiles />} />
         <Route path="/audit" element={<Audit />} />
         <Route path="/contact-artifacts" element={<ContactArtifacts />} />
+        <Route path="/blocked-numbers" element={<BlockedNumbers />} />
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
