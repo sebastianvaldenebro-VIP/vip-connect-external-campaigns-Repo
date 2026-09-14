@@ -18,6 +18,8 @@ const ACTIONS = [
   'update',
   'delete',
   'estimate',
+  'verify',
+  'reconcile',
   'snapshot',
   'start',
   'stop',

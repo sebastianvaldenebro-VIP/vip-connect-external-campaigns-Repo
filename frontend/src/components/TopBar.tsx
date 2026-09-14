@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useLocation } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 
 import { signOut } from '@/lib/auth';
 import { api } from '@/lib/api';
@@ -78,6 +78,7 @@ export function TopBar(): ReactNode {
           {menuOpen && (
             <div className="absolute right-0 top-10 z-10 w-44 rounded-md border border-border bg-card py-1 shadow-md">
               <div className="truncate border-b border-border px-3 py-2 text-xs text-muted-foreground">{user?.username}</div>
+              <Link to="/preferences" onClick={() => setMenuOpen(false)} className="block px-3 py-2 text-sm text-muted-foreground hover:bg-muted hover:text-foreground">Preferences</Link>
               <button
                 type="button"
                 onClick={() => void signOut()}

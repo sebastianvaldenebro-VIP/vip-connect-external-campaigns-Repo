@@ -1,3 +1,4 @@
+import { SegmentInsights } from '@/components/SegmentInsights';
 import { useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -213,6 +214,8 @@ export function SegmentDetail(): ReactNode {
             Delete
           </button>
         </div>
+
+      <SegmentInsights segmentName={seg.name} />
       </div>
 
       <EnableCampaignModal
