@@ -214,9 +214,9 @@ export function SegmentDetail(): ReactNode {
             Delete
           </button>
         </div>
+      </div>
 
       <SegmentInsights segmentName={seg.name} />
-      </div>
 
       <EnableCampaignModal
         open={enableOpen}

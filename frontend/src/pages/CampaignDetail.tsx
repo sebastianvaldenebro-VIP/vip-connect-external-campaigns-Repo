@@ -143,9 +143,9 @@ export function CampaignDetail(): ReactNode {
             Delete
           </button>
         </div>
+      </div>
 
       <SegmentInsights segmentName={campaignSegmentName(campaign)} campaign />
-      </div>
 
       {/* Configuration card with status-based left border */}
       <div
