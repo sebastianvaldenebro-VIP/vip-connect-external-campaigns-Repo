@@ -56,6 +56,7 @@ export function visibleNavGroups(groups: string[]): NavGroup[] {
  * Falls back to "Monitor" (the app's default landing item) if nothing matches.
  */
 export function breadcrumbLabelForPath(pathname: string): string {
+  if (pathname === '/preferences') return 'Preferences';
   const allItems = NAV_GROUPS.flatMap((g) => g.items);
   let best: NavItem | null = null;
   for (const item of allItems) {
@@ -74,6 +75,7 @@ export function breadcrumbLabelForPath(pathname: string): string {
  * the "Admin" group don't incorrectly read "Contact center".
  */
 export function breadcrumbGroupForPath(pathname: string): string {
+  if (pathname === '/preferences') return 'Account';
   let best: NavItem | null = null;
   let bestGroup = 'Contact center';
   for (const group of NAV_GROUPS) {

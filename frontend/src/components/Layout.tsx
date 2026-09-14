@@ -1,3 +1,4 @@
+import { UserPreferencesProvider } from './UserPreferencesProvider';
 import type { ReactNode } from 'react';
 import { Outlet } from 'react-router-dom';
 
@@ -11,14 +12,16 @@ export function Layout(): ReactNode {
   useIdleTimeout(Boolean(user));
 
   return (
-    <div className="flex min-h-screen bg-background text-foreground">
-      <Sidebar />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <TopBar />
-        <main className="min-w-0 flex-1 px-6 py-8">
-          <Outlet />
-        </main>
+    <UserPreferencesProvider>
+      <div className="flex min-h-screen bg-background text-foreground">
+        <Sidebar />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <TopBar />
+          <main className="min-w-0 flex-1 px-6 py-8">
+            <Outlet />
+          </main>
+        </div>
       </div>
-    </div>
+    </UserPreferencesProvider>
   );
 }
