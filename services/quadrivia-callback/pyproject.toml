@@ -1,0 +1,10 @@
+[project]
+name = "vip-quadrivia-callback"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No ../shared/python: this Lambda is bundled standalone on purpose (see the
+# module docstring in src/handler.py) so it has no vip_shared import to path.
+pythonpath = ["src"]

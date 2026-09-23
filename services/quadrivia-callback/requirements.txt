@@ -1,0 +1,5 @@
+# Pinned floor, not speculative: connect.start_task_contact's ScheduledTime
+# parameter is only present in reasonably recent botocore, and the Lambda
+# runtime's built-in boto3 lags. Bundling it (via buildBundledPythonCode)
+# removes the "works locally, ParamValidationError in prod" failure mode.
+boto3>=1.34.0

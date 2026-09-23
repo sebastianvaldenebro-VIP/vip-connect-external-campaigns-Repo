@@ -266,4 +266,27 @@ export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
 // The CFN exec role lacks SNS and cloudwatch:PutDashboard permissions.
 // All monitoring resources are created via CLI — see deploy-cli.sh.
 
+// NOT YET INSTANTIATED (deliberate, not an oversight): QuadriviaWebhookStack
+// (lib/stacks/quadrivia-webhook-stack.ts) — the mTLS webhook that lets
+// Quadrivia's after-hours AI agent schedule callback Tasks in Connect. Fully
+// built and unit-tested (`cdk synth` clean in isolation), but not wired here
+// because three required props have no real value yet, confirmed with
+// Sebastian 2026-09-23:
+//   - taskTemplateId — no Task Template exists in Connect for this flow yet.
+//   - ownerEmail / team — SCP-mandated tags, not yet decided for this stack.
+// mtlsDomain can stay omitted at first wire-up (the stack is fail-closed —
+// disableExecuteApiEndpoint, no domain mapping — until that's chosen too).
+// Once the above three exist, wire it the same way as every other stack:
+//
+//   import { QuadriviaWebhookStack } from '../lib/stacks/quadrivia-webhook-stack';
+//   new QuadriviaWebhookStack(app, 'QuadriviaWebhookStack', {
+//     env,
+//     dataKey: data.dataKey,
+//     connectInstanceArn: `arn:aws:connect:us-east-1:165505826690:instance/${connectInstanceId}`,
+//     taskTemplateId: requireContext('quadriviaTaskTemplateId'),
+//     ownerEmail: requireContext('quadriviaOwnerEmail'),
+//     team: requireContext('quadriviaTeam'),
+//     permissionsBoundaryName,
+//   });
+
 Object.entries(mandatoryTags).forEach(([k, v]) => cdk.Tags.of(app).add(k, v));
