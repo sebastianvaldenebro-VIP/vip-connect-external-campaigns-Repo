@@ -1,3 +1,4 @@
+import { Preferences } from '@/pages/Preferences';
 import type { ReactNode } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 
@@ -39,6 +40,7 @@ export default function App(): ReactNode {
           </ProtectedRoute>
         }
       >
+        <Route path="/preferences" element={<Preferences />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/segments" element={<Segments />} />
         <Route path="/segments/new" element={<SegmentNew />} />
