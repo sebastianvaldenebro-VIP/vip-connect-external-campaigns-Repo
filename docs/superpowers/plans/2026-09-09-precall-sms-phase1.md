@@ -38,7 +38,7 @@ Real lead time: the SMS is enqueued at bucket activation, while `_create_campaig
 
 Personalization is a hard requirement (`Hi [Name]! This is [Clinic Name]...`). The existing PHI guard `_validate_sms_campaign` (`services/api-plans/src/handlers/plans.py:503-552`) blocks `{{...}}` and `${...}` outright (`_PHI_PATTERNS`, lines 528-529). Investigation established **why**, and it is not primarily a PHI judgment:
 
-> **There is no renderer anywhere in the pipeline.** `sms_processor_handler.py:92` passes `"MessageBody": message_template` straight to EUM `send_text_message`, verbatim. The sender copies the template into the SQS body unmodified (`sms_sender_handler.py:118`). So a template containing `{{FirstName}}` would deliver the literal characters `{{FirstName}}` to the patient.
+> **There is no renderer anywhere in the pipeline.** `sms_processor_handler.py:92` passes `"MessageBody": message_template` straight to EUM `send_text_message`, verbatim. The sender copies the template into the SQS body unmodified (`sms_sender_handler.py:128`, the `"messageTemplate": message_tmpl` entry inside the `MessageBody` JSON at `123-133`). So a template containing `{{FirstName}}` would deliver the literal characters `{{FirstName}}` to the patient.
 
 That reframes the fix. The guard is load-bearing **until a renderer exists**, so the renderer must be built first and the guard narrowed second — never the reverse. Task 3 does both, in that order, and keeps every other PHI pattern intact.
 
@@ -64,7 +64,7 @@ Everything else stays blocked, including `{{LastName}}` — CP exposes it (`serv
 - **Branch from `origin/main`. PR #7 has already merged — this is not a prerequisite to wait on.** Verified against `origin/main` after a fresh `git fetch` on 2026-09-10: `origin/main`'s tip **is** `ad96df1 feat: TCPA opt-out gap — cross-channel opt-out enforcement (#7)`. The opt-out gate and `services/shared/python/vip_shared/infrastructure/persistence/opt_out.py` are both present on `main`. Every `sms_sender_handler.py` anchor in this plan is taken from that tree (285 lines, `StructuredLogger`-based). Four things an implementer must not get wrong:
   - **Resolve refs against `origin/main`, never a local `main` ref.** The local `main` in the primary checkout is **23 commits stale** (`5dc2eb1`) and does *not* contain the gate; the branch checked out there is `audit/2026-09-02`, which also predates it. Reading either one produces the false conclusion that the merge is still pending — a mistake made twice while writing this plan. Always `git fetch origin` first and read `origin/main` explicitly.
   - The gate's actual symbols are `from vip_shared.infrastructure.persistence.opt_out import build_from_env as build_opt_out_from_env` (lines 22-23), module-level `_opt_out = build_opt_out_from_env()` (38), `if _opt_out.is_blocked(phone):` inside the send loop (115), and the counter `totalSkippedOptOut` (start record 86, `UpdateExpression` 178, log field `skipped_opt_out` 193). **There is no `OPT_OUT_TABLE` literal in this handler** — the table name is resolved inside the shared module's `build_from_env()` and injected as a Lambda env var. Grepping the handler for `OPT_OUT_TABLE` returns zero *even though the gate is present*, which reads exactly like "the merge has not landed." Grep for `_opt_out.is_blocked` instead.
-  - **`OPT_OUT_TABLE` is already wired in CDK too**: `infra/lib/stacks/api-sms-stack.ts:167` sets `OPT_OUT_TABLE: 'VipConnectOptOutList'` inside `smsSenderFunction`'s `environment` block (`162-168`). Task 1 Step 6 appends to that block; it does not create it.
+  - **`OPT_OUT_TABLE` is already wired in CDK too**: `infra/lib/stacks/api-sms-stack.ts:167` sets `OPT_OUT_TABLE: 'VipConnectOptOutList'` inside `smsSenderFunction`'s `environment` block (`162-168`). **Task 1 Step 7** appends to that block; it does not create it. (Step 6 is the unrelated COT comment-only change — do not conflate the two.)
   - Do **not** branch from `.claude/worktrees/tcpa-optout-gap` or from the primary checkout's working tree, and do not edit a copy that predates the gate — that would silently revert a deployed production gate. The existing `.claude/worktrees/precall-sms-phase1` worktree is at `ad96df1` and is a correct base.
 - **Do not modify any CloudHesive-owned resource.** Nothing here needs to; the constraint stands so no one "helpfully" fixes their flow while in the area. Verified live 2026-09-09, account `165505826690` / us-east-1:
   - Lambdas (all 8 `cloudhesive-integration-*`): `connectcampaign_sms_lookup`, `callback-tz-TimezoneCheck`, `callback-tz-RequeueCallbacks`, `agent-initiatied-sms-send-sms`, `agent-initiatied-sms-get-history`, `agent-initiatied-sms-receive-sms`, `agent-initiatied-sms-list-sessions`, `agent-initiatied-sms-ws-handler`
@@ -82,7 +82,7 @@ Everything else stays blocked, including `{{LastName}}` — CP exposes it (`serv
 - **PHI.** Phone numbers are HIPAA identifier #4; first names are identifier #1. Never log either, and never log a rendered message body. **There is no `_last4()` helper in this repo** — do not go looking for one. The three real conventions, verified: `services/api-sms/src/sms_sender_handler.py` logs **no phone at all** (its own module docstring, lines 6-8: "Phone numbers are NOT logged"; the failure path at line 182 comments "no phone numbers here — only the SQS-assigned Id and error code"), which is the convention Task 1 and Task 3 must follow in that file; `executor.py` stores an inline `phone[-4:]` under `phone_last4` / `sourcePhoneLast4` field names (`424-446`, `671`, `696`, `4497`) when a last-4 must be persisted; and `services/api-deny-list/src/handlers/deny_list.py:37` has a `_mask()` returning `****1234` for log lines. Copy the convention of the file you are in — do not introduce a fourth. The SQS send queue is KMS-CMK encrypted (`alias/vip-data-key`, `infra/lib/stacks/api-sms-stack.ts:70-106`, created via CLI and imported with `keyArn: props.dataKeyArn`), which already covers phone numbers in message bodies and therefore covers an added first name — but Task 3 Step 8 re-verifies it live, because that queue is created by a manual CLI step and can drift.
 - **Contact window is 08:00–21:00 recipient-local, Monday through Saturday. No contact on Sunday.** Decided by Sebastian 2026-09-10: use the **full statutory TCPA window** on the hours axis (08:00–21:00, not the earlier tighter 08:00–20:00 proposal) and be **stricter than statute on the day axis** (TCPA does not exempt Sunday; this is a business choice). Both axes are load-bearing: the hours check alone is not enough, so **day-of-week is a real logic addition**, not a constant change (Tasks 1 and 2).
 - **If the `phonenumbers` layer budget check fails, stop and report.** Task 1 Step 4's contingency was **explicitly accepted** by Sebastian, not defaulted to: the hand-rolled area-code→timezone map is a documented fallback that requires its own decision, not a shortcut an implementer may take unilaterally when the layer measurement comes back unhappy.
-- **Do not invent patient-facing copy.** Business-approved SMS copy exists for Vein and Pain Management only (Task 5). Fibroid and General have none, and none is drafted here (**OQ-8**). If a specialty has no approved string, it does not ship — a plausible-looking placeholder in a patient-facing, TCPA-relevant message is worse than an empty row.
+- **Do not invent patient-facing copy, and do not add specialties.** Phase I ships **exactly two** specialties — **Vein** and **Pain Management** — with the business-approved strings in Task 5. Sebastian, 2026-09-10: *"por el momento solo vein y pein."* Fibroid and General are **deliberately not shipped** (**OQ-8**, resolved-deferred; see "Explicitly Out of Scope"), so the copy table has two entries and Task 7 verifies two. If a specialty has no approved string it does not ship — a plausible-looking placeholder in a patient-facing, TCPA-relevant message is worse than no row at all. Equally: **do not add a `Reply STOP` tail** to either approved template (**OQ-10**, resolved-no: *"no lo agreguemos."*).
 
 ---
 
@@ -893,7 +893,7 @@ Logically independent of Tasks 1 and 2, and must land before **Task 4** (which s
 - Consumes: nothing.
 - Produces: `vip_shared.domain.services.sms_template` — `RECIPIENT_FIELDS`, `CAMPAIGN_FIELDS`, `ALLOWED_FIELDS`, `extract_placeholders(tmpl) -> set[str]`, `render(tmpl, *, recipient, campaign) -> str`, `max_rendered_length(tmpl, *, campaign) -> int`; and `_get_segment_recipients` replacing `_get_segment_phones` in the sender. Task 5 validates against the same allowlist; Task 4 relies on rendering already working.
 
-**Step order is not negotiable: the renderer lands before the guard is narrowed.** Verified reason — nothing in the pipeline interpolates anything today. `sms_processor_handler.py:92` sets `"MessageBody": message_template` verbatim, and `sms_sender_handler.py:118` copies the template into the SQS body unchanged. Narrowing the guard first would let a template with `{{FirstName}}` through to a patient as literal braces.
+**Step order is not negotiable: the renderer lands before the guard is narrowed.** Verified reason — nothing in the pipeline interpolates anything today. `sms_processor_handler.py:92` sets `"MessageBody": message_template` verbatim, and `sms_sender_handler.py:128` copies the template into the SQS body unchanged (`"messageTemplate": message_tmpl`; do not confuse this with line `118`, which is the `item_sk` generation the new quiet-hours check sits directly above). Narrowing the guard first would let a template with `{{FirstName}}` through to a patient as literal braces.
 
 **Where rendering happens: the sender.** `_get_segment_phones` (`sms_sender_handler.py:201-239`) already calls `batch_get_profile` and receives whole profiles, then keeps **only** `PhoneNumber`/`MobilePhoneNumber` and discards the rest (lines 229-232). The recipient's `FirstName` is therefore already being fetched and thrown away — rendering in the sender needs no new API call. The processor stays **completely unchanged**: the sender keeps writing the finished text under the existing `messageTemplate` SQS key.
 
@@ -1104,8 +1104,9 @@ def max_rendered_length(
     budget is _NAME_MAX_LEN because render() truncates there, which makes it a
     real upper bound rather than a guess.
 
-    `name_budget` is overridable only so tests and the OQ-9 analysis can ask
-    "what if we truncated names shorter?" without mutating a module global.
+    `name_budget` is overridable only so a test can ask "what if we truncated
+    names shorter?" without mutating a module global. It is not a tuning knob:
+    _NAME_MAX_LEN stays 20 (see OQ-9, where lowering it was rejected).
     """
     return len(
         render(
@@ -1789,6 +1790,8 @@ Either approved template is valid here; Pain is shown because it is the shorter 
 
 - [ ] **Step 1: Write the failing tests**
 
+These share one local factory, `_plan_with_precall(precall=None, delivery_type="campaign", depends_on=None)`, which builds a minimal single-bucket plan around one campaign and is the only new helper this file needs. Follow `test_plan_validation_sms.py`'s existing plan-dict construction rather than inventing a shape. **Its default `precall` must be the valid config block shown above** (the Pain template, `clinicName: "VIP Medical Group"`, `originationNumberArn: "arn:x"`), because `test_valid_precall_campaign_has_no_errors` at the end of this block asserts that the default produces zero errors — a default that is merely *present* rather than *valid* turns that test into a false negative.
+
 ```python
 def test_precall_requires_template_when_enabled():
     plan = _plan_with_precall(precall={"enabled": True})
@@ -1897,9 +1900,10 @@ def test_both_approved_templates_pass_the_real_validator():
 
 def test_approved_copy_is_pure_gsm7():
     """A curly apostrophe (U+2019) instead of ASCII ' silently forces UCS-2
-    encoding, which cuts the per-segment budget from 160 to 70 — the message
-    would split into three segments and this plan's whole length analysis would
-    be wrong. Copy pasted out of a Word/Google doc is the usual source.
+    encoding, which cuts the per-segment budget from 160 to 70 — Vein would
+    split into three segments and Pain into two, and this plan's whole length
+    analysis would be wrong. Copy pasted out of a Word/Google doc is the usual
+    source.
     """
     for specialty, tmpl in _APPROVED_COPY_2026_09_10.items():
         assert "’" not in tmpl, specialty
@@ -1927,7 +1931,7 @@ def test_valid_precall_campaign_has_no_errors():
     assert validate_plan(_plan_with_precall()) == []
 ```
 
-`_MAX_SMS_CHARS` and `max_rendered_length`'s `name_budget` keyword do not exist yet. Introduce both in Step 3: replace the bare `160` literal at `services/api-plans/src/handlers/plans.py:514` with a module constant (a magic number governing legal copy should be named), and give `max_rendered_length` in the shared renderer a `name_budget: int = _NAME_MAX_LEN` keyword so no existing caller changes. Both are needed by whichever OQ-9 resolution is chosen, and the keyword is the only way to test the 12-char claim without mutating a module global.
+`_MAX_SMS_CHARS` and `max_rendered_length`'s `name_budget` keyword do not exist yet. Introduce both in Step 3: replace the bare `160` literal at `services/api-plans/src/handlers/plans.py:514` with a module constant (a magic number governing legal copy should be named), and give `max_rendered_length` in the shared renderer a `name_budget: int = _NAME_MAX_LEN` keyword so no existing caller changes. Both stay even though OQ-9 was resolved by shortening the copy rather than by moving either number: the named constant is what the length tests and the frontend counter agree on, and the keyword is the only way to measure an alternative name budget in a test without mutating a module global. **Neither value changes** — `_MAX_SMS_CHARS` stays 160 and `_NAME_MAX_LEN` stays 20 (OQ-9 options 2 and 3 were rejected).
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1955,7 +1959,7 @@ Add a "Pre-Call SMS (Phase I)" section. Task 6 adds the authoring UI, so this se
 - Required: `enabled: true`, `messageTemplate` (only `{{FirstName}}` and `{{ClinicName}}`), `originationNumberArn`, `clinicName`.
 - The campaign must **not** have `dependsOn` — that disables pre-warming, so no segment exists at activation and the SMS would never fire. Validation rejects the combination, and the UI disables the toggle while dependencies are checked.
 - Ordering is automatic: the SMS is enqueued at bucket activation, and Connect's own campaign `startTime` is warm-time + 6 minutes, so the first dial follows roughly 1–6 minutes later. There is no lead-time setting to tune.
-- Specialty copy: **one voice campaign per specialty, each with its own hand-written `messageTemplate`.** The specialty is part of the sentence, not a substituted value — copy the approved string for that specialty verbatim from this plan's Task 5 table. Only Vein and Pain Management have approved copy as of 2026-09-10.
+- Specialty copy: **one voice campaign per specialty, each with its own hand-written `messageTemplate`.** The specialty is part of the sentence, not a substituted value — copy the approved string for that specialty verbatim from this plan's Task 5 table. **Phase I ships two specialties only: Vein and Pain Management.** Fibroid and General are deferred and out of scope — if an operator needs pre-call SMS for either, that is a copy-approval request to Sebastian, not a configuration an operator may compose. Never edit an approved string in the panel: the 160-character ceiling applies to the *rendered* message, and both approved templates were measured against it (Vein 153, Pain 135).
 - Quiet hours are enforced per recipient, not per campaign: a lead whose area code puts them outside 08:00–21:00 local, or in any timezone where it is Sunday, is skipped and counted in `totalSkippedQuietHours` on the run record. A pre-call SMS run with fewer sends than the segment size is normal, not a failure.
 
 - [ ] **Step 6: Commit and deploy (ask for explicit confirmation)**
@@ -1990,7 +1994,7 @@ Follow that convention, not `frontend/src/components/ui.tsx`. Those primitives (
 
 **Do not confuse two endpoints.** `api.campaigns.phoneNumbers()` (used by `CampaignNew.tsx:111`) returns **Connect caller-ID** numbers and is a different thing. The SMS origination list is `api.sms.listNumbers()`.
 
-**One thing must NOT be copied from the neighbouring block: `maxLength={160}` on the raw template.** For `precallSms` the ceiling applies to the **rendered** string, and the approved Vein copy is 158 raw / 168 rendered. A raw `maxLength={160}` would let an operator type copy the backend then rejects, with the counter reading a reassuring `158/160`. The counter and any length cap must both measure the rendered worst case (`{{FirstName}}` → 20 chars, `{{ClinicName}}` → the configured `clinicName`), which is precisely the arithmetic Task 3's `max_rendered_length` does server-side.
+**One thing must NOT be copied from the neighbouring block: `maxLength={160}` on the raw template.** For `precallSms` the ceiling applies to the **rendered** string, which runs up to 10 characters longer than the raw template (`{{FirstName}}` is 13 characters but renders to 20; `{{ClinicName}}` is 14 but renders to 17). The rejected Vein draft is the concrete case: 158 raw, 168 rendered. A raw `maxLength={160}` would let an operator type copy the backend then rejects, with the counter reading a reassuring `158/160`. The counter and any length cap must both measure the rendered worst case (`{{FirstName}}` → 20 chars, `{{ClinicName}}` → the configured `clinicName`), which is precisely the arithmetic Task 3's `max_rendered_length` does server-side.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2013,6 +2017,11 @@ const PAIN =
   "Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a moment " +
   'to discuss your pain management request. Talk soon!';
 const VEIN =
+  "Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a quick " +
+  'call regarding your vein consultation request. Look out for our call!';
+// The pre-2026-09-10 Vein draft, kept ONLY as the over-ceiling fixture below.
+// It is 158 raw / 168 rendered — the exact string that forced OQ-9. Never ship it.
+const VEIN_REJECTED_DRAFT =
   "Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a quick " +
   'call regarding your vein consultation request. Look out for a call from ' +
   'this number!';
@@ -2068,14 +2077,27 @@ describe('rendered length, not raw length', () => {
     expect(renderedWorstCaseLength(PAIN, CLINIC)).toBe(135);
   });
 
+  it('accepts both approved templates — neither is over the ceiling', () => {
+    expect(renderedWorstCaseLength(VEIN, CLINIC)).toBe(153);
+    for (const tmpl of [VEIN, PAIN]) {
+      const errs = validatePrecallSms({
+        enabled: true,
+        messageTemplate: tmpl,
+        clinicName: CLINIC,
+        originationNumberArn: 'arn:x',
+      });
+      expect(errs).toEqual([]);
+    }
+  });
+
   it('catches the template that is under 160 raw but over 160 rendered', () => {
-    // This is why maxLength={160} on the raw textarea would be a bug: the
-    // approved Vein copy is 158 raw and 168 rendered.
-    expect(VEIN.length).toBeLessThanOrEqual(160);
-    expect(renderedWorstCaseLength(VEIN, CLINIC)).toBe(168);
+    // This is why maxLength={160} on the raw textarea would be a bug. The
+    // rejected Vein draft is the real example: 158 raw, 168 rendered.
+    expect(VEIN_REJECTED_DRAFT.length).toBeLessThanOrEqual(160);
+    expect(renderedWorstCaseLength(VEIN_REJECTED_DRAFT, CLINIC)).toBe(168);
     const errs = validatePrecallSms({
       enabled: true,
-      messageTemplate: VEIN,
+      messageTemplate: VEIN_REJECTED_DRAFT,
       clinicName: CLINIC,
       originationNumberArn: 'arn:x',
     });
@@ -2271,10 +2293,10 @@ Do **not** add `precallSms` to `DEFAULT_CAMPAIGN_CONFIG` (`PlanNew.tsx:38`). `cf
 Contents, mirroring the neighbouring block's markup and copying its inline class strings:
 
 1. **Toggle** — checkbox bound to `cfg.precallSms?.enabled`. Disabled (not hidden) when unavailable.
-2. **Template textarea** — same classes as line 877-883, but **no `maxLength`**: see the note above. Counter shows the rendered worst case, `({renderedWorstCaseLength(tmpl, clinicName)}/160)`, turning red past 160. Put the allowlist inline beneath it, verbatim: `Placeholders: {{FirstName}} (the patient's first name) and {{ClinicName}}. Nothing else is permitted.` Keep the existing PHI warning text from 884-886 word for word — it is already the right warning.
+2. **Template textarea** — same classes as line 877-883, but **no `maxLength`**: see the note above. Copy the `className` string only, **not the whole element**: line 881 carries `placeholder="Your appointment is confirmed. Reply STOP to opt out."`, and dragging that across would put opt-out wording back into pre-call authoring right after OQ-10 ruled it out. Use a pre-call-appropriate placeholder, or none. Counter shows the rendered worst case, `({renderedWorstCaseLength(tmpl, clinicName)}/160)`, turning red past 160. Put the allowlist inline beneath it, verbatim: `Placeholders: {{FirstName}} (the patient's first name) and {{ClinicName}}. Nothing else is permitted.` Keep the existing PHI warning text from 884-886 word for word — it is already the right warning.
 3. **`clinicName`** — text input. Label it as interpolated so the operator understands it appears in the message body.
 4. **Origination number** — `<select>` reusing the **same** `smsNumbers` query result as line 858-870 (`useQuery(['sms','numbers'])` at 1368-1373). Show `{phoneNumber} ({numberType})` per option, exactly as the existing dropdown does. Default the empty state to the number recorded in Task 5 (`+16106009752`) only as helper text — do **not** hardcode the ARN in the frontend; it must come from the endpoint so a number change does not need a frontend deploy.
-5. **Approved-copy hint** — a short line naming the two specialties with approved copy and pointing at the runbook. Operators must not compose their own copy.
+5. **Approved-copy hint** — a short line naming the two shipped specialties (Vein, Pain Management) and pointing at the runbook. Operators must not compose their own copy, and the hint must not list a specialty that has no approved string.
 
 No separate PHI-acknowledgment checkbox. The bulk-SMS block has one (`phiAcknowledged`, enforced at `handleSave()` line 1418) because an operator composes that copy freely; pre-call copy is transcribed from an approved list and PHI-screened server-side, so a second checkbox would be ceremony. If Sebastian wants parity, it is a one-line addition — say so rather than adding it unasked.
 
@@ -2374,12 +2396,12 @@ done
 
 Author it in the **Task 6 authoring panel**, not with a direct `PUT /plans/{id}` call. The point of doing it through the UI is that it exercises the client-side validator, the origination-number dropdown, and the error banner on the same save that exercises the backend validator — a curl-only test would prove the API works and leave the UI unverified.
 
-One voice campaign with `precallSms.enabled = true`, `clinicName: "VIP Medical Group"`, the origination number from the dropdown (`+16106009752`), and **no** `dependsOn`. Use the **Pain Management** approved copy, because as of 2026-09-10 the Vein copy renders to 168 characters and Task 5's validator legitimately rejects it (**OQ-9**) — reaching for Vein here would produce a save failure that looks like a bug and is not one. There is no `specialty` field; the specialty is inside the sentence.
+One voice campaign with `precallSms.enabled = true`, `clinicName: "VIP Medical Group"`, the origination number from the dropdown (`+16106009752`), and **no** `dependsOn`. Use the **Pain Management** approved copy from Task 5's table, verbatim. Either approved template would pass — both fit the ceiling since OQ-9 was resolved — and Pain is specified only so the expected received text in **Step 3(a)** below is a single fixed string. **Do not compose your own copy and do not add a `Reply STOP` tail** (**OQ-10**, resolved-no). There is no `specialty` field; the specialty is inside the sentence. **Phase I has exactly two approved templates** — if you find yourself needing a Fibroid or General string, stop: those specialties are out of scope (**OQ-8**).
 
 While here, confirm two UI negatives that Task 6's unit tests assert but cannot observe in the real form:
 
 1. Tick a `dependsOn` checkbox on the same campaign and confirm the pre-call panel goes unavailable with its reason shown, and that saving does not send an enabled `precallSms`.
-2. Paste the Vein copy and confirm the rendered-length counter reads over 160 and turns red **before** you press save — the raw string is 158, so a counter measuring raw length would read `158/160` and mislead.
+2. Paste the **rejected Vein draft** — the pre-OQ-9 wording ending `Look out for a call from this number!` — and confirm the rendered-length counter reads over 160 and turns red **before** you press save. That draft is 158 raw / 168 rendered, so a counter measuring raw length would read a reassuring `158/160` and mislead. Then clear it: it must not be saved, and neither approved template trips this check (Vein renders 153, Pain 135).
 
 - [ ] **Step 3: Run it and prove the four Phase I guarantees**
 
@@ -2389,7 +2411,7 @@ While here, confirm two UI negatives that Task 6's unit tests assert but cannot 
 Hi <KnownFirstName>! VIP Medical Group here. We're calling you in just a moment to discuss your pain management request. Talk soon!
 ```
 
-with the real name, and **no literal `{{FirstName}}`, no `Hi !`, no empty clinic name, and no `Reply STOP` tail** — no approved template carries opt-out language (**OQ-10**). Check the apostrophe in `We're` renders as a straight `'`: a curly `’` would silently switch the message to UCS-2 and split it into two 70-character segments.
+with the real name, and **no literal `{{FirstName}}`, no `Hi !`, no empty clinic name, and no `Reply STOP` tail** — neither approved template carries opt-out language and none is to be added (**OQ-10**, resolved-no). A `Reply STOP` tail appearing here means someone edited the copy; that is a failure, not a bonus. Check the apostrophe in `We're` renders as a straight `'`: a curly `’` would silently switch the message to UCS-2 and split it into two 70-character segments.
 
 **(b) The SMS strictly preceded the first dial.** Compare the `precall_sms_fired` log timestamp against the campaign's first CTR `InitiationTimestamp`:
 
@@ -2424,7 +2446,7 @@ Expected: `localTimeZoneDetection == ["AREA_CODE"]`, `defaultTimeZone == "Americ
 
 Two things to read off that output rather than skim past, both of which the earlier draft of this plan would have got wrong:
 
-1. **The `T` prefix must still be there.** `Iso8601Time`'s pattern is `^T\d{2}:\d{2}$` (verified against botocore 1.43.90). If the echo shows bare `08:00`, something normalised it and the whole shape needs re-checking.
+1. **The `T` prefix must still be there.** `Iso8601Time`'s pattern is `T\d{2}:\d{2}` — **unanchored**, verified against botocore 1.43.90, and **not enforced client-side at all** (see Task 2's note at line 652: `"08:00"`, `"8:00"` and outright garbage all pass `ParamValidator`). This echo is therefore the *first* place a bad literal becomes visible. If it shows bare `08:00`, something normalised it and the whole shape needs re-checking.
 2. **`SUNDAY` must still be absent.** If `describe-campaign` returns a `SUNDAY` key you never sent — with any value, `[]` included — then omission is not how Connect encodes a closed day, Task 2's chosen encoding is wrong, and Step 6 below stops being a confirmation and becomes a **hard blocker**.
 
 Then run a campaign containing both test numbers in the **13:00–15:00 UTC** band — 09:00 Eastern (allowed) but 06:00 Pacific (blocked, because 06:00 is before the 08:00 open) — and confirm from the CTR that Connect dialed the Eastern number and **not** the Pacific one. A stored config is not proof of enforcement; the differential outcome is.
@@ -2522,33 +2544,8 @@ git commit -m "docs: record Phase I pre-call SMS end-to-end verification evidenc
 
 ## Open Questions / Blockers
 
-### Still open — four items. OQ-8, OQ-9 and OQ-10 block Tasks 3 and 5; OQ-11 does not block, but gates Task 7
+### Still open — one item. OQ-11 does not block implementation; it gates Task 7's sign-off
 
-- **OQ-8 — approved copy is missing for Fibroid and General. BLOCKS shipping those two specialties.** Sebastian supplied business-approved copy for **Vein** and **Pain Management** only (Task 5, "The approved copy"). No copy has been drafted for Fibroid or General and **none will be invented here** — the copy is patient-facing and TCPA-relevant, so a placeholder that looks final is worse than an empty row. Two ways forward: get the real strings from Sebastian before implementing, or ship Phase I with only the two approved specialties and treat the other two as a follow-up. Either is fine; guessing is not. **Whatever arrives must be re-measured against the 160-character ceiling the same way OQ-9 measures the existing two — do not assume new copy fits.**
-- **OQ-9 — the approved Vein copy is 8 characters over the rendered ceiling. Needs a decision, not a workaround.** Measured, not estimated (`{{ClinicName}}` = `VIP Medical Group`, 17 chars; `{{FirstName}}` at the renderer's own `_NAME_MAX_LEN` truncation point of 20 chars, which is the real worst case):
-
-  | | raw | rendered @20-char name | rendered @"Maria" |
-  |---|---|---|---|
-  | Pain Management (approved) | 125 | **135** ✅ | 120 |
-  | Vein (approved) | 158 | **168** ❌ | 153 |
-
-  So Task 5's validator **rejects the approved Vein copy as written**. Three options, all measured:
-
-  1. **Shorten the copy** — needs Sebastian's sign-off since it is his wording. Four candidates, each measured at the 20-char worst case, with the exact resulting edit so he is approving a string and not a description:
-
-     | edit | resulting fragment | rendered @20 |
-     |---|---|---|
-     | `give you a quick call` → `call you` | `We're about to call you regarding your vein consultation request.` | **155** ✅ |
-     | delete `give you a quick ` | `We're about to call regarding your vein consultation request.` | **151** ✅ |
-     | closing sentence → `Look out for our call!` | — | **153** ✅ |
-     | delete the closing sentence entirely | — | **130** ✅ |
-
-     Two near-misses worth recording so nobody retries them: deleting only ` quick` gives **162**, and borrowing Pain's shorter opener (`{{ClinicName}} here.` instead of `This is {{ClinicName}}.`) gives **165**. Both are still over — the opener is not where the length is.
-  2. **Lower `_NAME_MAX_LEN` from 20 to 12.** Vein then renders to **exactly 160** — zero headroom, and any future copy edit or a longer clinic name breaks it again. Also truncates real first names at 12 characters for every message, not just this one.
-  3. **Raise `_MAX_SMS_CHARS` from 160 to 320.** Two GSM-7 segments, so **2× the per-message cost** on every send, to accommodate one template that is 8 characters over. Also removes the pressure that is currently keeping the copy short.
-
-  Recommendation: option 1. But it is his copy, so it is his call. Task 5's `test_approved_vein_copy_length_is_pinned_so_the_conflict_cannot_be_lost` deliberately asserts the **measurement** (168) and not a verdict, so whichever option is chosen, that test is the thing that changes and the conflict cannot be quietly lost in a refactor.
-- **OQ-10 — should the approved copy carry an opt-out instruction? Must be answered together with OQ-9.** Neither approved template says "Reply STOP". An earlier draft of this plan had added that tail; **it was this plan's invention, not Sebastian's, and it has been removed** rather than left in his wording. The case for adding it is in Task 5, point (3): the deployed opt-out path only ever populates from inbound `STOP`, so without an instruction the mechanism exists but is never exercised, and an unsolicited-looking "we're about to call you" text with no opt-out affordance is the TCPA fact pattern plaintiffs' counsel look for. The cost, measured: ` Reply STOP to opt out.` (23 chars) puts Pain at **158** (fits, max first name 22) and Vein at **191** — over the ceiling **even with a zero-length name** (171). So "add STOP" and "keep Vein as written" are mutually exclusive, which is why these two questions are one decision.
 - **OQ-11 — how Connect encodes "closed on this day" is unverified.** Botocore proves both `"SUNDAY": []` and omitting the key are *syntactically* valid (`DailyHours` has no required keys, `TimeRangeList` has no minimum length). Which one Connect *interprets* as "never contact" is undocumented and **cannot be verified without calling `CreateCampaign`**, which a planning pass must not do. Task 2 chooses omission and says so plainly; Task 7 Step 4 checks the `describe-campaign` echo and Task 7 Step 6 proves it with a real Sunday dial attempt. **This is the single most likely thing in Phase I to behave differently from the plan.** If omission turns out to be wrong and `"SUNDAY": []` is too, the day axis has to move into our own code for the voice channel — a design change, not a fix.
 
 ### Resolved (kept for the audit trail; numbering preserved so cross-references still hold)
@@ -2559,7 +2556,23 @@ git commit -m "docs: record Phase I pre-call SMS end-to-end verification evidenc
 - **OQ-4 — is `FirstName` actually populated in Customer Profiles? RESOLVED 2026-09-10.** Coverage is **100%**, **confirmed directly by Sebastian, not independently measured** — Customer Profiles has no cheap existence-filter API for this, so no aggregate query was run and none is required before Task 3. CP also exposes the field in code (`services/api-profiles/src/handlers/profiles.py:140-141`; `test_profiles_handler.py:38`). Task 3 proceeds on this basis with **no coverage caveat**: personalization is expected to land for every recipient. The renderer's `"there"` fallback and junk-name rejection (`test_missing_first_name_uses_neutral_fallback`, `test_blank_first_name_uses_fallback`) stay in as defensive code against a single bad profile record — they are **not** a hedge against poor coverage.
 - **OQ-5 — which origination number should the pre-call SMS use? RESOLVED 2026-09-10: `+16106009752`.** ARN `arn:aws:sms-voice:us-east-1:165505826690:phone-number/phone-ba711707215947e3a0e5112c0872014b` — ACTIVE, `TEN_DLC`, SMS capability, no `TwoWayChannelArn`, and unclaimed by any code (zero hits across all four repos searched). Task 5's "Origination number" section records the two caveats that are **notes, not blockers**: its `MessageType` is `TRANSACTIONAL`, and it shares a `RegistrationId` with the CloudHesive-owned `+19378702788` — **do not attempt to change that registration.** The earlier candidate `+18554810365` (Connect, `Capabilities: null`) was the wrong kind of number entirely; `+18443527135` and `+18444152389` are **already claimed by the separate `rcm-sms-inbox` application** and must not be reused here.
 - **OQ-6 — UI for `precallSms`. RESOLVED 2026-09-10: required, not deferred — it is now Task 6.** An operator-follows-the-runbook workflow was rejected. Task 6 adds a real authoring panel to the existing plan editor (`frontend/src/pages/PlanNew.tsx`'s `CampaignCard`), following that file's own conventions, and Task 7 Step 2 configures the verification campaign **through it**. The panel must not be able to author anything the backend rejects, which is why `precallSmsAvailability()` disables it for `dependsOn` campaigns and the length counter measures the **rendered** worst case rather than the raw string.
-- **OQ-7 — `{{LastName}}`. RESOLVED 2026-09-10: stays excluded, and the copy is now real.** A surname adds identifiability with no engagement benefit, so it remains denied by omission and nobody should expect `Hi Maria Gomez!`. The same decision replaced this plan's drafted copy with Sebastian's business-approved strings for Vein and Pain Management, which had two knock-on effects worth reading before implementing: `{{Specialty}}` is **no longer allowlisted** (the approved copy bakes the specialty into the sentence — Task 5, point 1, lists the five reversal sites), and the approved copy raised **OQ-9** and **OQ-10** above.
+- **OQ-7 — `{{LastName}}`. RESOLVED 2026-09-10: stays excluded, and the copy is now real.** A surname adds identifiability with no engagement benefit, so it remains denied by omission and nobody should expect `Hi Maria Gomez!`. The same decision replaced this plan's drafted copy with Sebastian's business-approved strings for Vein and Pain Management, which had two knock-on effects worth reading before implementing: `{{Specialty}}` is **no longer allowlisted** (the approved copy bakes the specialty into the sentence — Task 5, point 1, lists the five reversal sites), and the approved copy raised **OQ-8**, **OQ-9** and **OQ-10**, all three of which are now resolved below.
+- **OQ-8 — copy for Fibroid and General. RESOLVED 2026-09-10: deferred. Phase I ships Vein and Pain Management only.** Sebastian: *"por el momento solo vein y pein."* Fibroid and General are **not shipped in Phase I** — this is a scope decision, not a missing-copy blocker, and it is recorded in "Explicitly Out of Scope" rather than left as an open question. No placeholder rows exist, no `precallSms` config may name those specialties, and Task 5's copy table is authoritative at exactly two entries. Follow-up: when real business-approved copy exists for either specialty, adding it is a one-row change to the copy table plus its length test — but **it must be re-measured against the 160-character rendered ceiling the same way the two shipped templates were** (Task 5, point 2). Do not assume new copy fits.
+- **OQ-9 — the approved Vein copy exceeded the rendered ceiling. RESOLVED 2026-09-10: option 3, closing sentence shortened. Both templates now fit.** The original Vein wording ended `Look out for a call from this number!` and rendered to **168** at the 20-char worst case — 8 over. Of the four measured shortenings offered, Sebastian chose replacing the closing sentence with `Look out for our call!`. Final string, exactly as it must be implemented:
+
+  ```
+  Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a quick call regarding your vein consultation request. Look out for our call!
+  ```
+
+  Re-measured after the change (`{{ClinicName}}` = `VIP Medical Group`, 17 chars; `{{FirstName}}` at the renderer's `_NAME_MAX_LEN` truncation point of 20, the real worst case):
+
+  | | raw | rendered @20-char name | rendered @"Maria" | longest name that fits |
+  |---|---|---|---|---|
+  | Vein (final) | 143 | **153** ✅ | 138 | 27 |
+  | Pain Management (final) | 125 | **135** ✅ | 120 | 45 |
+
+  Neither `_NAME_MAX_LEN` nor `_MAX_SMS_CHARS` changes — the other two options (lowering truncation to 12, or doubling the segment budget to 320) are **rejected and must not be implemented**. Task 5's `test_approved_vein_copy_renders_within_the_length_ceiling` pins the new measurement at **153**, so a future copy edit that pushes it over fails a test instead of failing a patient send. For the record so nobody retries them: the near-misses were deleting only ` quick` (**162**) and borrowing Pain's shorter opener (**165**) — the opener was never where the length was.
+- **OQ-10 — should the approved copy carry a `Reply STOP` tail? RESOLVED 2026-09-10: no. Sebastian: *"no lo agreguemos."*** Neither shipped template says "Reply STOP" and **neither may have one added.** This was surfaced as an explicit recommendation with its TCPA rationale (Task 5, point 3) and declined on the business side; it is not an oversight and it is **not coupled to OQ-9** — the copy now has headroom for the 23-character ` Reply STOP to opt out.` tail on Pain (135 → **158**, fits) though still not on Vein (153 → **176**, over), but that arithmetic is moot because the answer is no on both. What does **not** change: the already-deployed `VipConnectOptOutList` gate still applies to every send, inbound `STOP` still works and still populates the list (Task 7 Step 9 verifies exactly that from the test handset), and the `MessageType: TRANSACTIONAL` note on the origination number (OQ-5) is unaffected. Revisiting this is a Sebastian-plus-counsel decision, not an implementer's.
 
 ---
 
@@ -2590,6 +2603,8 @@ Also for the handoff: version 1 of the `PreCallSMS` Wisdom template was created 
 - **`JOURNEY_FLOW_ARN` and the `Test-Journey-Flow` placeholder.** `services/api-plans/src/builders.py:324` hardcodes `_JOURNEY_FLOW_NAME = "Test-Journey-Flow"` and no CDK stack sets `JOURNEY_FLOW_ARN`. A real latent gap for `deliveryType: 'journey'` users. Track separately — this plan does not fix it. Note the distinction: pre-call SMS itself **is** deliberately available on journey campaigns (`precallSmsAvailability` returns `available` for both `campaign` and `journey`, and Task 6 unit-tests both), because the firing hook lives in the bucket-activation transition and is indifferent to `deliveryType`. What is out of scope is *exercising* journeys — Task 7's end-to-end gate uses a plain voice `campaign` only, so pre-call SMS on a journey is enabled-but-unverified until someone runs it.
 - **The `VIP_SMS_Journey_Texts` stores** (CloudHesive's DynamoDB table and the Connect Data Table) and the **`PreCallSMS` Wisdom template.** Unused under this design; do not add pre-call rows to either.
 - **A new DynamoDB message-template table.** Deliberately rejected: the repo's convention is inline validated config, and a new store would duplicate the PHI guard. Revisit only if copy must change without a plan edit.
+- **The Fibroid and General specialties.** Phase I ships **Vein and Pain Management only** — Sebastian, 2026-09-10: *"por el momento solo vein y pein"* (**OQ-8**, resolved-deferred). This is a shipping decision, not a copy backlog: do not add placeholder rows to Task 5's copy table, do not create Fibroid/General voice campaigns with `precallSms` enabled, and do not write tests or verification steps for them. Nothing in the design blocks a third specialty later — it is one new voice campaign carrying its own `precallSms` block, no code change — but it needs real business-approved copy first, and that copy must be re-measured against the 160-character **rendered** ceiling before it ships.
+- **Appending `Reply STOP to opt out.` (or any opt-out language) to either approved template.** Recommended, surfaced with its TCPA rationale, and **declined by Sebastian on 2026-09-10: *"no lo agreguemos"*** (**OQ-10**, resolved-no). Both templates ship exactly as written in Task 5's table. This is out of scope in both directions: an implementer may not add it, and an implementer may not weaken the existing inbound-`STOP` opt-out path to compensate — the deployed `VipConnectOptOutList` gate stays exactly as merged and Task 7 Step 9 verifies it still works.
 - **Widening the placeholder allowlist** beyond `{{FirstName}}` and `{{ClinicName}}` — including `{{LastName}}` (**OQ-7**), `{{Specialty}}` (dropped because the approved copy bakes the specialty into the sentence; re-adding it is additive at the five sites Task 5 lists), dates, appointment details, or free-text fields. That is a PHI decision requiring Sebastian and counsel, not an implementation detail. `${...}` stays banned outright.
 - **Removing or bypassing any of the other nine `_PHI_PATTERNS` entries.** The list has exactly **ten** entries (`plans.py:520-534`, counted: two SSN forms, email, two date forms, long numeric ID, URL, `{{...}}`, `${...}`, clinical terms). Task 3 narrows exactly one — the `{{...}}` entry at line 528 — and keeps the remaining nine byte-identical.
 - **Renaming the `messageTemplate` SQS message key.** Would strand in-flight messages across the deploy boundary.

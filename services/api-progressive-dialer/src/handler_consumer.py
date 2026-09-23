@@ -234,7 +234,12 @@ def _process_record(record: dict) -> None:
     # invocations both delete the lock then both acquire it, causing double-dispatch.
     first_campaign_id = campaigns[0]["campaignId"]["S"]
     lock = _get_lock()
-    if not lock.acquire(agent_arn, campaign_id=first_campaign_id):
+    # VIP-04: lock_token fences this specific lock generation — every release()
+    # call below (and the one propagated to the caller Lambda via the SQS
+    # message) must use THIS exact token, so a stale/slow invocation can never
+    # affect a lock generation acquired later by a different dispatch.
+    lock_token = lock.acquire(agent_arn, campaign_id=first_campaign_id)
+    if not lock_token:
         logger.info("Lock already held for agent — skipping dispatch")
         return
 
@@ -259,7 +264,7 @@ def _process_record(record: dict) -> None:
                 break
 
         if contact is None:
-            lock.release(agent_arn)
+            lock.release(agent_arn, lock_token)
             logger.info("All campaign queues empty — releasing lock")
             return
 
@@ -292,6 +297,10 @@ def _process_record(record: dict) -> None:
             "contactFlowId": contact_flow_id,
             "instanceId": _CONNECT_INSTANCE_ID,
             "correlationId": correlation_id,
+            # VIP-04: propagated so the caller Lambda's release() calls fence
+            # against this exact lock generation instead of releasing whatever
+            # lock happens to exist for this agentId at that later point in time.
+            "lockToken": lock_token,
         }
         _get_sqs().send_message(
             QueueUrl=_SQS_QUEUE_URL,
@@ -305,7 +314,7 @@ def _process_record(record: dict) -> None:
         )
         _record_dispatch(matched_queue_arn, campaign_id)
     except Exception:
-        lock.release(agent_arn)
+        lock.release(agent_arn, lock_token)
         raise
 
 

@@ -85,7 +85,7 @@ describe('ApiSmsStack', () => {
     template.resourceCountIs('AWS::Lambda::LayerVersion', 1);
   });
 
-  it('creates the SmsProcessorFunction with the imported role, no shared layer, and a distinct memory/timeout/concurrency profile', () => {
+  it('creates the SmsProcessorFunction with the imported role, the shared layer (VIP-02: now depends on vip_shared for the opt-out recheck), and a distinct memory/timeout/concurrency profile', () => {
     const template = Template.fromStack(buildStack());
     template.hasResourceProperties('AWS::Lambda::Function', {
       FunctionName: 'vip-admin-sms-processor',
@@ -96,16 +96,27 @@ describe('ApiSmsStack', () => {
       MemorySize: 256,
       ReservedConcurrentExecutions: 10,
       KmsKeyArn: DATA_KEY_ARN,
-      Layers: Match.absent(),
       Environment: {
         Variables: {
           SMS_CAMPAIGN_QUEUE_TABLE: 'VipSmsCampaignQueue',
           SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
           SMS_CONFIG_SET_NAME: 'vip-sms-config-set',
           SMS_OPT_OUT_LIST_NAME: 'vip-sms-opt-out',
+          OPT_OUT_TABLE: 'VipConnectOptOutList',
         },
       },
     });
+    // VIP-02: sms_processor_handler.py now imports vip_shared (opt_out
+    // repository) — without the layer attached, that import would
+    // ModuleNotFoundError on every cold start. Both functions reference the
+    // SAME shared layer construct, so there must still be exactly one
+    // AWS::Lambda::LayerVersion resource in the stack, not two.
+    const processorResources = template.findResources('AWS::Lambda::Function', {
+      Properties: { FunctionName: 'vip-admin-sms-processor' },
+    });
+    const [processorProps] = Object.values(processorResources).map((r) => r.Properties);
+    expect(processorProps.Layers).toHaveLength(1);
+    template.resourceCountIs('AWS::Lambda::LayerVersion', 1);
   });
 
   it('reflects custom smsConfigSetName/smsOptOutListName/profilesDomainName overrides in the environment', () => {

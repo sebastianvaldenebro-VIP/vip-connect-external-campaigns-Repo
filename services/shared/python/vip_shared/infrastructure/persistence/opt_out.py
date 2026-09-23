@@ -24,8 +24,20 @@ class OptOutRepository:
         )
 
     def is_blocked(self, phone: str) -> bool:
-        """Return True if `phone` (E.164) has opted out."""
-        response = self._table.get_item(Key={"ContactNumber": phone})
+        """Return True if `phone` (E.164) has opted out.
+
+        Uses ConsistentRead=True (VIP-02): this table is checked at both
+        enqueue time (sms_sender_handler.py) and again immediately before
+        send (sms_processor_handler.py, progressive-dialer's handler_caller.py)
+        specifically to catch a STOP recorded in the gap between those two
+        checks. An eventually-consistent read here can serve stale data from
+        a replica that hasn't yet applied a very recent `block()` write,
+        defeating that exact last-mile check — this is a compliance-critical
+        Do-Not-Contact gate, not a place to trade correctness for lower RCU cost.
+        """
+        response = self._table.get_item(
+            Key={"ContactNumber": phone}, ConsistentRead=True
+        )
         return "Item" in response
 
     def block(self, phone: str, *, reason: str, source: str) -> None:

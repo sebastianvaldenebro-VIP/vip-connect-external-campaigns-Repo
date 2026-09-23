@@ -475,7 +475,9 @@ class TestLockContention:
             [_insert_record()], contact=None
         )
         mock_sqs.send_message.assert_not_called()
-        mock_lock.release.assert_called_once_with(_AGENT_ARN)
+        # VIP-04: release() must be called with the exact token acquire()
+        # returned (here the _run() helper's mocked acquire() return value).
+        mock_lock.release.assert_called_once_with(_AGENT_ARN, True)
 
     def test_only_dispatches_once_per_insert(self):
         # Even with 3 available agents, only one dispatch per INSERT
@@ -536,7 +538,8 @@ class TestLockContention:
                         {"Records": [_insert_record()]}, None
                     )
 
-        mock_lock.release.assert_called_once_with(_AGENT_ARN)
+        # VIP-04: release() must be called with the exact token acquire() returned.
+        mock_lock.release.assert_called_once_with(_AGENT_ARN, True)
 
 
 # ── lambda_handler: EventBridge sweep (timer backstop) ────────────────────────
