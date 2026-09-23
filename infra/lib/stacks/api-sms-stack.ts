@@ -192,6 +192,13 @@ export class ApiSmsStack extends cdk.Stack {
       code: lambda.Code.fromAsset(
         path.join(__dirname, '../../../services/api-sms/src'),
       ),
+      // VIP-02: sms_processor_handler.py now imports
+      // vip_shared.infrastructure.persistence.opt_out for the pre-send opt-out
+      // recheck. Without this layer attached, that import raises
+      // ModuleNotFoundError on every cold start — a 100% outage, not a
+      // graceful degradation. This function previously had no vip_shared
+      // dependency at all.
+      layers: [sharedLayer],
       role: processorRole,
       logGroup: processorLogGroup,
       timeout: cdk.Duration.seconds(30),
@@ -207,6 +214,17 @@ export class ApiSmsStack extends cdk.Stack {
         SMS_CAMPAIGN_RUNS_TABLE: this.smsRunsTable.tableName,
         SMS_CONFIG_SET_NAME: props.smsConfigSetName,
         SMS_OPT_OUT_LIST_NAME: props.smsOptOutListName,
+        // VIP-02: final strongly-consistent opt-out recheck immediately before
+        // send (catches a STOP recorded between enqueue and send). Same shared
+        // cross-channel table the sender already checks at enqueue time.
+        //
+        // IMPORTANT — this role is imported with mutable:false (see the
+        // SmsProcessorPerms note above): CDK will NOT grant dynamodb:GetItem
+        // on this table. Before deploying this change, add it to the
+        // vip-sms-processor-role policy via the same CLI put-role-policy flow
+        // used for SmsProcessorPerms, or every send will fail closed with
+        // AccessDeniedException treated as a retryable error.
+        OPT_OUT_TABLE: 'VipConnectOptOutList',
       },
     });
     skipCheckovChecks(this.smsProcessorFunction, [VPC_SKIP]);

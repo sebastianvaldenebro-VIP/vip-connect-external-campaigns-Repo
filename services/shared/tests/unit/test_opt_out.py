@@ -21,7 +21,12 @@ def test_is_blocked_returns_true_when_item_exists():
     )
 
     assert repo.is_blocked("+15125551234") is True
-    mock_table.get_item.assert_called_once_with(Key={"ContactNumber": "+15125551234"})
+    # VIP-02: must be a strongly-consistent read — this table is checked again
+    # immediately before send specifically to catch opt-outs recorded after
+    # enqueue; an eventually-consistent read could serve stale (pre-STOP) data.
+    mock_table.get_item.assert_called_once_with(
+        Key={"ContactNumber": "+15125551234"}, ConsistentRead=True
+    )
 
 
 def test_is_blocked_returns_false_when_item_missing():
@@ -35,6 +40,9 @@ def test_is_blocked_returns_false_when_item_missing():
     )
 
     assert repo.is_blocked("+15125551234") is False
+    mock_table.get_item.assert_called_once_with(
+        Key={"ContactNumber": "+15125551234"}, ConsistentRead=True
+    )
 
 
 def test_block_writes_reason_and_source():
