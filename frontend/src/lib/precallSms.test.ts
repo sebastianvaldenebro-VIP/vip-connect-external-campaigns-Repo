@@ -255,6 +255,10 @@ describe('profile catalog preview contract', () => {
   });
 
   it('keeps both catalog variants within the approved rendered multipart bounds', () => {
+    // name is always one of the hardcoded literals passed below
+    // (FIRST_NAME_MAX_CHARS, MAX_CLINIC_NAME_CHARS, MAX_SMS_PARTS) — test-only
+    // code, never attacker/user-controlled input, so there's no ReDoS surface.
+    // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
     const bound = (name: string) => Number(pythonCatalog.match(new RegExp(`^${name} = (\\d+)$`, 'm'))?.[1]);
     const nameSize = bound('FIRST_NAME_MAX_CHARS');
     const clinicSize = bound('MAX_CLINIC_NAME_CHARS');
