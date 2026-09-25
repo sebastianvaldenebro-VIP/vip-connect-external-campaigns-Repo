@@ -256,3 +256,168 @@ class TestFinalSaveRetryExhaustion:
             result = executor.force_start_campaign("p1", "r1", 0, 0)
 
         assert result is adopted_run
+
+
+class TestForceStartClearsStalePrecallMarkers:
+    """Adversarial-review Critical finding: force_start_campaign's Phase 1 reset
+    must clear precallSmsSentAt / precallGatePausedAt / precallGateResumedAt.
+
+    Without this, a campaign that already completed one full precall-SMS
+    lifecycle (sent its text, been paused+resumed once) before this restart
+    inherits those stale markers:
+      - stale precallSmsSentAt short-circuits _fire_precall_sms_for_campaign's
+        send (_attempt_precall_sms_send returns early) — no text fires this cycle.
+      - stale precallGateResumedAt makes the resume-trigger condition
+        (precallGatePausedAt and not precallGateResumedAt) false even though
+        _create_and_start_campaign pauses the campaign again for THIS cycle —
+        so the resume never fires.
+      - _poll_campaign_state's stranded-pause self-heal checks the identical
+        condition, so it can't catch this either.
+    Net effect without the fix: the restarted campaign pauses but never
+    resumes — a permanent, silent stall with zero calls dialed.
+    """
+
+    @staticmethod
+    def _stub_precall_oc(mock_oc=None):
+        """Stub the vip_shared oc client via sys.modules — _fire_precall_sms_for_campaign
+        resolves it through a function-local import, never a module attribute, so
+        patch("executor.oc", ...) would have no effect. Same technique used by
+        test_executor_v2.py's _stub_precall_oc."""
+        if mock_oc is None:
+            mock_oc = MagicMock()
+        vip_stub = MagicMock()
+        vip_stub.build = MagicMock(return_value=mock_oc)
+        modules_to_stub = [
+            "vip_shared",
+            "vip_shared.infrastructure",
+            "vip_shared.infrastructure.persistence",
+            "vip_shared.infrastructure.persistence.outbound_campaigns_client",
+        ]
+        originals = {m: sys.modules.get(m) for m in modules_to_stub}
+        for m in modules_to_stub:
+            sys.modules[m] = vip_stub
+        return mock_oc, originals
+
+    @staticmethod
+    def _unstub_precall_oc(originals):
+        for m, orig in originals.items():
+            if orig is None:
+                sys.modules.pop(m, None)
+            else:
+                sys.modules[m] = orig
+
+    @staticmethod
+    def _fake_start_one_campaign_with_precall_cycle(new_connect_id="conn-restart-1"):
+        """side_effect for a mocked _start_one_campaign that mimics the real
+        cold-start sequence for a precall-enabled campaign — _create_and_start_campaign
+        pausing it (fresh precallGatePausedAt), then _fire_precall_sms_for_campaign
+        resolving the send + resume — without exercising the unrelated segment/Connect
+        campaign creation machinery those functions also do. Calls the REAL
+        _fire_precall_sms_for_campaign so the actual gate logic under test runs
+        unmocked.
+        """
+
+        def _side_effect(run, plan, bucket_index, campaign_index):
+            cs = run["bucketStates"][bucket_index]["campaignStates"][campaign_index]
+            cs["connectCampaignId"] = new_connect_id
+            cs["status"] = "running"
+            cs["precallGatePausedAt"] = executor._now_iso()
+            executor._fire_precall_sms_for_campaign(
+                run, plan, bucket_index, campaign_index
+            )
+
+        return _side_effect
+
+    def test_restarted_campaign_gets_fresh_precall_sms_and_completes_gate(self):
+        """Direct regression test: a campaign with precallSms.enabled and ALL
+        THREE stale markers already set (simulating a completed prior cycle) is
+        force-started. The SMS-sender must fire again THIS cycle, and the pause/
+        resume gate must reflect THIS cycle's own pause+resume — not the stale
+        prior-cycle values — proving the campaign doesn't end up stuck Paused.
+        """
+        campaign_def = {
+            "id": "c0",
+            "name": "c0",
+            "states": ["NY"],
+            "groups": [],
+            "dependsOn": [],
+            "campaignConfig": {
+                "precallSms": {
+                    "enabled": True,
+                    "messageTemplate": "Hi {{FirstName}}",
+                    "originationNumberArn": "arn:aws:sns:us-east-1:111122223333:phone-number/PN123",
+                    "clinicName": "VIP Clinic",
+                },
+            },
+        }
+        plan = _plan([{"id": "b0", "campaigns": [campaign_def]}])
+        stale_ts = "2026-05-01T09:00:00+00:00"
+        cs = _campaign_state(
+            "c0",
+            status="cancelled",
+            connectCampaignId="conn-old-1",
+            precallSmsSentAt=stale_ts,
+            precallGatePausedAt=stale_ts,
+            precallGateResumedAt=stale_ts,
+        )
+        bs = _bucket_state("b0", [cs], status="running")
+        run = _run(plan, [bs])
+
+        invoke = MagicMock()
+        mock_oc, originals = self._stub_precall_oc()
+        try:
+            with (
+                patch("executor.get_run", return_value=run),
+                patch("executor._reset_cascade_cancelled_children"),
+                patch("executor.save_run"),
+                patch("executor._safe_stop_campaign"),
+                patch("executor._safe_delete_campaign"),
+                patch("executor._invoke_sms_sender", invoke),
+                patch(
+                    "executor._start_one_campaign",
+                    side_effect=self._fake_start_one_campaign_with_precall_cycle(),
+                ),
+            ):
+                executor.force_start_campaign("p1", "r1", 0, 0)
+        finally:
+            self._unstub_precall_oc(originals)
+
+        # 1. The SMS-sender fires again this cycle — precallSmsSentAt being
+        # cleared genuinely lets the send fire fresh.
+        invoke.assert_called_once()
+        assert cs["precallSmsSentAt"] is not None
+        assert cs["precallSmsSentAt"] != stale_ts
+
+        # 2. The pause/resume gate completes for THIS restarted cycle: both
+        # markers reflect the new cycle, not the stale prior-cycle timestamp,
+        # and the resume call actually fired against the new Connect campaign.
+        mock_oc.resume_campaign.assert_called_once_with("conn-restart-1")
+        assert cs["precallGatePausedAt"] != stale_ts
+        assert cs["precallGateResumedAt"] is not None
+        assert cs["precallGateResumedAt"] != stale_ts
+
+    def test_force_start_without_precall_config_still_works_unaffected(self):
+        """No regression: a campaign without precallSms.enabled (or with no
+        precall config at all) force-starts exactly as before — the new
+        precall-marker resets are unconditional but harmless no-ops for it.
+        """
+        plan = _plan([{"id": "b0", "campaigns": [{"id": "c0", "name": "c0"}]}])
+        cs = _campaign_state("c0", status="cancelled", connectCampaignId="conn-old-1")
+        bs = _bucket_state("b0", [cs], status="running")
+        run = _run(plan, [bs])
+
+        with (
+            patch("executor.get_run", return_value=run),
+            patch("executor._reset_cascade_cancelled_children"),
+            patch("executor.save_run"),
+            patch("executor._safe_stop_campaign"),
+            patch("executor._safe_delete_campaign"),
+            patch("executor._start_one_campaign") as mock_start,
+        ):
+            executor.force_start_campaign("p1", "r1", 0, 0)
+
+        mock_start.assert_called_once()
+        assert cs["precallSmsSentAt"] is None
+        assert cs["precallGatePausedAt"] is None
+        assert cs["precallGateResumedAt"] is None
+        assert "precallSmsGeneration" not in cs

@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -51,6 +52,12 @@ export interface ApiPlansStackProps extends cdk.StackProps {
   readonly smsCampaignQueueTable?: dynamodb.ITable;
   readonly smsRunsTable?: dynamodb.ITable;
   readonly smsSenderFunctionArn?: string;
+  // Quiet-hours retry Lambda (separate Function, same code asset as the
+  // sender) — invoked from tick()'s poll loop for as long as a precall-SMS-
+  // enabled voice campaign stays "running". See api-sms-stack.ts's
+  // SmsRetryQuietHoursFunction for why this is a distinct ARN, not the same
+  // one as smsSenderFunctionArn.
+  readonly smsRetryFunctionArn?: string;
   // Location Onboarding Guard — DynamoDB stream ARN for VipLocationMapping.
   // Enable with: aws dynamodb update-table --table-name VipLocationMapping
   //   --stream-specification StreamEnabled=true,StreamViewType=NEW_IMAGE
@@ -148,7 +155,9 @@ export class ApiPlansStack extends cdk.Stack {
       }),
     );
 
-    // Connect Campaigns V2 — campaign lifecycle
+    // Connect Campaigns V2 — existing CloudFormation-managed lifecycle grants.
+    // PauseCampaign/ResumeCampaign are managed separately; see the pre-call
+    // policy note below. Adding them here blocks both update and rollback.
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: 'ConnectCampaignsV2',
@@ -387,6 +396,18 @@ export class ApiPlansStack extends cdk.Stack {
       );
     }
 
+    // Pre-call PauseCampaign/ResumeCampaign, UpdateCampaignSchedule and retry InvokeFunction must be
+    // granted through infra/config/precall-sms-plans-policy.json, inline policy
+    // PrecallSmsPlansAdditionalPerms on the existing execution role
+    // VipAdminApiPlansStack-FunctionRole111A5701-mSfFlCntjbO0, by an authorized
+    // IAM operator. EngineeringPermissionBoundary denies the CFN execution
+    // role iam:PutRolePolicy here (confirmed again on 2026-09-11), including
+    // rollback. Keep FunctionRoleDefaultPolicy unchanged, following the
+    // events-list-rules-cli precedent above. Preserve the execution role, its
+    // boundary, and the CloudFormation service role. SMS_RETRY_FUNCTION_ARN
+    // remains CDK-managed. Profile mode always updates the schedule before Start;
+    // its separately supplied IAM delta must be verified before activation.
+
     // EUM SMS — list origination numbers (GET /sms/numbers endpoint)
     role.addToPolicy(
       new iam.PolicyStatement({
@@ -434,6 +455,8 @@ export class ApiPlansStack extends cdk.Stack {
 
     // ── Lambda function ──────────────────────────────────────────────
     const sharedLayer = buildSharedLayer(this);
+    // Keep the preceding handler/layer pairing available for reviewed rollback.
+    sharedLayer.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
       queueName: 'vip-admin-ui-api-plans-dlq',
@@ -482,6 +505,9 @@ export class ApiPlansStack extends cdk.Stack {
         SNS_ALERTS_TOPIC_ARN: alertsTopic.topicArn,
         LOG_LEVEL: 'INFO',
         POWERTOOLS_SERVICE_NAME: 'api-plans',
+        // register_start also requires a recent successful reaper heartbeat.
+        // This flag alone cannot admit Start before the rule/permission exist.
+        PROFILE_VOICE_CLEANUP_ENABLED: 'true',
       },
     });
 
@@ -502,6 +528,28 @@ export class ApiPlansStack extends cdk.Stack {
       'LAMBDA_FUNCTION_ARN',
       `arn:aws:lambda:${this.region}:${this.account}:function:vip-admin-ui-api-plans`,
     );
+
+    // Independent of plan/latest-run schedules. The name deliberately stays
+    // outside vip-plan-*/vip-sched-* so the existing janitor cannot remove it.
+    // No target role/grants: preserve the existing CloudFormation IAM policy.
+    const profileCleanupRule = new events.CfnRule(this, 'ProfileVoiceCleanupRule', {
+      name: 'vip-profile-voice-cleanup',
+      description: 'Reconcile durable profile voice start/cancellation intents',
+      scheduleExpression: 'rate(1 minute)',
+      state: 'ENABLED',
+      targets: [{
+        arn: this.lambdaFunction.functionArn,
+        id: 'profile-voice-cleanup',
+        input: JSON.stringify({ action: 'profile_voice_cleanup' }),
+      }],
+    });
+    new lambda.CfnPermission(this, 'ProfileVoiceCleanupPermission', {
+      action: 'lambda:InvokeFunction',
+      functionName: this.lambdaFunction.functionName,
+      principal: 'events.amazonaws.com',
+      sourceArn: profileCleanupRule.attrArn,
+      sourceAccount: this.account,
+    });
 
     // #003 — inject Redis AUTH secret ARN when configured
     if (props.redis.passwordSecretArn) {
@@ -569,6 +617,13 @@ export class ApiPlansStack extends cdk.Stack {
       this.lambdaFunction.addEnvironment(
         'SMS_SENDER_FUNCTION_ARN',
         props.smsSenderFunctionArn,
+      );
+    }
+
+    if (props.smsRetryFunctionArn) {
+      this.lambdaFunction.addEnvironment(
+        'SMS_RETRY_FUNCTION_ARN',
+        props.smsRetryFunctionArn,
       );
     }
 

@@ -1,0 +1,253 @@
+/**
+ * Client-side mirror of the pre-call SMS rules enforced by
+ * services/api-plans/src/handlers/plans.py (_validate_precall_sms).
+ *
+ * SCOPE, deliberately narrow: this duplicates only the cheap, stable rules —
+ * required fields, the placeholder allowlist, the rendered-length ceiling, and
+ * the dependsOn/deliveryType conflicts. It does NOT reimplement the ten PHI
+ * regexes in _PHI_PATTERNS. Duplicating those in TypeScript would create two
+ * sources of truth for a compliance rule and they would drift. The server stays
+ * authoritative; the UI's job is to catch the common mistakes early and to
+ * surface whatever the server says verbatim when it says no.
+ */
+
+import type { PrecallSmsConfig } from './api';
+import { SMS_CAMPAIGN_TEMPLATE_VERSION, validateSmsCampaignTemplate } from './smsCampaign';
+
+export const PRECALL_ALLOWED_PLACEHOLDERS = new Set(['FirstName', 'ClinicName']);
+
+/** Mirrors the immutable Phase I catalog in vip_shared.domain.services.precall_sms. */
+export const PRECALL_CATALOG_VERSION = 'phase1-v1' as const;
+export const PRECALL_PROFILE_CATALOG = {
+  vein: 'Hi {{FirstName}}! This is {{ClinicName}}. We’re about to give you a quick call regarding your vein consultation request. Look out for a call!',
+  pain: 'Hi {{FirstName}}! {{ClinicName}} here. We’re calling you in just a moment to discuss your pain management request. Talk soon!',
+} as const;
+export const PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC = {
+  vein: 'Hi {{FirstName}}! We’re about to give you a quick call regarding your vein consultation request. Look out for a call!',
+  pain: 'Hi {{FirstName}}! We’re calling you in just a moment to discuss your pain management request. Talk soon!',
+} as const;
+export const MAX_PRECALL_CLINIC_NAME_CHARS = 80;
+
+/** Only the example patient is fictional; the clinic is the campaign's value. */
+export function profileSmsPreview(
+  variant: keyof typeof PRECALL_PROFILE_CATALOG,
+  clinicName?: string,
+): string {
+  const clinic = typeof clinicName === 'string' ? clinicName.normalize('NFC').trim() : '';
+  const catalog = clinic ? PRECALL_PROFILE_CATALOG : PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC;
+  return catalog[variant]
+    .replace('{{FirstName}}', 'Alex')
+    .replace('{{ClinicName}}', () => clinic);
+}
+
+/** Changing source is explicit; disabling alone preserves the existing config. */
+export function changePrecallSmsMode(
+  cfg: PrecallSmsConfig | undefined,
+  mode: 'manual' | 'profile',
+): PrecallSmsConfig {
+  const base = {
+    enabled: cfg?.enabled ?? false,
+    originationNumberArn: cfg?.originationNumberArn ?? '',
+    ...(cfg?.clinicName !== undefined ? { clinicName: cfg.clinicName } : {}),
+  };
+  return mode === 'profile'
+    ? { ...base, mode, catalogVersion: PRECALL_CATALOG_VERSION }
+    : { ...base, mode, messageTemplate: cfg?.messageTemplate ?? '', clinicName: cfg?.clinicName ?? '' };
+}
+
+/** Matches vip_shared…sms_template._PLACEHOLDER_RE. Case sensitive on purpose. */
+const PLACEHOLDER_RE = /\{\{\s*(\w+)\s*\}\}/g;
+
+/** Matches _NAME_MAX_LEN in the Python renderer, which truncates there. */
+const NAME_BUDGET = 20;
+
+/** Matches _MAX_SMS_CHARS in handlers/plans.py. One GSM-7 segment. */
+export const MAX_SMS_CHARS = 160;
+
+export function extractPlaceholders(template: string): Set<string> {
+  return new Set(
+    [...(template ?? '').matchAll(PLACEHOLDER_RE)].map((m) => m[1]),
+  );
+}
+
+function hasMalformedPlaceholders(template: string): boolean {
+  for (const match of template.matchAll(PLACEHOLDER_RE)) {
+    const start = match.index!;
+    if (template[start - 1] === '{' || template[start + match[0].length] === '}')
+      return true;
+  }
+  return /\{\{|\}\}/.test(template.replace(PLACEHOLDER_RE, ''));
+}
+
+function renderWorstCase(template: string, clinicName: string): string {
+  return (template ?? '').replace(PLACEHOLDER_RE, (token, field: string) => {
+    if (field === 'FirstName') return 'A'.repeat(NAME_BUDGET);
+    if (field === 'ClinicName') return (clinicName ?? '').trim();
+    return token;
+  });
+}
+
+function hasUnresolvedPlaceholders(template: string, clinicName: string): boolean {
+  return hasMalformedPlaceholders(template)
+    || /\{\{|\}\}/.test(renderWorstCase(template, clinicName));
+}
+
+/** Worst-case rendered length: the longest name the server would ever render. */
+export function renderedWorstCaseLength(
+  template: string,
+  clinicName: string,
+): number {
+  return renderWorstCase(template, clinicName).length;
+}
+
+/**
+ * Mirrors the backend's ALLOWLIST exactly (_VOICE_DELIVERY_TYPES in
+ * handlers/plans.py) rather than a denylist of just 'sms'. A denylist of one
+ * value happens to produce the same result as this allowlist for today's 4
+ * known deliveryType values, but a future non-voice type would silently pass
+ * a denylist and only get caught server-side, after the operator has already
+ * filled out the whole precall panel. Keep in sync with _VOICE_DELIVERY_TYPES.
+ */
+const VOICE_DELIVERY_TYPES = new Set(['campaign', 'branded', 'journey']);
+
+export function precallSmsAvailability(campaign: {
+  deliveryType?: string;
+  dependsOn?: string[];
+  mode?: string;
+}): { available: boolean; reason?: string } {
+  const deliveryType = campaign.deliveryType ?? 'campaign';
+  if (!VOICE_DELIVERY_TYPES.has(deliveryType)) {
+    return {
+      available: false,
+      reason:
+        `Pre-call SMS applies to voice campaigns — a '${deliveryType}' campaign has no dial to precede.`,
+    };
+  }
+  if (campaign.mode !== 'profile' && (campaign.dependsOn ?? []).length > 0) {
+    return {
+      available: false,
+      reason:
+        'Manual pre-call SMS is unavailable for campaigns with dependencies. Automatic messages from profiles support these dependencies.',
+    };
+  }
+  return { available: true };
+}
+
+export function validatePrecallSms(
+  cfg: Record<string, unknown> | undefined,
+): string[] {
+  if (!cfg?.enabled) return [];
+  const errors: string[] = [];
+  const mode = cfg.mode === undefined ? 'manual' : cfg.mode;
+  if (mode !== 'manual' && mode !== 'profile')
+    return ['Pre-call SMS: mode must be manual or profile'];
+  if (mode === 'profile') {
+    if (cfg.enabled !== true)
+      errors.push('Pre-call SMS: enabled must be true for profile mode');
+    if (cfg.catalogVersion !== PRECALL_CATALOG_VERSION)
+      errors.push(`Pre-call SMS: catalogVersion must be ${PRECALL_CATALOG_VERSION}`);
+    if (typeof cfg.originationNumberArn !== 'string' || !cfg.originationNumberArn.trim())
+      errors.push('Pre-call SMS: originationNumberArn is required');
+    if (cfg.messageTemplate)
+      errors.push('Pre-call SMS: messageTemplate cannot override the profile catalog');
+    if (cfg.clinicName !== undefined) {
+      if (typeof cfg.clinicName !== 'string') {
+        errors.push('Pre-call SMS: clinicName must be a string');
+      } else {
+        const clinic = cfg.clinicName.normalize('NFC').trim();
+        if ([...clinic].length > MAX_PRECALL_CLINIC_NAME_CHARS)
+          errors.push(`Pre-call SMS: clinicName must be at most ${MAX_PRECALL_CLINIC_NAME_CHARS} characters`);
+        // Match the server's character allowlist; deeper content screening stays server-side.
+        if (clinic && (!/\p{L}/u.test(clinic) || !/^[\p{L}\p{M}\p{N} &'’.,()/:\-]+$/u.test(clinic)))
+          errors.push('Pre-call SMS: clinicName must contain a letter and use only letters, numbers, spaces or clinic-name punctuation');
+      }
+    }
+    return errors;
+  }
+  const template = String(cfg.messageTemplate ?? '');
+  const clinicName = String(cfg.clinicName ?? '');
+
+  if (!template.trim()) errors.push('Pre-call SMS: messageTemplate is required');
+  if (!String(cfg.originationNumberArn ?? '').trim())
+    errors.push('Pre-call SMS: originationNumberArn is required');
+  const placeholders = extractPlaceholders(template);
+  // Mirrors the backend's conditional guard exactly (_validate_precall_sms):
+  // `"ClinicName" in extract_placeholders(tmpl) and not precall.get("clinicName")`.
+  // Requiring clinicName unconditionally — whenever enabled — was stricter
+  // than the server and rejected valid configs whose template never
+  // references {{ClinicName}} at all.
+  if (placeholders.has('ClinicName') && !clinicName.trim())
+    errors.push('Pre-call SMS: clinicName is required (it is interpolated into the message)');
+
+  const unknown = [...placeholders].filter(
+    (f) => !PRECALL_ALLOWED_PLACEHOLDERS.has(f),
+  );
+  if (unknown.length)
+    errors.push(
+      `Pre-call SMS: placeholder(s) not allowed: ${unknown.sort().join(', ')}. ` +
+        `Only {{FirstName}} and {{ClinicName}} may be used.`,
+    );
+  else if (hasUnresolvedPlaceholders(template, clinicName))
+    errors.push('Pre-call SMS: malformed or unresolved placeholder syntax. Use only {{FirstName}} and {{ClinicName}}.');
+
+  const rendered = renderedWorstCaseLength(template, clinicName);
+  if (rendered > MAX_SMS_CHARS)
+    errors.push(
+      `Pre-call SMS: renders to ${rendered} characters with a long first name, over the ${MAX_SMS_CHARS} limit`,
+    );
+
+  return errors;
+}
+
+/**
+ * Client-side mirror of the bulk-SMS rules enforced by
+ * services/api-plans/src/handlers/plans.py (_validate_sms_campaign), which
+ * shares _screen_sms_template_content with _validate_precall_sms above.
+ *
+ * SCOPE, deliberately narrow — same principle as validatePrecallSms: this
+ * duplicates only the cheap, stable rules (required template, the placeholder
+ * allowlist, the rendered-length ceiling, and the conditional clinicName
+ * requirement). It does NOT reimplement the PHI regexes in _PHI_PATTERNS —
+ * the server stays the single source of truth for those.
+ */
+export function validateBulkSms(
+  cfg: Record<string, unknown> | undefined,
+): string[] {
+  if (cfg?.smsTemplateVersion !== undefined) {
+    if (cfg.smsTemplateVersion !== SMS_CAMPAIGN_TEMPLATE_VERSION)
+      return ['SMS: unsupported template version'];
+    return validateSmsCampaignTemplate(cfg.smsMessageTemplate as string);
+  }
+  const errors: string[] = [];
+  const template = String(cfg?.smsMessageTemplate ?? '');
+  const clinicName = String(cfg?.clinicName ?? '');
+
+  if (!template.trim()) errors.push('SMS: message template is required');
+
+  const placeholders = extractPlaceholders(template);
+  // Mirrors the backend's conditional guard exactly (_validate_sms_campaign):
+  // requires clinicName only if the template actually references
+  // {{ClinicName}} — not unconditionally, same fix already applied to
+  // validatePrecallSms's own clinicName check for the identical reason.
+  if (placeholders.has('ClinicName') && !clinicName.trim())
+    errors.push('SMS: clinicName is required (it is interpolated into the message)');
+
+  const unknown = [...placeholders].filter(
+    (f) => !PRECALL_ALLOWED_PLACEHOLDERS.has(f),
+  );
+  if (unknown.length)
+    errors.push(
+      `SMS: placeholder(s) not allowed: ${unknown.sort().join(', ')}. ` +
+        `Only {{FirstName}} and {{ClinicName}} may be used.`,
+    );
+  else if (hasUnresolvedPlaceholders(template, clinicName))
+    errors.push('SMS: malformed or unresolved placeholder syntax. Use only {{FirstName}} and {{ClinicName}}.');
+
+  const rendered = renderedWorstCaseLength(template, clinicName);
+  if (rendered > MAX_SMS_CHARS)
+    errors.push(
+      `SMS: renders to ${rendered} characters with a long first name, over the ${MAX_SMS_CHARS} limit`,
+    );
+
+  return errors;
+}

@@ -26,6 +26,15 @@ describe('breadcrumbLabelForPath', () => {
   it('matches /dashboard to Monitor', () => {
     expect(breadcrumbLabelForPath('/dashboard')).toBe('Monitor');
   });
+
+  it('keeps SMS creation and editing in the SMS campaigns navigation', () => {
+    expect(breadcrumbLabelForPath('/sms')).toBe('SMS campaigns');
+    expect(breadcrumbLabelForPath('/sms/new')).toBe('SMS campaigns');
+    expect(breadcrumbLabelForPath('/sms/campaign-id/edit')).toBe('SMS campaigns');
+    expect(breadcrumbGroupForPath('/sms/new')).toBe('Contact center');
+    expect(visibleNavGroups(['Admin']).flatMap((group) => group.items).some((item) => item.to === '/sms')).toBe(true);
+    expect(visibleNavGroups(['Agent']).flatMap((group) => group.items).some((item) => item.to === '/sms')).toBe(false);
+  });
 });
 
 describe('breadcrumbGroupForPath', () => {

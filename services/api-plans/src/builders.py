@@ -21,6 +21,21 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
+# TCPA quiet-hours constants/builder for Connect Campaigns V2's openHours
+# structure now live in the shared module (see its docstring/comments there
+# for the full TCPA/AREA_CODE/T-prefix/Sunday-omission rationale) — centralized
+# so this policy value has exactly one place to change, alongside the
+# per-recipient SMS pipeline's equivalent gate.
+#
+# Imported from connect_open_hours.py, NOT quiet_hours.py: quiet_hours.py
+# unconditionally imports `phonenumbers` at module scope for the per-recipient
+# SMS gate, but this Lambda's layer is built from plain requirements.txt
+# (no phonenumbers — only api-sms's layer includes it). Importing from
+# quiet_hours.py here would crash every cold start with ModuleNotFoundError.
+from vip_shared.domain.services.connect_open_hours import (
+    connect_open_hours as _open_hours,
+)
+
 # ── State → location values — loaded from DynamoDB VipLocationMapping ─────────
 # Table PK: location (String). Each item also has stateCode, stateName, slug,
 # stateSortOrder. Cached in-process for _CACHE_TTL seconds to avoid per-request
@@ -523,6 +538,12 @@ def resolve_campaign_flow_arn(
 
     logger = logging.getLogger(__name__)
 
+    if not state_codes:
+        # Pinned-segment campaigns leave states empty by design (states/groups are
+        # ignored in favor of the pinned segment) — nothing to resolve or auto-create.
+        # Falling through to state_codes[0] below would raise IndexError.
+        return None
+
     connect = boto3.client("connect")
     flows: list[dict] = []
     kwargs: dict = {"InstanceId": connect_instance_id, "ContactFlowTypes": ["CAMPAIGN"]}
@@ -649,7 +670,12 @@ def build_campaign_params(
         "source": {"customerProfilesSegmentArn": segment_arn},
         "schedule": {"startTime": start_time, "endTime": end_time},
         "communicationTimeConfig": {
-            "localTimeZoneConfig": {"defaultTimeZone": "America/New_York"}
+            "localTimeZoneConfig": {
+                # Connect accepts local detection or a fixed default timezone,
+                # never both; defaultTimeZone is not a detection fallback.
+                "localTimeZoneDetection": ["AREA_CODE"],
+            },
+            "telephony": _open_hours(),
         },
     }
 

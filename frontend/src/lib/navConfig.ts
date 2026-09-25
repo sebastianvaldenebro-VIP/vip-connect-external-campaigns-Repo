@@ -17,6 +17,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/dashboard', label: 'Monitor' },
       { to: '/plans/history', label: 'History' },
       { to: '/plans', label: 'Plans' },
+      { to: '/sms', label: 'SMS campaigns' },
       { to: '/plans/templates', label: 'Templates' },
       { to: '/segments', label: 'Segments' },
     ],

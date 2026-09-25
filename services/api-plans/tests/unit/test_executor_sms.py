@@ -100,7 +100,7 @@ def test_count_sms_queue_returns_zero_when_count_missing():
 
 def test_invoke_sms_sender_calls_lambda_with_correct_function():
     mock_lambda = MagicMock()
-    mock_lambda.invoke.return_value = {"StatusCode": 200}
+    mock_lambda.invoke.return_value = {"StatusCode": 200, "Payload": MagicMock(read=MagicMock(return_value=b'{"enqueued":0}'))}
 
     # _get_lambda_client() does a local `import boto3` — patch the cached client directly
     with patch.object(executor, "_lambda_client", mock_lambda):
