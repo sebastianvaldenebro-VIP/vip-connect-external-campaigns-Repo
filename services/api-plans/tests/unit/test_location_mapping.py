@@ -32,7 +32,10 @@ _STUB_BY_CODE: dict = {
     "TX": ["Texas", "TX - Addison", "TX - Cinco Ranch"],
 }
 _STUB_GROUPS = [
-    {"state": "New York", "slug": "NewYork", "code": "NY", "locations": _STUB_BY_CODE["NY"]},
+    {
+        "state": "New York", "slug": "NewYork", "code": "NY", "locations": _STUB_BY_CODE["NY"],
+        "canonicalPhone": "+19175551234", "areaCodes": {"212", "718"},
+    },
     {"state": "New Jersey", "slug": "NewJersey", "code": "NJ", "locations": _STUB_BY_CODE["NJ"]},
     {"state": "Texas", "slug": "Texas", "code": "TX", "locations": _STUB_BY_CODE["TX"]},
 ]
@@ -82,6 +85,8 @@ class TestGetLocationMappingHandler:
             assert "code" in g
             assert "locations" in g
             assert "stateSortOrder" not in g
+            assert "canonicalPhone" not in g
+            assert "areaCodes" not in g
 
     def test_tx_group_present_in_response(self):
         import json as _json2

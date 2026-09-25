@@ -353,6 +353,11 @@ export class ApiPlansStack extends cdk.Stack {
       'VipLocationMapping',
     );
     locationMappingTable.grantReadData(role);
+    // Scoped rather than grantWriteData/grantReadWriteData: the only DynamoDB
+    // call auto_onboard_known_state_locations (builders.py) ever makes is a
+    // single-item conditional PutItem when a lead's location implies an
+    // already-known state — it never updates or deletes an existing row.
+    locationMappingTable.grant(role, 'dynamodb:PutItem');
 
     // ── Location Onboarding Guard — same physical table, second CDK
     // reference so we can expose its stream ARN (fromTableName can't).

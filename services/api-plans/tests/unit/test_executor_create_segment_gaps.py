@@ -157,6 +157,7 @@ class TestUnknownLocationFetchFailure:
             patch("executor.all_known_locations", side_effect=RuntimeError("DDB down")),
             patch("executor.locations_for_state_codes", return_value=[]),
             patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor.auto_onboard_known_state_locations", side_effect=lambda locs: locs),
             patch("executor.boto3.client") as mock_boto_client,
         ):
             executor._create_segment(bucket, campaign)
@@ -185,6 +186,7 @@ class TestUnknownLocationMetricEmission:
             patch("executor.all_known_locations", return_value=frozenset({"NY"})),
             patch("executor.locations_for_state_codes", return_value=[]),
             patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor.auto_onboard_known_state_locations", side_effect=lambda locs: locs),
             patch("executor.boto3.client", return_value=mock_cw),
         ):
             executor._create_segment(bucket, campaign)
@@ -215,11 +217,90 @@ class TestUnknownLocationMetricEmission:
             patch("executor.all_known_locations", return_value=frozenset({"NY"})),
             patch("executor.locations_for_state_codes", return_value=[]),
             patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor.auto_onboard_known_state_locations", side_effect=lambda locs: locs),
             patch("executor.boto3.client", side_effect=RuntimeError("CloudWatch down")),
         ):
             name, arn, expected, actual = executor._create_segment(bucket, campaign)
         # Must not raise — metric emission failure is non-fatal.
         assert expected == 1
+
+    def test_narrows_unknown_locs_before_metric_emission(self):
+        campaign = {"name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [
+                {"customerid": "c1", "phone": "5551234567", "location": "MYSTERY"},
+                {"customerid": "c2", "phone": "5559876543", "location": "MYSTERY2"},
+            ]
+        )
+        cp = _cp_client()
+        mock_cw = MagicMock()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=[]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor.auto_onboard_known_state_locations", return_value={"MYSTERY2"}),
+            patch("executor.boto3.client", return_value=mock_cw),
+        ):
+            executor._create_segment(bucket, campaign)
+
+        dimensional_values = {
+            dim["Value"]
+            for call in mock_cw.put_metric_data.call_args_list
+            for m in call.kwargs["MetricData"]
+            for dim in m.get("Dimensions", [])
+        }
+        assert dimensional_values == {"MYSTERY2"}
+        totals = [
+            m["Value"]
+            for call in mock_cw.put_metric_data.call_args_list
+            for m in call.kwargs["MetricData"]
+            if "Dimensions" not in m
+        ]
+        assert totals == [1]
+
+    def test_auto_onboard_failure_falls_back_to_original_unknown_locs(self):
+        campaign = {"name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [{"customerid": "c1", "phone": "5551234567", "location": "MYSTERY"}]
+        )
+        cp = _cp_client()
+        mock_cw = MagicMock()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=[]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch(
+                "executor.auto_onboard_known_state_locations",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("executor.boto3.client", return_value=mock_cw),
+        ):
+            executor._create_segment(bucket, campaign)
+
+        metric_names = {
+            m["MetricName"]
+            for call in mock_cw.put_metric_data.call_args_list
+            for m in call.kwargs["MetricData"]
+        }
+        assert metric_names == {"UnknownLocation"}
 
 
 class TestEmptyEntriesGuard:
