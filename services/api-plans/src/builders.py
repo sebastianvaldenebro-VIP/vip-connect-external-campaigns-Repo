@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
+from botocore.exceptions import ClientError
 
 # ── State → location values — loaded from DynamoDB VipLocationMapping ─────────
 # Table PK: location (String). Each item also has stateCode, stateName, slug,
@@ -67,6 +68,8 @@ def _load_location_mapping() -> tuple[dict[str, list[str]], list[dict], frozense
                 "slug": item["slug"],
                 "code": code,
                 "stateSortOrder": int(item.get("stateSortOrder", 99)),
+                "canonicalPhone": item.get("canonicalPhone"),
+                "areaCodes": item.get("areaCodes") or set(),
                 "locations": [],
             }
         by_code[code].append(loc)
@@ -92,9 +95,9 @@ def locations_for_state_codes(codes: list[str]) -> list[str]:
 def get_all_location_groups() -> list[dict]:
     """Return all state groups ordered by stateSortOrder (for the API endpoint)."""
     _, groups, _ = _load_location_mapping()
-    # Strip internal-only stateSortOrder from the API response
+    # Strip internal-only fields from the API response
     return [
-        {k: v for k, v in g.items() if k != "stateSortOrder"}
+        {k: v for k, v in g.items() if k not in ("stateSortOrder", "canonicalPhone", "areaCodes")}
         for g in groups
     ]
 
@@ -103,6 +106,100 @@ def all_known_locations() -> frozenset[str]:
     """Return the flat set of all known location strings (for unknown-location detection)."""
     _, _, known = _load_location_mapping()
     return known
+
+
+# ── Auto-onboarding a new location under an already-known state ──────────────
+# When a lead's location isn't in VipLocationMapping (all_known_locations()),
+# but its leading "<LABEL> - " prefix already matches an existing stateCode,
+# every field the new row needs (canonicalPhone/areaCodes/slug/stateSortOrder)
+# is identical across every sibling row for that code — so it's mechanical to
+# add, unlike onboarding a genuinely new state (no sibling to copy from).
+
+_LABEL_ALIASES = {"NYC": "NY", "SOUTH CA": "SCA", "NORTH CA": "NCA"}
+
+
+def _resolve_known_code(raw_label: str, groups_by_code: dict[str, dict]) -> str | None:
+    """Resolve a location string's leading label to a stateCode that
+    ALREADY has at least one row in VipLocationMapping. Never invents a
+    new code, and never guesses between multiple candidate codes (e.g. bare
+    "CA", ambiguous between SCA/NCA) — a label with no single existing match
+    returns None."""
+    key = raw_label.strip().upper()
+    if key in groups_by_code:
+        return key
+    aliased = _LABEL_ALIASES.get(key)
+    if aliased and aliased in groups_by_code:
+        return aliased
+    return None
+
+
+def auto_onboard_known_state_locations(unknown_locations: set[str]) -> set[str]:
+    """For each location string with a resolvable, already-known stateCode
+    prefix, insert a complete VipLocationMapping row by copying
+    canonicalPhone/areaCodes/slug/stateSortOrder from an existing sibling row
+    of that code. Returns the subset that could NOT be auto-onboarded
+    (unresolvable/ambiguous prefix, or a genuinely new stateCode) for the
+    caller to still alert on.
+    """
+    if not unknown_locations:
+        return set()
+
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    _, groups, _ = _load_location_mapping()
+    groups_by_code = {g["code"]: g for g in groups}
+    table = boto3.resource("dynamodb").Table(_LOCATION_TABLE)
+
+    still_unresolved: set[str] = set()
+    onboarded_any = False
+
+    for loc in unknown_locations:
+        if " - " not in loc:
+            still_unresolved.add(loc)
+            continue
+        raw_label, _, _rest = loc.partition(" - ")
+        code = _resolve_known_code(raw_label, groups_by_code)
+        if code is None:
+            still_unresolved.add(loc)
+            continue
+
+        sibling = groups_by_code[code]
+        item = {
+            "location": loc,
+            "stateCode": code,
+            "stateName": sibling["state"],
+            "slug": sibling["slug"],
+            "canonicalPhone": sibling["canonicalPhone"],
+            "areaCodes": sibling["areaCodes"],
+            "stateSortOrder": sibling["stateSortOrder"],
+        }
+        try:
+            table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(#loc)",
+                ExpressionAttributeNames={"#loc": "location"},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                # Already onboarded (race with a manual add or a concurrent
+                # invocation) — the row exists either way, so this instance's
+                # cache is invalidated below the same as a real success.
+                onboarded_any = True
+                continue
+            logger.warning(
+                "auto_onboard_known_state_locations put_item failed for %s: %s", loc, exc
+            )
+            still_unresolved.add(loc)
+            continue
+        onboarded_any = True
+
+    if onboarded_any:
+        global _cache_by_code
+        _cache_by_code = None
+
+    return still_unresolved
 
 
 # ── V2 campaign model → segment filter translator ─────────────────────────────

@@ -367,10 +367,14 @@ describe('ApiPlansStack', () => {
       expect(actions).toEqual(expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:PutItem']));
     });
 
-    it('grants read access to the imported VipLocationMapping table unconditionally', () => {
+    it('grants read and scoped write access to the imported VipLocationMapping table', () => {
       const actions = actionsForResource(policyStatements(template), 'VipLocationMapping');
-      expect(actions).toEqual(expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:Query']));
-      expect(actions).not.toContain('dynamodb:PutItem');
+      expect(actions).toEqual(
+        expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:PutItem']),
+      );
+      expect(actions).not.toContain('dynamodb:UpdateItem');
+      expect(actions).not.toContain('dynamodb:DeleteItem');
+      expect(actions).not.toContain('dynamodb:BatchWriteItem');
     });
 
     it('grants encrypt/decrypt on the imported data CMK (no key policy available, so scoped to *)', () => {
