@@ -1,3 +1,4 @@
+import { Preferences } from '@/pages/Preferences';
 import type { ReactNode } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 
@@ -26,6 +27,8 @@ import { BrandedMonitor } from '@/pages/BrandedMonitor';
 import { ContactArtifacts } from '@/pages/ContactArtifacts';
 import { BlockedNumbers } from '@/pages/BlockedNumbers';
 import { Segments } from '@/pages/Segments';
+import { SmsCampaigns } from '@/pages/SmsCampaigns';
+import { SmsCampaignNew } from '@/pages/SmsCampaignNew';
 
 export default function App(): ReactNode {
   return (
@@ -39,10 +42,14 @@ export default function App(): ReactNode {
           </ProtectedRoute>
         }
       >
+        <Route path="/preferences" element={<Preferences />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/segments" element={<Segments />} />
         <Route path="/segments/new" element={<SegmentNew />} />
         <Route path="/segments/:id" element={<SegmentDetail />} />
+        <Route path="/sms" element={<SmsCampaigns />} />
+        <Route path="/sms/new" element={<SmsCampaignNew />} />
+        <Route path="/sms/:id/edit" element={<SmsCampaignNew />} />
         <Route path="/campaigns" element={<Campaigns />} />
         <Route path="/campaigns/new" element={<CampaignNew />} />
         <Route path="/campaigns/:id" element={<CampaignDetail />} />

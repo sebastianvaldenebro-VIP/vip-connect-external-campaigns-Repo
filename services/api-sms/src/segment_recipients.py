@@ -49,7 +49,7 @@ def load_segment_recipients(
     load_snapshot: Callable[[], dict | None],
     publish_snapshot: Callable[[dict], dict],
 ) -> list[dict]:
-    """Return only phone/FirstName, or raise Pending/Error without partial data.
+    """Return phone and allowlisted personalization fields, or Pending/Error.
 
     ``publish_snapshot`` must conditionally publish only if metadata is absent,
     then return the persisted winner using a consistent read. Metadata contains
@@ -255,7 +255,7 @@ def _load_finite_members(
                 raise SegmentRecipientsError(
                     "Segment membership profile identity does not match"
                 )
-            recipient = _recipient(profile)
+            recipient = _recipient({**profile, "ProfileId": profile_id})
             if recipient is not None:
                 recipients.append(recipient)
         if seen != set(batch):
@@ -364,4 +364,14 @@ def _recipient(profile: dict) -> dict | None:
         raise SegmentRecipientsError("Profile has an invalid phone field")
     if not phone:
         return None  # A complete profile without a phone is not SMS-addressable.
-    return {"phone": phone, "FirstName": profile.get("FirstName") or ""}
+    attributes = profile.get("Attributes") or {}
+    return {
+        "phone": phone,
+        "ProfileId": profile.get("ProfileId"),
+        "FirstName": profile.get("FirstName") or "",
+        "Attributes": {
+            key: attributes[key]
+            for key in ("location", "location_id", "campaign", "clinic_name", "specialty")
+            if key in attributes
+        } if isinstance(attributes, dict) else attributes,
+    }

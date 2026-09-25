@@ -252,8 +252,11 @@ def create_run(
     return _run_from_item(item)
 
 
-def get_run(plan_id: str, run_id: str) -> dict | None:
-    result = _table().get_item(Key={"pk": f"PLAN#{plan_id}", "sk": f"RUN#{run_id}"})
+def get_run(plan_id: str, run_id: str, *, consistent_read: bool = False) -> dict | None:
+    kwargs = {"Key": {"pk": f"PLAN#{plan_id}", "sk": f"RUN#{run_id}"}}
+    if consistent_read:
+        kwargs["ConsistentRead"] = True
+    result = _table().get_item(**kwargs)
     item = result.get("Item")
     return _run_from_item(item) if item else None
 

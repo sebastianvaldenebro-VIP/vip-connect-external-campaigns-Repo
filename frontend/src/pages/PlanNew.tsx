@@ -18,8 +18,9 @@ import {
   type SmsOriginationNumber,
 } from '@/lib/api';
 import { STATE_DEFAULT_PHONES } from '@/lib/areaCodeMap';
-import { MAX_SMS_CHARS, precallSmsAvailability, renderedWorstCaseLength, validateBulkSms, validatePrecallSms } from '@/lib/precallSms';
+import { MAX_SMS_CHARS, PRECALL_CATALOG_VERSION, changePrecallSmsMode, precallSmsAvailability, profileSmsPreview, renderedWorstCaseLength, validateBulkSms, validatePrecallSms } from '@/lib/precallSms';
 import { useLocationMapping } from '@/lib/stateLocationMap';
+import { SMS_CAMPAIGN_TEMPLATE_VERSION, smsCampaignMessageStats, validateSmsCampaignTemplate } from '@/lib/smsCampaign';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -54,9 +55,9 @@ const CANONICAL_PHONES = new Set(Object.values(STATE_DEFAULT_PHONES));
 // campaign that hasn't opted in.
 const EMPTY_PRECALL: NonNullable<BucketCampaignConfig['precallSms']> = {
   enabled: false,
-  messageTemplate: '',
+  mode: 'profile',
+  catalogVersion: PRECALL_CATALOG_VERSION,
   originationNumberArn: '',
-  clinicName: '',
 };
 
 function pickPhoneForCampaign(states: string[]): string {
@@ -167,7 +168,7 @@ function assignStages(campaigns: CampaignDef[]): Map<string, number> {
 
 // ── Group checkboxes ──────────────────────────────────────────────────────────
 
-function GroupCheckboxes({
+export function GroupCheckboxes({
   options,
   selected,
   onChange,
@@ -521,7 +522,7 @@ function TriggerEditor({
 
 // ── Campaign card (inline editor) ─────────────────────────────────────────────
 
-function CampaignCard({
+export function CampaignCard({
   campaign,
   bucketIndex,
   allBuckets,
@@ -551,6 +552,8 @@ function CampaignCard({
   // can run longer than the raw template because of placeholder substitution
   // (same reasoning as the pre-call SMS panel's own counter below).
   const smsRendered = renderedWorstCaseLength(cfg.smsMessageTemplate ?? '', cfg.clinicName ?? '');
+  const isCampaignSms = cfg.smsTemplateVersion === SMS_CAMPAIGN_TEMPLATE_VERSION;
+  const campaignSmsStats = smsCampaignMessageStats(cfg.smsMessageTemplate ?? '');
   const [configOpen, setConfigOpen] = useState(false);
   const { locationMap } = useLocationMapping();
   const stateCodes = locationMap.map((g) => g.code);
@@ -655,12 +658,12 @@ function CampaignCard({
     const deps = isAdding
       ? [...campaign.dependsOn, depId]
       : campaign.dependsOn.filter((d) => d !== depId);
-    // A dependent campaign is never pre-warmed, so a stale enabled precallSms
-    // would fail server-side validation with a confusing error at save time.
+    // Profile preparation supports the existing DAG; only manual mode retains
+    // the legacy dependency restriction.
     onChange({
       ...campaign,
       dependsOn: deps,
-      ...clearPrecallIf(isAdding && cfg.precallSms?.enabled),
+      ...clearPrecallIf(isAdding && cfg.precallSms?.enabled && cfg.precallSms.mode !== 'profile'),
     });
   };
 
@@ -914,8 +917,8 @@ function CampaignCard({
                 <div className="space-y-1">
                   <label className="block text-xs font-medium text-gray-600">
                     Message Template{' '}
-                    <span className={smsRendered > MAX_SMS_CHARS ? 'text-red-600 font-semibold' : 'text-gray-400'}>
-                      ({smsRendered}/{MAX_SMS_CHARS})
+                    <span className={(isCampaignSms ? validateSmsCampaignTemplate(cfg.smsMessageTemplate ?? '').length > 0 : smsRendered > MAX_SMS_CHARS) ? 'text-red-600 font-semibold' : 'text-gray-400'}>
+                      {isCampaignSms ? ` (${campaignSmsStats.characters} characters · ${campaignSmsStats.parts} estimated parts)` : ` (${smsRendered}/${MAX_SMS_CHARS})`}
                     </span>
                   </label>
                   <textarea
@@ -925,13 +928,13 @@ function CampaignCard({
                     className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-amber-400"
                   />
                   <p className="text-[10px] text-gray-500">
-                    Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.
+                    {isCampaignSms ? <>Personalized with {'{{FirstName}}'} from the patient&apos;s profile.</> : <>Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.</>}
                   </p>
                   <p className="text-[10px] text-amber-600">
                     Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
                   </p>
                 </div>
-                <div className="space-y-1">
+                {!isCampaignSms && <div className="space-y-1">
                   <label className="block text-xs font-medium text-gray-600">
                     Clinic name{' '}
                     <span className="text-gray-400">(interpolated into {'{{ClinicName}}'} if used above)</span>
@@ -942,7 +945,7 @@ function CampaignCard({
                     placeholder="e.g. VIP Medical Group"
                     className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-amber-400"
                   />
-                </div>
+                </div>}
                 <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
                   <input
                     type="checkbox"
@@ -962,11 +965,13 @@ function CampaignCard({
                 Hiding it entirely for an unavailable campaign would leave the operator
                 guessing why a colleague's screenshot has a panel they don't see. */}
             {(() => {
+              const precall = cfg.precallSms;
+              const mode = precall ? (precall.mode ?? 'manual') : 'profile';
               const availability = precallSmsAvailability({
                 deliveryType: campaign.deliveryType,
                 dependsOn: campaign.dependsOn,
+                mode,
               });
-              const precall = cfg.precallSms;
               const precallEnabled = precall?.enabled ?? false;
               const rendered = renderedWorstCaseLength(
                 precall?.messageTemplate ?? '',
@@ -978,52 +983,106 @@ function CampaignCard({
                     <input
                       type="checkbox"
                       checked={precallEnabled}
-                      disabled={!availability.available}
+                      disabled={!availability.available && !precallEnabled}
                       onChange={(e) => patchPrecall({ enabled: e.target.checked })}
                       className="mt-0.5 accent-blue-500 disabled:cursor-not-allowed"
                     />
-                    <span>Pre-Call SMS — text the lead just before dialing</span>
+                    <span>Pre-Call SMS</span>
+                  </label>
+                  <label className="block text-xs font-medium text-gray-600 space-y-1">
+                    <span>Message source</span>
+                    <select
+                      aria-label="Pre-call SMS message source"
+                      value={mode}
+                      onChange={(e) => updateCfg({ precallSms: changePrecallSmsMode(precall, e.target.value as 'manual' | 'profile') })}
+                      className="block w-full rounded-lg border border-gray-200 px-3 py-2 text-sm bg-white"
+                    >
+                      <option value="profile">Automatic from profile</option>
+                      <option value="manual">Manual template</option>
+                    </select>
                   </label>
                   {!availability.available && (
                     <p className="text-xs text-gray-500">{availability.reason}</p>
                   )}
                   {availability.available && precallEnabled && (
                     <>
-                      <div className="space-y-1">
-                        <label className="block text-xs font-medium text-gray-600">
-                          Message Template{' '}
-                          <span className={rendered > MAX_SMS_CHARS ? 'text-red-600 font-semibold' : 'text-gray-400'}>
-                            ({rendered}/{MAX_SMS_CHARS})
-                          </span>
-                        </label>
-                        <textarea
-                          value={precall?.messageTemplate ?? ''}
-                          onChange={(e) => patchPrecall({ messageTemplate: e.target.value })}
-                          placeholder="Hi {{FirstName}}! {{ClinicName}} here…"
-                          className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        />
-                        <p className="text-[10px] text-gray-500">
-                          Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.
-                        </p>
-                        <p className="text-[10px] text-amber-600">
-                          Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
-                        </p>
-                      </div>
-                      <div className="space-y-1">
-                        <label className="block text-xs font-medium text-gray-600">
-                          Clinic name{' '}
-                          <span className="text-gray-400">(interpolated into {'{{ClinicName}}'})</span>
-                        </label>
-                        <input
-                          value={precall?.clinicName ?? ''}
-                          onChange={(e) => patchPrecall({ clinicName: e.target.value })}
-                          placeholder="e.g. VIP Medical Group"
-                          className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-blue-400"
-                        />
-                      </div>
+                      {mode === 'profile' ? (
+                        <div className="space-y-3">
+                          <p className="text-xs text-gray-600">
+                            The patient name and message variant are selected from each lead&apos;s profile. You can add a clinic name for this campaign.
+                          </p>
+                          <label className="block space-y-1 text-xs font-medium text-gray-600">
+                            <span>Clinic name (optional)</span>
+                            <input
+                              value={precall?.clinicName ?? ''}
+                              onChange={(e) => patchPrecall({ clinicName: e.target.value })}
+                              className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            />
+                          </label>
+                          <p className="text-[10px] text-gray-500">Leave blank to omit the clinic mention.</p>
+                          {precall?.catalogVersion !== PRECALL_CATALOG_VERSION ? (
+                            <p role="alert" className="text-xs text-red-600">
+                              This message catalog version is unsupported. Choose a supported message source before saving.
+                            </p>
+                          ) : (
+                            <>
+                              <p className="text-[10px] text-gray-500">
+                                Read-only examples using Alex as the patient name and your clinic name, if provided. The actual patient name is filled automatically.
+                              </p>
+                              {(['vein', 'pain'] as const).map((variant) => (
+                                <label key={variant} className="block space-y-1 text-xs font-medium text-gray-600">
+                                  <span>{variant === 'vein' ? 'Vein' : 'Pain management'}</span>
+                                  <textarea
+                                    aria-label={`${variant === 'vein' ? 'Vein' : 'Pain management'} message preview`}
+                                    readOnly
+                                    value={profileSmsPreview(variant, precall?.clinicName)}
+                                    className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm h-24 resize-none"
+                                  />
+                                </label>
+                              ))}
+                            </>
+                          )}
+                        </div>
+                      ) : (
+                        <>
+                          <div className="space-y-1">
+                            <label className="block text-xs font-medium text-gray-600">
+                              Message Template{' '}
+                              <span className={rendered > MAX_SMS_CHARS ? 'text-red-600 font-semibold' : 'text-gray-400'}>
+                                ({rendered}/{MAX_SMS_CHARS})
+                              </span>
+                            </label>
+                            <textarea
+                              value={precall?.messageTemplate ?? ''}
+                              onChange={(e) => patchPrecall({ messageTemplate: e.target.value })}
+                              placeholder="Hi {{FirstName}}! {{ClinicName}} here…"
+                              className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 h-20 resize-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            />
+                            <p className="text-[10px] text-gray-500">
+                              Placeholders: {'{{FirstName}}'} (the patient&apos;s first name) and {'{{ClinicName}}'}. Nothing else is permitted.
+                            </p>
+                            <p className="text-[10px] text-amber-600">
+                              Do NOT include patient names, dates of birth, diagnoses, medications, or any identifying information.
+                            </p>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="block text-xs font-medium text-gray-600">
+                              Clinic name{' '}
+                              <span className="text-gray-400">(interpolated into {'{{ClinicName}}'})</span>
+                            </label>
+                            <input
+                              value={precall?.clinicName ?? ''}
+                              onChange={(e) => patchPrecall({ clinicName: e.target.value })}
+                              placeholder="e.g. VIP Medical Group"
+                              className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            />
+                          </div>
+                        </>
+                      )}
                       <div className="space-y-1">
                         <label className="block text-xs font-medium text-gray-600">Origination Number</label>
                         <select
+                          aria-label="Pre-call SMS origination number"
                           value={precall?.originationNumberArn ?? ''}
                           onChange={(e) => patchPrecall({ originationNumberArn: e.target.value })}
                           className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
@@ -1039,10 +1098,10 @@ function CampaignCard({
                           Phase I default: +16106009752. If it&apos;s not in this list, the number isn&apos;t ACTIVE yet.
                         </p>
                       </div>
-                      <p className="text-[10px] text-gray-500">
+                      {mode === 'manual' && <p className="text-[10px] text-gray-500">
                         Use approved copy only — Vein and Pain Management are the two shipped specialties. Check the
                         pre-call SMS runbook before sending anything else.
-                      </p>
+                      </p>}
                     </>
                   )}
                 </div>
@@ -1092,6 +1151,22 @@ function CampaignCard({
                           </option>
                         ))}
                       </select>
+                    </div>
+                  )}
+                  {campaign.pinnedSegmentArn && (
+                    <div>
+                      <label className="block text-xs font-semibold text-gray-700 mb-1">
+                        Campaign flow ARN
+                      </label>
+                      <input
+                        value={cfg.campaignFlowArn ?? ''}
+                        onChange={(e) => updateCfg({ campaignFlowArn: e.target.value })}
+                        placeholder="arn:aws:connect:us-east-1:...:instance/.../contact-flow/..."
+                        className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-300"
+                      />
+                      <p className="mt-1 text-xs text-gray-400">
+                        Pinned segments have no state to auto-resolve a campaign-&lt;STATE&gt; flow from — set it here.
+                      </p>
                     </div>
                   )}
                   <div>

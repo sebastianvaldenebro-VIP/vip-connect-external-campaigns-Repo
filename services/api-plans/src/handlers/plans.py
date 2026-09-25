@@ -14,6 +14,7 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 import builders
 import executor
 import scheduler_manager
+import sms_origination
 import store
 
 
@@ -164,6 +165,8 @@ def create_plan(event: dict, _path_params: dict) -> dict:
         _validate_trigger_no_cycle(None, trigger, store.list_plans())
 
     branded_errors = _validate_plan_body(body)
+    if not branded_errors:
+        branded_errors.extend(sms_origination.validate_plan_origins(body))
     if branded_errors:
         return json_response(
             400,
@@ -230,6 +233,9 @@ def update_plan(event: dict, path_params: dict) -> dict:
         "schedule",
     )
     updated = {**existing, **{k: v for k, v in body.items() if k in allowed}}
+    origin_errors = sms_origination.validate_plan_origins(updated)
+    if origin_errors:
+        return json_response(400, {"error": {"code": "VALIDATION_ERROR", "messages": origin_errors}})
     plan = store.put_plan(updated)
 
     is_template = updated.get("isTemplate") or updated.get("is_template")
@@ -630,7 +636,17 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
     prefix = f"bucket '{bucket_name}' campaign[{ci}]"
 
     tmpl = cfg.get("smsMessageTemplate", "")
-    if not tmpl:
+    if "smsTemplateVersion" in cfg:
+        from vip_shared.domain.services.sms_campaign import validate_template, validate_version
+
+        try:
+            validate_version(cfg["smsTemplateVersion"])
+            validate_template(tmpl)
+        except ValueError as exc:
+            errors.append(f"{prefix}: smsMessageTemplate: {exc}")
+        if cfg.get("phiAcknowledged") is not True:
+            errors.append(f"{prefix}: campaign SMS requires phiAcknowledged=true")
+    elif not tmpl:
         errors.append(f"{prefix}: deliveryType='sms' requires campaignConfig.smsMessageTemplate")
     else:
         errors.extend(
@@ -648,7 +664,7 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
                 f"campaignConfig.clinicName is not set"
             )
 
-    if not cfg.get("smsOriginationNumberArn"):
+    if not isinstance(cfg.get("smsOriginationNumberArn"), str) or not cfg["smsOriginationNumberArn"].strip():
         errors.append(
             f"{prefix}: deliveryType='sms' requires campaignConfig.smsOriginationNumberArn"
         )
@@ -664,25 +680,19 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
 def _validate_precall_sms(campaign: dict, bucket_name: str, ci: int) -> list[str]:
     """Return validation errors for campaignConfig.precallSms.
 
-    Only validated when enabled=true — an unset/disabled block is inert
-    config, not a save-time error. Content (placeholders, rendered length,
-    PHI) is screened by the same _screen_sms_template_content helper
-    _validate_sms_campaign uses, so the pre-call and bulk-SMS channels can
-    never drift apart in what they allow.
-
-    Two checks are specific to precall and have no bulk-SMS equivalent:
-
-    - deliveryType must be a voice campaign — one of _VOICE_DELIVERY_TYPES
-      ('campaign', 'branded', or 'journey') — a pre-call SMS on an 'sms'
-      campaign has no dial to precede.
-    - dependsOn must be empty — a campaign with dependsOn is never
-      pre-warmed (see _fire_precall_sms's docstring in executor.py), so it
-      never reaches "warming" with a real segmentArn and the SMS would
-      silently never fire. Reject at save time instead of failing quietly
-      at run time.
+    Missing mode retains the existing manual contract. Profile mode uses a
+    versioned embedded catalog and resolves name/specialty per recipient;
+    an optional campaign clinic name controls whether its clause is included.
+    its rendered content is validated by the sender, including multipart SMS.
+    Disabled blocks remain inert. Dependent campaigns are supported only by
+    the new profile lifecycle; no existing plan is migrated implicitly.
     """
     cfg = campaign.get("campaignConfig") or {}
     precall = cfg.get("precallSms") or {}
+    if not isinstance(precall, dict):
+        raise ValueError(
+            f"bucket '{bucket_name}' campaign[{ci}]: precallSms must be an object"
+        )
     if not precall.get("enabled"):
         return []
 
@@ -696,6 +706,45 @@ def _validate_precall_sms(campaign: dict, bucket_name: str, ci: int) -> list[str
             f"campaign (deliveryType one of {sorted(_VOICE_DELIVERY_TYPES)}), "
             f"not '{delivery_type}' — there is no dial for it to precede"
         )
+        return errors
+
+    mode = precall.get("mode", "manual")
+    if mode not in ("manual", "profile"):
+        return [f"{prefix}: precallSms.mode must be 'manual' or 'profile'"]
+
+    if mode == "profile":
+        from vip_shared.domain.services.precall_sms import (
+            CATALOG_VERSION, PersonalizationError, normalize_policy,
+        )
+
+        if precall.get("enabled") is not True:
+            errors.append(f"{prefix}: precallSms.enabled must be a boolean in profile mode")
+        if precall.get("catalogVersion") != CATALOG_VERSION:
+            errors.append(
+                f"{prefix}: precallSms.catalogVersion must be '{CATALOG_VERSION}' "
+                "for profile mode"
+            )
+        if precall.get("messageTemplate"):
+            errors.append(
+                f"{prefix}: precallSms.messageTemplate must be omitted in profile mode; "
+                "templates are selected automatically"
+            )
+        if "clinicName" in precall:
+            try:
+                normalize_policy({
+                    "mode": "profile", "catalogVersion": CATALOG_VERSION,
+                    "clinicName": precall["clinicName"],
+                })
+            except PersonalizationError:
+                errors.append(
+                    f"{prefix}: precallSms.clinicName must be blank or a valid clinic "
+                    "name of at most 80 characters in profile mode"
+                )
+        origin = precall.get("originationNumberArn")
+        if not isinstance(origin, str) or not origin.strip():
+            errors.append(
+                f"{prefix}: precallSms.enabled requires precallSms.originationNumberArn"
+            )
         return errors
 
     if campaign.get("dependsOn"):

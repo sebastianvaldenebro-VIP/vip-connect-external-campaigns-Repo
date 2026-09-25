@@ -38,6 +38,22 @@ from vip_shared.domain.services.sms_template import (
     extract_placeholders,
     render as _render,
 )
+from vip_shared.domain.services.precall_sms import (
+    PersonalizationError,
+    normalize_policy,
+    personalize,
+    validate_policy,
+)
+from vip_shared.domain.services.sms_campaign import (
+    SmsCampaignError,
+    render as render_campaign,
+    validate_template as validate_campaign_template,
+    validate_version as validate_campaign_version,
+)
+from vip_shared.domain.services.sms_origination import (
+    SmsOriginationError,
+    validate_promotional_origin,
+)
 from vip_shared.infrastructure.persistence.opt_out import (
     build_from_env as build_opt_out_from_env,
 )
@@ -83,9 +99,74 @@ _sqs = boto3.client("sqs")
 _cp = boto3.client("customer-profiles")
 _s3 = boto3.client("s3")
 _opt_out = build_opt_out_from_env()
+# Legacy/precall paths do not create or query an origination inventory client.
+_origin_client = None
 
 # US 10-digit numbers in E.164 format only
 _E164_RE = re.compile(r"^\+1\d{10}$")
+
+
+def _is_managed_run(record: dict) -> bool:
+    return record.get("precallPolicy") is not None or "smsTemplateVersion" in record
+
+
+def _validate_managed_run(record: dict) -> None:
+    if "smsTemplateVersion" in record:
+        validate_campaign_version(record["smsTemplateVersion"])
+        if record.get("precallPolicy") is not None:
+            raise SmsCampaignError("conflicting_sms_modes")
+        validate_campaign_template(record.get("messageTemplate"))
+    else:
+        validate_policy(record["precallPolicy"])
+
+
+def _validate_campaign_origin(record: dict) -> None:
+    if "smsTemplateVersion" not in record:
+        return
+    global _origin_client
+    if _origin_client is None:
+        _origin_client = boto3.client("pinpoint-sms-voice-v2")
+    validate_promotional_origin(record["originationNumberArn"], client=_origin_client)
+
+
+def _bind_plan_schedule_source(record: dict, runs_table, event: dict) -> dict:
+    """Adopt Plans scheduling once for an unfinished legacy SMS run.
+
+    scheduleSource is an internal contract with the IAM-authorized Plans
+    invoker, not proof of an AWS caller's identity. Merely having planId/runId
+    does not opt a standalone invocation into this behavior. A persisted
+    source is immutable, and sealed managed runs cannot gain late SMS work.
+    """
+    if (
+        event.get("scheduleSource") != "plans"
+        or "scheduleSource" in record
+        or record.get("status") != "RUNNING"
+        or record.get("initializationComplete") is True
+    ):
+        return record
+    key = {"planId": record["planId"], "sk": record["sk"]}
+    try:
+        runs_table.update_item(
+            Key=key,
+            UpdateExpression="SET scheduleSource = :source",
+            ConditionExpression=(
+                "attribute_not_exists(scheduleSource) AND #status = :running "
+                "AND (attribute_not_exists(initializationComplete) "
+                "OR initializationComplete = :initializing)"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":source": "plans", ":running": "RUNNING", ":initializing": False,
+            },
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    # Use the winner, including a concurrent source, cancellation or seal.
+    current = runs_table.get_item(Key=key, ConsistentRead=True).get("Item")
+    if not current:
+        raise RuntimeError("SMS run disappeared during schedule source recovery")
+    return current
 
 
 def lambda_handler(event: dict, context: object) -> dict:
@@ -108,6 +189,8 @@ def lambda_handler(event: dict, context: object) -> dict:
                                         # and the patient reads "This is .".
       "originationNumberArn": str,     # EUM SMS phone number ARN
       "originationNumber": str,        # friendly E.164 (e.g. +15125551234)
+      "scheduleSource": "plans",      # internal Plans invocations only; optional
+      "smsTemplateVersion": "campaign-v1",  # optional SMS-only editable contract
     }
     Returns enqueue/failure counts. A snapshot still being generated adds
     "pending": true; a run that has ended adds "terminal": true and exitReason.
@@ -115,7 +198,15 @@ def lambda_handler(event: dict, context: object) -> dict:
     campaign_id = event["campaignId"]
     segment_arn = event["segmentArn"]
     segment_name = event.get("segmentName", segment_arn.split("/")[-1])
-    message_tmpl = event["messageTemplate"]
+    requested_policy = event.get("precallPolicy")
+    if "precallPolicy" in event:
+        requested_policy = normalize_policy(requested_policy)
+    if "smsTemplateVersion" in event:
+        validate_campaign_version(event["smsTemplateVersion"])
+        if requested_policy is not None:
+            raise SmsCampaignError("conflicting_sms_modes")
+        validate_campaign_template(event.get("messageTemplate"))
+    message_tmpl = event.get("messageTemplate", "") if requested_policy is not None else event["messageTemplate"]
     origination_arn = event["originationNumberArn"]
     now_epoch = int(time.time())
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -148,18 +239,53 @@ def lambda_handler(event: dict, context: object) -> dict:
         "updatedAt": now_iso,
         "pipelineVersion": "v1",
     }
+    if event.get("scheduleSource") == "plans":
+        record["scheduleSource"] = "plans"
+    if requested_policy is not None:
+        record["messageTemplate"] = ""
+        record["clinicName"] = ""
+        record["precallPolicy"] = requested_policy
+    if "smsTemplateVersion" in event:
+        record["smsTemplateVersion"] = event["smsTemplateVersion"]
+        record["clinicName"] = ""
+    if _is_managed_run(record):
+        record["initializationComplete"] = False
+        record["activeEnqueueBatches"] = 0
+        record["enqueueRevision"] = 0
+        record["totalSkippedPersonalization"] = 0
+        record["totalCancelled"] = 0
+    origin_prevalidated = False
+    if "smsTemplateVersion" in record:
+        # Reject a new incompatible campaign before creating an empty RUNNING
+        # row. Existing rows own their origin, even when the replay payload
+        # names a different number; sealed/terminal rows remain observable.
+        key = {"planId": record["planId"], "sk": record["sk"]}
+        existing = runs_table.get_item(Key=key, ConsistentRead=True).get("Item")
+        if not existing:
+            try:
+                _validate_campaign_origin(record)
+            except SmsOriginationError:
+                # Another initializer may have persisted a winner while EUM
+                # was queried. Recover that winner instead of rejecting its
+                # replay based on the losing candidate's origin.
+                if not runs_table.get_item(Key=key, ConsistentRead=True).get("Item"):
+                    raise
+            else:
+                origin_prevalidated = True
     already_sent_phones: set[str] = set()
     try:
         runs_table.put_item(Item=record, ConditionExpression="attribute_not_exists(sk)")
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
+        origin_prevalidated = False
         record = runs_table.get_item(
             Key={"planId": event["planId"], "sk": f"{event['runId']}#{campaign_id}"},
             ConsistentRead=True,
         ).get("Item")
         if not record:
             raise RuntimeError("SMS run disappeared during sender recovery") from None
+        record = _bind_plan_schedule_source(record, runs_table, event)
         if record.get("status") in _TERMINAL_RUN_STATUSES:
             return {
                 "terminal": True,
@@ -167,11 +293,19 @@ def lambda_handler(event: dict, context: object) -> dict:
                 "enqueued": 0,
                 "failed": 0,
             }
+        if _is_managed_run(record) and record.get("initializationComplete") is True:
+            _validate_managed_run(record)
+            return _managed_result(event["planId"], event["runId"], campaign_id)
         # A caller replay cannot replace the original audience or message.
         segment_name = record["segmentName"]
         message_tmpl = record["messageTemplate"]
         origination_arn = record["originationNumberArn"]
         already_sent_phones = _get_already_sent_phones(campaign_id)
+
+    if _is_managed_run(record):
+        _validate_managed_run(record)
+    if not origin_prevalidated:
+        _validate_campaign_origin(record)
 
     # Extract recipients (phone + allowlisted render fields) from CP segment
     try:
@@ -182,6 +316,8 @@ def lambda_handler(event: dict, context: object) -> dict:
             campaign_id=campaign_id,
         )
     except SegmentRecipientsPending:
+        if _is_managed_run(record):
+            return _managed_result(event["planId"], event["runId"], campaign_id)
         return {"pending": True, "enqueued": 0, "failed": 0}
     except _SmsRunInactive as exc:
         return {
@@ -190,6 +326,13 @@ def lambda_handler(event: dict, context: object) -> dict:
             "enqueued": 0,
             "failed": 0,
         }
+
+    if _is_managed_run(record):
+        return _process_managed_run(
+            recipients, record=record, campaign_id=campaign_id,
+            plan_id=event["planId"], run_id=event["runId"],
+            already_sent_phones=already_sent_phones, now_iso=now_iso, ttl=ttl,
+        )
 
     queue_table = _ddb.Table(_QUEUE_TABLE)
     enqueued, failed, opted_out, outside_quiet_hours, rejected_fields = (
@@ -205,6 +348,7 @@ def lambda_handler(event: dict, context: object) -> dict:
             now_iso=now_iso,
             ttl=ttl,
             queue_table=queue_table,
+            schedule_source=record.get("scheduleSource"),
         )
     )
 
@@ -257,6 +401,129 @@ def lambda_handler(event: dict, context: object) -> dict:
     return {"enqueued": enqueued, "failed": failed}
 
 
+def _managed_result(plan_id: str, run_id: str, campaign_id: str, *, enqueued: int = 0, failed: int = 0) -> dict:
+    """Fresh non-PHI aggregates; initialization and provider settlement are distinct."""
+    record = _ddb.Table(_RUNS_TABLE).get_item(
+        Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"}, ConsistentRead=True,
+    ).get("Item")
+    if not record or record.get("status") != "RUNNING":
+        return {"terminal": True, "exitReason": (record or {}).get("exitReason", ""), "enqueued": 0, "failed": 0}
+    counters = {
+        name: int(record.get(name) or 0) for name in (
+            "totalEnqueued", "totalSent", "totalFailed", "totalOptedOut", "totalCancelled",
+            "totalSkippedOptOut", "totalSkippedQuietHours", "totalSkippedPersonalization", "totalSqsSendFailed",
+        )
+    }
+    initialized = record.get("initializationComplete") is True
+    outstanding = counters["totalEnqueued"] - sum(counters[key] for key in (
+        "totalSent", "totalFailed", "totalOptedOut", "totalCancelled",
+    ))
+    return {
+        "enqueued": enqueued, "failed": failed, **counters,
+        "initializationComplete": initialized,
+        "pending": not initialized or outstanding > 0 or int(record.get("activeEnqueueBatches") or 0) > 0,
+    }
+
+
+def _process_managed_run(
+    recipients: list[dict], *, record: dict, campaign_id: str, plan_id: str,
+    run_id: str, already_sent_phones: set[str], now_iso: str, ttl: int,
+) -> dict:
+    _validate_managed_run(record)
+    policy = record.get("precallPolicy")
+    template_version = record.get("smsTemplateVersion")
+    # Resolve the whole cohort before claiming a phone. A shared phone with
+    # conflicting rendered identities must never pick the first profile.
+    grouped: dict[str, list[dict]] = {}
+    for recipient in recipients:
+        grouped.setdefault(recipient["phone"], []).append(recipient)
+    prepared: list[dict] = []
+    reasons: dict[str, int] = {}
+    opted_out_before = 0
+    for phone, profiles in grouped.items():
+        if phone in already_sent_phones:
+            continue
+        if not _E164_RE.fullmatch(phone):
+            reasons["invalid_phone"] = reasons.get("invalid_phone", 0) + 1
+            continue
+        if _opt_out.is_blocked(phone):
+            opted_out_before += 1
+            continue
+        bodies: set[str] = set()
+        invalid: set[str] = set()
+        for profile in profiles:
+            try:
+                bodies.add(
+                    render_campaign(record["messageTemplate"], recipient=profile)
+                    if template_version is not None else personalize(profile, policy).body
+                )
+            except (PersonalizationError, SmsCampaignError) as exc:
+                invalid.add(exc.reason)
+        reason = None
+        if len(bodies) > 1 or (bodies and invalid):
+            reason = "conflicting_profile"
+        elif invalid:
+            reason = sorted(invalid)[0]
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+        prepared.append({**profiles[0], "_managedBody": bodies.pop()})
+    # An earlier PENDING observation may become SQS_SEND_FAILED while this
+    # invocation works. Reconcile those phones again before sealing too.
+    pending = {recipient["phone"] for recipient in prepared} | (set(grouped) & already_sent_phones)
+    enqueued, failed, opted_out, quiet, _ = _process_recipients(
+        prepared, campaign_id=campaign_id, plan_id=plan_id, run_id=run_id,
+        message_tmpl="", clinic_name="", origination_arn=record["originationNumberArn"],
+        already_sent_phones=already_sent_phones, now_iso=now_iso, ttl=ttl,
+        queue_table=_ddb.Table(_QUEUE_TABLE), precall_policy=policy, pending_phones=pending,
+        sms_template_version=template_version,
+        schedule_source=record.get("scheduleSource"),
+    )
+    # PENDING/SENDING/SENT rows have reserved aggregate counts, even if a
+    # previous invocation crashed after reservation. Their unresolved counts
+    # continue blocking acceptance; never automatically resend to fix them.
+    runs_table = _ddb.Table(_RUNS_TABLE)
+    key = {"planId": plan_id, "sk": f"{run_id}#{campaign_id}"}
+    before_history = runs_table.get_item(Key=key, ConsistentRead=True).get("Item") or {}
+    pending.difference_update(_get_already_sent_phones(campaign_id))
+    values = {":o": opted_out_before + opted_out, ":q": quiet, ":p": sum(reasons.values()),
+              ":reasons": reasons, ":t": now_iso, ":running": "RUNNING", ":initializing": False}
+    expression = ("SET totalSkippedOptOut = :o, totalSkippedQuietHours = :q, "
+                  "totalSkippedPersonalization = :p, personalizationSkipReasons = :reasons, updatedAt = :t")
+    condition = "#status = :running AND initializationComplete = :initializing"
+    # A legacy worker may have evaluated recipient hours while a concurrent
+    # Plans invocation adopted scheduling ownership. It cannot seal that stale
+    # suppression; leave initialization pending for a pass using the winner.
+    if "scheduleSource" in record:
+        condition += " AND scheduleSource = :schedule_source"
+        values[":schedule_source"] = record["scheduleSource"]
+    else:
+        condition += " AND attribute_not_exists(scheduleSource)"
+    if not pending and int(before_history.get("activeEnqueueBatches") or 0) == 0:
+        expression += ", initializationComplete = :complete"
+        values[":complete"] = True
+        values[":no_batches"] = 0
+        values[":revision"] = int(before_history.get("enqueueRevision") or 0)
+        # Zero active batches alone is insufficient: another initializer can
+        # start and finish a rejected enqueue between our history read and
+        # this write. The revision makes that stale history unable to seal.
+        condition += (
+            " AND (attribute_not_exists(activeEnqueueBatches) OR activeEnqueueBatches = :no_batches)"
+            " AND (attribute_not_exists(enqueueRevision) OR enqueueRevision = :revision)"
+        )
+    try:
+        runs_table.update_item(
+            Key=key,
+            UpdateExpression=expression,
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#status": "status"}, ExpressionAttributeValues=values,
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    return _managed_result(plan_id, run_id, campaign_id, enqueued=enqueued, failed=failed)
+
+
 def _process_recipients(
     recipients: list[dict],
     *,
@@ -270,6 +537,10 @@ def _process_recipients(
     now_iso: str,
     ttl: int,
     queue_table,
+    precall_policy: dict | None = None,
+    sms_template_version: str | None = None,
+    pending_phones: set[str] | None = None,
+    schedule_source: str | None = None,
 ) -> tuple[int, int, int, int, set[str] | None]:
     """Per-recipient opt-out/quiet-hours/render/enqueue loop, shared by the
     initial/resumed send (lambda_handler) and the
@@ -312,15 +583,23 @@ def _process_recipients(
         if phone in already_sent_phones:
             # Already sent on a prior pass (the original send or an earlier
             # retry) — skip silently, no counting either way.
+            if pending_phones is not None:
+                pending_phones.discard(phone)
             continue
         if _opt_out.is_blocked(phone):
             opted_out += 1
+            if pending_phones is not None:
+                pending_phones.discard(phone)
             continue
-        # TCPA: the recipient's own local time, not the call-center's. This is
-        # the per-patient gate; executor.py's COT workingHours check is about
-        # whether our Bogota staff are on shift and does not answer this.
-        if not _is_within_quiet_hours(phone):
+        # Plans already owns scheduling for its campaigns. Standalone sends
+        # retain the recipient-hours gate; absent/unknown sources never skip it.
+        if schedule_source != "plans" and not _is_within_quiet_hours(phone):
             outside_quiet_hours += 1
+            if pending_phones is not None:
+                # Profile initialization resolves a quiet-hours suppression
+                # immediately. It never delays the paired voice campaign to
+                # wait for SMS hours, or sends this copy after voice begins.
+                pending_phones.discard(phone)
             continue
 
         # DB-level claim gate (2026-09 adversarial-review Finding, Critical):
@@ -380,7 +659,7 @@ def _process_recipients(
             raise
 
         try:
-            body = _render(
+            body = recipient["_managedBody"] if (precall_policy is not None or sms_template_version is not None) else _render(
                 message_tmpl,
                 recipient=recipient,
                 campaign={"clinicName": clinic_name},
@@ -414,6 +693,8 @@ def _process_recipients(
                         "originationNumberArn": origination_arn,
                         "planId": plan_id,
                         "runId": run_id,
+                        **({"precallPolicy": precall_policy} if precall_policy is not None else {}),
+                        **({"smsTemplateVersion": sms_template_version} if sms_template_version is not None else {}),
                     }
                 ),
             }
@@ -426,11 +707,13 @@ def _process_recipients(
             "createdAt": now_iso,
             "updatedAt": now_iso,
             "ttl": ttl,
+            **({"smsTemplateVersion": sms_template_version} if sms_template_version is not None else {}),
         }
 
         if len(sqs_batch) == 10:
             batch_ok, batch_failed = _flush_sms_batch(
-                sqs_batch, ddb_items_by_id, queue_table, campaign_id
+                sqs_batch, ddb_items_by_id, queue_table, campaign_id,
+                precall_policy=precall_policy, sms_template_version=sms_template_version,
             )
             enqueued += batch_ok
             failed += batch_failed
@@ -439,7 +722,8 @@ def _process_recipients(
 
     if sqs_batch:
         batch_ok, batch_failed = _flush_sms_batch(
-            sqs_batch, ddb_items_by_id, queue_table, campaign_id
+            sqs_batch, ddb_items_by_id, queue_table, campaign_id,
+            precall_policy=precall_policy, sms_template_version=sms_template_version,
         )
         enqueued += batch_ok
         failed += batch_failed
@@ -452,6 +736,9 @@ def _flush_sms_batch(
     ddb_items_by_id: dict[str, dict],
     queue_table,
     campaign_id: str,
+    *,
+    precall_policy: dict | None = None,
+    sms_template_version: str | None = None,
 ) -> tuple[int, int]:
     """Send one SQS batch, then write its DDB items reflecting the real outcome.
 
@@ -461,6 +748,36 @@ def _flush_sms_batch(
     not totalFailed — see the note at the call site) instead of PENDING, since no
     message exists for them to ever be picked up.
     """
+    managed = precall_policy is not None or sms_template_version is not None
+    if managed:
+        # Managed modes reserve work before dispatch. Reserve the attempted
+        # count before any external work, so a crash cannot report a false
+        # empty success. A reservation stranded by a crash remains pending
+        # until the executor's bounded initialization deadline; never resend
+        # an ambiguous provider attempt just to repair counters.
+        first = json.loads(sqs_batch[0]["MessageBody"])
+        runs_key = {"planId": first["planId"], "sk": f"{first['runId']}#{campaign_id}"}
+        try:
+            _ddb.Table(_RUNS_TABLE).update_item(
+                Key=runs_key,
+                UpdateExpression="ADD totalEnqueued :reserved, activeEnqueueBatches :one, enqueueRevision :one",
+                ConditionExpression="#status = :running AND initializationComplete = :initializing",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={":reserved": len(sqs_batch), ":one": 1, ":running": "RUNNING", ":initializing": False},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            # A concurrent initializer sealed the cohort (or the executor
+            # aborted it) while this invocation was still reading profiles.
+            # No new reservation or SQS work can begin after that point.
+            return 0, 0
+        # PENDING must exist before SQS can dispatch to the processor. Do not
+        # write these items again after SQS: a fast processor may already have
+        # moved them to SENT/CANCELLED before send_message_batch returns.
+        with queue_table.batch_writer() as bw:
+            for item in ddb_items_by_id.values():
+                bw.put_item(Item=item)
     resp = _sqs.send_message_batch(QueueUrl=_SQS_QUEUE_URL, Entries=sqs_batch)
     failed_entries = resp.get("Failed", [])
     failed_ids = {f["Id"] for f in failed_entries}
@@ -473,11 +790,37 @@ def _flush_sms_batch(
             batch_size=len(sqs_batch),
             codes=sorted({f.get("Code", "") for f in failed_entries}),
         )
-    with queue_table.batch_writer() as bw:
-        for entry_id, item in ddb_items_by_id.items():
-            if entry_id in failed_ids:
-                item["status"] = "SQS_SEND_FAILED"
-            bw.put_item(Item=item)
+    if not managed:
+        with queue_table.batch_writer() as bw:
+            for entry_id, item in ddb_items_by_id.items():
+                if entry_id in failed_ids:
+                    item["status"] = "SQS_SEND_FAILED"
+                bw.put_item(Item=item)
+    elif failed_ids:
+        # Only explicit SQS rejections are safe to compensate and retry.
+        # Network/unknown outcomes retain their reserved count and claims.
+        # Mark every rejected row first. If a write fails, the reservation
+        # remains outstanding. Decrementing first would leave a PENDING row
+        # that a retry could mistake for settled work with zero reservations.
+        for entry_id in failed_ids:
+            item = ddb_items_by_id[entry_id]
+            queue_table.update_item(
+                Key={"campaignId": campaign_id, "sk": item["sk"]},
+                UpdateExpression="SET #status = :failed",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={":failed": "SQS_SEND_FAILED"},
+            )
+        _ddb.Table(_RUNS_TABLE).update_item(
+            Key=runs_key,
+            UpdateExpression="ADD totalEnqueued :compensation, totalSqsSendFailed :failed, activeEnqueueBatches :closed",
+            ExpressionAttributeValues={":compensation": -len(failed_ids), ":failed": len(failed_ids), ":closed": -1},
+        )
+    else:
+        _ddb.Table(_RUNS_TABLE).update_item(
+            Key=runs_key,
+            UpdateExpression="ADD activeEnqueueBatches :closed",
+            ExpressionAttributeValues={":closed": -1},
+        )
 
     # Release the claim for every genuinely-failed send (2026-09
     # adversarial-review Finding, Important, part 2): no message was ever
@@ -511,31 +854,18 @@ def _flush_sms_batch(
     return len(ddb_items_by_id) - len(failed_ids), len(failed_ids)
 
 
-# ── Quiet-hours retry entry point ─────────────────────────────────────────────
-# Closes a finding from the 2026-09 adversarial code review: the pre-call SMS
-# quiet-hours check above (in _process_recipients, via lambda_handler) runs
-# exactly once, at bucket activation. The paired Connect Campaigns V2 voice
-# campaign, by contrast, uses localTimeZoneDetection=AREA_CODE + openHours,
-# which Connect's own campaign engine re-evaluates CONTINUOUSLY for as long as
-# the campaign stays "running" — so a recipient outside their local quiet-hours
-# window at activation could still get dialed hours later (once their window
-# opens) having never received the pre-call text.
-#
-# retry_quiet_hours_skipped closes that gap by giving the SMS side the same
-# continuous re-evaluation, invoked repeatedly from executor.py's tick() poll
-# loop for as long as the paired voice campaign remains "running" (see
-# executor._invoke_sms_retry_quiet_hours) — the same active window Connect's
-# own AREA_CODE detection uses, so retries stop the instant the voice campaign
-# does, with no separate bookkeeping needed for that bound.
+# Keep the deployed entry-point name for compatibility. Plans retries recover
+# unfinished reads/enqueues using the persisted scheduling source, without a
+# second recipient-hours check. Standalone runs retain their original gate.
 _TERMINAL_RUN_STATUSES = frozenset({"COMPLETED", "ABORTED"})
 
 
 def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
     """
-    Re-attempt sends for recipients skipped for quiet hours on an earlier pass
-    (the original send, or a prior retry) of this precall SMS campaign.
+    Recover unresolved recipients of an active SMS campaign.
 
-    event = {"campaignId": str, "planId": str, "runId": str}  # smsCampaignId
+    event = {"campaignId": str, "planId": str, "runId": str,
+             "scheduleSource": "plans"}  # source is optional for standalone
 
     Invoked while the paired campaign is active. Missing or terminal runs
     are no-ops. Quiet-hours counts are reporting only: a zero value does not
@@ -556,8 +886,17 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
     record = resp.get("Item")
     if not record:
         return {"retried": 0, "stillSkipped": 0}
+    record = _bind_plan_schedule_source(record, runs_table, event)
     if record.get("status") in _TERMINAL_RUN_STATUSES:
         return {"retried": 0, "stillSkipped": 0}
+    if _is_managed_run(record):
+        _validate_managed_run(record)
+        if record.get("initializationComplete") is True:
+            result = _managed_result(plan_id, run_id, campaign_id)
+            result["retried"] = 0
+            result["stillSkipped"] = result.get("totalSkippedQuietHours", 0)
+            return result
+    _validate_campaign_origin(record)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     ttl = int(time.time()) + _TTL_SECONDS
@@ -570,6 +909,8 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
             campaign_id=campaign_id,
         )
     except SegmentRecipientsPending:
+        if _is_managed_run(record):
+            return _managed_result(plan_id, run_id, campaign_id)
         return {
             "pending": True,
             "retried": 0,
@@ -578,6 +919,15 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
     except _SmsRunInactive:
         return {"retried": 0, "stillSkipped": 0}
     already_sent_phones = _get_already_sent_phones(campaign_id)
+    if _is_managed_run(record):
+        result = _process_managed_run(
+            recipients, record=record, campaign_id=campaign_id,
+            plan_id=plan_id, run_id=run_id, already_sent_phones=already_sent_phones,
+            now_iso=now_iso, ttl=ttl,
+        )
+        result["retried"] = result.get("enqueued", 0)
+        result["stillSkipped"] = result.get("totalSkippedQuietHours", 0)
+        return result
     queue_table = _ddb.Table(_QUEUE_TABLE)
 
     enqueued, failed, opted_out, outside_quiet_hours, rejected_fields = (
@@ -593,6 +943,7 @@ def retry_quiet_hours_skipped(event: dict, context: object) -> dict:
             now_iso=now_iso,
             ttl=ttl,
             queue_table=queue_table,
+            schedule_source=record.get("scheduleSource"),
         )
     )
 
@@ -764,7 +1115,9 @@ def _get_segment_recipients(
         return [
             {
                 "phone": _normalize_phone(recipient["phone"]),
+                "ProfileId": recipient.get("ProfileId"),
                 "FirstName": recipient.get("FirstName") or "",
+                "Attributes": recipient.get("Attributes") or {},
             }
             for recipient in recipients
         ]

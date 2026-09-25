@@ -1,3 +1,5 @@
+import { campaignSegmentName } from '@/lib/reliability';
+import { SegmentInsights } from '@/components/SegmentInsights';
 import type { ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -142,6 +144,8 @@ export function CampaignDetail(): ReactNode {
           </button>
         </div>
       </div>
+
+      <SegmentInsights segmentName={campaignSegmentName(campaign)} campaign />
 
       {/* Configuration card with status-based left border */}
       <div

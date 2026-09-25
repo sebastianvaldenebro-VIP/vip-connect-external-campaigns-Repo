@@ -114,6 +114,9 @@ export class ApiSmsStack extends cdk.Stack {
     // which no other stack uses — pass the SMS-specific superset file so
     // only this stack's layer copy carries the extra ~48 MB.
     const sharedLayer = buildSharedLayer(this, 'SharedLayer', 'requirements-sms.txt');
+    // Retain prior versions so an interrupted rollout can restore its reviewed
+    // handler/layer pairing without depending on a deleted Lambda layer.
+    sharedLayer.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
     const dataKey = kms.Key.fromKeyArn(this, 'DataKey', props.dataKeyArn);
     const snapshotEnvironment = {
       SMS_SNAPSHOT_BUCKET: props.snapshotBucketName,
@@ -146,6 +149,11 @@ export class ApiSmsStack extends cdk.Stack {
     // mutable:false — all permissions pre-attached via:
     //   aws iam put-role-policy --role-name vip-sms-sender-role \
     //     --policy-name SmsSenderPerms --policy-document file:///<policy-file>.json
+    // New campaign-v1 sends also validate the exact origination ARN through EUM.
+    // Before deploying that guard, attach the separate read-only policy from
+    // infra/config/sms-campaign-origination-read-policy.json as
+    // SmsCampaignOriginationRead. Keep the existing policies and boundary;
+    // this immutable imported role does not receive grants from CDK.
     const senderRole = iam.Role.fromRoleArn(
       this, 'SmsSenderRole',
       `arn:aws:iam::${this.account}:role/vip-sms-sender-role`,
@@ -287,6 +295,7 @@ export class ApiSmsStack extends cdk.Stack {
       code: lambda.Code.fromAsset(
         path.join(__dirname, '../../../services/api-sms/src'),
       ),
+      layers: [sharedLayer],
       role: processorRole,
       logGroup: processorLogGroup,
       timeout: cdk.Duration.seconds(30),

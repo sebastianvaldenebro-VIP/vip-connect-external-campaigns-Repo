@@ -728,3 +728,142 @@ def test_whitespace_clinic_is_rejected_when_interpolated(channel, clinic):
 @pytest.mark.parametrize("channel", ["precall", "bulk"])
 def test_unused_whitespace_clinic_does_not_block_a_valid_template(channel):
     assert validate_plan(_content_plan("Hi {{FirstName}}!", "   ", channel)) == []
+
+
+def _profile_precall(**overrides):
+    return {
+        "enabled": True,
+        "mode": "profile",
+        "catalogVersion": "phase1-v1",
+        "originationNumberArn": "arn:x",
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize("delivery_type", ["campaign", "journey", "branded"])
+def test_profile_mode_accepts_embedded_copy_without_manual_fields(delivery_type):
+    campaign = {
+        "deliveryType": delivery_type,
+        "campaignConfig": {"precallSms": _profile_precall()},
+    }
+    assert plans_handler._validate_precall_sms(campaign, "b", 0) == []
+
+
+def test_profile_mode_preserves_campaign_dependencies():
+    campaign = {
+        "deliveryType": "campaign",
+        "dependsOn": ["parent-campaign"],
+        "campaignConfig": {"precallSms": _profile_precall()},
+    }
+    assert plans_handler._validate_precall_sms(campaign, "b", 0) == []
+    assert campaign["dependsOn"] == ["parent-campaign"]
+
+
+@pytest.mark.parametrize("version", [None, "", "phase1-v2", [], 1])
+def test_profile_mode_rejects_missing_or_unknown_catalog_version(version):
+    errors = validate_plan(_plan_with_precall(
+        precall=_profile_precall(catalogVersion=version),
+    ))
+    assert any("catalogVersion" in error for error in errors)
+
+
+@pytest.mark.parametrize("mode", [None, "", "automatic", [], {}, True])
+def test_enabled_precall_rejects_unknown_mode_without_crashing(mode):
+    errors = validate_plan(_plan_with_precall(precall=_profile_precall(mode=mode)))
+    assert any("precallSms.mode" in error for error in errors)
+
+
+def test_profile_mode_rejects_manual_template_override_instead_of_ignoring_it():
+    errors = validate_plan(_plan_with_precall(precall=_profile_precall(
+        messageTemplate="Use a different specialty for everyone",
+    )))
+    assert any("messageTemplate" in error and "profile mode" in error for error in errors)
+
+
+@pytest.mark.parametrize("clinic", ["Example Clinic", "  Clínica del Valle  ", "", " \t\n", "A" * 80])
+def test_profile_mode_accepts_optional_clinic_with_embedded_template(clinic):
+    assert validate_plan(_plan_with_precall(
+        precall=_profile_precall(clinicName=clinic),
+    )) == []
+
+
+@pytest.mark.parametrize("clinic", [
+    None, False, 0, 123, [], {}, "A" * 81, "{{FirstName}}", "{{Unknown}}",
+    "someone@example.com", "https://example.com", "123-45-6789", "Clinic\nName",
+])
+def test_profile_mode_rejects_invalid_optional_clinic_before_execution(clinic):
+    errors = validate_plan(_plan_with_precall(precall=_profile_precall(clinicName=clinic)))
+    assert any("clinicName" in error for error in errors)
+    # Validation errors must describe the field, not echo its supplied value.
+    if isinstance(clinic, str):
+        assert all(clinic not in error for error in errors)
+
+
+@pytest.mark.parametrize("origin", [None, "", "   ", 123, {}])
+def test_profile_mode_requires_a_nonblank_origin(origin):
+    errors = validate_plan(_plan_with_precall(
+        precall=_profile_precall(originationNumberArn=origin),
+    ))
+    assert any("originationNumberArn" in error for error in errors)
+
+
+def test_disabled_profile_configuration_remains_inert():
+    assert validate_plan(_plan_with_precall(
+        precall=_profile_precall(enabled=False, mode="future", catalogVersion="future"),
+        depends_on=["parent-campaign"],
+    )) == []
+
+
+@pytest.mark.parametrize("enabled", [1, "true", "false", [True], {"enabled": True}])
+def test_profile_mode_requires_real_boolean_opt_in(enabled):
+    errors = validate_plan(_plan_with_precall(precall=_profile_precall(enabled=enabled)))
+    assert any("enabled must be a boolean" in error for error in errors)
+
+
+def test_profile_mode_does_not_allow_precall_on_bulk_sms():
+    errors = plans_handler._validate_precall_sms({
+        "deliveryType": "sms",
+        "campaignConfig": {"precallSms": _profile_precall()},
+    }, "b", 0)
+    assert any("only valid on a voice" in error for error in errors)
+
+
+def test_explicit_manual_mode_retains_existing_length_and_dependency_rules():
+    plan = _plan_with_precall(precall={
+        "enabled": True, "mode": "manual", "originationNumberArn": "arn:x",
+        "messageTemplate": "x" * 161,
+    }, depends_on=["parent-campaign"])
+    errors = validate_plan(plan)
+    assert any("160" in error for error in errors)
+    assert any("dependsOn" in error for error in errors)
+
+
+@pytest.mark.parametrize("precall", ["profile", [{"enabled": True}], True, 1, 1.5])
+def test_create_plan_rejects_non_object_precall_before_persisting(precall, monkeypatch):
+    """A malformed request must raise the ValueError mapped to HTTP 400."""
+    body = {
+        "name": "Example plan",
+        "buckets": [{
+            "name": "Example bucket",
+            "campaigns": [{
+                "deliveryType": "campaign",
+                "campaignConfig": {"precallSms": precall},
+            }],
+        }],
+    }
+    monkeypatch.setattr(plans_handler, "parse_body", lambda event: body)
+    monkeypatch.setattr(plans_handler, "extract_caller", lambda event: MagicMock())
+    put_plan = MagicMock()
+    monkeypatch.setattr(plans_handler.store, "put_plan", put_plan)
+
+    with pytest.raises(ValueError, match=r"precallSms must be an object"):
+        plans_handler.create_plan({}, {})
+
+    put_plan.assert_not_called()
+
+
+@pytest.mark.parametrize("precall", [None, {}, {"enabled": False}])
+def test_inert_precall_blocks_keep_their_existing_validation_contract(precall):
+    assert plans_handler._validate_precall_sms({
+        "campaignConfig": {"precallSms": precall},
+    }, "Example bucket", 0) == []

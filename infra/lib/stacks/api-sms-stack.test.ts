@@ -2,6 +2,16 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { ApiSmsStack, ApiSmsStackProps } from './api-sms-stack';
 
+// Exercise real layer resources and retention without pip/Docker bundling.
+jest.mock('../utils/shared-layer', () => ({
+  buildSharedLayer: jest.fn((scope: import('constructs').Construct, id = 'SharedLayer') => {
+    const lambda = require('aws-cdk-lib/aws-lambda');
+    return new lambda.LayerVersion(scope, id, {
+      code: lambda.Code.fromAsset(require('node:path').join(__dirname, '../../../services/shared/python')),
+    });
+  }),
+}));
+
 const ACCOUNT = '165505826690';
 const REGION = 'us-east-1';
 const DATA_KEY_ARN = `arn:aws:kms:${REGION}:${ACCOUNT}:key/df585888-2f49-4de0-9cba-14803fda63f0`;
@@ -23,6 +33,20 @@ function buildStack(overrides: Partial<ApiSmsStackProps> = {}) {
 }
 
 describe('ApiSmsStack', () => {
+  it('retains replaced and deleted layer versions and binds every SMS consumer to the same version', () => {
+    const template = Template.fromStack(buildStack());
+    const layers = Object.entries(template.findResources('AWS::Lambda::LayerVersion'));
+    expect(layers).toHaveLength(1);
+    const [layerId, layer] = layers[0];
+    expect(layer).toMatchObject({ DeletionPolicy: 'Retain', UpdateReplacePolicy: 'Retain' });
+    for (const functionName of ['vip-admin-sms-sender', 'vip-admin-sms-retry-quiet-hours', 'vip-admin-sms-processor']) {
+      template.hasResourceProperties('AWS::Lambda::Function', {
+        FunctionName: functionName,
+        Layers: [{ Ref: layerId }],
+      });
+    }
+  });
+
   it('does not create a PermissionsBoundary construct when permissionsBoundaryName is omitted', () => {
     const stack = buildStack();
     expect(stack.node.tryFindChild('PermissionsBoundary')).toBeUndefined();
@@ -127,7 +151,7 @@ describe('ApiSmsStack', () => {
     expect(retryProps.Layers).toHaveLength(1);
   });
 
-  it('creates the SmsProcessorFunction with the imported role, no shared layer, and a distinct memory/timeout/concurrency profile', () => {
+  it('creates the SmsProcessorFunction with the imported role, shared layer, and a distinct memory/timeout/concurrency profile', () => {
     const template = Template.fromStack(buildStack());
     template.hasResourceProperties('AWS::Lambda::Function', {
       FunctionName: 'vip-admin-sms-processor',
@@ -138,7 +162,7 @@ describe('ApiSmsStack', () => {
       MemorySize: 256,
       ReservedConcurrentExecutions: 10,
       KmsKeyArn: DATA_KEY_ARN,
-      Layers: Match.absent(),
+      Layers: [{ Ref: Match.anyValue() }],
       Environment: {
         Variables: {
           SMS_CAMPAIGN_QUEUE_TABLE: 'VipSmsCampaignQueue',

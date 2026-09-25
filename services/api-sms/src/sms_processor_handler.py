@@ -14,6 +14,12 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
+from vip_shared.domain.services.sms_campaign import (
+    SmsCampaignError,
+    validate_body as validate_campaign_body,
+    validate_version as validate_campaign_version,
+)
+
 _QUEUE_TABLE = os.environ["SMS_CAMPAIGN_QUEUE_TABLE"]
 _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
 _CONFIG_SET = os.environ.get("SMS_CONFIG_SET_NAME", "")
@@ -43,6 +49,9 @@ def lambda_handler(event: dict, context: object) -> None:
             origination_arn=body["originationNumberArn"],
             plan_id=body.get("planId", ""),
             run_id=body.get("runId", ""),
+            precall_policy=body.get("precallPolicy"),
+            sms_template_version=body.get("smsTemplateVersion"),
+            sms_template_version_present="smsTemplateVersion" in body,
         )
 
 
@@ -54,6 +63,9 @@ def _process(
     origination_arn: str,
     plan_id: str,
     run_id: str,
+    precall_policy: dict | None = None,
+    sms_template_version: str | None = None,
+    sms_template_version_present: bool = False,
 ) -> None:
     sent_at = datetime.now(timezone.utc).isoformat()
 
@@ -66,7 +78,7 @@ def _process(
         datetime.now(timezone.utc) - timedelta(seconds=_STALE_SENDING_SECONDS)
     ).isoformat()
     try:
-        _ddb.Table(_QUEUE_TABLE).update_item(
+        claim = _ddb.Table(_QUEUE_TABLE).update_item(
             Key={"campaignId": campaign_id, "sk": sk},
             UpdateExpression="SET #s = :sending, updatedAt = :t",
             ConditionExpression=(
@@ -79,6 +91,7 @@ def _process(
                 ":stale_before": stale_before,
                 ":t": sent_at,
             },
+            ReturnValues="ALL_OLD",
         )
     except _ddb.meta.client.exceptions.ConditionalCheckFailedException:
         # Already claimed by a still-live invocation, or already terminal — skip
@@ -87,14 +100,66 @@ def _process(
         return
 
     try:
+        previous = claim.get("Attributes") or {}
+        campaign_message = sms_template_version_present or sms_template_version is not None
+        campaign_row = "smsTemplateVersion" in previous
+        managed = precall_policy is not None or campaign_message or campaign_row
+        if campaign_message or campaign_row:
+            # The durable queue marker prevents a truncated/altered payload
+            # from silently downgrading to legacy TRANSACTIONAL or stale retry
+            # semantics. Settle invalid contracts once; do not strand PENDING
+            # work until the SQS DLQ catches it. Legacy rows have no marker.
+            try:
+                validate_campaign_version(sms_template_version)
+                if previous.get("smsTemplateVersion") != sms_template_version or precall_policy is not None:
+                    raise SmsCampaignError("conflicting_sms_modes")
+            except SmsCampaignError:
+                _update_queue_item(campaign_id, sk, "FAILED", error_code="INVALID_SMS_CONTRACT", sent_at=sent_at)
+                _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
+                print(f"sms_processor: FAILED campaign={campaign_id} error=INVALID_SMS_CONTRACT")
+                return
+        if managed and previous.get("status") == "SENDING":
+            # A stale worker may have reached EUM before it crashed. Managed
+            # copy must not be sent twice to repair that unknown
+            # outcome. Settle it as an explicit failure; legacy retry behavior
+            # remains unchanged.
+            _update_queue_item(campaign_id, sk, "FAILED", error_code="PROVIDER_OUTCOME_UNKNOWN", sent_at=sent_at)
+            _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
+            print(f"sms_processor: FAILED campaign={campaign_id} error=PROVIDER_OUTCOME_UNKNOWN")
+            return
         kwargs: dict = {
             "DestinationPhoneNumber": phone,
             "MessageBody": message_template,
             "OriginationIdentity": origination_arn,
-            "MessageType": "TRANSACTIONAL",
+            "MessageType": "PROMOTIONAL" if sms_template_version is not None else "TRANSACTIONAL",
         }
         if _CONFIG_SET:
             kwargs["ConfigurationSetName"] = _CONFIG_SET
+        if managed:
+            # The parent campaign may have ended (or its pre-call gate timed
+            # out) while this message waited in SQS.
+            # Recheck immediately before EUM and fail closed on policy drift.
+            run = _ddb.Table(_RUNS_TABLE).get_item(
+                Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
+                ConsistentRead=True,
+            ).get("Item")
+            if (
+                not run or run.get("status") != "RUNNING"
+                or run.get("precallPolicy") != precall_policy
+                or run.get("smsTemplateVersion") != sms_template_version
+            ):
+                _update_queue_item(campaign_id, sk, "CANCELLED", sent_at=sent_at)
+                if run:
+                    _increment_runs_counter(campaign_id, plan_id, run_id, "totalCancelled")
+                print(f"sms_processor: CANCELLED campaign={campaign_id}")
+                return
+        if sms_template_version is not None:
+            validate_campaign_body(message_template)
+        if precall_policy is not None:
+            # This copy announces an imminent call; do not retain it in the
+            # provider queue for the default 72 hours. Acceptance is not a
+            # guarantee of carrier delivery within this interval.
+            kwargs["TimeToLive"] = 300
         # Opt-out enforcement: EUM SMS automatically checks the phone number's
         # configured opt-out list (Default) — where STOP replies are recorded.
         # Passing a separate opt-out list here would bypass real opt-outs.

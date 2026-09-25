@@ -1,11 +1,19 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   PRECALL_ALLOWED_PLACEHOLDERS,
+  MAX_SMS_CHARS,
   extractPlaceholders,
   renderedWorstCaseLength,
   validatePrecallSms,
   validateBulkSms,
   precallSmsAvailability,
+  changePrecallSmsMode,
+  PRECALL_CATALOG_VERSION,
+  PRECALL_PROFILE_CATALOG,
+  PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC,
+  profileSmsPreview,
 } from './precallSms';
 
 const CLINIC = 'VIP Medical Group';
@@ -144,6 +152,139 @@ describe('required fields', () => {
       originationNumberArn: 'arn:x',
     });
     expect(errs.some((e) => e.includes('clinicName'))).toBe(false);
+  });
+});
+
+describe('profile pre-call configuration', () => {
+  const profile = {
+    enabled: true, mode: 'profile', catalogVersion: 'phase1-v1', originationNumberArn: 'arn:x',
+  };
+
+  it('accepts automatic copy without a manual template or clinic', () => {
+    expect(validatePrecallSms(profile)).toEqual([]);
+  });
+
+  it('allows dependencies for profile mode without changing the DAG', () => {
+    expect(precallSmsAvailability({ deliveryType: 'campaign', dependsOn: ['parent'], mode: 'profile' }).available).toBe(true);
+  });
+
+  it.each(['phase1-v2', '', null, undefined, 1])('rejects catalog version %s', (catalogVersion) => {
+    expect(validatePrecallSms({ ...profile, catalogVersion }).join(' ')).toMatch(/catalogVersion/);
+  });
+
+  it.each(['unknown', '', null, true, 1])('rejects enabled mode %s', (mode) => {
+    expect(validatePrecallSms({ ...profile, mode }).join(' ')).toMatch(/mode/);
+  });
+
+  it.each([1, 'true', {}])('requires boolean true for enabled profile mode, rejecting %j', (enabled) => {
+    expect(validatePrecallSms({ ...profile, enabled }).join(' ')).toContain('enabled');
+  });
+
+  it.each(['manual override', '   '])('rejects a profile template override %j', (messageTemplate) => {
+    expect(validatePrecallSms({ ...profile, messageTemplate }).join(' ')).toContain('messageTemplate');
+  });
+
+  it.each([' ', '', null, undefined, 123, {}, false])('rejects invalid profile origination %j', (originationNumberArn) => {
+    expect(validatePrecallSms({ ...profile, originationNumberArn }).join(' ')).toContain('originationNumberArn');
+  });
+
+  it.each([undefined, '', '   ', '  Clínica St. Mary’s (North) - A/B: 2 & Co.  ', 'A'.repeat(80)])(
+    'accepts an optional campaign clinic %j', (clinicName) => {
+      expect(validatePrecallSms({ ...profile, clinicName })).toEqual([]);
+    },
+  );
+
+  it.each([null, 123, false, true, {}, []])('rejects non-string campaign clinic %j', (clinicName) => {
+    expect(validatePrecallSms({ ...profile, clinicName }).join(' ')).toContain('clinicName must be a string');
+  });
+
+  it.each(['A'.repeat(81), '{{ClinicName}}', 'Clinic\nNorth', 'Clinic <North>', 'Clinic 😀', '123', '---']) (
+    'rejects a clinic outside the length or character contract %j', (clinicName) => {
+      expect(validatePrecallSms({ ...profile, clinicName }).join(' ')).toContain('clinicName');
+    },
+  );
+
+  it('measures clinic length after NFC normalization and trimming, in Unicode code points', () => {
+    expect(validatePrecallSms({ ...profile, clinicName: `  ${'e\u0301'.repeat(80)}  ` })).toEqual([]);
+    expect(validatePrecallSms({ ...profile, clinicName: '𐐀'.repeat(80) })).toEqual([]);
+    expect(validatePrecallSms({ ...profile, clinicName: '𐐀'.repeat(81) }).join(' ')).toContain('at most 80');
+  });
+
+  it('accepts empty optional profile fields while preserving strict versions', () => {
+    expect(validatePrecallSms({ ...profile, messageTemplate: '', clinicName: '' })).toEqual([]);
+  });
+
+  it('keeps disabled configurations inert even with unknown fields', () => {
+    expect(validatePrecallSms({ enabled: false, mode: 'unknown', catalogVersion: 'invalid' })).toEqual([]);
+  });
+
+  it('keeps explicit manual mode equivalent to omitted mode', () => {
+    const manual = { enabled: true, messageTemplate: PAIN, clinicName: CLINIC, originationNumberArn: 'arn:x' };
+    expect(validatePrecallSms({ ...manual, mode: 'manual' })).toEqual(validatePrecallSms(manual));
+  });
+
+  it('preserves the chosen clinic and removes the template when explicitly changing to profile', () => {
+    const legacy = { enabled: true, messageTemplate: PAIN, clinicName: CLINIC, originationNumberArn: 'arn:x' };
+    expect(changePrecallSmsMode(legacy, 'profile')).toEqual({ ...profile, clinicName: CLINIC });
+    expect(legacy).not.toHaveProperty('mode');
+    expect(legacy.messageTemplate).toBe(PAIN);
+    expect(changePrecallSmsMode(profile as Parameters<typeof changePrecallSmsMode>[0], 'manual'))
+      .toEqual({ enabled: true, mode: 'manual', originationNumberArn: 'arn:x', messageTemplate: '', clinicName: '' });
+    expect(changePrecallSmsMode(changePrecallSmsMode(legacy, 'profile'), 'manual'))
+      .toEqual({ enabled: true, mode: 'manual', originationNumberArn: 'arn:x', messageTemplate: '', clinicName: CLINIC });
+  });
+});
+
+describe('profile catalog preview contract', () => {
+  const pythonCatalog = readFileSync(resolve(process.cwd(), '../services/shared/python/vip_shared/domain/services/precall_sms.py'), 'utf8');
+
+  it('uses the exact approved Python copies and version, including curly apostrophes', () => {
+    expect(pythonCatalog).toContain(`CATALOG_VERSION = "${PRECALL_CATALOG_VERSION}"`);
+    for (const [pythonName, catalog] of [
+      ['CATALOG', PRECALL_PROFILE_CATALOG],
+      ['CATALOG_WITHOUT_CLINIC', PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC],
+    ] as const) {
+      const pythonCopies = pythonCatalog.match(new RegExp(`^${pythonName} = \\{[\\s\\S]*?^\\}`, 'm'))?.[0];
+      expect(pythonCopies).toBeDefined();
+      for (const copy of Object.values(catalog)) {
+        expect(pythonCopies).toContain(JSON.stringify(copy));
+        expect(copy).toContain('We’re');
+      }
+      expect(Object.keys(catalog)).toEqual(['vein', 'pain']);
+    }
+  });
+
+  it('keeps both catalog variants within the approved rendered multipart bounds', () => {
+    const bound = (name: string) => Number(pythonCatalog.match(new RegExp(`^${name} = (\\d+)$`, 'm'))?.[1]);
+    const nameSize = bound('FIRST_NAME_MAX_CHARS');
+    const clinicSize = bound('MAX_CLINIC_NAME_CHARS');
+    expect([nameSize, clinicSize, bound('MAX_SMS_PARTS')]).toEqual([20, 80, 6]);
+    for (const copy of Object.values(PRECALL_PROFILE_CATALOG)) {
+      const rendered = copy.replace('{{FirstName}}', 'A'.repeat(nameSize)).replace('{{ClinicName}}', 'B'.repeat(clinicSize));
+      // Curly apostrophe requires Unicode SMS; concatenated parts hold 67 UCS-2 units.
+      expect(Math.ceil(rendered.length / 67)).toBeLessThanOrEqual(bound('MAX_SMS_PARTS'));
+      expect(rendered.length).toBeGreaterThan(MAX_SMS_CHARS);
+    }
+    for (const copy of Object.values(PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC)) {
+      const rendered = copy.replace('{{FirstName}}', 'A'.repeat(nameSize));
+      expect(Math.ceil(rendered.length / 67)).toBeLessThanOrEqual(bound('MAX_SMS_PARTS'));
+      expect(rendered).not.toContain('{{');
+    }
+  });
+
+  it('previews the chosen clinic and example patient without modifying the catalog', () => {
+    for (const variant of ['vein', 'pain'] as const) {
+      expect(profileSmsPreview(variant, '  Cli\u0301nica Norte  ')).toContain('Hi Alex!');
+      expect(profileSmsPreview(variant, '  Cli\u0301nica Norte  ')).toContain('Clínica Norte');
+      expect(profileSmsPreview(variant, '  Cli\u0301nica Norte  ')).not.toContain('  ');
+      expect(profileSmsPreview(variant, 'Clínica Norte')).not.toContain('{{');
+      expect(PRECALL_PROFILE_CATALOG[variant]).toContain('{{ClinicName}}');
+    }
+  });
+
+  it.each([undefined, '', '   '])('omits the whole clinic phrase for an unselected clinic %j', (clinic) => {
+    expect(profileSmsPreview('vein', clinic)).toBe('Hi Alex! We’re about to give you a quick call regarding your vein consultation request. Look out for a call!');
+    expect(profileSmsPreview('pain', clinic)).toBe('Hi Alex! We’re calling you in just a moment to discuss your pain management request. Talk soon!');
   });
 });
 

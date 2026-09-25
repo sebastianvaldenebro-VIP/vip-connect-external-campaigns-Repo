@@ -17,6 +17,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { to: '/dashboard', label: 'Monitor' },
       { to: '/plans/history', label: 'History' },
       { to: '/plans', label: 'Plans' },
+      { to: '/sms', label: 'SMS campaigns' },
       { to: '/plans/templates', label: 'Templates' },
       { to: '/segments', label: 'Segments' },
     ],
@@ -56,6 +57,7 @@ export function visibleNavGroups(groups: string[]): NavGroup[] {
  * Falls back to "Monitor" (the app's default landing item) if nothing matches.
  */
 export function breadcrumbLabelForPath(pathname: string): string {
+  if (pathname === '/preferences') return 'Preferences';
   const allItems = NAV_GROUPS.flatMap((g) => g.items);
   let best: NavItem | null = null;
   for (const item of allItems) {
@@ -74,6 +76,7 @@ export function breadcrumbLabelForPath(pathname: string): string {
  * the "Admin" group don't incorrectly read "Contact center".
  */
 export function breadcrumbGroupForPath(pathname: string): string {
+  if (pathname === '/preferences') return 'Account';
   let best: NavItem | null = null;
   let bestGroup = 'Contact center';
   for (const group of NAV_GROUPS) {

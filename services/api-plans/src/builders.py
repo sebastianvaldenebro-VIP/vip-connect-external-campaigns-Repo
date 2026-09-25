@@ -441,6 +441,12 @@ def resolve_campaign_flow_arn(
 
     logger = logging.getLogger(__name__)
 
+    if not state_codes:
+        # Pinned-segment campaigns leave states empty by design (states/groups are
+        # ignored in favor of the pinned segment) — nothing to resolve or auto-create.
+        # Falling through to state_codes[0] below would raise IndexError.
+        return None
+
     connect = boto3.client("connect")
     flows: list[dict] = []
     kwargs: dict = {"InstanceId": connect_instance_id, "ContactFlowTypes": ["CAMPAIGN"]}

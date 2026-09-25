@@ -317,3 +317,21 @@ def test_first_function_error_aborts_initialization_before_fail_open(environment
     assert cs["precallSmsState"] == "failed"
     assert not cs.get("precallSmsSentAt")
     oc.resume_campaign.assert_called_once_with("connect")
+
+
+def test_invoke_throttled_fails_open_without_tombstoning(environment):
+    """The sender Lambda's reservedConcurrentExecutions=5 makes an Invoke API-level
+    throttle reachable (not hypothetical). Unlike a real sender failure, this must
+    fail the voice call open WITHOUT marking the SMS state terminal — a later
+    attempt for this campaign must not be permanently tombstoned by one throttle."""
+    client, oc = environment
+    run, plan, cs = model()
+    client.invoke.side_effect = ClientError(
+        {"Error": {"Code": "TooManyRequestsException"}}, "Invoke"
+    )
+    with patch.object(executor, "_stop_sms_campaign") as abort:
+        executor._fire_precall_sms_for_campaign(run, plan, 0, 0)
+    abort.assert_not_called()
+    assert cs.get("precallSmsState") not in executor._SMS_INITIALIZATION_TERMINAL
+    assert not cs.get("precallSmsSentAt")
+    oc.resume_campaign.assert_called_once_with("connect")

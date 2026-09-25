@@ -11,7 +11,49 @@
  * surface whatever the server says verbatim when it says no.
  */
 
+import type { PrecallSmsConfig } from './api';
+import { SMS_CAMPAIGN_TEMPLATE_VERSION, validateSmsCampaignTemplate } from './smsCampaign';
+
 export const PRECALL_ALLOWED_PLACEHOLDERS = new Set(['FirstName', 'ClinicName']);
+
+/** Mirrors the immutable Phase I catalog in vip_shared.domain.services.precall_sms. */
+export const PRECALL_CATALOG_VERSION = 'phase1-v1' as const;
+export const PRECALL_PROFILE_CATALOG = {
+  vein: 'Hi {{FirstName}}! This is {{ClinicName}}. We’re about to give you a quick call regarding your vein consultation request. Look out for a call!',
+  pain: 'Hi {{FirstName}}! {{ClinicName}} here. We’re calling you in just a moment to discuss your pain management request. Talk soon!',
+} as const;
+export const PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC = {
+  vein: 'Hi {{FirstName}}! We’re about to give you a quick call regarding your vein consultation request. Look out for a call!',
+  pain: 'Hi {{FirstName}}! We’re calling you in just a moment to discuss your pain management request. Talk soon!',
+} as const;
+export const MAX_PRECALL_CLINIC_NAME_CHARS = 80;
+
+/** Only the example patient is fictional; the clinic is the campaign's value. */
+export function profileSmsPreview(
+  variant: keyof typeof PRECALL_PROFILE_CATALOG,
+  clinicName?: string,
+): string {
+  const clinic = typeof clinicName === 'string' ? clinicName.normalize('NFC').trim() : '';
+  const catalog = clinic ? PRECALL_PROFILE_CATALOG : PRECALL_PROFILE_CATALOG_WITHOUT_CLINIC;
+  return catalog[variant]
+    .replace('{{FirstName}}', 'Alex')
+    .replace('{{ClinicName}}', () => clinic);
+}
+
+/** Changing source is explicit; disabling alone preserves the existing config. */
+export function changePrecallSmsMode(
+  cfg: PrecallSmsConfig | undefined,
+  mode: 'manual' | 'profile',
+): PrecallSmsConfig {
+  const base = {
+    enabled: cfg?.enabled ?? false,
+    originationNumberArn: cfg?.originationNumberArn ?? '',
+    ...(cfg?.clinicName !== undefined ? { clinicName: cfg.clinicName } : {}),
+  };
+  return mode === 'profile'
+    ? { ...base, mode, catalogVersion: PRECALL_CATALOG_VERSION }
+    : { ...base, mode, messageTemplate: cfg?.messageTemplate ?? '', clinicName: cfg?.clinicName ?? '' };
+}
 
 /** Matches vip_shared…sms_template._PLACEHOLDER_RE. Case sensitive on purpose. */
 const PLACEHOLDER_RE = /\{\{\s*(\w+)\s*\}\}/g;
@@ -71,6 +113,7 @@ const VOICE_DELIVERY_TYPES = new Set(['campaign', 'branded', 'journey']);
 export function precallSmsAvailability(campaign: {
   deliveryType?: string;
   dependsOn?: string[];
+  mode?: string;
 }): { available: boolean; reason?: string } {
   const deliveryType = campaign.deliveryType ?? 'campaign';
   if (!VOICE_DELIVERY_TYPES.has(deliveryType)) {
@@ -80,11 +123,11 @@ export function precallSmsAvailability(campaign: {
         `Pre-call SMS applies to voice campaigns — a '${deliveryType}' campaign has no dial to precede.`,
     };
   }
-  if ((campaign.dependsOn ?? []).length > 0) {
+  if (campaign.mode !== 'profile' && (campaign.dependsOn ?? []).length > 0) {
     return {
       available: false,
       reason:
-        'Pre-call SMS is unavailable while this campaign waits on another: a dependent campaign is not pre-warmed, so it has no lead segment when the bucket activates and the text would never be sent. Remove the dependency to enable it.',
+        'Manual pre-call SMS is unavailable for campaigns with dependencies. Automatic messages from profiles support these dependencies.',
     };
   }
   return { available: true };
@@ -95,6 +138,32 @@ export function validatePrecallSms(
 ): string[] {
   if (!cfg?.enabled) return [];
   const errors: string[] = [];
+  const mode = cfg.mode === undefined ? 'manual' : cfg.mode;
+  if (mode !== 'manual' && mode !== 'profile')
+    return ['Pre-call SMS: mode must be manual or profile'];
+  if (mode === 'profile') {
+    if (cfg.enabled !== true)
+      errors.push('Pre-call SMS: enabled must be true for profile mode');
+    if (cfg.catalogVersion !== PRECALL_CATALOG_VERSION)
+      errors.push(`Pre-call SMS: catalogVersion must be ${PRECALL_CATALOG_VERSION}`);
+    if (typeof cfg.originationNumberArn !== 'string' || !cfg.originationNumberArn.trim())
+      errors.push('Pre-call SMS: originationNumberArn is required');
+    if (cfg.messageTemplate)
+      errors.push('Pre-call SMS: messageTemplate cannot override the profile catalog');
+    if (cfg.clinicName !== undefined) {
+      if (typeof cfg.clinicName !== 'string') {
+        errors.push('Pre-call SMS: clinicName must be a string');
+      } else {
+        const clinic = cfg.clinicName.normalize('NFC').trim();
+        if ([...clinic].length > MAX_PRECALL_CLINIC_NAME_CHARS)
+          errors.push(`Pre-call SMS: clinicName must be at most ${MAX_PRECALL_CLINIC_NAME_CHARS} characters`);
+        // Match the server's character allowlist; deeper content screening stays server-side.
+        if (clinic && (!/\p{L}/u.test(clinic) || !/^[\p{L}\p{M}\p{N} &'’.,()/:\-]+$/u.test(clinic)))
+          errors.push('Pre-call SMS: clinicName must contain a letter and use only letters, numbers, spaces or clinic-name punctuation');
+      }
+    }
+    return errors;
+  }
   const template = String(cfg.messageTemplate ?? '');
   const clinicName = String(cfg.clinicName ?? '');
 
@@ -144,6 +213,11 @@ export function validatePrecallSms(
 export function validateBulkSms(
   cfg: Record<string, unknown> | undefined,
 ): string[] {
+  if (cfg?.smsTemplateVersion !== undefined) {
+    if (cfg.smsTemplateVersion !== SMS_CAMPAIGN_TEMPLATE_VERSION)
+      return ['SMS: unsupported template version'];
+    return validateSmsCampaignTemplate(cfg.smsMessageTemplate as string);
+  }
   const errors: string[] = [];
   const template = String(cfg?.smsMessageTemplate ?? '');
   const clinicName = String(cfg?.clinicName ?? '');

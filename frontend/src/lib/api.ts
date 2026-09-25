@@ -316,21 +316,36 @@ export type BucketSegmentFilters = {
   available: string;
 };
 
+export type PrecallSmsConfig = {
+  enabled: boolean;
+  /** Omitted mode preserves the existing manual-template behavior. */
+  mode?: 'manual' | 'profile';
+  catalogVersion?: 'phase1-v1';
+  originationNumberArn: string;
+  /** Manual mode only; profile mode selects the message variant per recipient. */
+  messageTemplate?: string;
+  /** Campaign clinic; blank or omitted in profile mode omits the clinic mention. */
+  clinicName?: string;
+};
+
 export type BucketCampaignConfig = {
-  queueId: string;
-  contactFlowId: string;
-  sourcePhoneNumber: string;
-  dialerType: string;
-  bandwidthAllocation: number;
-  dialingCapacity: number;
-  amdEnabled: boolean;
-  amdAwaitPrompt: boolean;
+  /** Voice settings are optional for campaigns delivered only by SMS. */
+  queueId?: string;
+  contactFlowId?: string;
+  sourcePhoneNumber?: string;
+  dialerType?: string;
+  bandwidthAllocation?: number;
+  dialingCapacity?: number;
+  amdEnabled?: boolean;
+  amdAwaitPrompt?: boolean;
   campaignFlowArn?: string;
   /** Full routing queue ARN — required for deliveryType='branded' */
   queueArn?: string;
   /** EUM SMS origination number ARN — required for deliveryType='sms' */
   smsOriginationNumberArn?: string;
-  /** SMS message template (≤160 chars, no PHI) — required for deliveryType='sms' */
+  /** Omitted version retains legacy SMS validation; campaign-v1 permits the booking template. */
+  smsTemplateVersion?: 'campaign-v1';
+  /** SMS message template; campaign-v1 supports personalized multipart messages. */
   smsMessageTemplate?: string;
   /** Staff acknowledgment that template contains no PHI — required for deliveryType='sms' */
   phiAcknowledged?: boolean;
@@ -341,18 +356,12 @@ export type BucketCampaignConfig = {
    */
   clinicName?: string;
   /**
-   * Pre-call SMS: texted to this campaign's own segment at bucket activation,
-   * immediately before the first dial. Ordering is guaranteed by the executor's
-   * bucket lifecycle, not by a timer — do NOT model this with dependsOn, which
-   * would disable the voice campaign's pre-warming.
-   * messageTemplate may use only {{FirstName}} and {{ClinicName}}.
+   * Pre-call SMS for this campaign's segment. Profile mode resolves approved
+   * name and specialty from each recipient, with an optional campaign clinic;
+   * omitted/manual mode retains the
+   * existing template configuration. Initialization is not a delivery receipt.
    */
-  precallSms?: {
-    enabled: boolean;
-    messageTemplate: string;
-    originationNumberArn: string;
-    clinicName: string;
-  };
+  precallSms?: PrecallSmsConfig;
 };
 
 export type SmsOriginationNumber = {
@@ -364,6 +373,9 @@ export type SmsOriginationNumber = {
   twoWayEnabled: boolean;
   optOutListName: string;
   status: string;
+  /** Optional for compatibility with older API responses; SMS campaigns require both. */
+  messageType?: 'TRANSACTIONAL' | 'PROMOTIONAL';
+  numberCapabilities?: string[];
 };
 
 export type SmsCampaignRunRecord = {

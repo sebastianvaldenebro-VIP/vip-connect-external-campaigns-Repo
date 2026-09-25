@@ -1,3 +1,4 @@
+import { ReliabilityOverview } from '@/components/ReliabilityPanel';
 import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
@@ -97,6 +98,7 @@ export function Dashboard(): ReactNode {
         <CampaignsCard items={running} loading={campaigns.isPending} />
         <AuditCard audit={audit.data?.entries ?? []} loading={audit.isPending} />
       </div>
+      <ReliabilityOverview segmentNames={(segments.data?.segments ?? []).map(segment => segment.name)} />
     </div>
   );
 }

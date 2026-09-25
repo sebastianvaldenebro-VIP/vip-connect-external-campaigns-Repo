@@ -2,23 +2,24 @@ import * as cdk from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import { Template } from 'aws-cdk-lib/assertions';
+import { createHash } from 'node:crypto';
 import precallSmsPlansPolicy from '../../config/precall-sms-plans-policy.json';
+import profileCleanupCfnPolicy from '../../config/profile-voice-cleanup-cfn-policy.json';
 
 // buildSharedLayer's real implementation shells out to `pip install` (or Docker)
 // against services/shared/requirements.txt during CDK asset bundling, which
 // happens synchronously the moment the Lambda Function construct is created.
 // That's appropriate for `cdk synth`/deploy but makes it unusable in a fast,
 // hermetic unit test — it needs either network access or Docker, neither of
-// which should be a precondition for `npm test`. Mocked out to an imported
-// (zero-bundling) LayerVersion so tests only exercise this stack's own logic.
+// which should be a precondition for `npm test`. Use a real resource with a
+// local asset so retention policies are exercised without dependency bundling.
 jest.mock('../utils/shared-layer', () => ({
-  buildSharedLayer: jest.fn((scope: import('constructs').Construct, id = 'SharedLayer') =>
-    require('aws-cdk-lib/aws-lambda').LayerVersion.fromLayerVersionArn(
-      scope,
-      id,
-      'arn:aws:lambda:us-east-1:165505826690:layer:mock-shared-layer:1',
-    ),
-  ),
+  buildSharedLayer: jest.fn((scope: import('constructs').Construct, id = 'SharedLayer') => {
+    const lambda = require('aws-cdk-lib/aws-lambda');
+    return new lambda.LayerVersion(scope, id, {
+      code: lambda.Code.fromAsset(require('node:path').join(__dirname, '../../../services/shared/python')),
+    });
+  }),
 }));
 
 import { ApiPlansStack, ApiPlansStackProps } from './api-plans-stack';
@@ -141,6 +142,84 @@ describe('ApiPlansStack', () => {
   describe('resources present regardless of optional props', () => {
     const { stack } = buildStack();
     const template = Template.fromStack(stack);
+
+    it('retains replaced and deleted shared layer versions for the Plans handler', () => {
+      const layers = Object.entries(template.findResources('AWS::Lambda::LayerVersion'));
+      expect(layers).toHaveLength(1);
+      const [layerId, layer] = layers[0];
+      expect(layer).toMatchObject({ DeletionPolicy: 'Retain', UpdateReplacePolicy: 'Retain' });
+      template.hasResourceProperties('AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+        Layers: [{ Ref: layerId }],
+      });
+    });
+
+    it('preserves the pre-cleanup default IAM resources byte for byte', () => {
+      // Baseline captured before adding the static cleanup rule. Updating these
+      // resources can fail both deploy and rollback under the execution boundary.
+      const iamResources = Object.fromEntries(
+        ['AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy'].map((type) =>
+          [type, template.findResources(type)]),
+      );
+      expect(createHash('sha256').update(JSON.stringify(iamResources)).digest('hex'))
+        .toBe('63319c9f23794bf61f08b34877d08820a8427bf7cc51bb51f6d2a63d68e27c7a');
+    });
+
+    it('provisions a cleanup rule independent of plan schedules and targets the real action', () => {
+      const functionId = logicalIdOf(template, 'AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+      });
+      template.resourceCountIs('AWS::Events::Rule', 1);
+      template.hasResourceProperties('AWS::Events::Rule', {
+        Name: 'vip-profile-voice-cleanup',
+        ScheduleExpression: 'rate(1 minute)',
+        State: 'ENABLED',
+        Targets: [{
+          Arn: { 'Fn::GetAtt': [functionId, 'Arn'] },
+          Id: 'profile-voice-cleanup',
+          Input: JSON.stringify({ action: 'profile_voice_cleanup' }),
+        }],
+      });
+      expect('vip-profile-voice-cleanup').not.toMatch(/^vip-(?:plan|sched)-/);
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').PROFILE_VOICE_CLEANUP_ENABLED).toBe('true');
+    });
+
+    it('limits the cleanup invocation permission to the fixed rule and source account', () => {
+      const functionId = logicalIdOf(template, 'AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+      });
+      const ruleId = logicalIdOf(template, 'AWS::Events::Rule', { Name: 'vip-profile-voice-cleanup' });
+      template.resourceCountIs('AWS::Lambda::Permission', 1);
+      template.hasResourceProperties('AWS::Lambda::Permission', {
+        Action: 'lambda:InvokeFunction',
+        FunctionName: { Ref: functionId },
+        Principal: 'events.amazonaws.com',
+        SourceArn: { 'Fn::GetAtt': [ruleId, 'Arn'] },
+        SourceAccount: ACCOUNT,
+      });
+    });
+
+    it('keeps cleanup provisioning grants in an exact-resource deployment policy', () => {
+      expect(profileCleanupCfnPolicy.Statement).toEqual([
+        {
+          Sid: 'ProfileVoiceCleanupRuleLifecycle',
+          Effect: 'Allow',
+          Action: [
+            'events:PutRule', 'events:DescribeRule', 'events:DeleteRule',
+            'events:PutTargets', 'events:ListTargetsByRule', 'events:RemoveTargets',
+            'events:TagResource', 'events:UntagResource', 'events:ListTagsForResource',
+          ],
+          Resource: `arn:aws:events:${REGION}:${ACCOUNT}:rule/vip-profile-voice-cleanup`,
+        },
+        {
+          Sid: 'ProfileVoiceCleanupLambdaPermission',
+          Effect: 'Allow',
+          Action: ['lambda:AddPermission', 'lambda:GetPolicy', 'lambda:RemovePermission'],
+          Resource: `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-ui-api-plans`,
+        },
+      ]);
+      expect(actionsForResource(policyStatements(template), 'vip-profile-voice-cleanup')).toEqual([]);
+    });
 
     it('creates VipAdminPlans with customer-managed encryption, PITR, and deletion protection', () => {
       template.hasResourceProperties('AWS::DynamoDB::Table', {
@@ -456,6 +535,7 @@ describe('ApiPlansStack', () => {
         SNS_ALERTS_TOPIC_ARN: `arn:aws:sns:${REGION}:${ACCOUNT}:vip-plans-alerts`,
         LOG_LEVEL: 'INFO',
         POWERTOOLS_SERVICE_NAME: 'api-plans',
+        PROFILE_VOICE_CLEANUP_ENABLED: 'true',
         LAMBDA_FUNCTION_ARN: `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-ui-api-plans`,
       });
     });
@@ -824,7 +904,7 @@ describe('ApiPlansStack', () => {
       });
     });
 
-    it('keeps only the approved, resource-scoped pre-call delta in the separate manual policy', () => {
+    it('keeps the required, resource-scoped pre-call delta in the separate manual policy', () => {
       expect(precallSmsPlansPolicy).toEqual({
         Version: '2012-10-17',
         Statement: [
@@ -840,6 +920,12 @@ describe('ApiPlansStack', () => {
             Action: 'lambda:InvokeFunction',
             Resource: SMS_RETRY_ARN,
           },
+          {
+            Sid: 'PrecallCampaignSchedule',
+            Effect: 'Allow',
+            Action: 'connect-campaigns:UpdateCampaignSchedule',
+            Resource: `arn:aws:connect-campaigns:${REGION}:${ACCOUNT}:campaign/*`,
+          },
         ],
       });
       const template = Template.fromStack(buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN }).stack);
@@ -847,6 +933,9 @@ describe('ApiPlansStack', () => {
       const actions = statements.flatMap((s) => toArray(s.Action as string | string[]));
       expect(actions).not.toContain('connect-campaigns:PauseCampaign');
       expect(actions).not.toContain('connect-campaigns:ResumeCampaign');
+      // Profile start always updates its schedule. Grant this prerequisite in
+      // the operator-managed policy; changing CFN IAM can break its rollback.
+      expect(actions).not.toContain('connect-campaigns:UpdateCampaignSchedule');
       expect(actionsForResource(statements, SMS_RETRY_ARN)).toEqual([]);
     });
   });

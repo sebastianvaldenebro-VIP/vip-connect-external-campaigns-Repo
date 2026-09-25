@@ -140,7 +140,7 @@ def test_canonical_search_filters_authoritative_membership(aws, field, key):
     _get_definition(stub, _definition(field))
     _search(stub, [_pid(1), _pid(2)], key=key)
     _membership(stub, [_pid(1), _pid(2)], absent=[_pid(2)])
-    assert _run(aws) == [{"phone": PHONE, "FirstName": "Jane"}]
+    assert _run(aws) == [{"phone": PHONE, "ProfileId": _pid(), "FirstName": "Jane", "Attributes": {}}]
 
 
 def test_search_pagination_deduplicates_and_membership_uses_max_100(aws):
@@ -326,7 +326,7 @@ def test_concurrent_export_reads_only_published_winner_then_reuses_it(aws):
     _snapshot(stub, winner)
     _csv(s3_stub, winner, f"pRoFiLeId\n{_pid()}\n".encode())
     _batch(stub, [_pid()])
-    assert _run(aws, winner) == [{"phone": PHONE, "FirstName": "Jane"}]
+    assert _run(aws, winner) == [{"phone": PHONE, "ProfileId": _pid(), "FirstName": "Jane", "Attributes": {}}]
 
 
 def test_snapshot_profile_hydration_uses_real_20_profile_batch_limit(aws):
@@ -400,7 +400,7 @@ def test_completed_snapshot_accepts_aws_trailing_slash_normalization(aws):
     # The requested slash-terminated prefix is still the exact S3 list prefix.
     _csv(aws[3], metadata, f"ProfileId\n{_pid()}\n".encode())
     _batch(aws[1], [_pid()])
-    assert _run(aws, metadata) == [{"phone": PHONE, "FirstName": "Jane"}]
+    assert _run(aws, metadata) == [{"phone": PHONE, "ProfileId": _pid(), "FirstName": "Jane", "Attributes": {}}]
 
 
 def test_valid_empty_snapshot_and_profile_without_phone_are_distinct_from_read_failure(
@@ -461,7 +461,7 @@ def test_membership_nested_identity_is_optional_but_cannot_disagree(aws, nested_
         },
     )
     if nested_id is None:
-        assert _run(aws) == [{"phone": PHONE, "FirstName": "Jane"}]
+        assert _run(aws) == [{"phone": PHONE, "ProfileId": _pid(), "FirstName": "Jane", "Attributes": {}}]
     else:
         with pytest.raises(SegmentRecipientsError, match="identity"):
             _run(aws)
@@ -522,3 +522,21 @@ def test_snapshot_s3_pagination_reads_every_part_and_deduplicates_ids(aws):
         )
     _batch(aws[1], [_pid(1), _pid(2)])
     assert len(_run(aws, metadata)) == 2
+
+
+@pytest.mark.parametrize("export", [False, True])
+def test_profile_personalization_fields_preserved_for_membership_and_export(aws, export):
+    attributes = {"location": "Test", "location_id": "42", "campaign": "Vein", "clinic_name": "Approved Clinic", "specialty": "Vein", "not_allowed": "discard"}
+    expected_attributes = {key: value for key, value in attributes.items() if key != "not_allowed"}
+    source = _profile(_pid(), FirstName="José", Attributes=attributes)
+    metadata = None
+    if export:
+        metadata = _metadata()
+        _snapshot(aws[1], metadata)
+        _csv(aws[3], metadata, f"ProfileId\n{_pid()}\n".encode())
+        _batch(aws[1], [_pid()], profiles=[source])
+    else:
+        _get_definition(aws[1])
+        _search(aws[1], [_pid()])
+        aws[1].add_response("get_segment_membership", {"Profiles": [{"ProfileId": _pid(), "QueryResult": "PRESENT", "Profile": source}]}, {"DomainName": DOMAIN, "SegmentDefinitionName": SEGMENT, "ProfileIds": [_pid()]})
+    assert _run(aws, metadata) == [{"phone": PHONE, "ProfileId": _pid(), "FirstName": "José", "Attributes": expected_attributes}]
