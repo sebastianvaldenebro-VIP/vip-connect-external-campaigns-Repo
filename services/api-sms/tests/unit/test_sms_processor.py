@@ -16,6 +16,7 @@ _ENV = {
     "SMS_CAMPAIGN_RUNS_TABLE": "VipSmsCampaignRuns",
     "SMS_CONFIG_SET_NAME": "vip-sms-config-set",
     "SMS_OPT_OUT_LIST_NAME": "vip-sms-opt-out",
+    "OPT_OUT_TABLE": "VipConnectOptOutList",
 }
 
 
@@ -312,15 +313,30 @@ def test_opted_out_path_does_not_reraise():
 # ── FAILED path (generic exception) ──────────────────────────────────────────
 
 
-def test_generic_exception_marks_failed_and_reraises():
+# ── VIP-01: retryable vs terminal failures ───────────────────────────────────
+# A transient error (network blip, throttling, EUM 5xx — anything that is NOT
+# the specific ValidationException/OptedOut case) must NEVER be marked FAILED.
+# The claim's ConditionExpression only accepts PENDING or stale-SENDING, so a
+# FAILED item can never be reclaimed by a redelivered SQS message — it would
+# hit ConditionalCheckFailedException and be silently skipped as "already
+# claimed" after exactly one attempt, despite SQS actually redelivering.
+
+
+def test_generic_exception_is_retryable_reverts_to_pending_and_reraises():
+    """A transient/throttling-style error must revert the claim to PENDING
+    (so the next SQS redelivery can reclaim it immediately) and must still
+    raise so SQS actually redelivers — but must NOT be recorded as FAILED."""
     handler = _load_handler()
 
     class FakeValidationException(Exception):
         pass
 
+    class ThrottlingException(Exception):
+        pass
+
     mock_sms = MagicMock()
     mock_sms.exceptions.ValidationException = FakeValidationException
-    mock_sms.send_text_message.side_effect = RuntimeError("unexpected")
+    mock_sms.send_text_message.side_effect = ThrottlingException("rate exceeded")
 
     mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
 
@@ -332,10 +348,79 @@ def test_generic_exception_marks_failed_and_reraises():
         with pytest.raises(RuntimeError):
             handler.lambda_handler(_make_sqs_event(), None)
 
-    last_queue_update = mock_queue_table.update_item.call_args.kwargs
-    assert "FAILED" in str(last_queue_update)
-    runs_update = mock_runs_table.update_item.call_args
-    assert "totalFailed" in str(runs_update)
+    # Claim (PENDING->SENDING), then a revert (->PENDING) — never FAILED.
+    assert mock_queue_table.update_item.call_count == 2
+    revert_call = mock_queue_table.update_item.call_args_list[1].kwargs
+    assert "PENDING" in str(revert_call)
+    for call in mock_queue_table.update_item.call_args_list:
+        assert "FAILED" not in str(call)
+    # A retryable failure is not a terminal outcome — totalFailed must not move.
+    mock_runs_table.update_item.assert_not_called()
+
+
+def test_network_error_on_send_is_retryable_not_terminal():
+    """Same guarantee for a plain network-style exception (not a service
+    exception class at all) — the retryable branch must not special-case on
+    exception type beyond ValidationException."""
+    handler = _load_handler()
+
+    class FakeValidationException(Exception):
+        pass
+
+    mock_sms = MagicMock()
+    mock_sms.exceptions.ValidationException = FakeValidationException
+    mock_sms.send_text_message.side_effect = ConnectionError("network blip")
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+    ):
+        with pytest.raises(RuntimeError):
+            handler.lambda_handler(_make_sqs_event(), None)
+
+    revert_call = mock_queue_table.update_item.call_args_list[-1].kwargs
+    assert "PENDING" in str(revert_call)
+    assert "FAILED" not in str(revert_call)
+
+
+def test_bookkeeping_failure_after_successful_send_never_marks_failed_and_does_not_reraise():
+    """If the post-send bookkeeping write itself fails, the message must stay
+    recorded as SENT (never flipped to FAILED — the send already happened,
+    that fact must not be lost) and the handler must not raise (re-raising
+    would risk SQS redelivering and double-sending an SMS that already went
+    out)."""
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.send_text_message.return_value = {"MessageId": "msg-already-sent"}
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    call_count = {"n": 0}
+
+    def _update_item_side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return {}  # the PENDING->SENDING claim succeeds
+        raise Exception("DynamoDB throttled")  # the SENT bookkeeping write fails
+
+    mock_queue_table.update_item.side_effect = _update_item_side_effect
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+    ):
+        # Must NOT raise — the SMS was already sent.
+        handler.lambda_handler(_make_sqs_event(), None)
+
+    mock_sms.send_text_message.assert_called_once()
+    for call in mock_queue_table.update_item.call_args_list:
+        assert "FAILED" not in str(call)
 
 
 def test_validation_exception_non_opted_out_marks_failed_and_reraises():
@@ -496,3 +581,100 @@ def test_no_phi_phone_in_print_output(capsys):
     captured = capsys.readouterr()
     assert phone not in captured.out
     assert phone not in captured.err
+
+
+# ── VIP-02: final strongly-consistent opt-out recheck before send ───────────
+# sms_sender_handler.py checks the shared cross-channel opt-out table at
+# enqueue time. SQS delivery can lag behind a STOP reply recorded in the
+# meantime, so the processor must recheck the same table immediately before
+# send — this is the last chance to catch it before EUM actually dials out.
+
+
+def test_opt_out_recheck_blocks_send_when_blocked_after_enqueue():
+    """A block recorded in the shared opt-out table AFTER this item was
+    enqueued (i.e. the sender's own check passed at the time) must still be
+    caught by the processor's final pre-send recheck."""
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    mock_opt_out = MagicMock()
+    mock_opt_out.is_blocked.return_value = True
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_opt_out", mock_opt_out),
+    ):
+        handler.lambda_handler(_make_sqs_event(), None)
+
+    # The SMS must never be sent once the recheck reports blocked.
+    mock_sms.send_text_message.assert_not_called()
+    mock_opt_out.is_blocked.assert_called_once_with("+15125551234")
+
+    last_queue_update = mock_queue_table.update_item.call_args.kwargs
+    assert "OPTED_OUT" in str(last_queue_update)
+    runs_update = mock_runs_table.update_item.call_args
+    assert "totalOptedOut" in str(runs_update)
+
+
+def test_opt_out_check_error_fails_closed_and_is_retryable():
+    """If the opt-out check itself errors, the send must be blocked (fail
+    closed) — but this is a transient read failure, not a real opt-out, so it
+    must be treated as retryable (revert to PENDING + raise), never silently
+    dropped and never mislabeled OPTED_OUT/FAILED."""
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    mock_opt_out = MagicMock()
+    mock_opt_out.is_blocked.side_effect = RuntimeError("DynamoDB unavailable")
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_opt_out", mock_opt_out),
+    ):
+        with pytest.raises(RuntimeError):
+            handler.lambda_handler(_make_sqs_event(), None)
+
+    mock_sms.send_text_message.assert_not_called()
+    revert_call = mock_queue_table.update_item.call_args_list[-1].kwargs
+    assert "PENDING" in str(revert_call)
+    assert "OPTED_OUT" not in str(revert_call)
+    assert "FAILED" not in str(revert_call)
+
+
+def test_opt_out_recheck_allows_send_when_not_blocked():
+    """Sanity check: when the recheck reports not-blocked, the send proceeds
+    normally — the recheck must not itself cause false-positive blocking."""
+    handler = _load_handler()
+
+    mock_sms = MagicMock()
+    mock_sms.send_text_message.return_value = {"MessageId": "msg-clear"}
+    mock_sms.exceptions.ValidationException = Exception
+
+    mock_ddb, mock_queue_table, mock_runs_table = _make_ddb_mock()
+
+    mock_opt_out = MagicMock()
+    mock_opt_out.is_blocked.return_value = False
+
+    with (
+        patch.dict(os.environ, _ENV),
+        patch.object(handler, "_sms", mock_sms),
+        patch.object(handler, "_ddb", mock_ddb),
+        patch.object(handler, "_opt_out", mock_opt_out),
+    ):
+        handler.lambda_handler(_make_sqs_event(), None)
+
+    mock_sms.send_text_message.assert_called_once()
+    last_queue_update = mock_queue_table.update_item.call_args.kwargs
+    assert "SENT" in str(last_queue_update)

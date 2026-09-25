@@ -16,7 +16,13 @@ def _make_lock():
 def test_acquire_succeeds_when_no_existing_lock():
     lock, table = _make_lock()
     table.put_item.return_value = {}
-    assert lock.acquire("agent-001", campaign_id="campaign-1") is True
+    token = lock.acquire("agent-001", campaign_id="campaign-1")
+    # VIP-04: acquire() returns a fencing token (truthy str), not a bare bool.
+    assert token is not None
+    assert isinstance(token, str) and token
+    # The same token must be the one persisted in the Item.
+    item = table.put_item.call_args[1]["Item"]
+    assert item["lockToken"] == token
 
 
 def test_acquire_fails_when_lock_exists():
@@ -27,7 +33,7 @@ def test_acquire_fails_when_lock_exists():
         "PutItem"
     )
     table.put_item.side_effect = error
-    assert lock.acquire("agent-001", campaign_id="campaign-1") is False
+    assert lock.acquire("agent-001", campaign_id="campaign-1") is None
 
 
 def test_acquire_reraises_non_conditional_check_errors():
@@ -47,11 +53,97 @@ def test_acquire_reraises_non_conditional_check_errors():
         lock.acquire("agent-001", campaign_id="campaign-1")
 
 
-def test_release_deletes_lock():
+def test_release_deletes_lock_when_token_matches():
     lock, table = _make_lock()
-    lock.release("agent-001")
+    table.delete_item.return_value = {}
+    lock.release("agent-001", "tok-abc123")
     call_kwargs = table.delete_item.call_args[1]
     assert call_kwargs["Key"]["agentId"] == "agent-001"
+    # VIP-04: the delete must be conditioned on the exact fencing token.
+    assert call_kwargs["ConditionExpression"] == "lockToken = :token"
+    assert call_kwargs["ExpressionAttributeValues"] == {":token": "tok-abc123"}
+
+
+def test_release_is_noop_when_token_does_not_match():
+    """VIP-04: a stale token (belongs to a prior/overridden lock generation)
+    must not raise and must not delete anything — the delete_item's own
+    ConditionExpression protects a newer generation's lock from a stale
+    caller, and a failed condition here is expected, not an error."""
+    from botocore.exceptions import ClientError
+    lock, table = _make_lock()
+    error = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}},
+        "DeleteItem",
+    )
+    table.delete_item.side_effect = error
+    # Must not raise.
+    lock.release("agent-001", "stale-token")
+
+
+def test_release_reraises_non_conditional_check_errors():
+    from botocore.exceptions import ClientError
+    import pytest
+
+    lock, table = _make_lock()
+    error = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": ""}},
+        "DeleteItem",
+    )
+    table.delete_item.side_effect = error
+    with pytest.raises(ClientError):
+        lock.release("agent-001", "tok-abc123")
+
+
+# ── VIP-04 acceptance criterion ──────────────────────────────────────────────
+# acquire A, expire/replace with B, then let A's stale operation try to
+# release — B's lock must survive and A must not be able to act on it.
+
+
+def test_stale_generation_cannot_release_a_newer_generations_lock():
+    """Simulates the exact race the audit flagged: dispatch A acquires the
+    lock (token_a). The lock goes stale (>60s) before A's in-flight caller
+    Lambda finishes. A second AVAILABLE event dispatches B, which acquires a
+    NEW lock generation (token_b) for the same agent. A's slow invocation
+    finally calls release(token_a) — this must be a no-op; B's lock (and
+    B's dispatch) must be unaffected."""
+    lock, table = _make_lock()
+
+    # --- A acquires ---
+    table.put_item.return_value = {}
+    token_a = lock.acquire("agent-001", campaign_id="campaign-a")
+    assert token_a is not None
+
+    # --- time passes; A's lock is now stale; B acquires a fresh generation ---
+    # A real DynamoDB table would accept B's conditional PutItem here because
+    # A's lockedAt is older than _LOCK_STALE_SECONDS — we model the *result*
+    # of that atomic replacement directly: the table now holds token_b.
+    token_b = lock.acquire("agent-001", campaign_id="campaign-b")
+    assert token_b is not None
+    assert token_b != token_a
+
+    # --- A's stale, in-flight invocation now tries to release its OLD token ---
+    # Model DynamoDB's real behavior: the stored lockToken is token_b, so a
+    # delete_item conditioned on token_a fails its ConditionExpression.
+    from botocore.exceptions import ClientError
+
+    def _delete_side_effect(**kwargs):
+        supplied_token = kwargs["ExpressionAttributeValues"][":token"]
+        if supplied_token != token_b:
+            raise ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}},
+                "DeleteItem",
+            )
+        return {}
+
+    table.delete_item.side_effect = _delete_side_effect
+
+    # A's release must be a silent no-op — must not raise, must not delete B's lock.
+    lock.release("agent-001", token_a)
+
+    # B's lock is still "held" (the mocked delete_item never actually
+    # succeeded for token_b) — confirmed by releasing with the CORRECT token
+    # succeeding cleanly, proving the table state was never disturbed by A.
+    lock.release("agent-001", token_b)
 
 
 def test_acquire_writes_correct_ttl():
@@ -70,15 +162,15 @@ def test_acquire_succeeds_when_lock_is_stale():
     """Stale lock (TTL expired but DynamoDB TTL sweep not yet run) must be atomically replaced."""
     from botocore.exceptions import ClientError
     lock, table = _make_lock()
-    # First call: ConditionalCheckFailed (live lock) — returns False
+    # First call: ConditionalCheckFailed (live lock) — returns None
     live_lock_error = ClientError(
         {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}}, "PutItem"
     )
-    # Second call: success (stale lock condition matched) — returns True
+    # Second call: success (stale lock condition matched) — returns a token
     table.put_item.side_effect = [live_lock_error, {}]
-    assert lock.acquire("agent-001", campaign_id="campaign-1") is False  # live lock blocks
+    assert lock.acquire("agent-001", campaign_id="campaign-1") is None  # live lock blocks
     table.put_item.side_effect = [{}]  # stale lock — put_item succeeds
-    assert lock.acquire("agent-001", campaign_id="campaign-1") is True
+    assert lock.acquire("agent-001", campaign_id="campaign-1") is not None
     # Verify the three-clause condition expression is actually sent to DynamoDB
     call_kwargs = table.put_item.call_args[1]
     assert call_kwargs["ConditionExpression"] == (
@@ -116,7 +208,7 @@ def test_acquire_overrides_lock_older_than_60s():
         mock_time.time.return_value = int(time.time()) + 61
         result = lock.acquire("agent-001", campaign_id="campaign-2")
 
-    assert result is True
+    assert result is not None
     values = table.put_item.call_args[1]["ExpressionAttributeValues"]
     # stale_threshold should be 61 - 60 = 1s in the past relative to the mocked now
     expected_threshold = int(time.time()) + 61 - 60
@@ -132,4 +224,4 @@ def test_acquire_blocked_within_stale_window():
         {"Error": {"Code": "ConditionalCheckFailedException", "Message": ""}}, "PutItem"
     )
     table.put_item.side_effect = error
-    assert lock.acquire("agent-001", campaign_id="campaign-1") is False
+    assert lock.acquire("agent-001", campaign_id="campaign-1") is None

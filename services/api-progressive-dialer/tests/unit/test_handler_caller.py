@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def _make_sqs_event(correlation_id: str | None = "abc12345") -> dict:
+def _make_sqs_event(
+    correlation_id: str | None = "abc12345",
+    *,
+    receive_count: str | None = None,
+    lock_token: str | None = "tok-default",
+) -> dict:
     # destinationPhone is intentionally absent — caller reads it from DynamoDB
     body = {
         "agentArn": "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001",
@@ -18,7 +23,15 @@ def _make_sqs_event(correlation_id: str | None = "abc12345") -> dict:
     }
     if correlation_id is not None:
         body["correlationId"] = correlation_id
-    return {"Records": [{"body": json.dumps(body), "receiptHandle": "rh-001"}]}
+    # VIP-04: the fencing token propagated by handler_consumer.py/handler_kickstart.py.
+    # Defaults to a fixed value so tests that don't care about it still exercise the
+    # real propagation path (release() called with this exact token).
+    if lock_token is not None:
+        body["lockToken"] = lock_token
+    record = {"body": json.dumps(body), "receiptHandle": "rh-001"}
+    if receive_count is not None:
+        record["attributes"] = {"ApproximateReceiveCount": receive_count}
+    return {"Records": [record]}
 
 
 def test_calls_start_outbound_voice_contact():
@@ -97,10 +110,21 @@ def test_raises_on_throttle_for_sqs_retry():
         mock_lock.release.assert_not_called()
 
 
-def test_first_orion_repushed_before_raise_on_throttle():
-    """First Orion push must fire before re-raising on throttle so the SQS-retried
-    dial lands inside a fresh branding window (original window expired during
-    the 180s visibilityTimeout)."""
+# ── VIP-03 (2026-09-11 audit): First Orion re-push moved from throttle-
+# detection time to immediately before the retried dial ────────────────────
+# Pushing at throttle-detection time (the old behavior) was stale long before
+# the actual retried dial ~180s later (SQS visibilityTimeout), since First
+# Orion's branding window is only ~10-30s. The push must instead fire right
+# before caller.dial() on the REDELIVERED invocation (ApproximateReceiveCount
+# > 1), so the push-to-dial gap always stays inside the window regardless of
+# how long the message sat in the queue.
+
+
+def test_no_first_orion_push_at_throttle_detection_time():
+    """On the FIRST attempt (receive_count=1) hitting a throttle, no push must
+    fire here — a push at throttle-detection time is followed by ~180s of
+    queue delay before the retry, long past the branding window. The retry's
+    own (redelivered) invocation is responsible for its own fresh push."""
     if "handler_caller" in sys.modules:
         del sys.modules["handler_caller"]
 
@@ -120,8 +144,6 @@ def test_first_orion_repushed_before_raise_on_throttle():
         mock_queue.get_phone.return_value = "+15551234567"
         mock_lock = MagicMock()
 
-        # _get_fo() calls FirstOrionClient.build_from_secret() which returns the instance.
-        # We patch the class so build_from_secret() returns a controllable mock instance.
         mock_fo_instance = MagicMock()
         mock_fo_instance.push.return_value = True
         mock_fo_class = MagicMock()
@@ -134,13 +156,132 @@ def test_first_orion_repushed_before_raise_on_throttle():
              patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
             from handler_caller import lambda_handler
             with pytest.raises(RuntimeError, match="throttled"):
+                # receive_count=None -> ApproximateReceiveCount absent -> defaults to 1
                 lambda_handler(_make_sqs_event(), None)
 
-        # First Orion push must have been called with a_number=sourcePhone, b_number=destinationPhone
+        mock_fo_instance.push.assert_not_called()
+
+
+def test_first_orion_pushed_before_dial_on_redelivered_message():
+    """A redelivered message (ApproximateReceiveCount > 1) must get a fresh
+    First Orion push immediately before caller.dial() is called — regardless
+    of whether this attempt then succeeds or throttles again."""
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
+    }):
+        from connect_caller import DialResult
+
+        call_order: list[str] = []
+
+        mock_caller = MagicMock()
+
+        def _dial(**kwargs):
+            call_order.append("dial")
+            return DialResult(success=True, contact_id="contact-retry-1")
+
+        mock_caller.dial.side_effect = _dial
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = "+15551234567"
+        mock_lock = MagicMock()
+
+        mock_fo_instance = MagicMock()
+
+        def _push(**kwargs):
+            call_order.append("push")
+            return True
+
+        mock_fo_instance.push.side_effect = _push
+        mock_fo_class = MagicMock()
+        mock_fo_class.build_from_secret.return_value = mock_fo_instance
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.FirstOrionClient", mock_fo_class), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
+            from handler_caller import lambda_handler
+            lambda_handler(_make_sqs_event(receive_count="2"), None)
+
         mock_fo_instance.push.assert_called_once_with(
             a_number="+12125550199",
             b_number="+15551234567",
         )
+        # Push must happen BEFORE the dial call, not after/independently of it.
+        assert call_order == ["push", "dial"]
+
+
+def test_first_orion_push_immediately_precedes_retried_dial_regardless_of_queue_delay():
+    """Fake-clock proof (VIP-03 acceptance criterion): no matter how long a
+    redelivered message sat in the SQS queue before this invocation ran, the
+    First Orion push for it must land at essentially zero elapsed time before
+    the dial call — never at some earlier, now-irrelevant clock value."""
+    if "handler_caller" in sys.modules:
+        del sys.modules["handler_caller"]
+
+    with patch.dict("os.environ", {
+        "CAMPAIGN_QUEUE_TABLE": "VipProgressiveCampaignQueue",
+        "AGENT_LOCK_TABLE": "VipProgressiveAgentLocks",
+        "FIRSTORION_SECRET_NAME": "vip/firstorion/credentials",
+        "OPT_OUT_TABLE": "VipConnectOptOutList",
+    }):
+        from connect_caller import DialResult
+
+        # A fake clock this test fully controls — advanced by an arbitrary
+        # "time spent sitting in the SQS queue" BEFORE each invocation runs,
+        # to model the redelivery delay (which can be anywhere from the 180s
+        # visibilityTimeout up to however long the DLQ/redrive policy allows).
+        fake_clock = {"t": 0.0}
+
+        mock_caller = MagicMock()
+        mock_queue = MagicMock()
+        mock_queue.get_phone.return_value = "+15551234567"
+        mock_lock = MagicMock()
+        mock_fo_instance = MagicMock()
+        mock_fo_class = MagicMock()
+        mock_fo_class.build_from_secret.return_value = mock_fo_instance
+
+        with patch("handler_caller.ConnectCaller", return_value=mock_caller), \
+             patch("handler_caller.CampaignQueue", return_value=mock_queue), \
+             patch("handler_caller.AgentLock", return_value=mock_lock), \
+             patch("handler_caller.FirstOrionClient", mock_fo_class), \
+             patch("handler_caller.build_opt_out_from_env", return_value=MagicMock(is_blocked=lambda *_: False)):
+            from handler_caller import lambda_handler
+
+            # First Orion's real branding window is ~10-30s — assert well past
+            # it, at several different simulated queue delays.
+            for queue_delay_seconds in (30, 180, 3_600, 86_400):
+                timeline: list[tuple[str, float]] = []
+
+                def _push(**kwargs):
+                    timeline.append(("push", fake_clock["t"]))
+                    return True
+
+                def _dial(**kwargs):
+                    timeline.append(("dial", fake_clock["t"]))
+                    return DialResult(success=True, contact_id="contact-x")
+
+                mock_fo_instance.push.side_effect = _push
+                mock_caller.dial.side_effect = _dial
+
+                fake_clock["t"] += queue_delay_seconds
+                lambda_handler(_make_sqs_event(receive_count="2"), None)
+
+                assert [name for name, _ in timeline] == ["push", "dial"]
+                push_time = timeline[0][1]
+                dial_time = timeline[1][1]
+                # No wall-clock time is spent between push and dial — the
+                # push always lands at "now" (this invocation's clock),
+                # independent of how large queue_delay_seconds was.
+                assert dial_time - push_time < 1.0, (
+                    f"push-to-dial gap was {dial_time - push_time}s at "
+                    f"simulated queue delay {queue_delay_seconds}s"
+                )
 
 
 def test_lock_held_after_mark_dialed_for_call_connect_window():
@@ -209,9 +350,11 @@ def test_reset_and_lock_released_when_phone_not_found():
         mock_queue.reset_to_pending.assert_called_once_with(
             "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
         )
-        # agent lock must be released so the agent can take the next dispatch
+        # agent lock must be released so the agent can take the next dispatch,
+        # using the exact fencing token this message carried (VIP-04).
         mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
+            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001",
+            "tok-default",
         )
 
 
@@ -245,7 +388,8 @@ def test_blocked_number_skips_dial_and_releases_lock():
             "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
         )
         mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
+            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001",
+            "tok-default",
         )
 
 
@@ -283,7 +427,8 @@ def test_permanent_dial_failure_resets_contact_and_releases_lock():
             "campaign-1", "2026-06-16T14:00:00.000Z#uuid-1"
         )
         mock_lock.release.assert_called_once_with(
-            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001"
+            "arn:aws:connect:us-east-1:165505826690:instance/abc/agent/agent-001",
+            "tok-default",
         )
 
 

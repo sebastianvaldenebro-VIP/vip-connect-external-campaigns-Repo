@@ -691,7 +691,8 @@ class TestH8LockReleaseOnException:
         }]}
 
         lock = mocker.patch("handler_consumer._get_lock").return_value
-        lock.acquire.return_value = True
+        # VIP-04: acquire() now returns a fencing token (str), not a bare bool.
+        lock.acquire.return_value = "tok-h8"
 
         queue = mocker.patch("handler_consumer._get_queue").return_value
         queue.dequeue.side_effect = RuntimeError("DynamoDB throttled")
@@ -711,7 +712,8 @@ class TestH8LockReleaseOnException:
         with pytest.raises(RuntimeError, match="DynamoDB throttled"):
             handler_consumer._process_record(record)
 
-        lock.release.assert_called_once_with(agent_arn)
+        # VIP-04: release() must be called with the SAME token acquire() returned.
+        lock.release.assert_called_once_with(agent_arn, "tok-h8")
 
 
 # ---------------------------------------------------------------------------

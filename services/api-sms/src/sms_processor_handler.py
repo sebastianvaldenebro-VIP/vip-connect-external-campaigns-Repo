@@ -19,6 +19,9 @@ from vip_shared.domain.services.sms_campaign import (
     validate_body as validate_campaign_body,
     validate_version as validate_campaign_version,
 )
+from vip_shared.infrastructure.persistence.opt_out import (
+    build_from_env as build_opt_out_from_env,
+)
 
 _QUEUE_TABLE = os.environ["SMS_CAMPAIGN_QUEUE_TABLE"]
 _RUNS_TABLE = os.environ["SMS_CAMPAIGN_RUNS_TABLE"]
@@ -36,6 +39,7 @@ _STALE_SENDING_SECONDS = 60
 
 _ddb = boto3.resource("dynamodb")
 _sms = boto3.client("pinpoint-sms-voice-v2", region_name="us-east-1")
+_opt_out = build_opt_out_from_env()
 
 
 def lambda_handler(event: dict, context: object) -> None:
@@ -99,101 +103,195 @@ def _process(
         print(f"sms_processor: skipped duplicate campaign={campaign_id} sk={sk[:20]}")
         return
 
+    # VIP-02: final strongly-consistent opt-out recheck immediately before send.
+    # sms_sender_handler.py already checked this same shared table at enqueue
+    # time, but SQS delivery can lag behind a STOP reply recorded in the
+    # meantime. EUM's own opt-out list (checked below by send_text_message
+    # itself) is carrier-level only and has no idea about this cross-channel
+    # list, so it cannot catch this gap on its own.
     try:
-        previous = claim.get("Attributes") or {}
-        campaign_message = sms_template_version_present or sms_template_version is not None
-        campaign_row = "smsTemplateVersion" in previous
-        managed = precall_policy is not None or campaign_message or campaign_row
-        if campaign_message or campaign_row:
-            # The durable queue marker prevents a truncated/altered payload
-            # from silently downgrading to legacy TRANSACTIONAL or stale retry
-            # semantics. Settle invalid contracts once; do not strand PENDING
-            # work until the SQS DLQ catches it. Legacy rows have no marker.
-            try:
-                validate_campaign_version(sms_template_version)
-                if previous.get("smsTemplateVersion") != sms_template_version or precall_policy is not None:
-                    raise SmsCampaignError("conflicting_sms_modes")
-            except SmsCampaignError:
-                _update_queue_item(campaign_id, sk, "FAILED", error_code="INVALID_SMS_CONTRACT", sent_at=sent_at)
-                _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
-                print(f"sms_processor: FAILED campaign={campaign_id} error=INVALID_SMS_CONTRACT")
-                return
-        if managed and previous.get("status") == "SENDING":
-            # A stale worker may have reached EUM before it crashed. Managed
-            # copy must not be sent twice to repair that unknown
-            # outcome. Settle it as an explicit failure; legacy retry behavior
-            # remains unchanged.
-            _update_queue_item(campaign_id, sk, "FAILED", error_code="PROVIDER_OUTCOME_UNKNOWN", sent_at=sent_at)
+        opted_out_now = _opt_out.is_blocked(phone)
+    except Exception as exc:
+        # Fail closed: if we can't determine opt-out status, do NOT send.
+        # This is a transient read failure, not a real opt-out — treat it as
+        # retryable (see the retryable branch below) rather than mislabeling
+        # the contact OPTED_OUT on what may just be a DynamoDB blip.
+        _revert_claim_to_pending(campaign_id, sk)
+        print(
+            f"sms_processor: RETRY (opt-out check failed, failing closed) "
+            f"campaign={campaign_id} error={type(exc).__name__}"
+        )
+        raise RuntimeError(
+            f"sms send blocked — opt-out check failed campaign={campaign_id} "
+            f"err={type(exc).__name__}"
+        ) from None
+
+    if opted_out_now:
+        _update_queue_item(
+            campaign_id, sk, "OPTED_OUT", error_code="OPTED_OUT", sent_at=sent_at
+        )
+        _increment_runs_counter(campaign_id, plan_id, run_id, "totalOptedOut")
+        print(f"sms_processor: OPTED_OUT (pre-send recheck) campaign={campaign_id}")
+        return
+
+    previous = claim.get("Attributes") or {}
+    campaign_message = sms_template_version_present or sms_template_version is not None
+    campaign_row = "smsTemplateVersion" in previous
+    managed = precall_policy is not None or campaign_message or campaign_row
+    if campaign_message or campaign_row:
+        # The durable queue marker prevents a truncated/altered payload
+        # from silently downgrading to legacy TRANSACTIONAL or stale retry
+        # semantics. Settle invalid contracts once; do not strand PENDING
+        # work until the SQS DLQ catches it. Legacy rows have no marker.
+        try:
+            validate_campaign_version(sms_template_version)
+            if previous.get("smsTemplateVersion") != sms_template_version or precall_policy is not None:
+                raise SmsCampaignError("conflicting_sms_modes")
+        except SmsCampaignError:
+            _update_queue_item(campaign_id, sk, "FAILED", error_code="INVALID_SMS_CONTRACT", sent_at=sent_at)
             _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
-            print(f"sms_processor: FAILED campaign={campaign_id} error=PROVIDER_OUTCOME_UNKNOWN")
+            print(f"sms_processor: FAILED campaign={campaign_id} error=INVALID_SMS_CONTRACT")
             return
-        kwargs: dict = {
-            "DestinationPhoneNumber": phone,
-            "MessageBody": message_template,
-            "OriginationIdentity": origination_arn,
-            "MessageType": "PROMOTIONAL" if sms_template_version is not None else "TRANSACTIONAL",
-        }
-        if _CONFIG_SET:
-            kwargs["ConfigurationSetName"] = _CONFIG_SET
-        if managed:
-            # The parent campaign may have ended (or its pre-call gate timed
-            # out) while this message waited in SQS.
-            # Recheck immediately before EUM and fail closed on policy drift.
-            run = _ddb.Table(_RUNS_TABLE).get_item(
-                Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
-                ConsistentRead=True,
-            ).get("Item")
-            if (
-                not run or run.get("status") != "RUNNING"
-                or run.get("precallPolicy") != precall_policy
-                or run.get("smsTemplateVersion") != sms_template_version
-            ):
-                _update_queue_item(campaign_id, sk, "CANCELLED", sent_at=sent_at)
-                if run:
-                    _increment_runs_counter(campaign_id, plan_id, run_id, "totalCancelled")
-                print(f"sms_processor: CANCELLED campaign={campaign_id}")
-                return
-        if sms_template_version is not None:
+    if managed and previous.get("status") == "SENDING":
+        # A stale worker may have reached EUM before it crashed. Managed
+        # copy must not be sent twice to repair that unknown
+        # outcome. Settle it as an explicit failure; legacy retry behavior
+        # remains unchanged.
+        _update_queue_item(campaign_id, sk, "FAILED", error_code="PROVIDER_OUTCOME_UNKNOWN", sent_at=sent_at)
+        _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
+        print(f"sms_processor: FAILED campaign={campaign_id} error=PROVIDER_OUTCOME_UNKNOWN")
+        return
+    kwargs: dict = {
+        "DestinationPhoneNumber": phone,
+        "MessageBody": message_template,
+        "OriginationIdentity": origination_arn,
+        "MessageType": "PROMOTIONAL" if sms_template_version is not None else "TRANSACTIONAL",
+    }
+    if _CONFIG_SET:
+        kwargs["ConfigurationSetName"] = _CONFIG_SET
+    if managed:
+        # The parent campaign may have ended (or its pre-call gate timed
+        # out) while this message waited in SQS.
+        # Recheck immediately before EUM and fail closed on policy drift.
+        run = _ddb.Table(_RUNS_TABLE).get_item(
+            Key={"planId": plan_id, "sk": f"{run_id}#{campaign_id}"},
+            ConsistentRead=True,
+        ).get("Item")
+        if (
+            not run or run.get("status") != "RUNNING"
+            or run.get("precallPolicy") != precall_policy
+            or run.get("smsTemplateVersion") != sms_template_version
+        ):
+            _update_queue_item(campaign_id, sk, "CANCELLED", sent_at=sent_at)
+            if run:
+                _increment_runs_counter(campaign_id, plan_id, run_id, "totalCancelled")
+            print(f"sms_processor: CANCELLED campaign={campaign_id}")
+            return
+    if sms_template_version is not None:
+        try:
             validate_campaign_body(message_template)
-        if precall_policy is not None:
-            # This copy announces an imminent call; do not retain it in the
-            # provider queue for the default 72 hours. Acceptance is not a
-            # guarantee of carrier delivery within this interval.
-            kwargs["TimeToLive"] = 300
-        # Opt-out enforcement: EUM SMS automatically checks the phone number's
-        # configured opt-out list (Default) — where STOP replies are recorded.
-        # Passing a separate opt-out list here would bypass real opt-outs.
+        except SmsCampaignError as exc:
+            # Never log the raw body here — it may contain PHI or the
+            # unresolved-placeholder/oversized content that triggered this.
+            _update_queue_item(campaign_id, sk, "FAILED", error_code=type(exc).__name__, sent_at=sent_at)
+            _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
+            print(f"sms_processor: FAILED campaign={campaign_id} error={type(exc).__name__}")
+            raise RuntimeError(
+                f"sms send failed campaign={campaign_id} err={type(exc).__name__}"
+            ) from None
+    if precall_policy is not None:
+        # This copy announces an imminent call; do not retain it in the
+        # provider queue for the default 72 hours. Acceptance is not a
+        # guarantee of carrier delivery within this interval.
+        kwargs["TimeToLive"] = 300
+    # Opt-out enforcement: EUM SMS automatically checks the phone number's
+    # configured opt-out list (Default) — where STOP replies are recorded.
+    # Passing a separate opt-out list here would bypass real opt-outs.
 
+    # VIP-01: the send call is deliberately isolated from bookkeeping (queue
+    # status + counters) below. A failure here means the SMS was NEVER sent —
+    # safe to classify as terminal (ValidationException) or retryable (anything
+    # else) and act accordingly. A failure AFTER a successful send (bookkeeping)
+    # must never be treated the same way — see the try/except below this one.
+    try:
         resp = _sms.send_text_message(**kwargs)
-        message_id = resp["MessageId"]
-
-        _update_queue_item(campaign_id, sk, "SENT", message_id=message_id, sent_at=sent_at)
-        _increment_runs_counter(campaign_id, plan_id, run_id, "totalSent")
-        print(f"sms_processor: SENT campaign={campaign_id} messageId={message_id}")
-
     except _sms.exceptions.ValidationException as exc:
         if "OptedOut" in str(exc):
             _update_queue_item(campaign_id, sk, "OPTED_OUT", error_code="OPTED_OUT", sent_at=sent_at)
             _increment_runs_counter(campaign_id, plan_id, run_id, "totalOptedOut")
             print(f"sms_processor: OPTED_OUT campaign={campaign_id}")
-            # Do NOT re-raise — opted-out numbers are expected, not errors
-        else:
-            # Store only the error class name — never the raw exception message (may contain PHI phone number)
-            _update_queue_item(campaign_id, sk, "FAILED", error_code=type(exc).__name__, sent_at=sent_at)
-            _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
-            print(f"sms_processor: FAILED campaign={campaign_id} error=ValidationException")
-            # Strip the original exception to prevent EUM's DestinationPhoneNumber from reaching CloudWatch
-            raise RuntimeError(
-                f"sms send failed campaign={campaign_id} err=ValidationException"
-            ) from None
-
-    except Exception as exc:
+            return  # expected outcome, not an error — do NOT re-raise
+        # Terminal: EUM rejected the request itself (bad number, bad template,
+        # etc.) — an identical retry would fail identically. Store only the
+        # error class name — never the raw exception message (may contain PHI
+        # phone number) — then mark FAILED and let it stay FAILED.
         _update_queue_item(campaign_id, sk, "FAILED", error_code=type(exc).__name__, sent_at=sent_at)
         _increment_runs_counter(campaign_id, plan_id, run_id, "totalFailed")
-        print(f"sms_processor: FAILED campaign={campaign_id} error={type(exc).__name__}")
+        print(f"sms_processor: FAILED campaign={campaign_id} error=ValidationException")
+        # Strip the original exception to prevent EUM's DestinationPhoneNumber from reaching CloudWatch
         raise RuntimeError(
-            f"sms send failed campaign={campaign_id} err={type(exc).__name__}"
+            f"sms send failed campaign={campaign_id} err=ValidationException"
         ) from None
+    except Exception as exc:
+        # VIP-01: retryable. Anything other than a validation rejection —
+        # network blip, ThrottlingException, an EUM 5xx, etc. — means the send
+        # itself never happened and a later attempt could well succeed.
+        # Previously this branch marked the item FAILED (terminal), so a
+        # redelivered SQS message for it hit ConditionalCheckFailedException
+        # on the claim above (status FAILED matches neither PENDING nor
+        # stale-SENDING) and was skipped as "already claimed" — one attempt,
+        # zero real retries, despite SQS redelivering. Revert the claim to
+        # PENDING so the very next redelivery can reclaim it immediately
+        # (rather than waiting out _STALE_SENDING_SECONDS), and raise so SQS
+        # actually redelivers it.
+        _revert_claim_to_pending(campaign_id, sk)
+        print(f"sms_processor: RETRY campaign={campaign_id} error={type(exc).__name__}")
+        raise RuntimeError(
+            f"sms send failed (retryable) campaign={campaign_id} err={type(exc).__name__}"
+        ) from None
+
+    # Send succeeded. Bookkeeping is intentionally its own try/except: a
+    # failure here (VIP-01) must never flip an already-sent message to FAILED
+    # — the SMS is gone, that fact must not be lost — and must never re-raise,
+    # since SQS redelivering would risk a duplicate send for a message whose
+    # SMS has ALREADY gone out.
+    message_id = resp["MessageId"]
+    try:
+        _update_queue_item(campaign_id, sk, "SENT", message_id=message_id, sent_at=sent_at)
+        _increment_runs_counter(campaign_id, plan_id, run_id, "totalSent")
+        print(f"sms_processor: SENT campaign={campaign_id} messageId={message_id}")
+    except Exception as exc:
+        print(
+            f"sms_processor: SENT but bookkeeping failed campaign={campaign_id} "
+            f"messageId={message_id} error={type(exc).__name__}"
+        )
+
+
+def _revert_claim_to_pending(campaign_id: str, sk: str) -> None:
+    """Revert a SENDING claim back to PENDING after a retryable send failure
+    (VIP-01), so the next SQS redelivery can reclaim it immediately instead of
+    waiting out _STALE_SENDING_SECONDS.
+
+    Best-effort: if this write itself fails, the stale-SENDING claim-recovery
+    path in _process's initial claim step still recovers the item once
+    _STALE_SENDING_SECONDS elapses — so a failure here delays retry, it does
+    not lose the item.
+    """
+    try:
+        _ddb.Table(_QUEUE_TABLE).update_item(
+            Key={"campaignId": campaign_id, "sk": sk},
+            UpdateExpression="SET #s = :pending, updatedAt = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":pending": "PENDING",
+                ":t": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as exc:
+        print(
+            f"sms_processor: revert_to_pending failed campaign={campaign_id} "
+            f"error={type(exc).__name__}"
+        )
 
 
 def _update_queue_item(

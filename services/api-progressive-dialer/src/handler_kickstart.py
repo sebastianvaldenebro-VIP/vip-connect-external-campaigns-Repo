@@ -168,7 +168,11 @@ def _try_dispatch(
     Returns True if a contact was successfully enqueued to SQS, False otherwise.
     Releases the lock on any failure so the agent remains available for the consumer.
     """
-    if not _get_lock().acquire(agent_arn, campaign_id=campaign_id):
+    # VIP-04: lock_token fences this specific lock generation — every
+    # release() call below (and the one propagated to the caller Lambda via
+    # the SQS message) must use THIS exact token.
+    lock_token = _get_lock().acquire(agent_arn, campaign_id=campaign_id)
+    if not lock_token:
         logger.info("kickstart lock already held agent=...%s", agent_arn[-12:])
         return False
 
@@ -181,7 +185,7 @@ def _try_dispatch(
     try:
         contact = _get_queue().dequeue(campaign_id)
         if contact is None:
-            _get_lock().release(agent_arn)
+            _get_lock().release(agent_arn, lock_token)
             logger.info(
                 "kickstart queue empty after lock acquire campaign_id=%s", campaign_id
             )
@@ -206,6 +210,9 @@ def _try_dispatch(
                 "contactFlowId": contact_flow_id,
                 "sourcePhone": source_phone,
                 "correlationId": correlation_id,
+                # VIP-04: propagated so the caller Lambda's release() calls
+                # fence against this exact lock generation.
+                "lockToken": lock_token,
             }),
             DelaySeconds=_SQS_DELAY_SECONDS,
         )
@@ -216,7 +223,7 @@ def _try_dispatch(
         )
         return True
     except Exception:
-        _get_lock().release(agent_arn)
+        _get_lock().release(agent_arn, lock_token)
         raise
 
 

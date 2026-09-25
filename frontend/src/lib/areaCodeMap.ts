@@ -13,6 +13,8 @@ export const STATE_DEFAULT_PHONES: Record<string, string> = {
   SCA:        '+18588686651',  // South CA
   NCA:        '+16694674988',  // North CA
   PA:         '+12154009167',  // PA - Vein Leads (Philadelphia, area code 215)
+  VA:         '+18042994502',  // VA - Vein Leads (Reston front desk)
+  GA:         '+14048014073',  // GA - Georgia Leads (Johns Creek / Sandy Springs front desk)
 };
 
 /** Normalize any phone format to digits-only for comparison (strips +, spaces, dashes). */
@@ -56,6 +58,8 @@ export function pickPhoneForStates<T extends { number: string }>(
     MD:  ['240', '301', '410', '443', '667'],
     LI:  ['516', '631'],
     PA:  ['215'],
+    VA:  ['703', '571'],
+    GA:  ['404', '470', '678', '770'],
   };
   const targetCodes = new Set<string>();
   for (const state of states) {

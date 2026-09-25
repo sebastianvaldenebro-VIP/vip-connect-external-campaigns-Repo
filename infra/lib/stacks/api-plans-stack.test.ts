@@ -161,8 +161,11 @@ describe('ApiPlansStack', () => {
         ['AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy'].map((type) =>
           [type, template.findResources(type)]),
       );
+      // Updated for the scoped dynamodb:PutItem grant on VipLocationMapping
+      // (auto_onboard_known_state_locations) — an intentional new IAM
+      // statement, not drift.
       expect(createHash('sha256').update(JSON.stringify(iamResources)).digest('hex'))
-        .toBe('63319c9f23794bf61f08b34877d08820a8427bf7cc51bb51f6d2a63d68e27c7a');
+        .toBe('4d2be2117bb37e23d9c5f23f6f91500f54f65dc9dfbe207aaeab4ebdd2027e18');
     });
 
     it('provisions a cleanup rule independent of plan schedules and targets the real action', () => {
@@ -448,10 +451,14 @@ describe('ApiPlansStack', () => {
       expect(actions).toEqual(expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:PutItem']));
     });
 
-    it('grants read access to the imported VipLocationMapping table unconditionally', () => {
+    it('grants read and scoped write access to the imported VipLocationMapping table', () => {
       const actions = actionsForResource(policyStatements(template), 'VipLocationMapping');
-      expect(actions).toEqual(expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:Query']));
-      expect(actions).not.toContain('dynamodb:PutItem');
+      expect(actions).toEqual(
+        expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:PutItem']),
+      );
+      expect(actions).not.toContain('dynamodb:UpdateItem');
+      expect(actions).not.toContain('dynamodb:DeleteItem');
+      expect(actions).not.toContain('dynamodb:BatchWriteItem');
     });
 
     it('grants encrypt/decrypt on the imported data CMK (no key policy available, so scoped to *)', () => {

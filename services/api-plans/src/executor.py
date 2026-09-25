@@ -54,6 +54,7 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 from builders import (
     _JOURNEY_FLOW_NAME,
     all_known_locations,
+    auto_onboard_known_state_locations,
     build_campaign_params,
     build_segment_name,
     campaign_to_segment_filters,
@@ -5599,6 +5600,12 @@ def _create_segment(
                 seen.add(cid)
                 raw_phone = str(record.get("phone", "")).strip()
                 entries.append((cid, _normalize_phone_e164(raw_phone), raw_phone))
+
+    if unknown_locs:
+        try:
+            unknown_locs = auto_onboard_known_state_locations(unknown_locs)
+        except Exception as exc:
+            logger.warning("auto_onboard_known_state_locations failed: %s", exc)
 
     if unknown_locs:
         _slog.warn("unknown_locations_detected", locations=sorted(unknown_locs))
