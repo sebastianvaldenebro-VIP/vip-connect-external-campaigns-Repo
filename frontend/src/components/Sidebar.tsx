@@ -42,6 +42,12 @@ const NAV_ICONS: Record<string, ReactNode> = {
       <path d="M9.5 9.5l3 3" strokeLinecap="round" />
     </svg>
   ),
+  '/sms': (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0">
+      <path d="M3 3h14v11H8l-5 3V3z" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M6 7h8M6 10h5" strokeLinecap="round" />
+    </svg>
+  ),
   '/campaigns': (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4 shrink-0">
       <path d="M3 8l14-4v12L3 12V8z" strokeLinecap="round" strokeLinejoin="round" />

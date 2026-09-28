@@ -41,6 +41,7 @@ export interface ApiSegmentsStackProps extends cdk.StackProps {
 export class ApiSegmentsStack extends cdk.Stack {
   public readonly lambdaFunction: lambda.Function;
   public readonly snapshotBucket: s3.Bucket;
+  public readonly snapshotRole: iam.Role;
   public readonly sharedLayer: lambda.LayerVersion;
 
   constructor(scope: Construct, id: string, props: ApiSegmentsStackProps) {
@@ -109,6 +110,7 @@ export class ApiSegmentsStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('profile.amazonaws.com'),
       description: 'Role passed to Customer Profiles for segment snapshot writes',
     });
+    this.snapshotRole = snapshotRole;
     this.snapshotBucket.grantWrite(snapshotRole);
     props.dataKey.grantEncryptDecrypt(snapshotRole);
 

@@ -165,13 +165,19 @@ export const metrics = new ApiMetricsStack(app, 'VipAdminApiMetricsStack', {
 //   - EUM SMS Opt-Out List: vip-sms-opt-out
 //   - DDB tables: VipSmsCampaignQueue, VipSmsCampaignRuns (pre-created via CLI)
 //   - SQS queues: vip-sms-campaign-queue + vip-sms-campaign-queue-dlq (pre-created via CLI)
-//   - IAM roles: vip-sms-sender-role, vip-sms-processor-role (pre-created via CLI)
-//   - Log groups: /aws/lambda/vip-admin-sms-sender, /aws/lambda/vip-admin-sms-processor
+//   - IAM roles: vip-sms-sender-role, vip-sms-processor-role (pre-created via CLI;
+//       vip-sms-sender-role is reused as-is by the retry Lambda below — no new role)
+//   - Log groups: /aws/lambda/vip-admin-sms-sender, /aws/lambda/vip-admin-sms-processor,
+//       /aws/lambda/vip-admin-sms-retry-quiet-hours (KMS-encrypted, see api-sms-stack.ts's
+//       SmsRetryQuietHoursFunction comment for the exact pre-create CLI commands)
 export const smsStack = new ApiSmsStack(app, 'VipAdminApiSmsStack', {
   env,
   description: 'SMS Campaign — bulk SMS via EUM SMS, SQS-driven processor',
   dataKeyArn: progressiveDialerDataKeyArn,
   profilesDomainName,
+  snapshotBucketName: segments.snapshotBucket.bucketName,
+  snapshotRoleArn: segments.snapshotRole.roleArn,
+  snapshotKeyArn: data.dataKey.keyArn,
   smsConfigSetName: (app.node.tryGetContext('smsConfigSetName') as string) ?? 'vip-sms-config-set',
   smsOptOutListName: (app.node.tryGetContext('smsOptOutListName') as string) ?? 'vip-sms-opt-out',
   permissionsBoundaryName,
@@ -198,6 +204,7 @@ export const plans = new ApiPlansStack(app, 'VipAdminApiPlansStack', {
   smsCampaignQueueTable:          smsStack.smsCampaignQueueTable,
   smsRunsTable:                   smsStack.smsRunsTable,
   smsSenderFunctionArn:           smsStack.smsSenderFunction.functionArn,
+  smsRetryFunctionArn:            smsStack.smsRetryQuietHoursFunction.functionArn,
   locationMappingStreamArn:       'arn:aws:dynamodb:us-east-1:165505826690:table/VipLocationMapping/stream/2026-08-18T21:05:11.209',
 });
 

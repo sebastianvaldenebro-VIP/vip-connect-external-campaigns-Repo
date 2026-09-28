@@ -73,10 +73,20 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     const err = typeof payload.error === 'object' && payload.error !== null
       ? (payload.error as Record<string, unknown>)
       : payload;
+    // The plans API returns validation failures as { messages: string[] }
+    // (plural, a list) rather than the singular `message` this client
+    // otherwise expects. Without this, every plan validation error — branded,
+    // bulk-SMS, and pre-call SMS alike — surfaced in the UI as a bare
+    // "HTTP 400" with all specifics discarded.
+    const messages = Array.isArray((err as { messages?: unknown }).messages)
+      ? ((err as { messages: unknown[] }).messages.filter((m) => typeof m === 'string') as string[])
+      : [];
     const message =
       typeof err.message === 'string' && err.message
         ? err.message
-        : `HTTP ${res.status}`;
+        : messages.length
+          ? messages.join('\n')
+          : `HTTP ${res.status}`;
     throw new ApiRequestError({
       status: res.status,
       code: typeof err.code === 'string' ? err.code : undefined,
@@ -306,24 +316,52 @@ export type BucketSegmentFilters = {
   available: string;
 };
 
+export type PrecallSmsConfig = {
+  enabled: boolean;
+  /** Omitted mode preserves the existing manual-template behavior. */
+  mode?: 'manual' | 'profile';
+  catalogVersion?: 'phase1-v1';
+  originationNumberArn: string;
+  /** Manual mode only; profile mode selects the message variant per recipient. */
+  messageTemplate?: string;
+  /** Campaign clinic; blank or omitted in profile mode omits the clinic mention. */
+  clinicName?: string;
+};
+
 export type BucketCampaignConfig = {
-  queueId: string;
-  contactFlowId: string;
-  sourcePhoneNumber: string;
-  dialerType: string;
-  bandwidthAllocation: number;
-  dialingCapacity: number;
-  amdEnabled: boolean;
-  amdAwaitPrompt: boolean;
+  /** Voice settings are optional for campaigns delivered only by SMS. */
+  queueId?: string;
+  contactFlowId?: string;
+  sourcePhoneNumber?: string;
+  dialerType?: string;
+  bandwidthAllocation?: number;
+  dialingCapacity?: number;
+  amdEnabled?: boolean;
+  amdAwaitPrompt?: boolean;
   campaignFlowArn?: string;
   /** Full routing queue ARN — required for deliveryType='branded' */
   queueArn?: string;
   /** EUM SMS origination number ARN — required for deliveryType='sms' */
   smsOriginationNumberArn?: string;
-  /** SMS message template (≤160 chars, no PHI) — required for deliveryType='sms' */
+  /** Omitted version retains legacy SMS validation; campaign-v1 permits the booking template. */
+  smsTemplateVersion?: 'campaign-v1';
+  /** SMS message template; campaign-v1 supports personalized multipart messages. */
   smsMessageTemplate?: string;
   /** Staff acknowledgment that template contains no PHI — required for deliveryType='sms' */
   phiAcknowledged?: boolean;
+  /**
+   * Bulk SMS: interpolated into {{ClinicName}} if smsMessageTemplate uses it.
+   * Distinct from precallSms.clinicName — the two channels may use different
+   * clinic names for different specialties/contexts.
+   */
+  clinicName?: string;
+  /**
+   * Pre-call SMS for this campaign's segment. Profile mode resolves approved
+   * name and specialty from each recipient, with an optional campaign clinic;
+   * omitted/manual mode retains the
+   * existing template configuration. Initialization is not a delivery receipt.
+   */
+  precallSms?: PrecallSmsConfig;
 };
 
 export type SmsOriginationNumber = {
@@ -335,6 +373,9 @@ export type SmsOriginationNumber = {
   twoWayEnabled: boolean;
   optOutListName: string;
   status: string;
+  /** Optional for compatibility with older API responses; SMS campaigns require both. */
+  messageType?: 'TRANSACTIONAL' | 'PROMOTIONAL';
+  numberCapabilities?: string[];
 };
 
 export type SmsCampaignRunRecord = {

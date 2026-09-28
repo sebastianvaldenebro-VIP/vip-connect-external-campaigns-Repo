@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from builders import build_create_campaign_params
@@ -56,10 +58,9 @@ def test_segment_source_produces_expected_nested_structure():
     assert amd["awaitAnswerMachinePrompt"] is True
 
     assert params["schedule"]["startTime"] == "2026-04-23T14:00:00Z"
-    assert (
-        params["communicationTimeConfig"]["localTimeZoneConfig"]["defaultTimeZone"]
-        == "America/New_York"
-    )
+    assert params["communicationTimeConfig"]["localTimeZoneConfig"] == {
+        "localTimeZoneDetection": ["AREA_CODE"]
+    }
 
 
 def test_owner_tag_is_added_when_instance_arn_provided():
@@ -117,9 +118,16 @@ def test_create_without_campaign_flow_arn_omits_field():
     assert "connectCampaignFlowArn" not in params_blank
 
 
-def test_event_trigger_source_strips_communication_time_config():
+@pytest.mark.parametrize(
+    "communication_time", [None, {"timezone": "America/Los_Angeles"}]
+)
+def test_event_trigger_source_strips_communication_time_config(communication_time):
     body = _base_body()
     del body["segmentArn"]  # no segment → falls back to event trigger
+    if communication_time is None:
+        body.pop("communicationTime")
+    else:
+        body["communicationTime"] = communication_time
 
     params = build_create_campaign_params(
         body,
@@ -180,3 +188,146 @@ def test_communication_limits_translation():
     assert per_day["maxCountPerRecipient"] == 3
     assert per_week["maxCountPerRecipient"] == 10
     assert per_month["maxCountPerRecipient"] == 20
+
+
+_CONTACT_DAYS = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"]
+
+
+@pytest.mark.parametrize("legacy_timezone", ["America/New_York", "America/Los_Angeles"])
+def test_communication_time_config_uses_per_recipient_area_code_detection(
+    legacy_timezone,
+):
+    """AWS rejects defaultTimeZone together with localTimeZoneDetection.
+
+    Legacy UI timezone values must not reintroduce a fixed zone when recipient
+    detection is selected; botocore's shape validation does not catch this.
+    """
+    body = _base_body()
+    body["communicationTime"] = {"timezone": legacy_timezone}
+    params = build_create_campaign_params(
+        body,
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    ltz = params["communicationTimeConfig"]["localTimeZoneConfig"]
+    assert ltz["localTimeZoneDetection"] == ["AREA_CODE"]
+    assert "defaultTimeZone" not in ltz
+
+
+def test_communication_time_config_sets_telephony_open_hours_monday_to_saturday():
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert sorted(daily) == sorted(_CONTACT_DAYS)
+    for day in _CONTACT_DAYS:
+        assert daily[day] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+
+
+def test_sunday_key_is_absent_from_daily_hours():
+    """No contact on Sunday. Encoded by OMITTING the key, not by an empty list —
+    see the shape table: both are syntactically valid, and this is the one whose
+    semantics we are betting on. Task 7 verifies it against a real dial attempt.
+    """
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert "SUNDAY" not in daily
+
+
+def test_open_hours_times_carry_the_iso8601_t_prefix():
+    """Iso8601Time's pattern is T\\d{2}:\\d{2}.
+
+    botocore does NOT enforce string patterns, so a missing T validates clean
+    locally and is sent to the service — this test is the only thing standing
+    between a typo and a rejected (or misread) CreateCampaign in production.
+    Nothing else in this repo uses openHours, so there is no precedent to
+    compare against.
+    """
+    params = build_create_campaign_params(
+        _base_body(),
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    for ranges in daily.values():
+        for rng in ranges:
+            assert rng["startTime"].startswith("T")
+            assert rng["endTime"].startswith("T")
+
+
+def test_builders_module_imports_and_builds_open_hours_with_phonenumbers_blocked():
+    """Regression guard for the api-plans/api-campaigns cold-start outage:
+    builders.py must import (and its openHours builder must still work) even
+    when `phonenumbers` is not importable.
+
+    builders.py imports `connect_open_hours` from
+    vip_shared.domain.services.connect_open_hours, which is intentionally
+    kept free of any phonenumbers dependency — unlike its sibling
+    quiet_hours.py (the per-recipient SMS gate), which unconditionally
+    `import phonenumbers` at module scope. api-campaigns's Lambda layer is
+    built from plain requirements.txt (no phonenumbers; only api-sms's layer
+    has it via requirements-sms.txt — see infra/lib/utils/shared-layer.ts).
+    If builders.py ever re-imports from quiet_hours.py instead, every
+    api-campaigns cold start crashes with ModuleNotFoundError.
+
+    `phonenumbers` is ambiently pip-installed on dev machines, which is
+    exactly how this bug shipped invisibly through a full green pytest run
+    before. This test blocks it for real via `sys.modules['phonenumbers'] =
+    None` and forces a FRESH import of both builders.py and
+    connect_open_hours.py (popping any cached module first — a cached
+    module's already-executed import statements wouldn't be re-run and would
+    hide a regression).
+    """
+    _OPEN_HOURS_MODULE = "vip_shared.domain.services.connect_open_hours"
+    saved_builders = sys.modules.pop("builders", None)
+    saved_open_hours = sys.modules.pop(_OPEN_HOURS_MODULE, None)
+    saved_phonenumbers = sys.modules.get("phonenumbers")
+    sys.modules["phonenumbers"] = None  # type: ignore[assignment]
+    try:
+        import builders as fresh_builders
+
+        params = fresh_builders.build_create_campaign_params(
+            _base_body(),
+            connect_instance_id="instance-1",
+            profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+        )
+    finally:
+        del sys.modules["phonenumbers"]
+        if saved_phonenumbers is not None:
+            sys.modules["phonenumbers"] = saved_phonenumbers
+        sys.modules.pop("builders", None)
+        sys.modules.pop(_OPEN_HOURS_MODULE, None)
+        if saved_builders is not None:
+            sys.modules["builders"] = saved_builders
+        if saved_open_hours is not None:
+            sys.modules[_OPEN_HOURS_MODULE] = saved_open_hours
+
+    daily = params["communicationTimeConfig"]["telephony"]["openHours"]["dailyHours"]
+    assert sorted(daily) == sorted(_CONTACT_DAYS)
+    assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
+    assert "SUNDAY" not in daily
+
+
+def test_communication_time_config_emitted_even_without_communication_time_key():
+    """Previously a segment campaign created without body['communicationTime']
+    got NO communicationTimeConfig at all — i.e. zero quiet-hours enforcement.
+    That hole is the point of this change."""
+    body = _base_body()
+    body.pop("communicationTime", None)
+    params = build_create_campaign_params(
+        body,
+        connect_instance_id="instance-1",
+        profiles_domain_arn="arn:aws:profile:us-east-1:123:domains/d",
+    )
+    assert "communicationTimeConfig" in params
+    ctc = params["communicationTimeConfig"]
+    assert ctc["localTimeZoneConfig"] == {"localTimeZoneDetection": ["AREA_CODE"]}
+    assert ctc["telephony"]["openHours"]["dailyHours"] == {
+        day: [{"startTime": "T08:00", "endTime": "T21:00"}] for day in _CONTACT_DAYS
+    }

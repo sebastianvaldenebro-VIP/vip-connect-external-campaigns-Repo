@@ -71,6 +71,46 @@ def _context(request_id: str = "req-1"):
     return ctx
 
 
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_profile_cleanup_action_drains_independently_of_new_start_flag(monkeypatch, enabled):
+    monkeypatch.setenv("PROFILE_VOICE_CLEANUP_ENABLED", enabled)
+    cleanup = MagicMock()
+    cleanup.reap.return_value = {"ok": True, "processed": 2, "pending": 1}
+    context = _context()
+    with patch.dict(sys.modules, {"profile_voice_cleanup": cleanup}), patch("handler.resolve") as resolve:
+        result = handler.lambda_handler({"action": "profile_voice_cleanup"}, context)
+    assert result == {"ok": True, "processed": 2, "pending": 1}
+    cleanup.reap.assert_called_once_with(context=context)
+    resolve.assert_not_called()
+
+
+def test_profile_cleanup_failure_propagates_for_lambda_retry_without_private_error():
+    cleanup = MagicMock()
+    cleanup.reap.side_effect = RuntimeError("private profile detail")
+    with patch.dict(sys.modules, {"profile_voice_cleanup": cleanup}), patch("handler._logger") as logger:
+        with pytest.raises(RuntimeError, match="Profile voice cleanup failed") as failure:
+            handler.lambda_handler({"action": "profile_voice_cleanup"}, _context())
+    assert "private profile detail" not in str(failure.value)
+    assert failure.value.__suppress_context__ is True
+    logger.error.assert_called_once_with("profile_voice_cleanup_failed", error_type="RuntimeError")
+
+
+def test_profile_cleanup_failed_rows_propagate_without_private_result_details():
+    cleanup = MagicMock()
+    cleanup.reap.return_value = {
+        "ok": False,
+        "processed": 1,
+        "counts": {"failed": 1},
+        "error": "private profile detail",
+    }
+    with patch.dict(sys.modules, {"profile_voice_cleanup": cleanup}), patch("handler._logger") as logger:
+        with pytest.raises(RuntimeError, match="^Profile voice cleanup failed$") as failure:
+            handler.lambda_handler({"action": "profile_voice_cleanup"}, _context())
+    assert "private profile detail" not in str(failure.value)
+    assert failure.value.__suppress_context__ is True
+    logger.error.assert_called_once_with("profile_voice_cleanup_failed", error_type="RuntimeError")
+
+
 class TestTickAction:
     def test_tick_success_returns_executor_result(self):
 

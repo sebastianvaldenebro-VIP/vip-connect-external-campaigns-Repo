@@ -30,6 +30,8 @@ def list_origination_numbers(event: dict, _path_params: dict) -> dict:
                     "twoWayEnabled": n.get("TwoWayEnabled", False),
                     "optOutListName": n.get("OptOutListName", ""),
                     "status": n.get("Status", "ACTIVE"),
+                    "messageType": n.get("MessageType", ""),
+                    "numberCapabilities": n.get("NumberCapabilities", []),
                 }
             )
 

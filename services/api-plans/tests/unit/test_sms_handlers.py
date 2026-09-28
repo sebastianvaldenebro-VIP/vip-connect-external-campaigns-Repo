@@ -46,6 +46,8 @@ def _make_phone_number(arn: str, number: str, number_type: str = "TEN_DLC") -> d
         "TwoWayEnabled": False,
         "OptOutListName": "vip-sms-opt-out",
         "Status": "ACTIVE",
+        "MessageType": "TRANSACTIONAL",
+        "NumberCapabilities": ["SMS", "VOICE"],
     }
 
 
@@ -104,6 +106,22 @@ def test_list_origination_numbers_fields():
     assert num["status"] == "ACTIVE"
     assert num["twoWayEnabled"] is False
     assert num["optOutListName"] == "vip-sms-opt-out"
+    assert num["messageType"] == "TRANSACTIONAL"
+    assert num["numberCapabilities"] == ["SMS", "VOICE"]
+
+
+def test_discovery_preserves_both_message_types_and_does_not_assume_missing_capabilities():
+    transactional = _make_phone_number("arn:tx", "+15125551234")
+    promotional = {**_make_phone_number("arn:promo", "+15125551235"), "MessageType": "PROMOTIONAL"}
+    unknown = _make_phone_number("arn:unknown", "+15125551236")
+    unknown.pop("MessageType")
+    unknown.pop("NumberCapabilities")
+    mock_client = MagicMock()
+    mock_client.get_paginator.return_value = _paginator([[transactional], [promotional, unknown]])
+    with patch.object(sms_handler, "_sms", mock_client):
+        numbers = json.loads(sms_handler.list_origination_numbers({}, {})["body"])["originationNumbers"]
+    assert [number["messageType"] for number in numbers] == ["TRANSACTIONAL", "PROMOTIONAL", ""]
+    assert numbers[-1]["numberCapabilities"] == []
 
 
 def test_list_origination_numbers_filter_active_sent_to_paginator():

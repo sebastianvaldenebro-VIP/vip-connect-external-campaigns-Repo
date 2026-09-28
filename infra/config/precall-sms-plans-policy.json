@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PrecallCampaignPauseResume",
+      "Effect": "Allow",
+      "Action": [
+        "connect-campaigns:PauseCampaign",
+        "connect-campaigns:ResumeCampaign"
+      ],
+      "Resource": "arn:aws:connect-campaigns:us-east-1:165505826690:campaign/*"
+    },
+    {
+      "Sid": "InvokeSmsRetryQuietHours",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:us-east-1:165505826690:function:vip-admin-sms-retry-quiet-hours"
+    },
+    {
+      "Sid": "PrecallCampaignSchedule",
+      "Effect": "Allow",
+      "Action": "connect-campaigns:UpdateCampaignSchedule",
+      "Resource": "arn:aws:connect-campaigns:us-east-1:165505826690:campaign/*"
+    }
+  ]
+}

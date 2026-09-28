@@ -115,7 +115,7 @@ class TestPrestartPlan:
             patch("executor.get_latest_run", return_value=None),
             patch(
                 "executor._create_campaign_only",
-                return_value=("conn-1", "seg-1", "arn:seg", True, None, None),
+                return_value=("conn-1", "seg-1", "arn:seg", True, None, None, None),
             ),
             patch("executor.update_plan_pending_warmup") as mock_update,
         ):
@@ -150,7 +150,7 @@ class TestPrestartPlan:
             patch("executor.get_latest_run", return_value=None),
             patch(
                 "executor._create_campaign_only",
-                return_value=("conn-1", "seg-1", "arn:seg", True, None, None),
+                return_value=("conn-1", "seg-1", "arn:seg", True, None, None, None),
             ) as mock_create,
             patch("executor.update_plan_pending_warmup") as mock_update,
         ):
@@ -179,7 +179,7 @@ class TestPrestartPlan:
             patch(
                 "executor._create_campaign_only",
                 side_effect=[
-                    ("conn-1", "seg-1", "arn:seg", True, None, None),
+                    ("conn-1", "seg-1", "arn:seg", True, None, None, None),
                     RuntimeError("Redis unavailable"),
                 ],
             ),

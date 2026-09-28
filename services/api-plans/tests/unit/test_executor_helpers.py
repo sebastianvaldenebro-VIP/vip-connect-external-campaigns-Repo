@@ -159,7 +159,7 @@ class TestInvokeSmsSender:
     def test_invokes_lambda_with_json_payload(self, monkeypatch):
         monkeypatch.setenv("SMS_SENDER_FUNCTION_ARN", "arn:aws:lambda:us-east-1:123:function:sms-sender")
         fake_client = MagicMock()
-        fake_client.invoke.return_value = {"FunctionError": None}
+        fake_client.invoke.return_value = {"FunctionError": None, "Payload": MagicMock(read=MagicMock(return_value=b'{"enqueued":0}'))}
         with patch.object(executor, "_get_lambda_client", return_value=fake_client):
             executor._invoke_sms_sender(campaignId="c1")
         call_kwargs = fake_client.invoke.call_args.kwargs

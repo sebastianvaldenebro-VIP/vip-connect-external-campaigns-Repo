@@ -114,7 +114,7 @@ class TestMidFlightSaveFailure:
         with (
             patch(
                 "executor._create_campaign_only",
-                return_value=("connect-1", "seg-1", "arn:seg", True, None, None),
+                return_value=("connect-1", "seg-1", "arn:seg", True, None, None, None),
             ),
             patch("executor.save_run", side_effect=[None, RuntimeError("DDB throttled")]),
         ):

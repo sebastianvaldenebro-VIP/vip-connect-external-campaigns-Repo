@@ -14,6 +14,7 @@ from vip_shared.infrastructure.persistence.audit import build_from_env as build_
 import builders
 import executor
 import scheduler_manager
+import sms_origination
 import store
 
 
@@ -164,6 +165,8 @@ def create_plan(event: dict, _path_params: dict) -> dict:
         _validate_trigger_no_cycle(None, trigger, store.list_plans())
 
     branded_errors = _validate_plan_body(body)
+    if not branded_errors:
+        branded_errors.extend(sms_origination.validate_plan_origins(body))
     if branded_errors:
         return json_response(
             400,
@@ -230,6 +233,9 @@ def update_plan(event: dict, path_params: dict) -> dict:
         "schedule",
     )
     updated = {**existing, **{k: v for k, v in body.items() if k in allowed}}
+    origin_errors = sms_origination.validate_plan_origins(updated)
+    if origin_errors:
+        return json_response(400, {"error": {"code": "VALIDATION_ERROR", "messages": origin_errors}})
     plan = store.put_plan(updated)
 
     is_template = updated.get("isTemplate") or updated.get("is_template")
@@ -500,46 +506,165 @@ def _validate_branded_campaign(campaign: dict, bucket_name: str, ci: int) -> lis
     return errors
 
 
-def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[str]:
-    """Return validation errors for an SMS campaign's required config fields + PHI guard."""
+# Ceiling for a *rendered* SMS body (GSM-7, single segment). Named so the
+# frontend character counter (Task 6) and the length tests below agree on one
+# source of truth instead of a bare 160 scattered across the codebase.
+_MAX_SMS_CHARS = 160
+
+# deliveryTypes that actually place a dial — the only ones a pre-call SMS can
+# meaningfully precede. 'sms' has no dial to precede.
+_VOICE_DELIVERY_TYPES = {"campaign", "branded", "journey"}
+
+
+def _screen_sms_template_content(
+    tmpl: str, prefix: str, field_name: str, render_campaign: dict
+) -> list[str]:
+    """Screen a present (non-empty) SMS template string: non-allowlisted
+    placeholders, rendered-length overflow, and PHI patterns.
+
+    Shared by _validate_sms_campaign (smsMessageTemplate) and
+    _validate_precall_sms (precallSms.messageTemplate) so the bulk-SMS and
+    pre-call channels can never drift apart in what content they allow.
+    Callers own the "is the template present at all" check — this only
+    screens content that IS present.
+
+    `render_campaign` is passed straight through to max_rendered_length's
+    `campaign=` kwarg (render()'s source for {{ClinicName}}): the bulk-SMS
+    campaign passes its own campaignConfig, precall passes the precallSms
+    block itself, since that is where its own clinicName lives.
+    """
     import re as _re
 
+    from vip_shared.domain.services.sms_template import (
+        ALLOWED_FIELDS,
+        extract_placeholders,
+        max_rendered_length,
+        render,
+        strip_placeholders,
+    )
+
+    errors: list[str] = []
+
+    # Placeholder policy: a NAMED ALLOWLIST, not a blanket ban.
+    # The blanket {{...}} ban existed partly because no renderer existed —
+    # sms_processor_handler passes the template verbatim to EUM, so a
+    # placeholder would reach the patient as literal braces. That renderer now
+    # exists (vip_shared.domain.services.sms_template), so the ban narrows to
+    # "only these fields". Everything else stays blocked, and ${...} stays
+    # banned outright because no renderer supports it.
+    rendered_for_screen = None
+    unknown = extract_placeholders(tmpl) - ALLOWED_FIELDS
+    if unknown:
+        errors.append(
+            f"{prefix}: {field_name} uses non-allowlisted placeholder(s) "
+            f"{sorted(unknown)}. Allowed: {sorted(ALLOWED_FIELDS)}."
+        )
+    else:
+        try:
+            rendered_len = max_rendered_length(tmpl, campaign=render_campaign)
+            # No recipient data is needed: the renderer uses its neutral name
+            # fallback and the actual clinic value, preserving substitution
+            # boundaries that can assemble a prohibited value.
+            rendered_for_screen = render(tmpl, recipient={}, campaign=render_campaign)
+        except ValueError:
+            errors.append(
+                f"{prefix}: {field_name} contains malformed or unresolved placeholder "
+                "syntax. Use only {{FirstName}} and {{ClinicName}}."
+            )
+        else:
+            if rendered_len > _MAX_SMS_CHARS:
+                errors.append(
+                    f"{prefix}: {field_name} must render to ≤{_MAX_SMS_CHARS} chars "
+                    f"(worst case {rendered_len})"
+                )
+
+    # Active PHI detection — block templates with identifiable information
+    _PHI_PATTERNS = [
+        (_re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "SSN-like number"),
+        (_re.compile(r"\b\d{3}\s\d{2}\s\d{4}\b"), "SSN-like number"),
+        (_re.compile(r"\S+@\S+\.\S+"), "email address"),
+        (_re.compile(r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b"), "date with day/month"),
+        (_re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "ISO date (possible DOB)"),
+        (_re.compile(r"\b\d{7,}\b"), "long numeric ID (possible MRN/account)"),
+        (_re.compile(r"https?://"), "URL"),
+        (_re.compile(r"\$\{[^}]+\}"), "template placeholder"),
+        (
+            _re.compile(r"\b(?:diagnosis|dx|condition|prescribed|medication)\b", _re.IGNORECASE),
+            "clinical term",
+        ),
+    ]
+    # Run the remaining PHI patterns against the template with placeholders
+    # stripped, so an allowlisted placeholder cannot itself trip a pattern
+    # (e.g. the clinical-term regex) while real violations elsewhere in the
+    # copy still do.
+    #
+    # Must use strip_placeholders (== extract_placeholders'/render()'s own
+    # \{\{\s*(\w+)\s*\}\} regex), NOT a broader hand-rolled pattern like
+    # `\{\{[^}]+\}\}` — that broader pattern would also match and delete
+    # something like {{123-45-6789}} or {{jane@example.com}}, which is
+    # neither a recognized placeholder (extract_placeholders ignores it, so
+    # the unknown-placeholder check above never fires) nor substituted by
+    # render() (it's left untouched in the outbound SMS verbatim). Stripping
+    # only well-formed tokens here ensures anything shaped like {{...}} but
+    # not a valid placeholder stays in `scannable` for the PHI patterns below
+    # to catch.
+    #
+    # Keep scanning the clinic value independently, and also screen the real
+    # substitution boundaries: "123-{{ClinicName}}-6789" with clinicName "45"
+    # assembles an SSN even though neither input matches the pattern alone.
+    clinic_name = str(render_campaign.get("clinicName") or "")
+    scannable = [strip_placeholders(tmpl), clinic_name]
+    if rendered_for_screen is not None:
+        scannable.append(rendered_for_screen)
+    violations = [
+        label for pattern, label in _PHI_PATTERNS
+        if any(pattern.search(text) for text in scannable)
+    ]
+    if violations:
+        errors.append(
+            f"{prefix}: {field_name} may contain PHI — detected: "
+            f"{', '.join(violations)}. Remove identifying information."
+        )
+
+    return errors
+
+
+def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[str]:
+    """Return validation errors for an SMS campaign's required config fields + PHI guard."""
     errors = []
     cfg = campaign.get("campaignConfig") or {}
     prefix = f"bucket '{bucket_name}' campaign[{ci}]"
 
     tmpl = cfg.get("smsMessageTemplate", "")
-    if not tmpl:
+    if "smsTemplateVersion" in cfg:
+        from vip_shared.domain.services.sms_campaign import validate_template, validate_version
+
+        try:
+            validate_version(cfg["smsTemplateVersion"])
+            validate_template(tmpl)
+        except ValueError as exc:
+            errors.append(f"{prefix}: smsMessageTemplate: {exc}")
+        if cfg.get("phiAcknowledged") is not True:
+            errors.append(f"{prefix}: campaign SMS requires phiAcknowledged=true")
+    elif not tmpl:
         errors.append(f"{prefix}: deliveryType='sms' requires campaignConfig.smsMessageTemplate")
-    elif len(tmpl) > 160:
-        errors.append(
-            f"{prefix}: smsMessageTemplate must be ≤160 chars (got {len(tmpl)})"
-        )
     else:
-        # Active PHI detection — block templates with identifiable information
-        _PHI_PATTERNS = [
-            (_re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "SSN-like number"),
-            (_re.compile(r"\b\d{3}\s\d{2}\s\d{4}\b"), "SSN-like number"),
-            (_re.compile(r"\S+@\S+\.\S+"), "email address"),
-            (_re.compile(r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b"), "date with day/month"),
-            (_re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "ISO date (possible DOB)"),
-            (_re.compile(r"\b\d{7,}\b"), "long numeric ID (possible MRN/account)"),
-            (_re.compile(r"https?://"), "URL"),
-            (_re.compile(r"\{\{[^}]+\}\}"), "template placeholder"),
-            (_re.compile(r"\$\{[^}]+\}"), "template placeholder"),
-            (
-                _re.compile(r"\b(?:diagnosis|dx|condition|prescribed|medication)\b", _re.IGNORECASE),
-                "clinical term",
-            ),
-        ]
-        violations = [label for pattern, label in _PHI_PATTERNS if pattern.search(tmpl)]
-        if violations:
+        errors.extend(
+            _screen_sms_template_content(tmpl, prefix, "smsMessageTemplate", cfg)
+        )
+        from vip_shared.domain.services.sms_template import extract_placeholders
+
+        # An unset clinicName renders {{ClinicName}} as an empty string —
+        # "This is ." shipped to a patient — so require the value whenever
+        # the template actually references the placeholder. Mirrors the
+        # identical guard in _validate_precall_sms below.
+        if "ClinicName" in extract_placeholders(tmpl) and not str(cfg.get("clinicName") or "").strip():
             errors.append(
-                f"{prefix}: smsMessageTemplate may contain PHI — detected: "
-                f"{', '.join(violations)}. Remove identifying information."
+                f"{prefix}: smsMessageTemplate uses {{{{ClinicName}}}} but "
+                f"campaignConfig.clinicName is not set"
             )
 
-    if not cfg.get("smsOriginationNumberArn"):
+    if not isinstance(cfg.get("smsOriginationNumberArn"), str) or not cfg["smsOriginationNumberArn"].strip():
         errors.append(
             f"{prefix}: deliveryType='sms' requires campaignConfig.smsOriginationNumberArn"
         )
@@ -547,6 +672,114 @@ def _validate_sms_campaign(campaign: dict, bucket_name: str, ci: int) -> list[st
     if not cfg.get("phiAcknowledged"):
         errors.append(
             f"{prefix}: deliveryType='sms' requires campaignConfig.phiAcknowledged=true"
+        )
+
+    return errors
+
+
+def _validate_precall_sms(campaign: dict, bucket_name: str, ci: int) -> list[str]:
+    """Return validation errors for campaignConfig.precallSms.
+
+    Missing mode retains the existing manual contract. Profile mode uses a
+    versioned embedded catalog and resolves name/specialty per recipient;
+    an optional campaign clinic name controls whether its clause is included.
+    its rendered content is validated by the sender, including multipart SMS.
+    Disabled blocks remain inert. Dependent campaigns are supported only by
+    the new profile lifecycle; no existing plan is migrated implicitly.
+    """
+    cfg = campaign.get("campaignConfig") or {}
+    precall = cfg.get("precallSms") or {}
+    if not isinstance(precall, dict):
+        raise ValueError(
+            f"bucket '{bucket_name}' campaign[{ci}]: precallSms must be an object"
+        )
+    if not precall.get("enabled"):
+        return []
+
+    prefix = f"bucket '{bucket_name}' campaign[{ci}]"
+    errors: list[str] = []
+
+    delivery_type = campaign.get("deliveryType", "campaign")
+    if delivery_type not in _VOICE_DELIVERY_TYPES:
+        errors.append(
+            f"{prefix}: campaignConfig.precallSms is only valid on a voice "
+            f"campaign (deliveryType one of {sorted(_VOICE_DELIVERY_TYPES)}), "
+            f"not '{delivery_type}' — there is no dial for it to precede"
+        )
+        return errors
+
+    mode = precall.get("mode", "manual")
+    if mode not in ("manual", "profile"):
+        return [f"{prefix}: precallSms.mode must be 'manual' or 'profile'"]
+
+    if mode == "profile":
+        from vip_shared.domain.services.precall_sms import (
+            CATALOG_VERSION, PersonalizationError, normalize_policy,
+        )
+
+        if precall.get("enabled") is not True:
+            errors.append(f"{prefix}: precallSms.enabled must be a boolean in profile mode")
+        if precall.get("catalogVersion") != CATALOG_VERSION:
+            errors.append(
+                f"{prefix}: precallSms.catalogVersion must be '{CATALOG_VERSION}' "
+                "for profile mode"
+            )
+        if precall.get("messageTemplate"):
+            errors.append(
+                f"{prefix}: precallSms.messageTemplate must be omitted in profile mode; "
+                "templates are selected automatically"
+            )
+        if "clinicName" in precall:
+            try:
+                normalize_policy({
+                    "mode": "profile", "catalogVersion": CATALOG_VERSION,
+                    "clinicName": precall["clinicName"],
+                })
+            except PersonalizationError:
+                errors.append(
+                    f"{prefix}: precallSms.clinicName must be blank or a valid clinic "
+                    "name of at most 80 characters in profile mode"
+                )
+        origin = precall.get("originationNumberArn")
+        if not isinstance(origin, str) or not origin.strip():
+            errors.append(
+                f"{prefix}: precallSms.enabled requires precallSms.originationNumberArn"
+            )
+        return errors
+
+    if campaign.get("dependsOn"):
+        errors.append(
+            f"{prefix}: campaignConfig.precallSms cannot be combined with "
+            f"dependsOn — a dependent campaign is never pre-warmed, so it has "
+            f"no segmentArn at bucket activation and the pre-call SMS would "
+            f"silently never fire"
+        )
+
+    tmpl = precall.get("messageTemplate", "")
+    if not tmpl:
+        errors.append(
+            f"{prefix}: precallSms.enabled requires precallSms.messageTemplate"
+        )
+    else:
+        from vip_shared.domain.services.sms_template import extract_placeholders
+
+        errors.extend(
+            _screen_sms_template_content(
+                tmpl, prefix, "precallSms.messageTemplate", precall
+            )
+        )
+        # An unset clinicName renders {{ClinicName}} as an empty string —
+        # "This is ." shipped to a patient — so require the value whenever
+        # the template actually references the placeholder.
+        if "ClinicName" in extract_placeholders(tmpl) and not str(precall.get("clinicName") or "").strip():
+            errors.append(
+                f"{prefix}: precallSms.messageTemplate uses {{{{ClinicName}}}} "
+                f"but precallSms.clinicName is not set"
+            )
+
+    if not precall.get("originationNumberArn"):
+        errors.append(
+            f"{prefix}: precallSms.enabled requires precallSms.originationNumberArn"
         )
 
     return errors
@@ -599,6 +832,7 @@ def _validate_plan_body(plan_body: dict) -> list[str]:
                 errors.extend(
                     _validate_sms_campaign(campaign, bucket_name, ci)
                 )
+            errors.extend(_validate_precall_sms(campaign, bucket_name, ci))
             errors.extend(_validate_max_lead_age(campaign, bucket, bucket_name, ci))
     return errors
 

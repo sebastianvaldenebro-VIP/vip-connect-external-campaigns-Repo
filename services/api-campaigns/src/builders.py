@@ -9,6 +9,21 @@ from __future__ import annotations
 
 from typing import Any
 
+# TCPA quiet-hours constants/builder for Connect Campaigns V2's openHours
+# structure now live in the shared module (see its docstring/comments there
+# for the full TCPA/AREA_CODE/T-prefix/Sunday-omission rationale) — centralized
+# so this policy value has exactly one place to change, alongside the
+# per-recipient SMS pipeline's equivalent gate.
+#
+# Imported from connect_open_hours.py, NOT quiet_hours.py: quiet_hours.py
+# unconditionally imports `phonenumbers` at module scope for the per-recipient
+# SMS gate, but this Lambda's layer is built from plain requirements.txt
+# (no phonenumbers — only api-sms's layer includes it). Importing from
+# quiet_hours.py here would crash every cold start with ModuleNotFoundError.
+from vip_shared.domain.services.connect_open_hours import (
+    connect_open_hours as _open_hours,
+)
+
 
 def build_create_campaign_params(
     body: dict,
@@ -30,7 +45,7 @@ def build_create_campaign_params(
       "dialer": {"type": "progressive"|"predictive"|"agentless", "bandwidthAllocation": float, "dialingCapacity": float},
       "answerMachineDetection": {"enabled": bool, "awaitPrompt": bool},
       "schedule": {"startTime": "...Z", "endTime": "...Z"},
-      "communicationTime": {"timezone": "..."},
+      "communicationTime": {"timezone": "..."},  # legacy input; fixed timezone ignored
       "communicationLimits": {"perDay": int, "perWeek": int, "perMonth": int} (optional),
       "tags": {...} (optional)
     }
@@ -91,12 +106,14 @@ def build_create_campaign_params(
         params["connectCampaignFlowArn"] = body["campaignFlowArn"]
 
     # communicationTimeConfig only valid for segment-source campaigns, not event-trigger
-    if "segmentArn" in body and body.get("communicationTime"):
-        comm_time = body["communicationTime"]
+    if "segmentArn" in body:
         params["communicationTimeConfig"] = {
             "localTimeZoneConfig": {
-                "defaultTimeZone": comm_time.get("timezone", "America/New_York"),
-            }
+                # AWS makes recipient detection exclusive with defaultTimeZone.
+                # Connect drops recipients whose timezone cannot be resolved.
+                "localTimeZoneDetection": ["AREA_CODE"],
+            },
+            "telephony": _open_hours(),
         }
 
     if body.get("communicationLimits"):

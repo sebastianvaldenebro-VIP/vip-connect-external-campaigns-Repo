@@ -1,0 +1,31 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProfileVoiceCleanupRuleLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:DescribeRule",
+        "events:DeleteRule",
+        "events:PutTargets",
+        "events:ListTargetsByRule",
+        "events:RemoveTargets",
+        "events:TagResource",
+        "events:UntagResource",
+        "events:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:events:us-east-1:165505826690:rule/vip-profile-voice-cleanup"
+    },
+    {
+      "Sid": "ProfileVoiceCleanupLambdaPermission",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:AddPermission",
+        "lambda:GetPolicy",
+        "lambda:RemovePermission"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:165505826690:function:vip-admin-ui-api-plans"
+    }
+  ]
+}

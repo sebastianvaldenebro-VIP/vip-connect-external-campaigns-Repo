@@ -2,22 +2,24 @@ import * as cdk from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import { Template } from 'aws-cdk-lib/assertions';
+import { createHash } from 'node:crypto';
+import precallSmsPlansPolicy from '../../config/precall-sms-plans-policy.json';
+import profileCleanupCfnPolicy from '../../config/profile-voice-cleanup-cfn-policy.json';
 
 // buildSharedLayer's real implementation shells out to `pip install` (or Docker)
 // against services/shared/requirements.txt during CDK asset bundling, which
 // happens synchronously the moment the Lambda Function construct is created.
 // That's appropriate for `cdk synth`/deploy but makes it unusable in a fast,
 // hermetic unit test — it needs either network access or Docker, neither of
-// which should be a precondition for `npm test`. Mocked out to an imported
-// (zero-bundling) LayerVersion so tests only exercise this stack's own logic.
+// which should be a precondition for `npm test`. Use a real resource with a
+// local asset so retention policies are exercised without dependency bundling.
 jest.mock('../utils/shared-layer', () => ({
-  buildSharedLayer: jest.fn((scope: import('constructs').Construct, id = 'SharedLayer') =>
-    require('aws-cdk-lib/aws-lambda').LayerVersion.fromLayerVersionArn(
-      scope,
-      id,
-      'arn:aws:lambda:us-east-1:165505826690:layer:mock-shared-layer:1',
-    ),
-  ),
+  buildSharedLayer: jest.fn((scope: import('constructs').Construct, id = 'SharedLayer') => {
+    const lambda = require('aws-cdk-lib/aws-lambda');
+    return new lambda.LayerVersion(scope, id, {
+      code: lambda.Code.fromAsset(require('node:path').join(__dirname, '../../../services/shared/python')),
+    });
+  }),
 }));
 
 import { ApiPlansStack, ApiPlansStackProps } from './api-plans-stack';
@@ -38,6 +40,7 @@ const SMS_QUEUE_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/VipSmsCampaig
 const SMS_RUNS_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/VipSmsCampaignRuns`;
 const REDIS_SECRET_ARN = `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:vip/redis/auth-abc123`;
 const SMS_SENDER_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-sms-sender`;
+const SMS_RETRY_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-sms-retry-quiet-hours`;
 const SEEDER_ARN = `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-progressive-dialer-seeder`;
 const PROGRESSIVE_DIALER_KEY_ARN = `arn:aws:kms:${REGION}:${ACCOUNT}:key/progressive-dialer-key`;
 const LOCATION_MAPPING_STREAM_ARN =
@@ -139,6 +142,87 @@ describe('ApiPlansStack', () => {
   describe('resources present regardless of optional props', () => {
     const { stack } = buildStack();
     const template = Template.fromStack(stack);
+
+    it('retains replaced and deleted shared layer versions for the Plans handler', () => {
+      const layers = Object.entries(template.findResources('AWS::Lambda::LayerVersion'));
+      expect(layers).toHaveLength(1);
+      const [layerId, layer] = layers[0];
+      expect(layer).toMatchObject({ DeletionPolicy: 'Retain', UpdateReplacePolicy: 'Retain' });
+      template.hasResourceProperties('AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+        Layers: [{ Ref: layerId }],
+      });
+    });
+
+    it('preserves the pre-cleanup default IAM resources byte for byte', () => {
+      // Baseline captured before adding the static cleanup rule. Updating these
+      // resources can fail both deploy and rollback under the execution boundary.
+      const iamResources = Object.fromEntries(
+        ['AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy'].map((type) =>
+          [type, template.findResources(type)]),
+      );
+      // Updated for the scoped dynamodb:PutItem grant on VipLocationMapping
+      // (auto_onboard_known_state_locations) — an intentional new IAM
+      // statement, not drift.
+      expect(createHash('sha256').update(JSON.stringify(iamResources)).digest('hex'))
+        .toBe('4d2be2117bb37e23d9c5f23f6f91500f54f65dc9dfbe207aaeab4ebdd2027e18');
+    });
+
+    it('provisions a cleanup rule independent of plan schedules and targets the real action', () => {
+      const functionId = logicalIdOf(template, 'AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+      });
+      template.resourceCountIs('AWS::Events::Rule', 1);
+      template.hasResourceProperties('AWS::Events::Rule', {
+        Name: 'vip-profile-voice-cleanup',
+        ScheduleExpression: 'rate(1 minute)',
+        State: 'ENABLED',
+        Targets: [{
+          Arn: { 'Fn::GetAtt': [functionId, 'Arn'] },
+          Id: 'profile-voice-cleanup',
+          Input: JSON.stringify({ action: 'profile_voice_cleanup' }),
+        }],
+      });
+      expect('vip-profile-voice-cleanup').not.toMatch(/^vip-(?:plan|sched)-/);
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').PROFILE_VOICE_CLEANUP_ENABLED).toBe('true');
+    });
+
+    it('limits the cleanup invocation permission to the fixed rule and source account', () => {
+      const functionId = logicalIdOf(template, 'AWS::Lambda::Function', {
+        FunctionName: 'vip-admin-ui-api-plans',
+      });
+      const ruleId = logicalIdOf(template, 'AWS::Events::Rule', { Name: 'vip-profile-voice-cleanup' });
+      template.resourceCountIs('AWS::Lambda::Permission', 1);
+      template.hasResourceProperties('AWS::Lambda::Permission', {
+        Action: 'lambda:InvokeFunction',
+        FunctionName: { Ref: functionId },
+        Principal: 'events.amazonaws.com',
+        SourceArn: { 'Fn::GetAtt': [ruleId, 'Arn'] },
+        SourceAccount: ACCOUNT,
+      });
+    });
+
+    it('keeps cleanup provisioning grants in an exact-resource deployment policy', () => {
+      expect(profileCleanupCfnPolicy.Statement).toEqual([
+        {
+          Sid: 'ProfileVoiceCleanupRuleLifecycle',
+          Effect: 'Allow',
+          Action: [
+            'events:PutRule', 'events:DescribeRule', 'events:DeleteRule',
+            'events:PutTargets', 'events:ListTargetsByRule', 'events:RemoveTargets',
+            'events:TagResource', 'events:UntagResource', 'events:ListTagsForResource',
+          ],
+          Resource: `arn:aws:events:${REGION}:${ACCOUNT}:rule/vip-profile-voice-cleanup`,
+        },
+        {
+          Sid: 'ProfileVoiceCleanupLambdaPermission',
+          Effect: 'Allow',
+          Action: ['lambda:AddPermission', 'lambda:GetPolicy', 'lambda:RemovePermission'],
+          Resource: `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-ui-api-plans`,
+        },
+      ]);
+      expect(actionsForResource(policyStatements(template), 'vip-profile-voice-cleanup')).toEqual([]);
+    });
 
     it('creates VipAdminPlans with customer-managed encryption, PITR, and deletion protection', () => {
       template.hasResourceProperties('AWS::DynamoDB::Table', {
@@ -458,6 +542,7 @@ describe('ApiPlansStack', () => {
         SNS_ALERTS_TOPIC_ARN: `arn:aws:sns:${REGION}:${ACCOUNT}:vip-plans-alerts`,
         LOG_LEVEL: 'INFO',
         POWERTOOLS_SERVICE_NAME: 'api-plans',
+        PROFILE_VOICE_CLEANUP_ENABLED: 'true',
         LAMBDA_FUNCTION_ARN: `arn:aws:lambda:${REGION}:${ACCOUNT}:function:vip-admin-ui-api-plans`,
       });
     });
@@ -792,6 +877,76 @@ describe('ApiPlansStack', () => {
     });
   });
 
+  // ── smsRetryFunctionArn ────────────────────────────────────────────────
+  describe('smsRetryFunctionArn', () => {
+    it('does not grant invoke access or inject the env var when absent', () => {
+      const { stack } = buildStack();
+      const template = Template.fromStack(stack);
+      expect(findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours')).toBeUndefined();
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBeUndefined();
+    });
+
+    it('injects SMS_RETRY_FUNCTION_ARN without modifying the CloudFormation policy', () => {
+      const { stack } = buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN });
+      const template = Template.fromStack(stack);
+      expect(findStatement(policyStatements(template), 'InvokeSmsRetryQuietHours')).toBeUndefined();
+      expect(functionEnv(template, 'vip-admin-ui-api-plans').SMS_RETRY_FUNCTION_ARN).toBe(SMS_RETRY_ARN);
+    });
+
+    it('preserves every CloudFormation IAM resource when adding retry to an existing sender', () => {
+      const baseline = Template.fromStack(buildStack({ smsSenderFunctionArn: SMS_SENDER_ARN }).stack);
+      const { stack } = buildStack({
+        smsSenderFunctionArn: SMS_SENDER_ARN,
+        smsRetryFunctionArn: SMS_RETRY_ARN,
+      });
+      const template = Template.fromStack(stack);
+      const senderStmt = findStatement(policyStatements(template), 'InvokeSmsSender');
+      expect(toArray(senderStmt!.Resource as string | string[])).toEqual([SMS_SENDER_ARN]);
+      for (const resourceType of ['AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::IAM::ManagedPolicy']) {
+        expect(template.findResources(resourceType)).toEqual(baseline.findResources(resourceType));
+      }
+      expect(functionEnv(template, 'vip-admin-ui-api-plans')).toMatchObject({
+        SMS_SENDER_FUNCTION_ARN: SMS_SENDER_ARN,
+        SMS_RETRY_FUNCTION_ARN: SMS_RETRY_ARN,
+      });
+    });
+
+    it('keeps the required, resource-scoped pre-call delta in the separate manual policy', () => {
+      expect(precallSmsPlansPolicy).toEqual({
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Sid: 'PrecallCampaignPauseResume',
+            Effect: 'Allow',
+            Action: ['connect-campaigns:PauseCampaign', 'connect-campaigns:ResumeCampaign'],
+            Resource: `arn:aws:connect-campaigns:${REGION}:${ACCOUNT}:campaign/*`,
+          },
+          {
+            Sid: 'InvokeSmsRetryQuietHours',
+            Effect: 'Allow',
+            Action: 'lambda:InvokeFunction',
+            Resource: SMS_RETRY_ARN,
+          },
+          {
+            Sid: 'PrecallCampaignSchedule',
+            Effect: 'Allow',
+            Action: 'connect-campaigns:UpdateCampaignSchedule',
+            Resource: `arn:aws:connect-campaigns:${REGION}:${ACCOUNT}:campaign/*`,
+          },
+        ],
+      });
+      const template = Template.fromStack(buildStack({ smsRetryFunctionArn: SMS_RETRY_ARN }).stack);
+      const statements = policyStatements(template);
+      const actions = statements.flatMap((s) => toArray(s.Action as string | string[]));
+      expect(actions).not.toContain('connect-campaigns:PauseCampaign');
+      expect(actions).not.toContain('connect-campaigns:ResumeCampaign');
+      // Profile start always updates its schedule. Grant this prerequisite in
+      // the operator-managed policy; changing CFN IAM can break its rollback.
+      expect(actions).not.toContain('connect-campaigns:UpdateCampaignSchedule');
+      expect(actionsForResource(statements, SMS_RETRY_ARN)).toEqual([]);
+    });
+  });
+
   // ── locationMappingStreamArn — the big conditional block ─────────────
   describe('locationMappingStreamArn', () => {
     it('creates no guard Lambda and no EventSourceMapping when absent', () => {
@@ -892,6 +1047,7 @@ describe('ApiPlansStack', () => {
       progressiveDialerSeederArn: SEEDER_ARN,
       progressiveDialerDataKeyArn: PROGRESSIVE_DIALER_KEY_ARN,
       smsSenderFunctionArn: SMS_SENDER_ARN,
+      smsRetryFunctionArn: SMS_RETRY_ARN,
       locationMappingStreamArn: LOCATION_MAPPING_STREAM_ARN,
     });
     const template = Template.fromStack(stack);
@@ -909,6 +1065,7 @@ describe('ApiPlansStack', () => {
       SMS_CAMPAIGN_QUEUE_TABLE: 'VipSmsCampaignQueue',
       SMS_CAMPAIGN_RUNS_TABLE: 'VipSmsCampaignRuns',
       SMS_SENDER_FUNCTION_ARN: SMS_SENDER_ARN,
+      SMS_RETRY_FUNCTION_ARN: SMS_RETRY_ARN,
     });
   });
 });

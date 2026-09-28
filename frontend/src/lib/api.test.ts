@@ -14,6 +14,8 @@ import { ApiRequestError, api } from './api';
 import type {
   CreateCampaignBody,
   PlanTrigger,
+  BucketDefV2,
+  PrecallSmsConfig,
 } from './api';
 
 const jsonResponse = (body: unknown, status = 200) =>
@@ -33,6 +35,43 @@ beforeEach(() => {
   getIdToken.mockResolvedValue('fake-id-token');
   fetchMock = vi.fn(async () => jsonResponse({ ok: true }));
   vi.stubGlobal('fetch', fetchMock);
+});
+
+describe('plan pre-call config serialization', () => {
+  const legacy: PrecallSmsConfig = {
+    enabled: true, originationNumberArn: 'arn:example',
+    messageTemplate: 'Hi {{FirstName}} from {{ClinicName}}.', clinicName: 'Example Clinic',
+  };
+  const profile: PrecallSmsConfig = {
+    enabled: true, mode: 'profile', catalogVersion: 'phase1-v1', originationNumberArn: 'arn:example',
+  };
+
+  it.each([
+    legacy, { ...legacy, mode: 'manual' as const }, profile,
+    { ...profile, clinicName: 'Clínica Norte' }, { ...profile, clinicName: '' },
+    { ...profile, enabled: false }, { ...profile, enabled: false, clinicName: 'Clínica Norte' },
+  ])(
+    'preserves the configured mode, fields and dependencies on the wire: %j', async (precallSms) => {
+      const config = {
+        queueId: 'queue', contactFlowId: 'flow', sourcePhoneNumber: '', dialerType: 'progressive',
+        bandwidthAllocation: 1, dialingCapacity: 1, amdEnabled: true, amdAwaitPrompt: true, precallSms,
+      };
+      const bucket: BucketDefV2 = {
+        id: 'bucket', name: 'Example', run_mode: 'status_based', cleanup: false, prestart_next: true,
+        campaignConfig: config,
+        campaigns: [{ id: 'campaign', name: 'Example', states: ['NY'], groups: [], run_type: 'full',
+          dependsOn: precallSms.mode === 'profile' ? ['parent'] : [], campaignConfig: config }],
+      };
+      await api.plans.updateV2('plan', { buckets: [bucket] });
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.buckets[0].campaigns[0].campaignConfig.precallSms).toEqual(precallSms);
+      expect(body.buckets[0].campaigns[0].dependsOn).toEqual(bucket.campaigns[0].dependsOn);
+      expect(body).toEqual({ buckets: [bucket] });
+      fetchMock.mockResolvedValueOnce(jsonResponse({ plan: { planId: 'plan', buckets: body.buckets } }));
+      const loaded = await api.plans.getV2('plan');
+      expect(loaded.plan.buckets[0].campaigns[0].campaignConfig?.precallSms).toEqual(precallSms);
+    },
+  );
 });
 
 // ── request()/buildUrl() internals, exercised through a representative endpoint ──

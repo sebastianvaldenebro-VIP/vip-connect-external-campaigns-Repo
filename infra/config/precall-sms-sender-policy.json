@@ -1,0 +1,53 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PrecallRetryLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:us-east-1:165505826690:log-group:/aws/lambda/vip-admin-sms-retry-quiet-hours:*"
+    },
+    {
+      "Sid": "PrecallRetryLedger",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query", "dynamodb:DeleteItem"],
+      "Resource": "arn:aws:dynamodb:us-east-1:165505826690:table/VipSmsCampaignQueue"
+    },
+    {
+      "Sid": "PrecallSegmentMembers",
+      "Effect": "Allow",
+      "Action": [
+        "profile:GetSegmentDefinition",
+        "profile:SearchProfiles",
+        "profile:GetSegmentMembership",
+        "profile:BatchGetProfile",
+        "profile:CreateSegmentSnapshot",
+        "profile:GetSegmentSnapshot"
+      ],
+      "Resource": [
+        "arn:aws:profile:us-east-1:165505826690:domains/amazon-connect-vipmedicalgroup",
+        "arn:aws:profile:us-east-1:165505826690:domains/amazon-connect-vipmedicalgroup/*"
+      ]
+    },
+    {
+      "Sid": "PrecallSnapshotRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::165505826690:role/VipAdminSnapshotRole-us-east-1",
+      "Condition": {"StringEquals": {"iam:PassedToService": "profile.amazonaws.com"}}
+    },
+    {
+      "Sid": "PrecallSnapshotList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::vip-admin-segment-snapshots-165505826690",
+      "Condition": {"StringLike": {"s3:prefix": "precall-sms/*"}}
+    },
+    {
+      "Sid": "PrecallSnapshotRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::vip-admin-segment-snapshots-165505826690/precall-sms/*"
+    }
+  ]
+}

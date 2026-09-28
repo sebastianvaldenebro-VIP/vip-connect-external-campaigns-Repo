@@ -200,7 +200,6 @@ DIST_ID=$(AWS_PROFILE=production aws cloudformation describe-stacks \
   --output text)
 
 AWS_PROFILE=production aws s3 sync dist/ "s3://${ASSET_BUCKET}/" \
-  --delete \
   --region us-east-1
 
 AWS_PROFILE=production aws cloudfront create-invalidation \
@@ -703,7 +702,59 @@ A: In the Connect instance's configured S3 bucket (pre-existing, not managed by 
 
 ---
 
-## 7. Planned enhancements
+## 7. Pre-Call SMS (Phase I)
+
+A short text attempted for a voice campaign's segment while that campaign prepares to dial. The Plan editor's "Pre-Call SMS" panel configures it. The [release and recovery guide](precall-sms-release.md) records the current asynchronous snapshot behavior, permissions, deployment approval and E2E gate; earlier planning estimates do not establish delivery guarantees.
+
+**Configuration lives on the voice campaign, not as a separate campaign.** Set `campaignConfig.precallSms` on the voice campaign itself (the "Pre-Call SMS" panel on the campaign card in the plan editor). There is no separate SMS campaign to create and no bucket to add.
+
+Required fields when `enabled: true`:
+
+| Field | Notes |
+|---|---|
+| `messageTemplate` | Only `{{FirstName}}` and `{{ClinicName}}` are interpolatable. Unknown, malformed, incomplete or nested double-brace expressions are rejected. PHI checks also examine the resolved clinic substitution. |
+| `originationNumberArn` | EUM SMS origination number ARN. |
+| `clinicName` | Required and nonempty after trimming whenever `messageTemplate` references `{{ClinicName}}`. |
+
+**The campaign must not have `dependsOn`.** A campaign with `dependsOn` is never pre-warmed, so no segment exists at bucket activation and the pre-call SMS would silently never fire. Save-time validation rejects the combination; the UI disables the toggle while dependencies are checked.
+
+**Preparation can wait for a segment snapshot.** A small canonical phone/customer-ID list can be resolved directly. Other segments use an encrypted asynchronous CSV export. While the sender returns `pending: true`, Connect's pre-call pause remains in place and branded campaigns have not yet been seeded. The existing tick resumes the same initialization. After five minutes from the recorded pending timestamp, or on a definitive initialization failure, the pre-call SMS attempt fails and voice proceeds; a bulk-SMS campaign instead enters `error`. Explicit cancellation prevents resume/seeding. There is no configurable lead-time setting.
+
+**Strict SMS-before-call delivery is not guaranteed.** Provider delivery is asynchronous, the pause follows Connect start, quiet-hours SMS retries and Connect dialing run independently, and the timeout/failure path deliberately permits voice without an SMS. `precallSmsSentAt` records completed sender initialization, not handset delivery. The inherited SQS publish/DynamoDB ledger sequence also does not provide exactly-once delivery. See the release guide for the observed limits and E2E evidence still required.
+
+**Specialty copy — one voice campaign per specialty, each with its own hand-written `messageTemplate`.** The specialty is baked into the sentence, not substituted from a value — copy the approved string for that specialty verbatim from the table below. **Phase I ships two specialties only: Vein and Pain Management.** Fibroid and General are deferred and out of scope — if an operator needs pre-call SMS for either, that is a copy-approval request to Sebastian, not a configuration an operator may compose.
+
+**Never edit an approved string in the panel.** The 160-character ceiling (`_MAX_SMS_CHARS` in `services/api-plans/src/handlers/plans.py`) applies to the *rendered* message (worst-case 20-character first name), not the raw template, and both approved templates were measured against it:
+
+| Specialty | Status | `messageTemplate` | Rendered (20-char name) |
+|---|---|---|---|
+| Vein | APPROVED (final) | `Hi {{FirstName}}! This is {{ClinicName}}. We're about to give you a quick call regarding your vein consultation request. Look out for our call!` | 153 |
+| Pain Management | APPROVED (final) | `Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a moment to discuss your pain management request. Talk soon!` | 135 |
+
+Both are business-approved verbatim (2026-09-10) and must be pasted, not retyped — copy pasted out of a Word/Google doc commonly carries a curly apostrophe (`’`) or other non-ASCII punctuation, which silently forces UCS-2 encoding and cuts the per-segment budget from 160 to 70 chars. Neither template contains an opt-out instruction — that was declined by Sebastian on 2026-09-10 and must not be re-added as an implementation detail.
+
+Example valid config:
+
+```json
+{
+  "precallSms": {
+    "enabled": true,
+    "messageTemplate": "Hi {{FirstName}}! {{ClinicName}} here. We're calling you in just a moment to discuss your pain management request. Talk soon!",
+    "clinicName": "VIP Medical Group",
+    "originationNumberArn": "arn:aws:sms-voice:us-east-1:165505826690:phone-number/phone-ba711707215947e3a0e5112c0872014b"
+  }
+}
+```
+
+**Quiet hours are enforced per recipient, not per campaign.** A lead whose area code puts them outside 08:00–21:00 local, or in any timezone where it is Sunday, is skipped and counted in `totalSkippedQuietHours` on the run record. A pre-call SMS run with fewer sends than the segment size is normal, not a failure.
+
+After successful initialization, eligible pre-call SMS campaigns retry throughout the voice campaign's active window. A zero `totalSkippedQuietHours` is not proof that all work finished: retries also reconcile unfinished claims and SQS enqueue failures. Failed or partial profile reads preserve retryability instead of becoming a successful empty cohort. Force Start creates a new persisted `precallSmsGeneration`; it may send a new SMS for that new voice lifecycle.
+
+**Opt-out.** The origination number above is registered `TRANSACTIONAL`, which fits "we are calling you in a moment" — but that is not an exemption from opt-out handling. `VipConnectOptOutList` only ever populates from *inbound* `STOP` messages; neither approved template advertises this, but the gate still applies to every send regardless.
+
+---
+
+## 8. Planned enhancements
 
 - [ ] Custom dashboards per-campaign in Analytics screen
 - [ ] Multi-role RBAC (admin vs. read-only analyst)

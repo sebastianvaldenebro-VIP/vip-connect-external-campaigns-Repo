@@ -637,6 +637,8 @@ Runs in parallel with Task 1.
 
 API shapes verified against installed botocore 1.43.90 — every field below is real:
 
+**2026-09-11 production correction:** `defaultTimeZone` and `localTimeZoneDetection` are mutually exclusive in the service. Sending both caused `CreateCampaign` to fail with `ValidationException`; botocore's structural validator did not reject that combination. This feature selects only `localTimeZoneDetection=["AREA_CODE"]`. A fixed timezone is not a fallback for detection. Connect can discard recipients whose local timezone cannot be determined; the separate SMS fallback must not be inferred to apply to Connect.
+
 ```
 CommunicationTimeConfig := { localTimeZoneConfig, telephony, sms, email, whatsApp }
 LocalTimeZoneConfig     := { defaultTimeZone, localTimeZoneDetection, localTimeZoneDetectionScope }
@@ -680,7 +682,7 @@ def test_communication_time_config_uses_per_recipient_area_code_detection():
     )
     ltz = params["communicationTimeConfig"]["localTimeZoneConfig"]
     assert ltz["localTimeZoneDetection"] == ["AREA_CODE"]
-    assert ltz["defaultTimeZone"] == "America/New_York"  # fallback only
+    assert "defaultTimeZone" not in ltz
 
 
 def test_communication_time_config_sets_telephony_open_hours_monday_to_saturday():
@@ -759,7 +761,7 @@ def test_campaign_params_gates_telephony_on_per_lead_local_open_hours():
     )
     ctc = params["communicationTimeConfig"]
     assert ctc["localTimeZoneConfig"]["localTimeZoneDetection"] == ["AREA_CODE"]
-    assert ctc["localTimeZoneConfig"]["defaultTimeZone"] == "America/New_York"
+    assert "defaultTimeZone" not in ctc["localTimeZoneConfig"]
     daily = ctc["telephony"]["openHours"]["dailyHours"]
     assert daily["SATURDAY"] == [{"startTime": "T08:00", "endTime": "T21:00"}]
     assert "SUNDAY" not in daily  # no contact on Sunday
@@ -820,18 +822,16 @@ Replace lines 93-99 (comment through the closing brace):
 ```python
     # communicationTimeConfig only valid for segment-source campaigns, not event-trigger
     if "segmentArn" in body:
-        comm_time = body.get("communicationTime") or {}
         params["communicationTimeConfig"] = {
             "localTimeZoneConfig": {
-                # Fallback only — used when Connect cannot resolve the area code.
-                "defaultTimeZone": comm_time.get("timezone", "America/New_York"),
+                # Detection and a fixed default timezone are mutually exclusive.
                 "localTimeZoneDetection": ["AREA_CODE"],
             },
             "telephony": _open_hours(),
         }
 ```
 
-Note the guard change: `communicationTime` is no longer required for the block to be emitted. The `"segmentArn" in body` half stays — `eventTrigger` campaigns still reject `communicationTimeConfig`, which the existing test at line 135 asserts. Update the body-contract docstring at line 33 to say `communicationTime.timezone` is now only the ambiguous-area-code fallback.
+Note the guard change: `communicationTime` is no longer required for the block to be emitted. The `"segmentArn" in body` half stays — `eventTrigger` campaigns still reject `communicationTimeConfig`, which the existing test at line 135 asserts. Update the body-contract docstring to say legacy `communicationTime.timezone` is ignored because segment campaigns use per-recipient detection. Do not emit a fixed timezone alongside detection.
 
 - [ ] **Step 4: Implement in `services/api-plans/src/builders.py`**
 
@@ -842,8 +842,7 @@ Replace lines 554-556:
 ```python
         "communicationTimeConfig": {
             "localTimeZoneConfig": {
-                # Fallback only, for area codes Connect cannot resolve.
-                "defaultTimeZone": "America/New_York",
+                # Detection and a fixed default timezone are mutually exclusive.
                 "localTimeZoneDetection": ["AREA_CODE"],
             },
             "telephony": _open_hours(),
@@ -2442,7 +2441,7 @@ aws connectcampaignsv2 describe-campaign --profile production --region us-east-1
   --id <campaign-id> --query 'campaign.communicationTimeConfig' --output json
 ```
 
-Expected: `localTimeZoneDetection == ["AREA_CODE"]`, `defaultTimeZone == "America/New_York"`, and a `telephony.openHours.dailyHours` map with **exactly six keys** — `MONDAY` through `SATURDAY`, each `[{"startTime": "T08:00", "endTime": "T21:00"}]` — and **no `SUNDAY` key at all**.
+Expected: `localTimeZoneDetection == ["AREA_CODE"]`, **no `defaultTimeZone`**, and a `telephony.openHours.dailyHours` map with **exactly six keys** — `MONDAY` through `SATURDAY`, each `[{"startTime": "T08:00", "endTime": "T21:00"}]` — and **no `SUNDAY` key at all**.
 
 Two things to read off that output rather than skim past, both of which the earlier draft of this plan would have got wrong:
 

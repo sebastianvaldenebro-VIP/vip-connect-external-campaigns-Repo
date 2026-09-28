@@ -14,8 +14,14 @@ import {
 
 type AvailableFilter = 'any' | 'yes' | 'no';
 
-export function SegmentNew(): ReactNode {
+type SegmentNewProps = {
+  onCreated?: (segment: SegmentSummary) => void;
+  onCancel?: () => void;
+};
+
+export function SegmentNew({ onCreated, onCancel }: SegmentNewProps = {}): ReactNode {
   const navigate = useNavigate();
+  const cancel = onCancel ?? (() => navigate('/segments'));
 
   // Live location mapping from DynamoDB — falls back to the static map while loading.
   const { locationMap } = useLocationMapping();
@@ -178,7 +184,10 @@ export function SegmentNew(): ReactNode {
         syncMode: 'manual',
       });
     },
-    onSuccess: (created) => setJustCreated(created),
+    onSuccess: (created) => {
+      if (onCreated) onCreated(created);
+      else setJustCreated(created);
+    },
     onError: (err: Error) => setError(err.message),
   });
 
@@ -375,7 +384,7 @@ export function SegmentNew(): ReactNode {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => navigate('/segments')}
+            onClick={cancel}
             className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
           >
             Cancel
@@ -558,7 +567,7 @@ export function SegmentNew(): ReactNode {
       <div className="flex items-center justify-end gap-2 pb-2">
         <button
           type="button"
-          onClick={() => navigate('/segments')}
+          onClick={cancel}
           className="rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium hover:bg-gray-50 transition-colors"
         >
           Cancel

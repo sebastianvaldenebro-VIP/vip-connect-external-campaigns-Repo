@@ -1,0 +1,16 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SmsCampaignOriginationRead",
+      "Effect": "Allow",
+      "Action": "sms-voice:DescribePhoneNumbers",
+      "Resource": "arn:aws:sms-voice:us-east-1:165505826690:phone-number/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    }
+  ]
+}

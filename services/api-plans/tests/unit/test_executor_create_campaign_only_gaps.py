@@ -166,7 +166,7 @@ class TestCreateCampaignOnlyStartCampaignFailureSwallowed:
                 ),
                 patch("executor._account_id", return_value="123456789012"),
             ):
-                connect_id, _seg, _arn, warmup_started, _exp, _act = (
+                connect_id, _seg, _arn, warmup_started, _exp, _act, _paused_at = (
                     executor._create_campaign_only(bucket, campaign, run)
                 )
         finally:
@@ -174,6 +174,144 @@ class TestCreateCampaignOnlyStartCampaignFailureSwallowed:
 
         assert connect_id == "connect-3"
         assert warmup_started is False  # start_campaign failed but is not fatal here
+        assert _paused_at is None  # never started, so never paused either
+
+
+class TestCreateCampaignOnlyPrecallSmsGate:
+    """Touch point A (2026-09 adversarial-review fix): a precall-SMS-enabled
+    campaign must be paused immediately after a successful warm-start, so it
+    cannot dial while paused regardless of its 6-min-ahead startTime."""
+
+    def test_precall_enabled_pauses_immediately_after_start_campaign(self):
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-4"}
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                connect_id, *_rest, paused_at = executor._create_campaign_only(
+                    bucket, campaign, run
+                )
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert connect_id == "connect-4"
+        mock_oc.pause_campaign.assert_called_once_with("connect-4")
+        assert paused_at  # precallGatePausedAt returned — pause actually succeeded
+
+    def test_precall_disabled_never_pauses(self):
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {"id": "c1", "name": "TX-NL", "states": ["TX"]}  # no campaignConfig at all
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-5"}
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                executor._create_campaign_only(bucket, campaign, run)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.pause_campaign.assert_not_called()
+
+    def test_precall_enabled_but_start_campaign_failed_never_pauses(self):
+        """warmup_started=False means StartCampaign never actually succeeded —
+        pausing a campaign that never started would be a no-op at best and a
+        confusing Connect API error at worst. Nothing to gate on either way:
+        this degrades to the pre-existing race, same as a pause failure would."""
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-6"}
+        mock_oc.start_campaign.side_effect = RuntimeError("Connect busy")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                _connect_id, _seg, _arn, warmup_started, _exp, _act, _paused_at = (
+                    executor._create_campaign_only(bucket, campaign, run)
+                )
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert warmup_started is False
+        mock_oc.pause_campaign.assert_not_called()
+        assert _paused_at is None
+
+    def test_pause_campaign_failure_is_logged_and_does_not_raise(self):
+        """A pause failure must not fail the whole pre-warm — accepted residual
+        risk: the resume-based gate simply has nothing to gate on for this
+        campaign, degrading to the pre-existing timer race, not a new failure."""
+        bucket = {"id": "B1", "name": "B1", "campaigns": [], "segmentFilters": {"state": ["TX"]}}
+        campaign = {
+            "id": "c1",
+            "name": "TX-NL",
+            "states": ["TX"],
+            "campaignConfig": {"precallSms": {"enabled": True}},
+        }
+        run = {"planId": "p1", "runId": "r1"}
+        mock_oc = MagicMock()
+        mock_oc.create_campaign.return_value = {"id": "connect-7"}
+        mock_oc.pause_campaign.side_effect = RuntimeError("pause failed")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._now_utc", return_value=_NOW_UTC),
+                patch("executor._create_segment", return_value=("seg1", "arn:cp:seg1", None, None)),
+                patch("executor.resolve_campaign_flow_arn", return_value="arn:flow"),
+                patch(
+                    "executor.build_campaign_params",
+                    return_value={"connectCampaignFlowArn": "arn:flow"},
+                ),
+                patch("executor._account_id", return_value="123456789012"),
+            ):
+                connect_id, *_rest, paused_at = executor._create_campaign_only(
+                    bucket, campaign, run
+                )  # must not raise despite pause_campaign failing
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert connect_id == "connect-7"
+        assert paused_at is None  # pause failed — never set on failure
 
 
 class TestPollCampaignState:
@@ -228,3 +366,119 @@ class TestPollCampaignState:
             executor._poll_campaign_state(cs)
         assert cs["status"] == "running"
         assert "exitReason" not in cs or cs.get("exitReason") is None
+
+
+class TestPollCampaignStatePrecallGateRetry:
+    """Step 3 of the 2026-09 adversarial-review resume-retry fix: the single
+    resume attempt in _fire_precall_sms_for_campaign can itself fail
+    (throttling, a transient AWS error), and before this fix nothing ever
+    retried it — the campaign would sit paused, never dialing, for the rest
+    of its run. tick() calls _poll_campaign_state on every running campaign
+    every cycle, so this is where the stranded pause self-heals."""
+
+    def _cs(self, **overrides):
+        cs = {
+            "campaignId": "c0",
+            "name": "Test Campaign",
+            "connectCampaignId": "conn-1",
+            "status": "running",
+            "precallGatePausedAt": "2026-09-09T00:00:00+00:00",
+        }
+        cs.update(overrides)
+        return cs
+
+    def test_retries_resume_when_stranded_paused(self):
+        cs = self._cs()
+        mock_oc = MagicMock()
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with patch("executor._get_campaign_state", return_value="Paused"):
+                executor._poll_campaign_state(cs, plan_id="p1", run_id="r1")
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.resume_campaign.assert_called_once_with("conn-1")
+        assert cs["precallGateResumedAt"]
+        assert cs["status"] == "running"  # untouched — "Paused" isn't terminal
+
+    def test_does_not_retry_when_already_resumed(self):
+        """Idempotent: a resume that already succeeded (precallGateResumedAt
+        set) must never be re-attempted, even if Connect still briefly
+        reports Paused due to eventual consistency."""
+        cs = self._cs(precallGateResumedAt="2026-09-09T00:01:00+00:00")
+        mock_oc = MagicMock()
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with patch("executor._get_campaign_state", return_value="Paused"):
+                executor._poll_campaign_state(cs)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.resume_campaign.assert_not_called()
+
+    def test_does_not_retry_when_genuinely_running(self):
+        """The very first resume attempt already succeeded and Connect has
+        moved on to Running — no redundant/duplicate resume call."""
+        cs = self._cs()
+        mock_oc = MagicMock()
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with patch("executor._get_campaign_state", return_value="Running"):
+                executor._poll_campaign_state(cs)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.resume_campaign.assert_not_called()
+
+    def test_does_not_retry_when_never_actually_paused_by_us(self):
+        """No precallGatePausedAt (the cold-started or pause-failed noise
+        cases) — resuming a campaign we never paused would predictably fail,
+        so this is a structural no-op here too, same as in
+        _fire_precall_sms_for_campaign."""
+        cs = self._cs(precallGatePausedAt=None)
+        mock_oc = MagicMock()
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with patch("executor._get_campaign_state", return_value="Paused"):
+                executor._poll_campaign_state(cs)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_oc.resume_campaign.assert_not_called()
+
+    def test_retry_failure_is_logged_distinctly_and_does_not_raise(self):
+        cs = self._cs()
+        mock_oc = MagicMock()
+        mock_oc.resume_campaign.side_effect = RuntimeError("Throttled")
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with (
+                patch("executor._get_campaign_state", return_value="Paused"),
+                patch("executor._slog") as mock_slog,
+            ):
+                executor._poll_campaign_state(
+                    cs, plan_id="p1", run_id="r1"
+                )  # must not raise
+        finally:
+            _unstub_vip_shared(originals)
+
+        assert cs.get("precallGateResumedAt") is None  # never marked — safe to retry again
+        error_events = [c.args[0] for c in mock_slog.error.call_args_list]
+        assert "precall_gate_resume_retry_failed" in error_events
+
+    def test_state_fetched_only_once_per_poll(self):
+        """The terminal-state check and the paused-retry check must share one
+        _get_campaign_state call — this function exists specifically to avoid
+        a second, redundant Connect API call per tick per running campaign."""
+        cs = self._cs()
+        mock_oc = MagicMock()
+        originals = _stub_vip_shared(mock_oc)
+        try:
+            with patch(
+                "executor._get_campaign_state", return_value="Paused"
+            ) as mock_get_state:
+                executor._poll_campaign_state(cs)
+        finally:
+            _unstub_vip_shared(originals)
+
+        mock_get_state.assert_called_once_with("conn-1")

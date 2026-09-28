@@ -47,16 +47,19 @@ jobs:
           if [ -f "services/${{ matrix.service }}/requirements.txt" ]; then
             pip install -r "services/${{ matrix.service }}/requirements.txt"
           fi
+          # The SMS runtime gets phonenumbers from its own shared-layer bundle.
+          # Both suites import that module; the base layer intentionally omits it.
+          case "${{ matrix.service }}" in
+            api-sms|shared) pip install -r services/shared/requirements-sms.txt ;;
+          esac
       - name: ruff
         run: ruff check services/${{ matrix.service }}
       - name: pytest
         working-directory: services/${{ matrix.service }}
         run: python3 -m pytest -q
 
-  # infra/ has no working build/lint/test scripts wired (tsconfig.json and
-  # jest.config.js referenced by package.json don't exist). The real, working
-  # entry point is `cdk synth` (via ts-node, per cdk.json) — that's what
-  # actually validates the CDK app compiles and every stack resolves.
+  # Jest checks the constructs; CDK synth also compiles the app through
+  # ts-node (per cdk.json), bundles the Lambda assets, and resolves all stacks.
   infra-synth:
     name: infra · cdk synth
     runs-on: ubuntu-latest

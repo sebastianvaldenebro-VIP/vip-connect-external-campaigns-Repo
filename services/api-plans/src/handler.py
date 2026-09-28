@@ -1,8 +1,9 @@
 """Lambda entrypoint for api-plans.
 
-Two event sources:
+Event sources:
   1. API Gateway HTTP API → route via router.resolve()
   2. EventBridge Scheduler → tick payload: {"action": "tick", "planId", "runId", "bucketIndex"}
+  3. Fixed EventBridge rule → {"action": "profile_voice_cleanup"}
 """
 
 from __future__ import annotations
@@ -113,6 +114,22 @@ def lambda_handler(event: dict, context) -> dict:
         except Exception as exc:
             _logger.error("janitor_error", error=str(exc))
             return {"ok": False, "error": str(exc)}
+
+    if action == "profile_voice_cleanup":
+        try:
+            from profile_voice_cleanup import reap
+
+            result = reap(context=context)
+            if result.get("ok") is False:
+                # Per-item provider failures retain their durable cursor, but
+                # the scheduled delivery must still surface as Lambda Errors.
+                raise RuntimeError("Profile voice cleanup failed")
+            return result
+        except Exception as exc:
+            _logger.error("profile_voice_cleanup_failed", error_type=type(exc).__name__)
+            # Propagate for Lambda Errors/retries; raw provider errors can
+            # include private data. Cleanup must still run when new starts are disabled.
+            raise RuntimeError("Profile voice cleanup failed") from None
 
     # HTTP API event
     route_key = event.get("routeKey") or event.get("requestContext", {}).get(
