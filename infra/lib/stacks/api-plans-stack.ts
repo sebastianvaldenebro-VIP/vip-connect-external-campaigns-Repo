@@ -362,11 +362,24 @@ export class ApiPlansStack extends cdk.Stack {
       'VipLocationMapping',
     );
     locationMappingTable.grantReadData(role);
-    // Scoped rather than grantWriteData/grantReadWriteData: the only DynamoDB
-    // call auto_onboard_known_state_locations (builders.py) ever makes is a
-    // single-item conditional PutItem when a lead's location implies an
-    // already-known state — it never updates or deletes an existing row.
-    locationMappingTable.grant(role, 'dynamodb:PutItem');
+    // dynamodb:PutItem for auto_onboard_known_state_locations (builders.py) —
+    // NOT granted here via CDK. `role` is a normal, CDK-managed iam.Role, but
+    // this account's EngineeringPermissionBoundary blocks iam:PutRolePolicy
+    // on ANY role's inline policy via the CloudFormation exec role, not just
+    // imported/immutable ones — confirmed 2026-09-28 when a `grant()` call
+    // here (scoped to just PutItem, deliberately not grantWriteData/
+    // grantReadWriteData, since that single-item conditional PutItem is the
+    // only DynamoDB call this feature ever makes) failed FunctionRole's
+    // policy update mid-deploy and left VipAdminApiPlansStack in
+    // UPDATE_ROLLBACK_FAILED, recovered via `continue-update-rollback
+    // --resources-to-skip FunctionRoleDefaultPolicy41A10F9C`. Applied instead
+    // via CLI directly on the live policy (same pattern as every other
+    // permission-boundary-blocked grant in this stack, e.g. the guard role):
+    //   aws iam put-role-policy --role-name <FunctionRole physical id> \
+    //     --policy-name FunctionRoleDefaultPolicy41A10F9C \
+    //     --policy-document file://<full existing statements + this one>
+    // Do not re-add a grant()/addToPolicy() call for this here — it will
+    // fail identically on every future deploy that touches this policy.
 
     // ── Location Onboarding Guard — same physical table, second CDK
     // reference so we can expose its stream ARN (fromTableName can't).
