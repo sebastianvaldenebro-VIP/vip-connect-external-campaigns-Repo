@@ -17,6 +17,7 @@ import re
 from datetime import timezone
 
 import boto3
+from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from vip_shared.application.http import error_response, extract_caller, json_response
@@ -52,7 +53,13 @@ def _get_connect():
 def _get_s3():
     global _s3_client
     if _s3_client is None:
-        _s3_client = boto3.client("s3")
+        # Connect recordings/voicemails are stored with SSE-KMS at the object
+        # level (regardless of the bucket's own default encryption) — S3
+        # rejects a presigned URL for a KMS-encrypted object unless it was
+        # signed with SigV4, so this must be explicit: confirmed live
+        # 2026-09-30 via "Requests specifying Server Side Encryption with AWS
+        # KMS managed keys require AWS Signature Version 4" on every download.
+        _s3_client = boto3.client("s3", config=Config(signature_version="s3v4"))
     return _s3_client
 
 

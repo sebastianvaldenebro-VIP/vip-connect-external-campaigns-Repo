@@ -439,7 +439,12 @@ def test_get_s3_constructs_and_caches_client():
     with patch("boto3.client", return_value=fake_client) as mock_boto:
         first = handler._get_s3()
         second = handler._get_s3()
-    mock_boto.assert_called_once_with("s3")
+    mock_boto.assert_called_once()
+    args, kwargs = mock_boto.call_args
+    assert args == ("s3",)
+    # SigV4 required — presigned URLs for SSE-KMS objects (Connect recordings/
+    # voicemails) are rejected by S3 without it.
+    assert kwargs["config"].signature_version == "s3v4"
     assert first is fake_client
     assert second is fake_client
 
