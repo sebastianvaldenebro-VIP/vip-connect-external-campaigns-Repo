@@ -283,6 +283,54 @@ export type Profile = {
   lastUpdatedAt?: string;
 };
 
+/**
+ * Response shape from GET /phone-lookup, proxied verbatim from the sibling
+ * repo's connectcampaignRedisAuxiliar Lambda. redis.matches[] and
+ * profiles.matches[] carry raw PHI (lead/profile records) — the UI must mask
+ * PHI fields before rendering, never log this payload.
+ */
+export type PhoneLookupRedisMatch = {
+  lead_id?: string;
+  campaign?: string;
+  location?: string;
+  groups?: string;
+  [key: string]: unknown;
+};
+
+export type PhoneLookupProfileMatch = {
+  ProfileId?: string;
+  FirstName?: string;
+  LastName?: string;
+  PhoneNumber?: string;
+  EmailAddress?: string;
+  Attributes?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export type PhoneLookupResult = {
+  phone_searched: string;
+  redis: {
+    list_key: string;
+    total_scanned: number;
+    match_count: number;
+    matches: PhoneLookupRedisMatch[];
+  };
+  profiles: {
+    domain: string;
+    key_tried: string;
+    matches: PhoneLookupProfileMatch[];
+    errors: Record<string, unknown>;
+  };
+  cross_check: {
+    in_redis: boolean;
+    in_profiles: boolean;
+    lead_ids_redis: string[];
+    profile_ids: string[];
+    orphan_in_profiles: boolean;
+    pending_ingest_in_redis: boolean;
+  };
+};
+
 
 export type CreateCampaignBody = {
   name: string;
@@ -817,6 +865,12 @@ const realApi = {
       request<{ profileId: string; calculatedAttributes: unknown[] }>(
         `/profiles/${encodeURIComponent(id)}/calculated-attributes`,
       ),
+  },
+  phoneLookup: {
+    /** GET /phone-lookup?phone=<digits or E.164> — cross-checks the Redis
+     * wait list and Customer Profiles for one phone number. */
+    lookup: (phone: string) =>
+      request<PhoneLookupResult>('/phone-lookup', { query: { phone } }),
   },
   leads: {
     distinctValues: (field: string, max = 200) =>

@@ -26,6 +26,15 @@ export interface ApiProfilesStackProps extends cdk.StackProps {
   readonly permissionsBoundaryName?: string;
 }
 
+// GET /phone-lookup invokes the sibling repo's already-deployed
+// `connectcampaignRedisAuxiliar` Lambda (same account/region, own naming
+// prefix — not part of this app's stacks) to cross-check a phone number
+// against the Redis wait_list + Customer Profiles. No prop/grant/env-var
+// wiring for it here — see the comments beside `dlq` below for why: this
+// exact FunctionRole update path is what took VipAdminApiProfilesStack to
+// UPDATE_ROLLBACK_FAILED for 15 days (2026-09-14 to 2026-09-30). Applied
+// manually, outside CDK.
+
 export class ApiProfilesStack extends cdk.Stack {
   public readonly lambdaFunction: lambda.Function;
 
@@ -74,6 +83,20 @@ export class ApiProfilesStack extends cdk.Stack {
 
     props.dataKey.grantDecrypt(role);
 
+    // redisAuxiliarLookupArn grant intentionally NOT added via role.addToPolicy()
+    // here — see api-segments-stack.ts's deadLetterQueue comment for the full
+    // explanation (EngineeringPermissionBoundary denies the CFN exec role
+    // iam:TagRole/iam:UntagRole/logs:ListTagsForResource on THIS stack's
+    // FunctionRole/LogGroup, which is what took VipAdminApiProfilesStack to
+    // UPDATE_ROLLBACK_FAILED for 15 days, 2026-09-14 to 2026-09-30, before this
+    // grant was even added). Applied manually, outside CDK, same as the DLQ
+    // pattern below:
+    //   aws iam put-role-policy --role-name <FunctionRole physical name> \
+    //     --policy-name invoke-redis-auxiliar-lookup --policy-document '{"Version":
+    //     "2012-10-17","Statement":[{"Sid":"InvokeRedisAuxiliarLookup","Effect":
+    //     "Allow","Action":"lambda:InvokeFunction","Resource":
+    //     "arn:aws:lambda:us-east-1:165505826690:function:connectcampaignRedisAuxiliar"}]}'
+
     const dlq = new sqs.Queue(this, 'DeadLetterQueue', {
       queueName: 'vip-admin-ui-api-profiles-dlq',
       encryption: sqs.QueueEncryption.KMS,
@@ -101,6 +124,12 @@ export class ApiProfilesStack extends cdk.Stack {
         DATA_KEY_ARN: props.dataKey.keyArn,
         LOG_LEVEL: 'INFO',
         POWERTOOLS_SERVICE_NAME: 'api-profiles',
+        // REDIS_AUXILIAR_LOOKUP_ARN intentionally NOT set here — see the grant
+        // comment above. Applied manually via:
+        //   aws lambda update-function-configuration --function-name
+        //     vip-admin-ui-api-profiles --environment '{"Variables":{...
+        //     existing vars ..., "REDIS_AUXILIAR_LOOKUP_ARN":
+        //     "arn:aws:lambda:us-east-1:165505826690:function:connectcampaignRedisAuxiliar"}}'
       },
     });
     skipCheckovChecks(this.lambdaFunction, [VPC_SKIP]);

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from handlers import phone_lookup as phone_lookup_handler
 from handlers import profiles as profiles_handler
 
 Handler = Callable[[dict, dict], dict]
 
 
 ROUTES: dict[str, Handler] = {
+    "GET /phone-lookup": phone_lookup_handler.phone_lookup,
     "GET /profiles/search": profiles_handler.search_profiles,
     "POST /profiles/batch": profiles_handler.batch_get_profiles,
     "GET /profiles/{profileId}": profiles_handler.get_profile,

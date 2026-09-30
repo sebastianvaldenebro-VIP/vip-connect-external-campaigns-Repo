@@ -66,9 +66,27 @@ function buildStack(propsOverride: Partial<ApiStackProps> = {}) {
 }
 
 describe('ApiStack', () => {
-  it('creates exactly 63 ApiGatewayV2 routes (one per method across every addRoutes call)', () => {
+  it('creates exactly 64 ApiGatewayV2 routes (one per method across every addRoutes call)', () => {
     const template = Template.fromStack(buildStack());
-    template.resourceCountIs('AWS::ApiGatewayV2::Route', 63);
+    template.resourceCountIs('AWS::ApiGatewayV2::Route', 64);
+  });
+
+  it('routes GET /phone-lookup to the profiles Lambda integration', () => {
+    const template = Template.fromStack(buildStack());
+    const profilesIntegrationId = Object.keys(
+      template.findResources('AWS::ApiGatewayV2::Integration', {
+        Properties: {
+          IntegrationUri: 'arn:aws:lambda:us-east-1:165505826690:function:vip-admin-ui-api-profiles',
+        },
+      }),
+    )[0];
+    const phoneLookupRoutes = template.findResources('AWS::ApiGatewayV2::Route', {
+      Properties: { RouteKey: 'GET /phone-lookup' },
+    });
+    const [phoneLookupRoute] = Object.values(phoneLookupRoutes);
+    expect(phoneLookupRoute.Properties.Target['Fn::Join'][1]).toEqual(
+      expect.arrayContaining([{ Ref: profilesIntegrationId }]),
+    );
   });
 
   it('creates exactly 7 Lambda integrations, one per backing Lambda', () => {

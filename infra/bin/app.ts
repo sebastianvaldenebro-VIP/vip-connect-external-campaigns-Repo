@@ -216,6 +216,9 @@ export const profiles = new ApiProfilesStack(app, 'VipAdminApiProfilesStack', {
   profilesDomainName,
   profileObjectType: app.node.tryGetContext('profileObjectType') ?? 'leads-data-mapping',
   permissionsBoundaryName,
+  // GET /phone-lookup invokes connectcampaignRedisAuxiliar (sibling repo,
+  // already deployed, same account/region) — grant + env var applied
+  // manually outside CDK, see api-profiles-stack.ts for why.
 });
 
 // 9. api-deny-list Lambda — manual "block this number" entry, backs the

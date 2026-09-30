@@ -229,6 +229,34 @@ export const mockApi: typeof RealApi = {
       };
     },
   },
+  phoneLookup: {
+    lookup: async (phone) => {
+      await delay(300);
+      return {
+        phone_searched: phone,
+        redis: {
+          list_key: 'wait_list:BASIC_TEAM:list',
+          total_scanned: 50244,
+          match_count: 0,
+          matches: [],
+        },
+        profiles: {
+          domain: 'amazon-connect-vipmedicalgroup',
+          key_tried: '_phone',
+          matches: [],
+          errors: {},
+        },
+        cross_check: {
+          in_redis: false,
+          in_profiles: false,
+          lead_ids_redis: [],
+          profile_ids: [],
+          orphan_in_profiles: false,
+          pending_ingest_in_redis: false,
+        },
+      };
+    },
+  },
   leads: {
     distinctValues: async (field) => {
       await delay(200);

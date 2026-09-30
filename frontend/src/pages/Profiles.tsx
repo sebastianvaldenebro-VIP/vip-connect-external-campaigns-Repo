@@ -2,8 +2,16 @@ import { useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import { Badge, Spinner } from '@/components/ui';
-import { api, type Profile } from '@/lib/api';
+import { api, type Profile, type PhoneLookupResult } from '@/lib/api';
 import { formatDateTime } from '@/lib/utils';
+
+/** Masks PHI so only the last 4 characters are visible (e.g. "***1027",
+ * "***@x.com" keeps the domain hidden too — deliberately conservative). */
+function maskPhi(value?: string | null): string {
+  if (!value) return '—';
+  const visible = value.slice(-4);
+  return value.length <= 4 ? `***${visible}` : `${'*'.repeat(value.length - 4)}${visible}`;
+}
 
 type SearchKey = '_phone' | '_email' | '_fullName' | '_profileId' | 'customerid';
 
@@ -121,6 +129,101 @@ export function Profiles(): ReactNode {
           )}
         </div>
       ) : null}
+
+      {/* Redis wait list cross-check — only meaningful for a phone search */}
+      {applied && applied.key === '_phone' ? (
+        <RedisWaitListPane phone={applied.value} />
+      ) : null}
+    </div>
+  );
+}
+
+function RedisWaitListPane({ phone }: { phone: string }): ReactNode {
+  const lookup = useQuery({
+    queryKey: ['phone-lookup', phone],
+    queryFn: () => api.phoneLookup.lookup(phone),
+  });
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h4 className="text-sm font-semibold text-gray-900">Redis wait list</h4>
+        {lookup.data ? (
+          <div className="flex items-center gap-2">
+            <Badge>Redis: {lookup.data.cross_check.in_redis ? 'found' : 'not found'}</Badge>
+            <Badge>Profiles: {lookup.data.cross_check.in_profiles ? 'found' : 'not found'}</Badge>
+          </div>
+        ) : null}
+      </div>
+
+      {lookup.isPending ? (
+        <div className="flex items-center justify-center py-8">
+          <Spinner />
+        </div>
+      ) : lookup.isError ? (
+        <p className="text-sm text-destructive">{(lookup.error as Error).message}</p>
+      ) : lookup.data ? (
+        <PhoneLookupDetails data={lookup.data} />
+      ) : null}
+    </div>
+  );
+}
+
+function PhoneLookupDetails({ data }: { data: PhoneLookupResult }): ReactNode {
+  return (
+    <div className="flex flex-col gap-4">
+      {data.cross_check.orphan_in_profiles || data.cross_check.pending_ingest_in_redis ? (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          {data.cross_check.orphan_in_profiles ? 'Present in Profiles but not in the Redis wait list. ' : ''}
+          {data.cross_check.pending_ingest_in_redis ? 'Present in Redis but not yet ingested into Profiles.' : ''}
+        </div>
+      ) : null}
+
+      {/* Redis leads — non-PHI fields, shown unmasked */}
+      <div>
+        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+          Redis leads ({data.redis.match_count} of {data.redis.total_scanned} scanned in {data.redis.list_key})
+        </p>
+        {data.redis.matches.length > 0 ? (
+          <div className="divide-y divide-gray-100 rounded-lg border border-gray-100">
+            {data.redis.matches.map((m, i) => (
+              <div key={m.lead_id ?? i} className="grid grid-cols-1 gap-2 px-3 py-2 md:grid-cols-4">
+                <KV k="Lead ID" v={m.lead_id as string | undefined} />
+                <KV k="Campaign" v={m.campaign as string | undefined} />
+                <KV k="Location" v={m.location as string | undefined} />
+                <KV k="Groups" v={m.groups as string | undefined} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-gray-200 p-4 text-center text-sm text-gray-400">
+            No Redis matches.
+          </div>
+        )}
+      </div>
+
+      {/* Profiles matches — PHI fields masked, last 4 chars visible */}
+      <div>
+        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">
+          Customer Profiles matches ({data.profiles.matches.length})
+        </p>
+        {data.profiles.matches.length > 0 ? (
+          <div className="divide-y divide-gray-100 rounded-lg border border-gray-100">
+            {data.profiles.matches.map((m, i) => (
+              <div key={m.ProfileId ?? i} className="grid grid-cols-1 gap-2 px-3 py-2 md:grid-cols-4">
+                <KV k="First name" v={maskPhi(m.FirstName)} />
+                <KV k="Last name" v={maskPhi(m.LastName)} />
+                <KV k="Phone" v={maskPhi(m.PhoneNumber)} />
+                <KV k="Email" v={maskPhi(m.EmailAddress)} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-lg border border-dashed border-gray-200 p-4 text-center text-sm text-gray-400">
+            No Customer Profiles matches.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

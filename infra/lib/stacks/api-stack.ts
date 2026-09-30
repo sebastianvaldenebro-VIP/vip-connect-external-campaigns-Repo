@@ -283,6 +283,17 @@ export class ApiStack extends cdk.Stack {
       integration: profilesIntegration,
       authorizer,
     });
+    // Added after the routes above (not before) so the shared
+    // profilesIntegration construct's auto-generated logical ID stays
+    // anchored to /profiles/search — inserting it earlier caused CDK to
+    // rename that logical ID and retarget all 5 existing /profiles/* routes
+    // in the diff, an unintended blast-radius increase caught before deploy.
+    this.httpApi.addRoutes({
+      path: '/phone-lookup',
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: profilesIntegration,
+      authorizer,
+    });
 
     // ── Plans routes ────────────────────────────────────────────────
     for (const [path, methods] of [
