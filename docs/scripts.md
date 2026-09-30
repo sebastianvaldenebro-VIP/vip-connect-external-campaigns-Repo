@@ -131,6 +131,18 @@ See full procedure in `docs/runbook.md` § "Deploy shared Lambda layer". Summary
 
 ### Deploy frontend
 
+> **CRITICAL:** export `VITE_COGNITO_*`/`VITE_API_BASE_URL` before `npm run
+> build` — they're baked into the JS bundle at build time, not read at
+> runtime. Skipping this breaks login for the whole admin app ("Auth
+> UserPool not configured", confirmed live 2026-09-30). See the full
+> command block in `docs/runbook.md` → "Deploy frontend (SPA)".
+>
+> Also: this bucket hosts unrelated static content under other prefixes
+> (e.g. `sms/opt-in-preview-*/`) — `--delete` removes anything not in
+> `dist/`, which wiped one of those on 2026-09-30 (recovered via S3
+> versioning). Confirm what else lives in the bucket before using
+> `--delete`, or drop it and prune stale `assets/*` hashes manually.
+
 ```bash
 cd /home/devaju/projects/vip-connect-external-campaigns/frontend
 npm run build

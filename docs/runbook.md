@@ -182,8 +182,38 @@ done
 
 ### Deploy frontend (SPA)
 
+> **CRITICAL:** `VITE_COGNITO_*`/`VITE_API_BASE_URL` are baked into the JS
+> bundle at BUILD time by Vite (`import.meta.env`) — they are NOT read at
+> runtime. Building without exporting them first produces a bundle with
+> empty auth config, which breaks login for the ENTIRE admin app (not just
+> whatever feature you're shipping) with "Auth UserPool not configured" —
+> confirmed live 2026-09-30. Always export these before `npm run build`.
+
 ```bash
 cd /home/devaju/projects/vip-connect-external-campaigns/frontend
+
+DIST_DOMAIN=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminHostingStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='DistributionDomain'].OutputValue" \
+  --output text)
+
+export VITE_PREVIEW_MODE=false
+export VITE_AWS_REGION=us-east-1
+export VITE_COGNITO_USER_POOL_ID=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminAuthStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+export VITE_COGNITO_CLIENT_ID=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminAuthStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+export VITE_COGNITO_DOMAIN=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminAuthStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='UserPoolDomain'].OutputValue" --output text | sed 's#https://##')
+export VITE_COGNITO_REDIRECT_SIGNIN="${DIST_DOMAIN}/callback"
+export VITE_COGNITO_REDIRECT_SIGNOUT="${DIST_DOMAIN}/"
+export VITE_API_BASE_URL=$(AWS_PROFILE=production aws cloudformation describe-stacks \
+  --stack-name VipAdminApiStack --region us-east-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='HttpApiEndpoint'].OutputValue" --output text)
+
 npm run build
 
 # Fetch bucket name and CloudFront distribution ID from CDK outputs
@@ -199,6 +229,13 @@ DIST_ID=$(AWS_PROFILE=production aws cloudformation describe-stacks \
   --query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue" \
   --output text)
 
+# NOTE: --delete removes anything in the bucket not present in dist/ — this
+# bucket also hosts unrelated static content under other prefixes (e.g.
+# sms/opt-in-preview-*/). Confirmed live 2026-09-30: --delete wiped an
+# unrelated SMS opt-in preview page (recovered via S3 versioning, which is
+# enabled on this bucket — but don't rely on that). Sync only the SPA's own
+# path if the bucket has non-SPA content, or omit --delete and manually
+# prune stale dist/assets/* hashes instead.
 AWS_PROFILE=production aws s3 sync dist/ "s3://${ASSET_BUCKET}/" \
   --region us-east-1
 
