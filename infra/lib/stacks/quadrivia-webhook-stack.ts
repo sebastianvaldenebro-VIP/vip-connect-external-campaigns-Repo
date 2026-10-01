@@ -2,13 +2,11 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
-import * as certificatemanager from 'aws-cdk-lib/aws-certificatemanager';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as path from 'path';
 import { buildBundledPythonCode } from '../utils/python-bundling';
@@ -40,36 +38,44 @@ const DLQ_SKIP = {
     'the idempotency table makes that retry safe.',
 };
 
-/** mTLS custom-domain wiring. See the comment on `mtlsDomain` below. */
-export interface QuadriviaMtlsDomainProps {
-  /**
-   * FQDN for the webhook, e.g. `quadrivia-webhook.<zone>`.
-   * PLACEHOLDER-FREE ON PURPOSE: no default. Nothing in this repo owns a
-   * hosted zone, so inventing one would produce a stack that deploys and
-   * silently serves nothing.
-   */
-  readonly domainName: string;
-  /** ACM cert ARN for `domainName` (must be in this stack's region). */
-  readonly certificateArn: string;
+/**
+ * Real facts about quadrivia-webhook.medwork.io, confirmed live via
+ * `aws apigatewayv2 get-domain-name --domain-name quadrivia-webhook.medwork.io
+ * --profile production` on 2026-09-28. This DomainName resource is NOT
+ * created or owned by this stack (or any CDK app) — IT (Raymond) created it
+ * directly against the VIP-Techsupport account, tagged `ManagedBy: manual`,
+ * with a direct DNS record in the main medwork.io zone (same pattern as
+ * unifi-alerts.medwork.io — no subzone delegation was needed after all).
+ * Re-run the command above if these ever need re-verifying; do not guess
+ * new values if the domain is ever recreated.
+ */
+const EXISTING_DOMAIN_NAME = 'quadrivia-webhook.medwork.io';
+const EXISTING_DOMAIN_REGIONAL_NAME = 'd-xo30rcmxk8.execute-api.us-east-1.amazonaws.com';
+const EXISTING_DOMAIN_HOSTED_ZONE_ID = 'Z1UJRXOUMOOFQ8';
+
+/**
+ * Wiring for the ALREADY-EXISTING quadrivia-webhook.medwork.io custom
+ * domain. See the comment on `existingDomain` below for the mTLS
+ * activation sequencing this depends on.
+ */
+export interface QuadriviaExistingDomainProps {
   /**
    * Bucket holding the PEM truststore of the CA that signs Quadrivia's client
    * certificate. Imported by name — the truststore is a security artifact
-   * whose upload/rotation is an operator action, not a CDK asset.
+   * whose upload/rotation is an operator action, not a CDK asset. Needed to
+   * run the manual mTLS-activation command documented at the mapping site
+   * below, NOT used to configure the DomainName from this stack (this stack
+   * does not own that resource — see EXISTING_DOMAIN_NAME above).
    */
   readonly truststoreBucketName: string;
   /** Key of the truststore object, e.g. `quadrivia/truststore.pem`. */
   readonly truststoreKey: string;
   /**
    * S3 object version of the truststore. Strongly recommended: pinning a
-   * version makes a CA rotation an explicit, reviewable stack change instead
-   * of an out-of-band bucket write that silently changes who can call in.
+   * version makes a CA rotation an explicit, reviewable change instead of
+   * an out-of-band bucket write that silently changes who can call in.
    */
   readonly truststoreVersion?: string;
-  /**
-   * Required by API Gateway when `certificateArn` is an imported or private-CA
-   * certificate rather than an ACM-issued public one.
-   */
-  readonly ownershipCertificateArn?: string;
 }
 
 export interface QuadriviaWebhookStackProps extends cdk.StackProps {
@@ -82,29 +88,80 @@ export interface QuadriviaWebhookStackProps extends cdk.StackProps {
    * cannot silently widen if the account/region ever differ.
    */
   readonly connectInstanceArn: string;
-  /** Task template the scheduled callback task is created from. */
-  readonly taskTemplateId: string;
+  /**
+   * The dedicated Connect flow the scheduled callback task runs. Deliberately
+   * NOT a Task Template ID — publishing the first-ever Task Template on this
+   * Connect instance forces every agent to pick a template for every
+   * manually-created task from then on, an instance-wide behavior change
+   * decided against on 2026-09-29. This flow is expected to be a plain
+   * attribute-based router: read `is_billing_question` (-> PST queue) and
+   * `patient_status` (`existing` -> existing-patient voicemail queue,
+   * anything else -> agents/New Lead voicemail queue) and transfer
+   * accordingly. It does NOT invoke SOPS-ConnectPatientLookup itself — see
+   * `patientLookupFunctionArn` below for why that lookup happens in this
+   * Lambda instead.
+   */
+  readonly contactFlowId: string;
+  /**
+   * ARN of the existing `SOPS-ConnectPatientLookup` Lambda that
+   * *MainInboundVoice already uses to classify existing-patient vs
+   * new-lead. Invoked directly from this Lambda (a plain lambda:Invoke,
+   * not via a Connect flow) with a synthetic event shaped like a voice
+   * contact's, because that Lambda reads the caller's number from
+   * `Details.ContactData.CustomerEndpoint.Address` — a field
+   * StartTaskContact has no way to populate for a Task contact (it isn't a
+   * StartTaskContact parameter at all). A Connect flow invoking it directly
+   * for our task would silently always get a missing-number "error"
+   * response, which *MainInboundVoice's own closed-hours branch defaults to
+   * the New Lead queue — every Quadrivia callback would be misclassified
+   * as New Lead with no visible error. See handler.py's
+   * `_lookup_patient_status` for the full reasoning.
+   */
+  readonly patientLookupFunctionArn: string;
+  /**
+   * The exact `subjectDN` Quadrivia's mTLS client certificate must present,
+   * e.g. `CN=quadrivia-afterhours,OU=Integrations,O=Quadrivia,C=US`.
+   * Quadrivia confirmed (2026-09-30) they operate a private CA used only
+   * for this integration and will state the subject when they send the CA
+   * certificate for the truststore. Required, not optional: the truststore
+   * alone trusts any certificate that CA ever issues, not just theirs —
+   * see handler.py's `_verify_client_certificate_subject` for the full
+   * reasoning. Do not invent a placeholder value; leave this stack
+   * unwired (as it already is, pending contactFlowId) until the real
+   * subject is known.
+   */
+  readonly clientCertSubjectDn: string;
   /** Owner tag — email of the accountable engineer (SCP-mandated). */
   readonly ownerEmail: string;
   /** Team tag — one of `specialOps` | `engineering` | `medwork-devs`. */
   readonly team: string;
   /**
-   * mTLS custom domain. When omitted the API is created with
-   * `disableExecuteApiEndpoint: true` and no domain mapping, i.e. it is
-   * reachable from nowhere — fail-closed, on purpose.
+   * Connects this stack's HttpApi to the existing quadrivia-webhook.medwork.io
+   * custom domain (see EXISTING_DOMAIN_NAME above — domain + cert + DNS
+   * record are already live, created by IT on 2026-09-28). When omitted the
+   * API has no domain mapping and `disableExecuteApiEndpoint: true`, i.e. it
+   * is reachable from nowhere — fail-closed, on purpose.
    *
-   * >>> PENDING HUMAN DECISION (Sebastian): <<<
-   * There is no hosted zone / ACM certificate / truststore bucket for this
-   * webhook yet, and this repo owns none to borrow. Until that decision is
-   * made this prop must be left undefined; supplying an invented FQDN would
-   * create a real custom domain with a real (mis-issued) cert requirement and
-   * defeat layer 1 of the defence-in-depth design. Also note: creating the
-   * DomainName alone is not enough — the DNS ALIAS record pointing
-   * `domainName` at `RegionalDomainName`/`RegionalHostedZoneId` (both emitted
-   * as stack outputs) must be created in whichever zone is chosen, which is
-   * intentionally NOT done here because that zone is unknown.
+   * >>> DEPLOY-ORDER WARNING — read before setting this prop: <<<
+   * This stack does NOT own the DomainName resource and therefore CANNOT
+   * configure its mTLS truststore via CloudFormation — that is a manual,
+   * out-of-band step against a resource IT created directly (tagged
+   * `ManagedBy: manual`). If this prop is supplied and deployed BEFORE mTLS
+   * is actually active on the domain, the webhook becomes reachable over
+   * plain TLS with no client-certificate check at all — a real bypass of
+   * layer 1, not a theoretical one. Sequence must be:
+   *   1. Upload Quadrivia's client cert/CA to the truststore bucket+key
+   *      given below.
+   *   2. Run (once, manually, after step 1):
+   *        aws apigatewayv2 update-domain-name \
+   *          --domain-name quadrivia-webhook.medwork.io \
+   *          --domain-name-configurations '[{"ApiGatewayDomainName":"'"$EXISTING_DOMAIN_REGIONAL_NAME"'","CertificateArn":"<existing cert arn — do not change>","EndpointType":"REGIONAL","SecurityPolicy":"TLS_1_2"}]' \
+   *          --mutual-tls-authentication TruststoreUri=s3://<bucket>/<key>,TruststoreVersion=<version>
+   *      (confirm with `aws apigatewayv2 get-domain-name` that
+   *      MutualTlsAuthentication is present before proceeding)
+   *   3. Only then deploy this stack with `existingDomain` set.
    */
-  readonly mtlsDomain?: QuadriviaMtlsDomainProps;
+  readonly existingDomain?: QuadriviaExistingDomainProps;
   readonly permissionsBoundaryName?: string;
 }
 
@@ -125,7 +182,8 @@ export interface QuadriviaWebhookStackProps extends cdk.StackProps {
  * the blast radius of either one's misconfiguration.
  *
  * Three independent layers guard the endpoint:
- *   1. mTLS on a custom domain (transport) — `mtlsDomain` prop.
+ *   1. mTLS on a custom domain (transport) — `existingDomain` prop, wired
+ *      to the already-existing quadrivia-webhook.medwork.io (IT-owned).
  *   2. HMAC-SHA256 over the raw body + a ±5min timestamp window, verified
  *      INLINE in the business Lambda. Not a separate Lambda authorizer on
  *      purpose: an extra Lambda in the synchronous path of a live call adds a
@@ -137,7 +195,10 @@ export class QuadriviaWebhookStack extends cdk.Stack {
   public readonly lambdaFunction: lambda.Function;
   public readonly idempotencyTable: dynamodb.Table;
   public readonly hmacSecret: secretsmanager.Secret;
-  public readonly domainName?: apigatewayv2.DomainName;
+  // IDomainName, not the concrete DomainName class: this is always an
+  // imported reference (fromDomainNameAttributes) to a resource this stack
+  // never creates — see EXISTING_DOMAIN_NAME above.
+  public readonly domainName?: apigatewayv2.IDomainName;
 
   constructor(scope: Construct, id: string, props: QuadriviaWebhookStackProps) {
     super(scope, id, props);
@@ -236,21 +297,30 @@ export class QuadriviaWebhookStack extends cdk.Stack {
     );
 
     // StartTaskContact only, scoped to contacts of this one Connect instance.
-    // No connect:StopContact / UpdateContact / ListTaskTemplates etc. — the
-    // webhook creates and never reads or mutates.
-    //
-    // OPEN ITEM: AWS's StartTaskContact docs also discuss task-template
-    // permissions; if a live invoke returns AccessDenied mentioning
-    // GetTaskTemplate, add exactly that one action scoped to
-    // `${connectInstanceArn}/task-template/${taskTemplateId}` — nothing
-    // broader. Deliberately not pre-granted here, since granting an
-    // unverified permission is the same mistake in the other direction.
+    // No connect:StopContact / UpdateContact etc. — the webhook creates and
+    // never reads or mutates. No task-template permission needed either:
+    // this passes ContactFlowId, not TaskTemplateId (see contactFlowId prop
+    // doc) — deliberately avoiding the org-wide side effect of publishing
+    // this instance's first-ever Task Template.
     role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         sid: 'StartScheduledCallbackTask',
         effect: iam.Effect.ALLOW,
         actions: ['connect:StartTaskContact'],
         resources: [`${props.connectInstanceArn}/contact/*`],
+      }),
+    );
+
+    // Scoped to exactly this one Lambda — not lambda:InvokeFunction:* — so
+    // this role can never invoke anything else. See patientLookupFunctionArn
+    // prop doc for why this Lambda is invoked directly rather than from a
+    // Connect flow.
+    role.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'LookupExistingPatient',
+        effect: iam.Effect.ALLOW,
+        actions: ['lambda:InvokeFunction'],
+        resources: [props.patientLookupFunctionArn],
       }),
     );
 
@@ -334,11 +404,16 @@ export class QuadriviaWebhookStack extends cdk.Stack {
       role,
       logGroup,
       memorySize: 256,
-      // Short on purpose: the only work is one HMAC comparison, one
-      // conditional PutItem and one StartTaskContact. A live caller is
-      // waiting, so failing fast beats hanging — and a long timeout would let
-      // a flood of slow requests hold concurrency open.
-      timeout: cdk.Duration.seconds(3),
+      // Short on purpose, but not as short as the original 3s: an HMAC
+      // comparison, a conditional PutItem, and StartTaskContact are all
+      // fast, but the SOPS-ConnectPatientLookup invoke (see
+      // patientLookupFunctionArn) has its own 1s connect / 1.5s read
+      // timeout in handler.py — worst case ~2.5s spent there alone before
+      // it gives up and falls back to "error". 6s leaves real headroom
+      // above that worst case instead of racing it. A live caller is still
+      // waiting, so this stays well short of a "long" timeout, and a flood
+      // of slow requests still can't hold concurrency open indefinitely.
+      timeout: cdk.Duration.seconds(6),
       // Same value as ApiAuthorizerStack's front-door Lambda: enough headroom
       // that a burst cannot throttle legitimate callbacks, low enough that a
       // misbehaving caller cannot consume the account's whole concurrency
@@ -350,7 +425,9 @@ export class QuadriviaWebhookStack extends cdk.Stack {
         // settable prop — that way the IAM scope above and the instance the
         // Lambda actually calls can never drift apart.
         CONNECT_INSTANCE_ID: connectInstanceId,
-        TASK_TEMPLATE_ID: props.taskTemplateId,
+        CONTACT_FLOW_ID: props.contactFlowId,
+        PATIENT_LOOKUP_FUNCTION_ARN: props.patientLookupFunctionArn,
+        QUADRIVIA_CLIENT_CERT_SUBJECT_DN: props.clientCertSubjectDn,
         IDEMPOTENCY_TABLE: this.idempotencyTable.tableName,
         HMAC_SECRET_ARN: this.hmacSecret.secretArn,
         LOG_LEVEL: 'INFO',
@@ -360,32 +437,19 @@ export class QuadriviaWebhookStack extends cdk.Stack {
     skipCheckovChecks(this.lambdaFunction, [VPC_SKIP, DLQ_SKIP]);
 
     // ── Layer 1: dedicated HTTP API behind an mTLS custom domain ─────────
-    const mtls = props.mtlsDomain;
-    if (mtls) {
-      this.domainName = new apigatewayv2.DomainName(this, 'WebhookDomain', {
-        domainName: mtls.domainName,
-        certificate: certificatemanager.Certificate.fromCertificateArn(
-          this,
-          'WebhookCertificate',
-          mtls.certificateArn,
-        ),
-        ownershipCertificate: mtls.ownershipCertificateArn
-          ? certificatemanager.Certificate.fromCertificateArn(
-              this,
-              'WebhookOwnershipCertificate',
-              mtls.ownershipCertificateArn,
-            )
-          : undefined,
-        securityPolicy: apigatewayv2.SecurityPolicy.TLS_1_2,
-        mtls: {
-          bucket: s3.Bucket.fromBucketName(
-            this,
-            'TruststoreBucket',
-            mtls.truststoreBucketName,
-          ),
-          key: mtls.truststoreKey,
-          version: mtls.truststoreVersion,
-        },
+    // Imported, not created: quadrivia-webhook.medwork.io + its ACM cert +
+    // DNS record already exist, owned by IT (see EXISTING_DOMAIN_NAME above).
+    // `fromDomainNameAttributes` produces no AWS::ApiGatewayV2::DomainName in
+    // this stack's template — CloudFormation never manages, and cannot
+    // configure mTLS on, a resource it did not create. See the
+    // DEPLOY-ORDER WARNING on `existingDomain` for why mTLS must already be
+    // active before this is wired.
+    const existingDomain = props.existingDomain;
+    if (existingDomain) {
+      this.domainName = apigatewayv2.DomainName.fromDomainNameAttributes(this, 'WebhookDomain', {
+        name: EXISTING_DOMAIN_NAME,
+        regionalDomainName: EXISTING_DOMAIN_REGIONAL_NAME,
+        regionalHostedZoneId: EXISTING_DOMAIN_HOSTED_ZONE_ID,
       });
     }
 
@@ -519,8 +583,10 @@ export class QuadriviaWebhookStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'HmacSecretArn', { value: this.hmacSecret.secretArn });
     if (this.domainName) {
-      // The two values needed to create the DNS ALIAS record in whichever
-      // hosted zone is eventually chosen (see the mtlsDomain prop comment).
+      // DNS is already live (IT created the record directly in the main
+      // medwork.io zone) — these are sanity-check outputs to confirm the
+      // imported domain resolved to what EXISTING_DOMAIN_NAME above expects,
+      // not something a deploy needs to act on.
       new cdk.CfnOutput(this, 'RegionalDomainName', {
         value: this.domainName.regionalDomainName,
       });

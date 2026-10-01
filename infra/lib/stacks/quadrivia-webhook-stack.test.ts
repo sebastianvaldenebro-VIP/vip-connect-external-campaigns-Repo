@@ -9,13 +9,17 @@ import {
 const ENV = { account: '165505826690', region: 'us-east-1' };
 const INSTANCE_ID = '6b3f17ba-68a4-472a-9b20-db1991507009';
 const CONNECT_INSTANCE_ARN = `arn:aws:connect:us-east-1:165505826690:instance/${INSTANCE_ID}`;
-const TASK_TEMPLATE_ID = '11111111-2222-3333-4444-555555555555';
+const CONTACT_FLOW_ID = '11111111-2222-3333-4444-555555555555';
+const PATIENT_LOOKUP_FUNCTION_ARN =
+  'arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup';
+const CLIENT_CERT_SUBJECT_DN = 'CN=quadrivia-afterhours,OU=Integrations,O=Quadrivia,C=US';
 
-// Synthetic placeholders — this stack has no real domain/cert/truststore yet
-// (see the mtlsDomain prop comment in the stack).
-const MTLS_DOMAIN = {
-  domainName: 'quadrivia-webhook.example.invalid',
-  certificateArn: 'arn:aws:acm:us-east-1:165505826690:certificate/00000000-0000-0000-0000-000000000000',
+// The domain itself (quadrivia-webhook.medwork.io) is real and already
+// live — see EXISTING_DOMAIN_NAME in the stack. Only the truststore
+// location is a placeholder here (that S3 object doesn't exist in this
+// test's fixtures — it's an out-of-band artifact, see existingDomain prop
+// comment in the stack).
+const EXISTING_DOMAIN = {
   truststoreBucketName: 'vip-quadrivia-truststore-example',
   truststoreKey: 'quadrivia/truststore.pem',
 };
@@ -35,7 +39,9 @@ function buildStack(propsOverride: Partial<QuadriviaWebhookStackProps> = {}) {
     env: ENV,
     dataKey,
     connectInstanceArn: CONNECT_INSTANCE_ARN,
-    taskTemplateId: TASK_TEMPLATE_ID,
+    contactFlowId: CONTACT_FLOW_ID,
+    patientLookupFunctionArn: PATIENT_LOOKUP_FUNCTION_ARN,
+    clientCertSubjectDn: CLIENT_CERT_SUBJECT_DN,
     ownerEmail: 'placeholder.owner@medwork.io',
     team: 'engineering',
     ...propsOverride,
@@ -111,58 +117,27 @@ describe('QuadriviaWebhookStack', () => {
   });
 
   describe('layer 1 — mTLS custom domain', () => {
-    it('creates no domain or mapping when mtlsDomain is omitted (fail-closed pending the domain decision)', () => {
+    it('creates no domain or mapping when existingDomain is omitted (fail-closed pending mTLS activation)', () => {
       const template = templateOf();
       template.resourceCountIs('AWS::ApiGatewayV2::DomainName', 0);
       template.resourceCountIs('AWS::ApiGatewayV2::ApiMapping', 0);
       expect(buildStack().stack.domainName).toBeUndefined();
     });
 
-    it('configures the truststore and TLS 1.2 on the domain when mtlsDomain is supplied', () => {
-      const template = templateOf({ mtlsDomain: MTLS_DOMAIN });
-      template.hasResourceProperties('AWS::ApiGatewayV2::DomainName', {
-        DomainName: MTLS_DOMAIN.domainName,
-        DomainNameConfigurations: Match.arrayWith([
-          Match.objectLike({
-            CertificateArn: MTLS_DOMAIN.certificateArn,
-            SecurityPolicy: 'TLS_1_2',
-            EndpointType: 'REGIONAL',
-          }),
-        ]),
-        MutualTlsAuthentication: {
-          TruststoreUri: `s3://${MTLS_DOMAIN.truststoreBucketName}/${MTLS_DOMAIN.truststoreKey}`,
-        },
-      });
+    it('imports the existing quadrivia-webhook.medwork.io domain rather than creating one', () => {
+      const template = templateOf({ existingDomain: EXISTING_DOMAIN });
+      // No AWS::ApiGatewayV2::DomainName in the template at all — this
+      // stack does not own that resource (IT created it directly) and
+      // CloudFormation cannot manage a resource it didn't create.
+      template.resourceCountIs('AWS::ApiGatewayV2::DomainName', 0);
       template.resourceCountIs('AWS::ApiGatewayV2::ApiMapping', 1);
-    });
-
-    it('pins the truststore object version when one is given', () => {
-      templateOf({
-        mtlsDomain: { ...MTLS_DOMAIN, truststoreVersion: 'v-abc123' },
-      }).hasResourceProperties('AWS::ApiGatewayV2::DomainName', {
-        MutualTlsAuthentication: Match.objectLike({ TruststoreVersion: 'v-abc123' }),
+      template.hasResourceProperties('AWS::ApiGatewayV2::ApiMapping', {
+        DomainName: 'quadrivia-webhook.medwork.io',
       });
     });
 
-    it('wires an ownership certificate when the cert is imported/private-CA', () => {
-      templateOf({
-        mtlsDomain: {
-          ...MTLS_DOMAIN,
-          ownershipCertificateArn:
-            'arn:aws:acm:us-east-1:165505826690:certificate/99999999-9999-9999-9999-999999999999',
-        },
-      }).hasResourceProperties('AWS::ApiGatewayV2::DomainName', {
-        DomainNameConfigurations: Match.arrayWith([
-          Match.objectLike({
-            OwnershipVerificationCertificateArn:
-              'arn:aws:acm:us-east-1:165505826690:certificate/99999999-9999-9999-9999-999999999999',
-          }),
-        ]),
-      });
-    });
-
-    it('emits the Route53 ALIAS target outputs only when a domain exists', () => {
-      const withDomain = templateOf({ mtlsDomain: MTLS_DOMAIN });
+    it('emits the imported domain facts as sanity-check outputs only when wired', () => {
+      const withDomain = templateOf({ existingDomain: EXISTING_DOMAIN });
       withDomain.hasOutput('RegionalDomainName', {});
       withDomain.hasOutput('RegionalHostedZoneId', {});
       withDomain.hasOutput('WebhookUrl', {});
@@ -172,8 +147,8 @@ describe('QuadriviaWebhookStack', () => {
       expect(Object.keys(withoutDomain.findOutputs('WebhookUrl'))).toHaveLength(0);
     });
 
-    it('does not create a Route53 record itself (hosted zone is an open decision)', () => {
-      templateOf({ mtlsDomain: MTLS_DOMAIN }).resourceCountIs('AWS::Route53::RecordSet', 0);
+    it('never creates a Route53 record — DNS is already live, owned by IT', () => {
+      templateOf({ existingDomain: EXISTING_DOMAIN }).resourceCountIs('AWS::Route53::RecordSet', 0);
     });
   });
 
@@ -235,6 +210,19 @@ describe('QuadriviaWebhookStack', () => {
         .flatMap((s) => (Array.isArray(s.Action) ? s.Action : [s.Action]))
         .filter((action) => typeof action === 'string' && action.startsWith('connect:'));
       expect(connectActions).toEqual(['connect:StartTaskContact']);
+    });
+
+    it('grants lambda:InvokeFunction scoped to exactly the patient-lookup Lambda', () => {
+      const statement = statementBySid(templateOf(), 'LookupExistingPatient');
+      expect(statement.Action).toEqual('lambda:InvokeFunction');
+      expect(statement.Resource).toEqual(PATIENT_LOOKUP_FUNCTION_ARN);
+    });
+
+    it('grants no other lambda action anywhere in the stack', () => {
+      const lambdaActions = allStatements(templateOf())
+        .flatMap((s) => (Array.isArray(s.Action) ? s.Action : [s.Action]))
+        .filter((action) => typeof action === 'string' && action.startsWith('lambda:'));
+      expect(lambdaActions).toEqual(['lambda:InvokeFunction']);
     });
 
     it('grants exactly PutItem + GetItem + DeleteItem on the idempotency table and nothing else', () => {
@@ -330,7 +318,7 @@ describe('QuadriviaWebhookStack', () => {
         FunctionName: 'vip-quadrivia-callback',
         Runtime: 'python3.12',
         Handler: 'handler.lambda_handler',
-        Timeout: 3,
+        Timeout: 6,
         MemorySize: 256,
         ReservedConcurrentExecutions: 100,
       });
@@ -340,13 +328,15 @@ describe('QuadriviaWebhookStack', () => {
       }
     });
 
-    it('passes the Connect instance id derived from the ARN, plus the task template', () => {
+    it('passes the Connect instance id derived from the ARN, plus the contact flow id', () => {
       const template = templateOf();
       template.hasResourceProperties('AWS::Lambda::Function', {
         Environment: {
           Variables: Match.objectLike({
             CONNECT_INSTANCE_ID: INSTANCE_ID,
-            TASK_TEMPLATE_ID: TASK_TEMPLATE_ID,
+            CONTACT_FLOW_ID: CONTACT_FLOW_ID,
+            PATIENT_LOOKUP_FUNCTION_ARN: PATIENT_LOOKUP_FUNCTION_ARN,
+            QUADRIVIA_CLIENT_CERT_SUBJECT_DN: CLIENT_CERT_SUBJECT_DN,
             POWERTOOLS_SERVICE_NAME: 'quadrivia-afterhours-callback',
           }),
         },
@@ -512,7 +502,9 @@ describe('QuadriviaWebhookStack', () => {
         env: ENV,
         dataKey,
         connectInstanceArn: CONNECT_INSTANCE_ARN,
-        taskTemplateId: TASK_TEMPLATE_ID,
+        contactFlowId: CONTACT_FLOW_ID,
+        patientLookupFunctionArn: PATIENT_LOOKUP_FUNCTION_ARN,
+        clientCertSubjectDn: CLIENT_CERT_SUBJECT_DN,
         ownerEmail: 'placeholder.owner@medwork.io',
         team: 'engineering',
       });

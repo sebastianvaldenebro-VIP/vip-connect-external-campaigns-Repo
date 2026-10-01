@@ -269,23 +269,56 @@ export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
 // NOT YET INSTANTIATED (deliberate, not an oversight): QuadriviaWebhookStack
 // (lib/stacks/quadrivia-webhook-stack.ts) — the mTLS webhook that lets
 // Quadrivia's after-hours AI agent schedule callback Tasks in Connect. Fully
-// built and unit-tested (`cdk synth` clean in isolation), but not wired here
-// because three required props have no real value yet, confirmed with
-// Sebastian 2026-09-23:
-//   - taskTemplateId — no Task Template exists in Connect for this flow yet.
-//   - ownerEmail / team — SCP-mandated tags, not yet decided for this stack.
-// mtlsDomain can stay omitted at first wire-up (the stack is fail-closed —
-// disableExecuteApiEndpoint, no domain mapping — until that's chosen too).
-// Once the above three exist, wire it the same way as every other stack:
+// built and unit-tested (`cdk synth` clean in isolation), but not wired here.
+//
+// Status as of 2026-09-28:
+//   - ownerEmail = sebastian.valdenebro@medwork.io, team = specialOps — DECIDED.
+//   - quadrivia-webhook.medwork.io custom domain — LIVE (IT created it directly
+//     in the VIP-Techsupport account + a DNS record in the main medwork.io
+//     zone; NOT part of this CDK app — see EXISTING_DOMAIN_NAME in the stack).
+//   - mTLS on that domain — NOT YET ACTIVE. Do not set `existingDomain` below
+//     until it is (see the DEPLOY-ORDER WARNING on that prop in the stack —
+//     wiring the mapping before mTLS is active makes the webhook reachable
+//     over plain TLS with no client-cert check).
+//   - patientLookupFunctionArn = SOPS-ConnectPatientLookup's ARN — DECIDED,
+//     invoked directly by this Lambda (not by the flow — see that prop's
+//     doc in the stack for why).
+//   - clientCertSubjectDn — STILL BLOCKING: Quadrivia confirmed 2026-09-30
+//     they'll state the exact subjectDN when they send their CA cert PEM.
+//     Do not invent a placeholder; the truststore alone trusts any cert
+//     that CA ever issues, so a wrong/placeholder subject here would either
+//     lock out the real client or (worse) silently accept the wrong one.
+//   - contactFlowId — STILL BLOCKING: no dedicated Connect flow exists yet.
+//     Decided 2026-09-29 to use a plain ContactFlowId, NOT a Task Template
+//     (publishing this instance's first-ever Task Template would force
+//     every agent to pick one for every manually-created task from then on
+//     — an org-wide side effect, not worth it here). The flow to build is a
+//     plain attribute-based router: read `is_billing_question` (-> PST
+//     queue if true) and `patient_status` (`existing` -> existing-patient
+//     voicemail queue, else -> agents/New Lead voicemail queue) and
+//     transfer accordingly. It does NOT call SOPS-ConnectPatientLookup
+//     itself. Queue ARNs TBD, per Maria Jose. This is the only remaining
+//     reason this stack isn't wired.
+//
+// Once that flow exists AND mTLS has been activated on the existing domain
+// (manual step — see the stack's `existingDomain` prop doc), wire it the
+// same way as every other stack:
 //
 //   import { QuadriviaWebhookStack } from '../lib/stacks/quadrivia-webhook-stack';
 //   new QuadriviaWebhookStack(app, 'QuadriviaWebhookStack', {
 //     env,
 //     dataKey: data.dataKey,
 //     connectInstanceArn: `arn:aws:connect:us-east-1:165505826690:instance/${connectInstanceId}`,
-//     taskTemplateId: requireContext('quadriviaTaskTemplateId'),
-//     ownerEmail: requireContext('quadriviaOwnerEmail'),
-//     team: requireContext('quadriviaTeam'),
+//     contactFlowId: requireContext('quadriviaContactFlowId'),
+//     patientLookupFunctionArn: `arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup`,
+//     clientCertSubjectDn: requireContext('quadriviaClientCertSubjectDn'),
+//     ownerEmail: 'sebastian.valdenebro@medwork.io',
+//     team: 'specialOps',
+//     existingDomain: {
+//       truststoreBucketName: requireContext('quadriviaTruststoreBucket'),
+//       truststoreKey: requireContext('quadriviaTruststoreKey'),
+//       truststoreVersion: requireContext('quadriviaTruststoreVersion'),
+//     },
 //     permissionsBoundaryName,
 //   });
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -20,8 +21,15 @@ import handler
 SIGNING_KEY = "unit-test-signing-key-not-a-real-secret"
 SYNTHETIC_PHONE = "+15555550123"
 INSTANCE_ID = "6b3f17ba-68a4-472a-9b20-db1991507009"
-TASK_TEMPLATE_ID = "11111111-2222-3333-4444-555555555555"
+CONTACT_FLOW_ID = "11111111-2222-3333-4444-555555555555"
+PATIENT_LOOKUP_ARN = "arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup"
+CLIENT_CERT_SUBJECT_DN = "CN=quadrivia-afterhours,OU=Integrations,O=Quadrivia,C=US"
 TABLE = "VipQuadriviaCallbackIdempotency"
+
+
+def _lambda_payload(body: dict):
+    """A botocore Lambda invoke response's Payload is a stream, not a dict."""
+    return {"Payload": io.BytesIO(json.dumps(body).encode("utf-8"))}
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
@@ -30,7 +38,9 @@ def _env(monkeypatch):
     monkeypatch.setenv("HMAC_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:165505826690:secret:fake")
     monkeypatch.setenv("IDEMPOTENCY_TABLE", TABLE)
     monkeypatch.setenv("CONNECT_INSTANCE_ID", INSTANCE_ID)
-    monkeypatch.setenv("TASK_TEMPLATE_ID", TASK_TEMPLATE_ID)
+    monkeypatch.setenv("CONTACT_FLOW_ID", CONTACT_FLOW_ID)
+    monkeypatch.setenv("PATIENT_LOOKUP_FUNCTION_ARN", PATIENT_LOOKUP_ARN)
+    monkeypatch.setenv("QUADRIVIA_CLIENT_CERT_SUBJECT_DN", CLIENT_CERT_SUBJECT_DN)
     handler._reset_caches()
     yield
     handler._reset_caches()
@@ -48,8 +58,12 @@ def aws(monkeypatch):
     ddb.get_item.return_value = {}
     connect = MagicMock()
     connect.start_task_contact.return_value = {"ContactId": "contact-abc-123"}
+    # Default: caller not found -> "new". Individual tests override this to
+    # exercise "existing" / "error".
+    lambda_ = MagicMock()
+    lambda_.invoke.return_value = _lambda_payload({"exists": "no"})
 
-    clients = {"secretsmanager": secrets, "dynamodb": ddb, "connect": connect}
+    clients = {"secretsmanager": secrets, "dynamodb": ddb, "connect": connect, "lambda": lambda_}
     monkeypatch.setattr(handler.boto3, "client", lambda service, **_: clients[service])
     return clients
 
@@ -86,6 +100,7 @@ def _event(
     base64_encode: bool = False,
     omit_timestamp: bool = False,
     omit_signature: bool = False,
+    client_cert_subject: str | None = CLIENT_CERT_SUBJECT_DN,
 ) -> dict:
     raw = body if isinstance(body, str) else json.dumps(_valid_payload() if body is None else body)
     ts = int(datetime.now(tz=timezone.utc).timestamp()) if timestamp is None else timestamp
@@ -105,11 +120,49 @@ def _event(
     if base64_encode:
         event["body"] = base64.b64encode(raw.encode("utf-8")).decode("ascii")
         event["isBase64Encoded"] = True
+    if client_cert_subject is not None:
+        event["requestContext"] = {
+            "authentication": {"clientCert": {"subjectDN": client_cert_subject}}
+        }
     return event
 
 
 def _body(response: dict) -> dict:
     return json.loads(response["body"])
+
+
+# ── Client certificate subject pinning ────────────────────────────────────
+def test_wrong_client_certificate_subject_is_rejected(aws):
+    """The truststore alone trusts any cert Quadrivia's CA ever issues —
+
+    this is what actually enforces "only this one client", not just "only
+    this one CA".
+    """
+    response = handler.lambda_handler(
+        _event(client_cert_subject="CN=someone-else,O=Not Quadrivia,C=US")
+    )
+    assert response["statusCode"] == 401
+    aws["connect"].start_task_contact.assert_not_called()
+
+
+def test_missing_client_certificate_is_rejected(aws):
+    # No requestContext.authentication.clientCert at all — e.g. a direct
+    # console test invoke that bypassed API Gateway's mTLS entirely.
+    response = handler.lambda_handler(_event(client_cert_subject=None))
+    assert response["statusCode"] == 401
+    aws["connect"].start_task_contact.assert_not_called()
+
+
+def test_client_cert_check_runs_before_anything_else_is_parsed(aws):
+    """Checked first, before even body parsing — an unauthenticated
+
+    connection shouldn't get a different error shape depending on what
+    garbage it sends as a body.
+    """
+    response = handler.lambda_handler(
+        _event(body="not json at all", client_cert_subject="CN=wrong")
+    )
+    assert response["statusCode"] == 401
 
 
 # ── Happy path ───────────────────────────────────────────────────────────
@@ -121,17 +174,19 @@ def test_valid_request_creates_scheduled_task_and_returns_202(aws):
 
     kwargs = aws["connect"].start_task_contact.call_args[1]
     assert kwargs["InstanceId"] == INSTANCE_ID
-    assert kwargs["TaskTemplateId"] == TASK_TEMPLATE_ID
+    assert kwargs["ContactFlowId"] == CONTACT_FLOW_ID
     assert kwargs["Attributes"]["callback_phone"] == SYNTHETIC_PHONE
     assert kwargs["Attributes"]["source"] == "quadrivia_afterhours"
     assert kwargs["Attributes"]["quadrivia_request_id"] == "req-0001"
+    assert kwargs["Attributes"]["is_billing_question"] == "false"
+    assert kwargs["Attributes"]["patient_status"] == "new"  # fixture default: exists=no
     assert kwargs["References"] == {
         "quadriviaRequestId": {"Value": "req-0001", "Type": "STRING"}
     }
     assert kwargs["ClientToken"] == "req-0001"
     # Exactly one of ContactFlowId/QuickConnectId/TaskTemplateId, and never
     # both ScheduledTime and DelaySeconds — the API rejects either combination.
-    assert "ContactFlowId" not in kwargs and "QuickConnectId" not in kwargs
+    assert "TaskTemplateId" not in kwargs and "QuickConnectId" not in kwargs
     assert "DelaySeconds" not in kwargs
     assert kwargs["ScheduledTime"].tzinfo == timezone.utc
 
@@ -379,6 +434,30 @@ def test_callback_time_just_inside_six_days_is_accepted(aws):
     assert response["statusCode"] == 202
 
 
+def test_missing_callback_time_creates_the_task_immediately(aws):
+    """No specific time requested — the fallback is "create now," not
+
+    "reject the request." StartTaskContact runs the flow right away when
+    ScheduledTime is omitted entirely (never defaulted to e.g. now() — that
+    would be a needless extra field, and this achieves the same result).
+    An immediate task still just waits in its queue like any other contact
+    until an agent is available — no special "urgent" handling.
+    """
+    body = _valid_payload()
+    del body["preferredCallbackTime"]
+    response = handler.lambda_handler(_event(body=body))
+    assert response["statusCode"] == 202
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert "ScheduledTime" not in kwargs
+
+
+def test_empty_string_callback_time_is_treated_the_same_as_omitted(aws):
+    response = handler.lambda_handler(_event(body=_valid_payload(preferredCallbackTime="")))
+    assert response["statusCode"] == 202
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert "ScheduledTime" not in kwargs
+
+
 def test_naive_callback_time_without_timezone_is_rejected(aws):
     naive = (datetime.now(tz=timezone.utc) + timedelta(hours=4)).replace(tzinfo=None).isoformat()
     response = handler.lambda_handler(_event(body=_valid_payload(preferredCallbackTime=naive)))
@@ -404,7 +483,7 @@ def test_non_utc_offset_is_converted_to_utc_epoch(aws):
     assert scheduled == target.astimezone(timezone.utc).replace(microsecond=0)
 
 
-@pytest.mark.parametrize("bad_time", ["", "tomorrow at 9", "2026-13-45T99:00:00Z"])
+@pytest.mark.parametrize("bad_time", ["tomorrow at 9", "2026-13-45T99:00:00Z"])
 def test_unparseable_callback_time_is_rejected(aws, bad_time):
     response = handler.lambda_handler(_event(body=_valid_payload(preferredCallbackTime=bad_time)))
     assert response["statusCode"] == 400
@@ -416,9 +495,58 @@ def test_missing_reason_is_rejected(aws):
     assert "reason" in _body(response)["error"]["message"]
 
 
-def test_overlong_reason_is_rejected(aws):
-    response = handler.lambda_handler(_event(body=_valid_payload(reason="x" * 201)))
+# ── Quality gate (individually well-formed but placeholder-looking data) ──
+@pytest.mark.parametrize(
+    "bad_reason", ["test", "n/a", "TBD", "asdf", "short", "xxxxxxxxxxxx", "          x"]
+)
+def test_placeholder_looking_reason_is_rejected(aws, bad_reason):
+    response = handler.lambda_handler(_event(body=_valid_payload(reason=bad_reason)))
     assert response["statusCode"] == 400
+    aws["connect"].start_task_contact.assert_not_called()
+
+
+def test_genuine_short_reason_over_the_meaningful_length_floor_is_accepted(aws):
+    # 8+ non-whitespace chars, not on the placeholder list — a real, if
+    # terse, reason must not be swept up by the placeholder check.
+    response = handler.lambda_handler(_event(body=_valid_payload(reason="Wants a follow-up call")))
+    assert response["statusCode"] == 202
+
+
+def test_placeholder_looking_phone_is_rejected(aws):
+    response = handler.lambda_handler(
+        _event(body=_valid_payload(customerPhone="+11111111111"))
+    )
+    assert response["statusCode"] == 400
+    aws["connect"].start_task_contact.assert_not_called()
+
+
+def test_quality_rejection_is_logged_under_its_own_event_name(aws, capsys):
+    handler.lambda_handler(_event(body=_valid_payload(reason="test")))
+    logs = capsys.readouterr().out
+    assert "low_quality_data_rejected" in logs
+
+
+def test_overlong_reason_is_rejected(aws):
+    # 4097 — one over StartTaskContact's real, documented Description limit.
+    response = handler.lambda_handler(_event(body=_valid_payload(reason="x" * 4097)))
+    assert response["statusCode"] == 400
+
+
+def test_reason_up_to_4096_chars_is_accepted_and_becomes_the_task_description(aws):
+    """4096 is not an arbitrary round number — it's StartTaskContact's real
+
+    Description limit, large enough to carry a full call transcript rather
+    than just a one-line summary.
+    """
+    # Realistic-looking text, not a repeated character — a single repeated
+    # character is exactly what the quality gate (_classify_request_quality)
+    # exists to reject, so it can't be used here to test the length ceiling.
+    sentence = "Patient asked to be called back about a billing question. "
+    transcript = (sentence * (4096 // len(sentence) + 1))[:4096]
+    handler.lambda_handler(_event(body=_valid_payload(reason=transcript)))
+    call_kwargs = aws["connect"].start_task_contact.call_args.kwargs
+    assert call_kwargs["Description"] == transcript
+    assert call_kwargs["Attributes"]["callback_reason"] == transcript
 
 
 @pytest.mark.parametrize("bad_language", ["", "fr", "klingon"])
@@ -429,6 +557,92 @@ def test_unsupported_language_is_rejected(aws, bad_language):
 
 def test_language_is_case_insensitive(aws):
     assert handler.lambda_handler(_event(body=_valid_payload(language="ES")))["statusCode"] == 202
+
+
+# ── Existing-patient vs new-lead lookup ───────────────────────────────────
+def test_patient_lookup_invokes_sops_connect_patient_lookup_with_synthetic_event(aws):
+    aws["lambda"].invoke.return_value = _lambda_payload({"exists": "yes"})
+    handler.lambda_handler(_event())
+    invoke_kwargs = aws["lambda"].invoke.call_args[1]
+    assert invoke_kwargs["FunctionName"] == PATIENT_LOOKUP_ARN
+    assert invoke_kwargs["InvocationType"] == "RequestResponse"
+    sent_payload = json.loads(invoke_kwargs["Payload"])
+    assert sent_payload == {
+        "Details": {"ContactData": {"CustomerEndpoint": {"Address": SYNTHETIC_PHONE}}}
+    }
+
+
+def test_existing_patient_lookup_result_is_passed_through(aws):
+    aws["lambda"].invoke.return_value = _lambda_payload({"exists": "yes"})
+    handler.lambda_handler(_event())
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["patient_status"] == "existing"
+
+
+def test_new_lead_lookup_result_is_passed_through(aws):
+    aws["lambda"].invoke.return_value = _lambda_payload({"exists": "no"})
+    handler.lambda_handler(_event())
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["patient_status"] == "new"
+
+
+@pytest.mark.parametrize(
+    "broken_response",
+    [
+        {"exists": "error"},  # the real Lambda's own reported failure mode
+        {"exists": "something-unexpected"},
+        {},
+    ],
+)
+def test_unrecognized_lookup_result_defaults_to_error(aws, broken_response):
+    aws["lambda"].invoke.return_value = _lambda_payload(broken_response)
+    handler.lambda_handler(_event())
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["patient_status"] == "error"
+
+
+def test_patient_lookup_invocation_failure_does_not_fail_the_callback(aws):
+    """A timeout/throttle/exception talking to SOPS-ConnectPatientLookup
+
+    must never be the reason a callback fails to schedule — it degrades to
+    "error" (the same value the real Lambda returns on its own DB
+    failures), same as *MainInboundVoice already treats it.
+    """
+    aws["lambda"].invoke.side_effect = RuntimeError("timed out")
+    response = handler.lambda_handler(_event())
+    assert response["statusCode"] == 202
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["patient_status"] == "error"
+
+
+def test_patient_lookup_malformed_payload_defaults_to_error(aws):
+    aws["lambda"].invoke.return_value = {"Payload": io.BytesIO(b"not json")}
+    response = handler.lambda_handler(_event())
+    assert response["statusCode"] == 202
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["patient_status"] == "error"
+
+
+# ── Billing classification (routing hint, not this Lambda's decision) ─────
+def test_billing_flag_defaults_to_false_when_omitted(aws):
+    handler.lambda_handler(_event())
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["is_billing_question"] == "false"
+
+
+def test_billing_flag_true_is_passed_through_as_a_connect_attribute(aws):
+    handler.lambda_handler(_event(body=_valid_payload(isBillingQuestion=True)))
+    kwargs = aws["connect"].start_task_contact.call_args[1]
+    assert kwargs["Attributes"]["is_billing_question"] == "true"
+
+
+@pytest.mark.parametrize("bad_value", ["true", "yes", 1, "false"])
+def test_non_boolean_billing_flag_is_rejected(aws, bad_value):
+    # A string like "true"/"false" is intentionally not treated as truthy —
+    # that ambiguity is exactly how a routing bug would slip in unnoticed.
+    response = handler.lambda_handler(_event(body=_valid_payload(isBillingQuestion=bad_value)))
+    assert response["statusCode"] == 400
+    aws["connect"].start_task_contact.assert_not_called()
 
 
 def test_non_json_body_is_rejected_with_400(aws):
@@ -446,11 +660,13 @@ def test_json_array_body_is_rejected_with_400(aws):
 
 
 def test_missing_headers_key_entirely_is_rejected_not_crashed(aws):
-    # request_id is now checked before signature/timestamp (it's part of the
-    # signed payload — see _verify_signature), so an entirely headerless
-    # request is a 400 for the missing X-Request-Id, not a 401.
+    # No requestContext at all either — the client-cert check runs first
+    # (see test_client_cert_check_runs_before_anything_else_is_parsed) and
+    # is what actually catches this, not the missing-headers/request-id
+    # path. The real point of this test is "doesn't crash" — a raw event
+    # missing entire top-level keys must still resolve to a clean 4xx.
     response = handler.lambda_handler({"body": json.dumps(_valid_payload())})
-    assert response["statusCode"] == 400
+    assert response["statusCode"] == 401
 
 
 def test_uppercase_header_names_are_normalised(aws):
