@@ -14,6 +14,7 @@ import { ApiStack } from '../lib/stacks/api-stack';
 import { AuthStack } from '../lib/stacks/auth-stack';
 import { DataStack } from '../lib/stacks/data-stack';
 import { HostingStack } from '../lib/stacks/hosting-stack';
+import { QuadriviaWebhookStack } from '../lib/stacks/quadrivia-webhook-stack';
 
 export const app = new cdk.App();
 
@@ -266,60 +267,47 @@ export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
 // The CFN exec role lacks SNS and cloudwatch:PutDashboard permissions.
 // All monitoring resources are created via CLI — see deploy-cli.sh.
 
-// NOT YET INSTANTIATED (deliberate, not an oversight): QuadriviaWebhookStack
-// (lib/stacks/quadrivia-webhook-stack.ts) — the mTLS webhook that lets
-// Quadrivia's after-hours AI agent schedule callback Tasks in Connect. Fully
-// built and unit-tested (`cdk synth` clean in isolation), but not wired here.
+// QuadriviaWebhookStack — the mTLS webhook that lets Quadrivia's after-hours
+// AI agent schedule callback Tasks in Connect.
 //
-// Status as of 2026-09-28:
+// Status as of 2026-10-01 — DELIBERATE DRY-RUN DEPLOY, not a real go-live:
 //   - ownerEmail = sebastian.valdenebro@medwork.io, team = specialOps — DECIDED.
-//   - quadrivia-webhook.medwork.io custom domain — LIVE (IT created it directly
-//     in the VIP-Techsupport account + a DNS record in the main medwork.io
-//     zone; NOT part of this CDK app — see EXISTING_DOMAIN_NAME in the stack).
-//   - mTLS on that domain — NOT YET ACTIVE. Do not set `existingDomain` below
-//     until it is (see the DEPLOY-ORDER WARNING on that prop in the stack —
-//     wiring the mapping before mTLS is active makes the webhook reachable
-//     over plain TLS with no client-cert check).
-//   - patientLookupFunctionArn = SOPS-ConnectPatientLookup's ARN — DECIDED,
-//     invoked directly by this Lambda (not by the flow — see that prop's
-//     doc in the stack for why).
-//   - clientCertSubjectDn — STILL BLOCKING: Quadrivia confirmed 2026-09-30
-//     they'll state the exact subjectDN when they send their CA cert PEM.
-//     Do not invent a placeholder; the truststore alone trusts any cert
-//     that CA ever issues, so a wrong/placeholder subject here would either
-//     lock out the real client or (worse) silently accept the wrong one.
-//   - contactFlowId — STILL BLOCKING: no dedicated Connect flow exists yet.
-//     Decided 2026-09-29 to use a plain ContactFlowId, NOT a Task Template
-//     (publishing this instance's first-ever Task Template would force
-//     every agent to pick one for every manually-created task from then on
-//     — an org-wide side effect, not worth it here). The flow to build is a
-//     plain attribute-based router: read `is_billing_question` (-> PST
-//     queue if true) and `patient_status` (`existing` -> existing-patient
-//     voicemail queue, else -> agents/New Lead voicemail queue) and
-//     transfer accordingly. It does NOT call SOPS-ConnectPatientLookup
-//     itself. Queue ARNs TBD, per Maria Jose. This is the only remaining
-//     reason this stack isn't wired.
-//
-// Once that flow exists AND mTLS has been activated on the existing domain
-// (manual step — see the stack's `existingDomain` prop doc), wire it the
-// same way as every other stack:
-//
-//   import { QuadriviaWebhookStack } from '../lib/stacks/quadrivia-webhook-stack';
-//   new QuadriviaWebhookStack(app, 'QuadriviaWebhookStack', {
-//     env,
-//     dataKey: data.dataKey,
-//     connectInstanceArn: `arn:aws:connect:us-east-1:165505826690:instance/${connectInstanceId}`,
-//     contactFlowId: requireContext('quadriviaContactFlowId'),
-//     patientLookupFunctionArn: `arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup`,
-//     clientCertSubjectDn: requireContext('quadriviaClientCertSubjectDn'),
-//     ownerEmail: 'sebastian.valdenebro@medwork.io',
-//     team: 'specialOps',
-//     existingDomain: {
-//       truststoreBucketName: requireContext('quadriviaTruststoreBucket'),
-//       truststoreKey: requireContext('quadriviaTruststoreKey'),
-//       truststoreVersion: requireContext('quadriviaTruststoreVersion'),
-//     },
-//     permissionsBoundaryName,
-//   });
+//   - patientLookupFunctionArn = SOPS-ConnectPatientLookup's ARN — DECIDED.
+//   - existingDomain — intentionally OMITTED (left undefined). mTLS is not
+//     yet active on quadrivia-webhook.medwork.io, so this stack creates no
+//     ApiMapping and the webhook is reachable from nowhere. Safe by
+//     construction, not by discipline — do not add existingDomain until
+//     mTLS is confirmed active (see the DEPLOY-ORDER WARNING on that prop).
+//   - clientCertSubjectDn below is still an EXPLICIT PLACEHOLDER, not a real
+//     value — see QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN for why this is
+//     still safe to deploy. Must be replaced with a real value — via a
+//     second, deliberate deploy — before mTLS is ever activated on the
+//     domain: Quadrivia confirmed 2026-09-30 they'll state the exact
+//     subjectDN when they send their CA cert PEM. Per the stack's own doc:
+//     derive it from the actual PEM they send (`openssl x509 -noout
+//     -subject`), not from a typed description.
+//   - contactFlowId now points at the real TEST flow ("Quadrivia Test
+//     Flow", created 2026-10-01, always transfers to the "Quadrivia Test"
+//     queue — no live agent has that queue in their routing profile). This
+//     is deliberately the test-window flow, not the real
+//     billing/existing-patient/new-lead router — that one still needs the
+//     real queue ARNs (PST pending Maria Jose) and must replace this value
+//     before go-live.
+const QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN = 'PENDING-QUADRIVIA-CERT-DO-NOT-ACTIVATE-MTLS-WITH-THIS-VALUE';
+const QUADRIVIA_TEST_CONTACT_FLOW_ID = '94aa3f9d-5ed3-4de5-aa7b-065012de3beb';
+
+export const quadriviaWebhook = new QuadriviaWebhookStack(app, 'QuadriviaWebhookStack', {
+  env,
+  dataKey: data.dataKey,
+  connectInstanceArn: `arn:aws:connect:us-east-1:165505826690:instance/${connectInstanceId}`,
+  contactFlowId: QUADRIVIA_TEST_CONTACT_FLOW_ID,
+  patientLookupFunctionArn:
+    'arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup',
+  clientCertSubjectDn: QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN,
+  ownerEmail: 'sebastian.valdenebro@medwork.io',
+  team: 'specialOps',
+  // existingDomain intentionally omitted — see status note above.
+  permissionsBoundaryName,
+});
 
 Object.entries(mandatoryTags).forEach(([k, v]) => cdk.Tags.of(app).add(k, v));

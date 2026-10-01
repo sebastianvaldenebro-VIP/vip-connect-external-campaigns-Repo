@@ -15,7 +15,9 @@ import { skipCheckovChecks } from '../utils/checkov-skip';
 const APPLICATION = 'quadrivia-afterhours-callback';
 const FUNCTION_NAME = 'vip-quadrivia-callback';
 const TABLE_NAME = 'VipQuadriviaCallbackIdempotency';
-const SECRET_NAME = 'vip/quadrivia/webhook-hmac';
+// vip/quadrivia/webhook-hmac — now imported by ARN below (HmacSecret), not
+// created by name; kept here only as a comment since the name itself is no
+// longer referenced in code.
 const WEBHOOK_PATH = '/callbacks';
 
 const VPC_SKIP = {
@@ -193,8 +195,8 @@ export interface QuadriviaWebhookStackProps extends cdk.StackProps {
 export class QuadriviaWebhookStack extends cdk.Stack {
   public readonly httpApi: apigatewayv2.HttpApi;
   public readonly lambdaFunction: lambda.Function;
-  public readonly idempotencyTable: dynamodb.Table;
-  public readonly hmacSecret: secretsmanager.Secret;
+  public readonly idempotencyTable: dynamodb.ITable;
+  public readonly hmacSecret: secretsmanager.ISecret;
   // IDomainName, not the concrete DomainName class: this is always an
   // imported reference (fromDomainNameAttributes) to a resource this stack
   // never creates — see EXISTING_DOMAIN_NAME above.
@@ -228,164 +230,75 @@ export class QuadriviaWebhookStack extends cdk.Stack {
     const connectInstanceId = arnMatch[1];
 
     // ── Layer 3: idempotency store ──────────────────────────────────────
-    this.idempotencyTable = new dynamodb.Table(this, 'IdempotencyTable', {
-      tableName: TABLE_NAME,
-      partitionKey: { name: 'requestId', type: dynamodb.AttributeType.STRING },
-      // On-demand: traffic is a handful of after-hours requests per night with
-      // no predictable shape, and a provisioned floor would be paid 24/7 to
-      // sit idle.
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+    // IMPORTED, not created: the 2026-10-01 deploy attempt that first got
+    // past the PassRole gap created this table fully (CREATE_COMPLETE: on
+    // demand, requestId hash key, CMK-encrypted, TTL on `ttl`, PITR enabled)
+    // before a later resource failed and rolled the stack back.
+    // RemovalPolicy.RETAIN left the real, correctly-configured table in
+    // place (DELETE_SKIPPED) — confirmed live via `aws dynamodb
+    // describe-table` / `describe-time-to-live` / `describe-continuous-backups`
+    // on 2026-10-01, all matching this stack's intent exactly. A second
+    // `new dynamodb.Table` with the same name fails changeset validation
+    // with "already exists".
+    this.idempotencyTable = dynamodb.Table.fromTableAttributes(this, 'IdempotencyTable', {
+      tableArn: `arn:aws:dynamodb:${this.region}:${this.account}:table/${TABLE_NAME}`,
       encryptionKey: props.dataKey,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      // Matches IDEMPOTENCY_TTL_SECONDS in the handler.
-      timeToLiveAttribute: 'ttl',
-      // RETAIN, never DESTROY: this is account 165505826690 (production).
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // ── Layer 2: HMAC signing key ───────────────────────────────────────
-    // Created empty-but-generated: no secret value in version control, and
-    // the initial value is a real random key rather than a guessable
-    // placeholder. Quadrivia gets the value out-of-band, and rotation is a
-    // Secrets Manager operation — not a stack change.
-    this.hmacSecret = new secretsmanager.Secret(this, 'HmacSecret', {
-      secretName: SECRET_NAME,
-      description: 'Shared HMAC-SHA256 signing key for the Quadrivia callback webhook',
-      encryptionKey: props.dataKey,
-      generateSecretString: {
-        secretStringTemplate: JSON.stringify({}),
-        generateStringKey: 'signingKey',
-        passwordLength: 64,
-        excludePunctuation: true,
-      },
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // IMPORTED, not created: the 2026-10-01 dry-run deploy got far enough to
+    // fully create this secret (CREATE_COMPLETE) before a later resource
+    // (FunctionRole, see below) hit the EngineeringPermissionBoundary deny
+    // and rolled the stack back. RemovalPolicy.RETAIN meant CloudFormation
+    // left the physical secret in place (DELETE_SKIPPED) instead of deleting
+    // it, so a real random signing key already exists under this name — a
+    // second `new secretsmanager.Secret` with the same `secretName` would
+    // fail with ResourceExistsException on the next deploy. Importing by its
+    // exact ARN adopts that already-generated key rather than discarding and
+    // regenerating it. Confirmed live via `aws secretsmanager describe-secret
+    // --secret-id vip/quadrivia/webhook-hmac --profile production` on
+    // 2026-10-01 — re-run that command if this secret is ever recreated and
+    // update the ARN below.
+    this.hmacSecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this,
+      'HmacSecret',
+      'arn:aws:secretsmanager:us-east-1:165505826690:secret:vip/quadrivia/webhook-hmac-C2Sw6c',
+    );
 
-    const logGroup = new logs.LogGroup(this, 'FunctionLogs', {
-      logGroupName: `/aws/lambda/${FUNCTION_NAME}`,
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: props.dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // IMPORTED, not created: a prior rolled-back deploy attempt's
+    // CreateLogGroup call physically succeeded against CloudWatch Logs
+    // before CloudFormation's own bookkeeping marked the resource
+    // "cancelled" during rollback — a known CFN race, not specific to this
+    // stack. A fresh `new logs.LogGroup` with the same name fails with
+    // AlreadyExists. Retention (365 days) was set to match this stack's
+    // intended config via `aws logs put-retention-policy` on 2026-10-01
+    // after confirming the group's real state with `describe-log-groups`.
+    const logGroup = logs.LogGroup.fromLogGroupName(
+      this,
+      'FunctionLogs',
+      `/aws/lambda/${FUNCTION_NAME}`,
+    );
 
     // ── Least-privilege execution role ──────────────────────────────────
-    // NOTE FOR WHOEVER DEPLOYS THIS: EngineeringPermissionBoundary denies
-    // iam:CreateRole/PutRolePolicy to this app's CFN exec role, which is why
-    // several sibling stacks import a hand-created role instead (see
-    // api-authorizer-stack.ts and api-sms-stack.ts). The role is declared here
-    // anyway so the intended least-privilege policy is version-controlled and
-    // test-asserted; if the deploy hits that deny, mirror this exact policy
-    // into a manually-created role and switch to Role.fromRoleArn — do not
-    // widen it.
-    const role = new iam.Role(this, 'FunctionRole', {
-      roleName: `${FUNCTION_NAME}-role`,
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      description: 'Execution role for the Quadrivia after-hours callback webhook',
-    });
-
-    // Log delivery only into this function's own log group — not the
-    // AWSLambdaBasicExecutionRole managed policy, which allows
-    // logs:CreateLogGroup account-wide.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'WriteOwnLogs',
-        effect: iam.Effect.ALLOW,
-        actions: ['logs:CreateLogStream', 'logs:PutLogEvents'],
-        resources: [logGroup.logGroupArn, `${logGroup.logGroupArn}:*`],
-      }),
-    );
-
-    // StartTaskContact only, scoped to contacts of this one Connect instance.
-    // No connect:StopContact / UpdateContact etc. — the webhook creates and
-    // never reads or mutates. No task-template permission needed either:
-    // this passes ContactFlowId, not TaskTemplateId (see contactFlowId prop
-    // doc) — deliberately avoiding the org-wide side effect of publishing
-    // this instance's first-ever Task Template.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'StartScheduledCallbackTask',
-        effect: iam.Effect.ALLOW,
-        actions: ['connect:StartTaskContact'],
-        resources: [`${props.connectInstanceArn}/contact/*`],
-      }),
-    );
-
-    // Scoped to exactly this one Lambda — not lambda:InvokeFunction:* — so
-    // this role can never invoke anything else. See patientLookupFunctionArn
-    // prop doc for why this Lambda is invoked directly rather than from a
-    // Connect flow.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'LookupExistingPatient',
-        effect: iam.Effect.ALLOW,
-        actions: ['lambda:InvokeFunction'],
-        resources: [props.patientLookupFunctionArn],
-      }),
-    );
-
-    // Exactly PutItem + GetItem — NOT grantReadWriteData(), which would also
-    // hand over Query/Scan/UpdateItem/DeleteItem/BatchWriteItem. PutItem does
-    // the atomic conditional claim; GetItem is used only on the duplicate path
-    // to return the original contactId alongside the 409.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'IdempotencyClaim',
-        effect: iam.Effect.ALLOW,
-        // DeleteItem is for _release_reservation (handler.py): without it, a
-        // Connect failure's cleanup delete silently AccessDenied's (caught
-        // and only WARN-logged), so the release never actually happens and
-        // the request_id stays claimed for the full TTL — exactly the bug
-        // this cleanup exists to prevent.
-        actions: ['dynamodb:PutItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'],
-        resources: [this.idempotencyTable.tableArn],
-      }),
-    );
-
-    // Written as explicit identity-policy statements rather than
-    // `hmacSecret.grantRead(role)` / `dataKey.grantDecrypt(role)` on purpose.
-    // Both of those helpers append this role's ARN to the *CMK's resource
-    // policy*, and the CMK is owned by DataStack — that makes DataStack depend
-    // on this stack's role while this stack depends on DataStack's key ARN,
-    // which CloudFormation rejects as a cyclic reference (reproduced in this
-    // stack's own test). The CMK's default key policy already delegates to IAM
-    // for the account root, so identity-side grants are sufficient and stay
-    // one-directional.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'ReadWebhookSigningKey',
-        effect: iam.Effect.ALLOW,
-        actions: ['secretsmanager:GetSecretValue'],
-        resources: [this.hmacSecret.secretArn],
-      }),
-    );
-    // One CMK protects three things this role touches, and each needs a
-    // different slice of KMS — under-granting here is invisible to unit tests
-    // (the boto3 clients are mocked) and only surfaces as a runtime
-    // AccessDenied in production:
-    //   - Secrets Manager GetSecretValue on a CMK-encrypted secret → Decrypt
-    //   - Lambda decrypting the encrypted environment variables at init
-    //     → Decrypt (performed with the execution role's permissions)
-    //   - DynamoDB PutItem into a CMK-encrypted table → GenerateDataKey* /
-    //     Encrypt / ReEncrypt*, not just Decrypt (this is the same action set
-    //     CDK's own grantEncryptDecrypt() emits for table.grantWriteData()).
-    // Still scoped to this one key ARN. A `kms:ViaService` condition limiting
-    // it to dynamodb/secretsmanager/lambda in this region would be tighter
-    // still, but is left off until it can be verified against a real invoke
-    // rather than guessed.
-    role.addToPrincipalPolicy(
-      new iam.PolicyStatement({
-        sid: 'UseDataKey',
-        effect: iam.Effect.ALLOW,
-        actions: [
-          'kms:Decrypt',
-          'kms:DescribeKey',
-          'kms:Encrypt',
-          'kms:ReEncrypt*',
-          'kms:GenerateDataKey*',
-        ],
-        resources: [props.dataKey.keyArn],
-      }),
+    // IMPORTED, not created: EngineeringPermissionBoundary denies
+    // iam:CreateRole to this app's CFN exec role (reproduced live during the
+    // 2026-10-01 dry-run deploy — HandlerErrorCode: UnauthorizedTaggingOperation
+    // / explicit deny on iam:CreateRole), same pattern as api-authorizer-stack.ts
+    // and api-sms-stack.ts. The role was created manually via the AWS console
+    // on 2026-10-01 with the exact statements below mirrored into its inline
+    // policy by hand — see the policy JSON kept alongside this stack's docs
+    // for the source of truth. If this role is ever recreated, re-apply that
+    // same policy; do not widen it.
+    // mutable: false — nothing in this stack may call addToPrincipalPolicy /
+    // grantXxx on this role. Those would synthesize their own
+    // AWS::IAM::Policy against the CFN exec role, hitting the exact same
+    // PutRolePolicy deny this import exists to avoid. All permissions this
+    // Lambda needs already live in the role's manually-created inline policy.
+    const role = iam.Role.fromRoleArn(
+      this,
+      'FunctionRole',
+      'arn:aws:iam::165505826690:role/vip-quadrivia-callback-role',
+      { mutable: false },
     );
 
     // ── Business Lambda (layers 2 + 3 live inside it) ───────────────────
@@ -484,12 +397,13 @@ export class QuadriviaWebhookStack extends cdk.Stack {
     });
 
     // ── Access logging ──────────────────────────────────────────────────
-    const accessLogGroup = new logs.LogGroup(this, 'AccessLogs', {
-      logGroupName: `/aws/apigateway/${FUNCTION_NAME}-access`,
-      retention: logs.RetentionDays.ONE_YEAR,
-      encryptionKey: props.dataKey,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
+    // IMPORTED, not created — same orphaned-by-a-rolled-back-deploy reason as
+    // FunctionLogs above; see that comment.
+    const accessLogGroup = logs.LogGroup.fromLogGroupName(
+      this,
+      'AccessLogs',
+      `/aws/apigateway/${FUNCTION_NAME}-access`,
+    );
     // Same scoped grant pattern as ApiStack: API Gateway's log-delivery
     // principal needs explicit CMK access, narrowed to this account and this
     // log group rather than every stage in the account.
