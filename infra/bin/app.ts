@@ -14,6 +14,7 @@ import { ApiStack } from '../lib/stacks/api-stack';
 import { AuthStack } from '../lib/stacks/auth-stack';
 import { DataStack } from '../lib/stacks/data-stack';
 import { HostingStack } from '../lib/stacks/hosting-stack';
+import { QuadriviaWebhookStack } from '../lib/stacks/quadrivia-webhook-stack';
 
 export const app = new cdk.App();
 
@@ -275,6 +276,49 @@ export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
 // NOTE: MonitoringStack (SNS + CloudWatch alarms + dashboard) is NOT managed by CDK.
 // The CFN exec role lacks SNS and cloudwatch:PutDashboard permissions.
 // All monitoring resources are created via CLI — see deploy-cli.sh.
+
+// QuadriviaWebhookStack — the mTLS webhook that lets Quadrivia's after-hours
+// AI agent schedule callback Tasks in Connect.
+//
+// Status as of 2026-10-01 — DELIBERATE DRY-RUN DEPLOY, not a real go-live:
+//   - ownerEmail = sebastian.valdenebro@medwork.io, team = specialOps — DECIDED.
+//   - patientLookupFunctionArn = SOPS-ConnectPatientLookup's ARN — DECIDED.
+//   - existingDomain — intentionally OMITTED (left undefined). mTLS is not
+//     yet active on quadrivia-webhook.medwork.io, so this stack creates no
+//     ApiMapping and the webhook is reachable from nowhere. Safe by
+//     construction, not by discipline — do not add existingDomain until
+//     mTLS is confirmed active (see the DEPLOY-ORDER WARNING on that prop).
+//   - clientCertSubjectDn below is still an EXPLICIT PLACEHOLDER, not a real
+//     value — see QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN for why this is
+//     still safe to deploy. Must be replaced with a real value — via a
+//     second, deliberate deploy — before mTLS is ever activated on the
+//     domain: Quadrivia confirmed 2026-09-30 they'll state the exact
+//     subjectDN when they send their CA cert PEM. Per the stack's own doc:
+//     derive it from the actual PEM they send (`openssl x509 -noout
+//     -subject`), not from a typed description.
+//   - contactFlowId now points at the real TEST flow ("Quadrivia Test
+//     Flow", created 2026-10-01, always transfers to the "Quadrivia Test"
+//     queue — no live agent has that queue in their routing profile). This
+//     is deliberately the test-window flow, not the real
+//     billing/existing-patient/new-lead router — that one still needs the
+//     real queue ARNs (PST pending Maria Jose) and must replace this value
+//     before go-live.
+const QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN = 'PENDING-QUADRIVIA-CERT-DO-NOT-ACTIVATE-MTLS-WITH-THIS-VALUE';
+const QUADRIVIA_TEST_CONTACT_FLOW_ID = '94aa3f9d-5ed3-4de5-aa7b-065012de3beb';
+
+export const quadriviaWebhook = new QuadriviaWebhookStack(app, 'QuadriviaWebhookStack', {
+  env,
+  dataKey: data.dataKey,
+  connectInstanceArn: `arn:aws:connect:us-east-1:165505826690:instance/${connectInstanceId}`,
+  contactFlowId: QUADRIVIA_TEST_CONTACT_FLOW_ID,
+  patientLookupFunctionArn:
+    'arn:aws:lambda:us-east-1:165505826690:function:SOPS-ConnectPatientLookup',
+  clientCertSubjectDn: QUADRIVIA_PLACEHOLDER_CERT_SUBJECT_DN,
+  ownerEmail: 'sebastian.valdenebro@medwork.io',
+  team: 'specialOps',
+  // existingDomain intentionally omitted — see status note above.
+  permissionsBoundaryName,
+});
 
 // AWS::IAM::Role is excluded: EngineeringPermissionBoundary explicitly denies
 // iam:TagRole/iam:UntagRole account-wide, so any attempt to re-sync tags on a
