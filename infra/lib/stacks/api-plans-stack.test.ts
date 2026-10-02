@@ -166,7 +166,9 @@ describe('ApiPlansStack', () => {
       // the live policy (see the comment above locationMappingTable.grantReadData
       // in api-plans-stack.ts) after a CDK grant() call for it failed
       // mid-deploy on 2026-09-28 under this account's permission boundary.
-      // This hash stays at the pre-that-change baseline.
+      // Verified unchanged after merging integrate/main-into-precall-sms into
+      // main (2026-10-02) — that branch's own IAM-adjacent grant is likewise
+      // CLI-only, so this baseline still holds.
       expect(createHash('sha256').update(JSON.stringify(iamResources)).digest('hex'))
         .toBe('63319c9f23794bf61f08b34877d08820a8427bf7cc51bb51f6d2a63d68e27c7a');
     });
