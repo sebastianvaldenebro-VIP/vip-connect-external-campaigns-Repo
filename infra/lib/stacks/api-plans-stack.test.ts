@@ -535,12 +535,20 @@ describe('ApiPlansStack', () => {
 
     it('sets exactly the minimal (no optional props) environment variables, nothing extra', () => {
       const plansTableId = logicalIdOf(template, 'AWS::DynamoDB::Table', { TableName: 'VipAdminPlans' });
+      const notContactedAuditTableId = logicalIdOf(template, 'AWS::DynamoDB::Table', {
+        TableName: 'VipCampaignNotContactedAudit',
+      });
+      const nonGeographicExclusionAuditTableId = logicalIdOf(template, 'AWS::DynamoDB::Table', {
+        TableName: 'VipNonGeographicExclusionAudit',
+      });
       expect(functionEnv(template, 'vip-admin-ui-api-plans')).toEqual({
         CONNECT_INSTANCE_ID,
         RECORDINGS_BUCKET: 'amazon-connect-c5a2158755eb',
         VOICEMAIL_BUCKET: 'vmx3-recordings-vipmedicalgroup',
         PROFILES_DOMAIN_NAME,
         PLANS_TABLE_NAME: { Ref: plansTableId },
+        NOT_CONTACTED_AUDIT_TABLE: { Ref: notContactedAuditTableId },
+        NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE: { Ref: nonGeographicExclusionAuditTableId },
         AUDIT_TABLE: 'AdminAuditLog',
         DATA_KEY_ARN,
         REDIS_HOST: 'master.prod-medwork-api.jrdc0s.use1.cache.amazonaws.com',

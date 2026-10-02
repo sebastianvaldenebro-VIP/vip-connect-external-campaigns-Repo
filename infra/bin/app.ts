@@ -276,4 +276,11 @@ export const hostingStack = new HostingStack(app, 'VipAdminHostingStack', {
 // The CFN exec role lacks SNS and cloudwatch:PutDashboard permissions.
 // All monitoring resources are created via CLI — see deploy-cli.sh.
 
-Object.entries(mandatoryTags).forEach(([k, v]) => cdk.Tags.of(app).add(k, v));
+// AWS::IAM::Role is excluded: EngineeringPermissionBoundary explicitly denies
+// iam:TagRole/iam:UntagRole account-wide, so any attempt to re-sync tags on a
+// role fails deploy AND the subsequent rollback (same denied action), leaving
+// the stack stuck in UPDATE_ROLLBACK_FAILED (hit 2026-09-14 on 4 stacks,
+// see BUGLOG.md BD-024).
+Object.entries(mandatoryTags).forEach(([k, v]) =>
+  cdk.Tags.of(app).add(k, v, { excludeResourceTypes: ['AWS::IAM::Role'] }),
+);

@@ -188,3 +188,27 @@ class TestNormalizePhoneE164AlreadyE164NonNanp:
         # 11-digit-starting-with-1 branches, so it falls through to the final
         # "already E.164, pass through unchanged" return.
         assert executor._normalize_phone_e164("+442012345678") == "+442012345678"
+
+
+class TestIsGeographicNanpPhone:
+    def test_geographic_area_code_is_true(self):
+        assert executor._is_geographic_nanp_phone("+19174105649") is True
+
+    def test_toll_free_800_is_false(self):
+        assert executor._is_geographic_nanp_phone("+18005551234") is False
+
+    def test_each_toll_free_prefix_is_false(self):
+        for npa in ("800", "822", "833", "844", "855", "866", "877",
+                     "880", "881", "882", "883", "884", "885", "886",
+                     "887", "888", "889", "900"):
+            assert executor._is_geographic_nanp_phone(f"+1{npa}5551234") is False
+
+    def test_non_nanp_country_code_passes_through(self):
+        # Out of scope for the AREA_CODE +1 42-timezone fallback -- not filtered.
+        assert executor._is_geographic_nanp_phone("+442012345678") is True
+
+    def test_malformed_plus1_wrong_length_passes_through(self):
+        # Defensive: only a well-formed 12-char +1XXXXXXXXXX string is checked
+        # against the non-geographic set; anything else is left to the
+        # existing _normalize_phone_e164 format validation.
+        assert executor._is_geographic_nanp_phone("+1917410564") is True

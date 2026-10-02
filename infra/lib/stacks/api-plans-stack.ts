@@ -95,6 +95,86 @@ export class ApiPlansStack extends cdk.Stack {
       deletionProtection: true,
     });
 
+    // ── Not-Contacted Audit table ────────────────────────────────────
+    // Read-only bookkeeping (_audit_not_contacted_leads in executor.py):
+    // right before a completed campaign's CP segment is deleted, diffs the
+    // segment's targeted phone numbers against who was actually dialed for
+    // that specific connectCampaignId, and records every never-contacted
+    // number here. No automated action is taken on these leads — for manual
+    // review only. Approved by Sebastian 2026-09-29 as a low-risk visibility
+    // feature, explicitly NOT the earlier-discussed defaultTimeZone/
+    // EVENT_TRIGGERED-campaign auto-heal design (that one was dropped).
+    const notContactedAuditTable = new dynamodb.Table(this, 'NotContactedAuditTable', {
+      tableName: 'VipCampaignNotContactedAudit',
+      partitionKey: { name: 'campaignId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'phoneNumber', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: props.dataKey,
+      pointInTimeRecovery: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      deletionProtection: true,
+    });
+    // TWO new IAM actions are needed for _audit_not_contacted_leads and are
+    // NOT granted here via CDK:
+    //   1. dynamodb:PutItem on this table.
+    //   2. connect:SearchContacts on the instance (connect:DescribeContact
+    //      is already granted below under ContactArtifactsDescribeContact
+    //      and covers this feature's other API call).
+    // Adding either via grant()/addToPolicy() updates `role`'s
+    // FunctionRoleDefaultPolicy41A10F9C — the same CDK-managed inline policy
+    // that has failed via CFN on EVERY prior attempt to add or change a
+    // statement on it under this account's EngineeringPermissionBoundary
+    // (see the VipLocationMapping PutItem and events:ListRules comments
+    // below for the two prior UPDATE_ROLLBACK_FAILED incidents this
+    // produced, 2026-09-08 and 2026-09-28). This is a property of updating
+    // THIS role's policy at all, not of either resource/action being new —
+    // expect the identical failure here. After this stack deploys (table
+    // creation itself is unaffected, it's a distinct resource), apply both
+    // grants together via one CLI call on the live policy instead:
+    //   aws iam put-role-policy --role-name <FunctionRole physical id> \
+    //     --policy-name FunctionRoleDefaultPolicy41A10F9C \
+    //     --policy-document file://<full existing statements, plus a
+    //       PutItem statement scoped to
+    //       arn:aws:dynamodb:...:table/VipCampaignNotContactedAudit, plus a
+    //       SearchContacts statement scoped to the Connect instance ARN>
+    // Do not add a grant()/addToPolicy() call for either of these here.
+    // Until this CLI grant is applied, _audit_not_contacted_leads will fail
+    // with AccessDenied on every call — it is wrapped in a broad try/except
+    // (never raises) so this is silent and does not block bucket cleanup,
+    // but it also means no audit rows get written until the grant lands.
+
+    // ── Non-Geographic Exclusion Audit table ─────────────────────────
+    // Read-only bookkeeping (_create_segment in executor.py): every lead
+    // phone excluded from a segment for being a non-geographic NANP number
+    // (toll-free/premium — the root cause of the 42-timezone AREA_CODE stall,
+    // see _is_geographic_nanp_phone) is recorded here so these numbers can be
+    // looked up later without digging through CloudWatch Logs. No automated
+    // action is taken — for manual review only. Approved by Sebastian
+    // 2026-10-02.
+    const nonGeographicExclusionAuditTable = new dynamodb.Table(this, 'NonGeographicExclusionAuditTable', {
+      tableName: 'VipNonGeographicExclusionAudit',
+      partitionKey: { name: 'campaignId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'phoneNumber', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: props.dataKey,
+      pointInTimeRecovery: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      deletionProtection: true,
+    });
+    // dynamodb:PutItem on this table is NOT granted here via CDK — same
+    // EngineeringPermissionBoundary limitation on updating this role's
+    // FunctionRoleDefaultPolicy41A10F9C documented in detail just above for
+    // NotContactedAuditTable. Apply via CLI after this stack deploys:
+    //   aws iam put-role-policy --role-name <FunctionRole physical id> \
+    //     --policy-name FunctionRoleDefaultPolicy41A10F9C \
+    //     --policy-document file://<full existing statements, plus a
+    //       PutItem statement scoped to
+    //       arn:aws:dynamodb:...:table/VipNonGeographicExclusionAudit>
+    // Until applied, the write in _create_segment fails with AccessDenied —
+    // wrapped in try/except (never raises, never blocks segment creation).
+
     // ── SNS alerts topic ─────────────────────────────────────────────
     // Topic created manually (CFN exec role lacks SNS:GetTopicAttributes within
     // the EngineeringPermissionBoundary). Import by ARN so CDK can wire IAM
@@ -590,6 +670,16 @@ export class ApiPlansStack extends cdk.Stack {
         props.brandedRunSummaryTable.tableName,
       );
     }
+
+    this.lambdaFunction.addEnvironment(
+      'NOT_CONTACTED_AUDIT_TABLE',
+      notContactedAuditTable.tableName,
+    );
+
+    this.lambdaFunction.addEnvironment(
+      'NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE',
+      nonGeographicExclusionAuditTable.tableName,
+    );
 
     if (props.brandedCampaignMetricsTable) {
       this.lambdaFunction.addEnvironment(

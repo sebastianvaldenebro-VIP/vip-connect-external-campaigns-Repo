@@ -110,6 +110,8 @@ _PROGRESSIVE_DIALER_SEEDER_ARN: Final = os.environ.get("PROGRESSIVE_DIALER_SEEDE
 _ACTIVE_BRANDED_CAMPAIGNS_TABLE: Final = os.environ.get("ACTIVE_BRANDED_CAMPAIGNS_TABLE", "")
 _CAMPAIGN_QUEUE_TABLE_BRANDED: Final = os.environ.get("CAMPAIGN_QUEUE_TABLE_BRANDED", "")
 _BRANDED_RUN_SUMMARY_TABLE: Final = os.environ.get("BRANDED_RUN_SUMMARY_TABLE", "")
+_NOT_CONTACTED_AUDIT_TABLE: Final = os.environ.get("NOT_CONTACTED_AUDIT_TABLE", "")
+_NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE: Final = os.environ.get("NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE", "")
 
 # Consecutive branded-poll failure tracking — keyed by brandedCampaignId.
 # Resets on a successful poll; campaign transitions to error after this many consecutive failures.
@@ -216,6 +218,17 @@ def _get_ddb_client():
         import boto3 as _boto3
         _ddb_client_branded = _boto3.client("dynamodb")
     return _ddb_client_branded
+
+
+_connect_client_audit = None
+
+
+def _get_connect_client():
+    global _connect_client_audit
+    if _connect_client_audit is None:
+        import boto3 as _boto3
+        _connect_client_audit = _boto3.client("connect")
+    return _connect_client_audit
 
 
 def _emit_branded_metric(metric_name: str, value: float = 1.0) -> None:
@@ -3265,6 +3278,7 @@ def _advance_bucket(run: dict, plan: dict, bucket_index: int, reason: str) -> No
                     _safe_stop_campaign(cs["connectCampaignId"])
                     _safe_delete_campaign(cs["connectCampaignId"])
                 if cs.get("segmentName"):
+                    _audit_not_contacted_leads(run, cs, bucket)
                     _safe_delete_segment(cs["segmentName"])
 
         bucket_state["status"] = "completed"
@@ -5484,6 +5498,78 @@ def _normalize_phone_e164(raw: str) -> str | None:
     return None
 
 
+# NANP area codes (NPA) that are not tied to a single geographic timezone.
+# Connect Campaigns V2's AREA_CODE local-timezone detection falls back to ALL
+# 42 timezones in the +1 country code when it can't resolve an NPA to a
+# region. With a fixed openHours window, a profile assigned all 42 timezones
+# can never have every one of them simultaneously in-window, so it can never
+# be dialed — and since a campaign only reaches a terminal state once every
+# profile has been dialed, that single undialable profile holds the whole
+# campaign ACTIVE until the plan's end time (confirmed AWS root cause,
+# 2026-09-29 case-165505826690-muen-2026-65eae3ee1b283a1b). Toll-free NPAs are
+# the most common source of this in our lead data; filter them out before
+# they ever reach the segment.
+_NON_GEOGRAPHIC_NANP_AREA_CODES: frozenset[str] = frozenset(
+    {"800", "822", "833", "844", "855", "866", "877", "880", "881", "882",
+     "883", "884", "885", "886", "887", "888", "889", "900"}
+)
+
+
+def _is_geographic_nanp_phone(e164: str) -> bool:
+    """True if `e164` is either non-NANP (not +1) or a +1 number with a
+    geographic (non-toll-free/non-premium) area code.
+
+    Only +1 numbers are checked against `_NON_GEOGRAPHIC_NANP_AREA_CODES` —
+    the AREA_CODE 42-timezone fallback this guards against is specific to the
+    +1 country code, so non-NANP numbers (e.g. +44...) pass through
+    unaffected; they're out of scope for this campaign's calling area anyway.
+    """
+    if not e164.startswith("+1") or len(e164) != 12:
+        return True
+    return e164[2:5] not in _NON_GEOGRAPHIC_NANP_AREA_CODES
+
+
+def _audit_non_geographic_exclusions(
+    campaign: dict | None, excluded: list[tuple[str, str]]
+) -> None:
+    """Read-only bookkeeping: record every lead phone dropped from a segment
+    by `_is_geographic_nanp_phone` so these numbers can be looked up later
+    without digging through CloudWatch Logs. No action is taken on the leads.
+
+    Best-effort: never raises. A failure here must never block segment
+    creation (same contract as `_audit_not_contacted_leads`).
+    """
+    if not _NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE or not excluded:
+        return
+    campaign_id = (campaign or {}).get("id") or (campaign or {}).get("name") or "unknown"
+    campaign_name = (campaign or {}).get("name", "")
+    try:
+        ddb = _get_ddb_client()
+        now_iso = _now_iso()
+        for cid, phone_number in excluded:
+            try:
+                ddb.put_item(
+                    TableName=_NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE,
+                    Item={
+                        "campaignId":   {"S": str(campaign_id)},
+                        "phoneNumber":  {"S": phone_number},
+                        "campaignName": {"S": campaign_name},
+                        "leadId":       {"S": cid},
+                        "excludedAt":   {"S": now_iso},
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_audit_non_geographic_exclusions: put_item failed for campaign %s: %s",
+                    campaign_id, type(exc).__name__,
+                )
+    except Exception as exc:
+        logger.warning(
+            "_audit_non_geographic_exclusions: failed for campaign %s: %s",
+            campaign_id, type(exc).__name__,
+        )
+
+
 def _max_age_cutoff(max_age_minutes: Any, now: datetime | None = None) -> str | None:
     """Build the createdAt >= cutoff for the maxLeadAgeMinutes filter.
 
@@ -5590,6 +5676,8 @@ def _create_segment(
     unknown_locs: set[str] = set()
     seen: set[str] = set()
     entries: list[tuple[str, str | None, str]] = []
+    non_geographic_cids: set[str] = set()
+    non_geographic_excluded: list[tuple[str, str]] = []  # (cid, e164 phone)
     for record in redis_source.iter_records():
         loc_val = str(record.get("location", "")).strip()
         if loc_val and loc_val not in known_locs:
@@ -5599,7 +5687,20 @@ def _create_segment(
             if cid and cid not in seen:
                 seen.add(cid)
                 raw_phone = str(record.get("phone", "")).strip()
-                entries.append((cid, _normalize_phone_e164(raw_phone), raw_phone))
+                normalized = _normalize_phone_e164(raw_phone)
+                # Drop toll-free/premium NPAs before they reach the segment —
+                # see _is_geographic_nanp_phone for why (42-timezone AREA_CODE
+                # fallback stalls the whole campaign on one undialable lead).
+                if normalized is not None and not _is_geographic_nanp_phone(normalized):
+                    non_geographic_cids.add(cid)
+                    non_geographic_excluded.append((cid, normalized))
+                    normalized = None
+                entries.append((cid, normalized, raw_phone))
+
+    if non_geographic_excluded:
+        # Count only — no phone numbers (PHI) in this log line.
+        _slog.warn("segment_phones_non_geographic_excluded", count=len(non_geographic_excluded))
+        _audit_non_geographic_exclusions(campaign, non_geographic_excluded)
 
     if unknown_locs:
         try:
@@ -5666,7 +5767,11 @@ def _create_segment(
                 {
                     "cid": cid,
                     "phone_last4": raw[-4:] if len(raw) >= 4 else "",
-                    "reason": "empty" if not raw else "bad_format",
+                    "reason": (
+                        "non_geographic" if cid in non_geographic_cids
+                        else "empty" if not raw
+                        else "bad_format"
+                    ),
                 }
                 for cid, raw in excluded[:50]
             ],
@@ -6152,6 +6257,139 @@ def _safe_delete_campaign(campaign_id: str) -> None:
         build_oc().delete_campaign(campaign_id)
     except Exception as exc:
         logger.warning("_safe_delete_campaign %s: %s", campaign_id, exc)
+
+
+def _extract_segment_phone_numbers(segment_definition: dict) -> set[str]:
+    numbers: set[str] = set()
+    groups = segment_definition.get("SegmentGroups", {}).get("Groups", [])
+    for group in groups:
+        for dimension in group.get("Dimensions", []):
+            values = (
+                dimension.get("ProfileAttributes", {})
+                .get("PhoneNumber", {})
+                .get("Values", [])
+            )
+            numbers.update(values)
+    return numbers
+
+
+def _audit_not_contacted_leads(run: dict, cs: dict, bucket: dict | None = None) -> None:
+    """Read-only bookkeeping: diff a campaign's targeted phone numbers (its
+    Customer Profiles segment) against who Connect actually dialed for that
+    specific connectCampaignId, and write one row per never-contacted number
+    to _NOT_CONTACTED_AUDIT_TABLE. No action is taken on the leads — this is
+    purely for later manual review.
+
+    Must be called BEFORE _safe_delete_segment, since the segment definition
+    is the only source for the original target list and gets deleted right
+    after (same constraint documented on _write_branded_run_start).
+
+    describe-contact's Campaign.CampaignId disambiguates contacts when the
+    same source phone number is shared across multiple same-state campaigns
+    (NY-NL_1/2/3/4-5-6-7 all dial from the same number) — a plain ANI+time-
+    window match is NOT reliable for this, confirmed live 2026-09-29.
+
+    search_contacts is filtered by QueueIds (the campaign's queue) — without
+    it this scans every contact on the whole instance and describe-contacts
+    each one serially inside the tick hot path, which risks delaying bucket
+    advancement and adds avoidable connect:SearchContacts/DescribeContact
+    volume against an API surface already suspected of being rate-limited
+    (flagged by adversarial review 2026-09-29, before this ever deployed).
+
+    Best-effort: never raises. A failure here must never block bucket
+    cleanup/advancement.
+    """
+    if not _NOT_CONTACTED_AUDIT_TABLE:
+        return
+    connect_campaign_id = cs.get("connectCampaignId")
+    segment_name = cs.get("segmentName")
+    if not connect_campaign_id or not segment_name:
+        return
+
+    try:
+        from vip_shared.infrastructure.persistence.customer_profiles_client import (
+            build_from_env as build_cp,
+        )
+
+        segment_def = build_cp().get_segment_definition(segment_name)
+        targeted = _extract_segment_phone_numbers(segment_def)
+        if not targeted:
+            return
+
+        queue_id = ""
+        if bucket:
+            cfg = dict(bucket.get("campaignConfig", {}))
+            campaign_def = next(
+                (c for c in bucket.get("campaigns", []) if c.get("id") == cs.get("campaignId")),
+                None,
+            )
+            if campaign_def:
+                cfg.update(campaign_def.get("campaignConfig", {}))
+            queue_id = cfg.get("queueId", "")
+        if not queue_id:
+            return
+
+        connect = _get_connect_client()
+        dialed: set[str] = set()
+        paginator = connect.get_paginator("search_contacts")
+        started_at = cs.get("startedAt") or run.get("startedAt") or _now_iso()
+        search_kwargs = {
+            "InstanceId": CONNECT_INSTANCE_ID,
+            "TimeRange": {
+                "Type": "INITIATION_TIMESTAMP",
+                "StartTime": started_at,
+                "EndTime": _now_iso(),
+            },
+            "SearchCriteria": {"QueueIds": [queue_id]},
+        }
+        for page in paginator.paginate(**search_kwargs):
+            for contact in page.get("Contacts", []):
+                contact_id = contact.get("Id")
+                if not contact_id:
+                    continue
+                try:
+                    detail = connect.describe_contact(
+                        InstanceId=CONNECT_INSTANCE_ID, ContactId=contact_id
+                    )["Contact"]
+                except Exception:
+                    continue
+                if detail.get("Campaign", {}).get("CampaignId") != connect_campaign_id:
+                    continue
+                address = detail.get("CustomerEndpoint", {}).get("Address")
+                if address:
+                    dialed.add(address)
+
+        not_contacted = targeted - dialed
+        if not not_contacted:
+            return
+
+        ddb = _get_ddb_client()
+        now_iso = _now_iso()
+        for phone_number in not_contacted:
+            try:
+                ddb.put_item(
+                    TableName=_NOT_CONTACTED_AUDIT_TABLE,
+                    Item={
+                        "campaignId":     {"S": connect_campaign_id},
+                        "phoneNumber":    {"S": phone_number},
+                        "planId":         {"S": run.get("planId", "")},
+                        "runId":          {"S": run.get("runId", "")},
+                        "campaignName":   {"S": cs.get("name", "")},
+                        "segmentName":    {"S": segment_name},
+                        "targetedAt":     {"S": started_at},
+                        "checkedAt":      {"S": now_iso},
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "_audit_not_contacted_leads: put_item failed for campaign %s: %s",
+                    connect_campaign_id, type(exc).__name__,
+                )
+    except Exception as exc:
+        logger.warning(
+            "_audit_not_contacted_leads: failed for campaign %s: %s",
+            connect_campaign_id, type(exc).__name__,
+        )
 
 
 def _safe_delete_segment(segment_name: str) -> None:

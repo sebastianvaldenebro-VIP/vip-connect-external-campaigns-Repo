@@ -119,6 +119,168 @@ class TestLocationGroupsCreatedAtRules:
         assert actual == 1
 
 
+class TestNonGeographicPhoneFilteredFromSegment:
+    def test_toll_free_lead_excluded_geographic_lead_kept(self):
+        campaign = {"name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [
+                {"customerid": "geo", "phone": "9174105649", "location": "NY"},
+                {"customerid": "tollfree", "phone": "8005551234", "location": "NY"},
+            ]
+        )
+        cp = _cp_client()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=["loc-ny"]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+        ):
+            _, _, total_matched, dialable = executor._create_segment(bucket, campaign)
+
+        # Both leads matched the segment filters (total_matched), but only the
+        # geographic one is actually dialable -- the toll-free lead never
+        # reaches phones_e164 / the Customer Profiles segment.
+        assert total_matched == 2
+        assert dialable == 1
+
+    def test_toll_free_lead_logged_with_non_geographic_reason(self):
+        campaign = {"name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [
+                {"customerid": "geo", "phone": "9174105649", "location": "NY"},
+                {"customerid": "tollfree", "phone": "8005551234", "location": "NY"},
+                {"customerid": "malformed", "phone": "123", "location": "NY"},
+            ]
+        )
+        cp = _cp_client()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=["loc-ny"]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch.object(executor._slog, "warn") as mock_warn,
+        ):
+            executor._create_segment(bucket, campaign)
+
+        excluded_calls = [
+            c for c in mock_warn.call_args_list if c.args[0] == "segment_phones_excluded"
+        ]
+        assert len(excluded_calls) == 1
+        excluded_by_cid = {e["cid"]: e for e in excluded_calls[0].kwargs["excluded"]}
+        assert excluded_by_cid["tollfree"]["reason"] == "non_geographic"
+        assert excluded_by_cid["malformed"]["reason"] == "bad_format"
+
+    def test_toll_free_lead_written_to_exclusion_audit_table(self):
+        campaign = {"id": "camp-1", "name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [
+                {"customerid": "geo", "phone": "9174105649", "location": "NY"},
+                {"customerid": "tollfree", "phone": "8005551234", "location": "NY"},
+            ]
+        )
+        cp = _cp_client()
+        mock_ddb = MagicMock()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=["loc-ny"]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor._NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE", "VipNonGeographicExclusionAudit"),
+            patch("executor._get_ddb_client", return_value=mock_ddb),
+        ):
+            executor._create_segment(bucket, campaign)
+
+        mock_ddb.put_item.assert_called_once()
+        kwargs = mock_ddb.put_item.call_args.kwargs
+        assert kwargs["TableName"] == "VipNonGeographicExclusionAudit"
+        item = kwargs["Item"]
+        assert item["campaignId"] == {"S": "camp-1"}
+        assert item["phoneNumber"] == {"S": "+18005551234"}
+        assert item["leadId"] == {"S": "tollfree"}
+
+    def test_no_write_to_exclusion_audit_table_when_env_var_unset(self):
+        campaign = {"id": "camp-1", "name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [{"customerid": "tollfree", "phone": "8005551234", "location": "NY"}]
+        )
+        cp = _cp_client()
+        mock_ddb = MagicMock()
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=["loc-ny"]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor._NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE", ""),
+            patch("executor._get_ddb_client", return_value=mock_ddb),
+            pytest.raises(executor._EmptySegmentError),
+        ):
+            executor._create_segment(bucket, campaign)
+
+        mock_ddb.put_item.assert_not_called()
+
+    def test_exclusion_audit_put_item_failure_does_not_raise(self):
+        campaign = {"id": "camp-1", "name": "c0"}
+        bucket = {"name": "b0", "segmentFilters": {}}
+        rs = _redis_source(
+            [
+                {"customerid": "geo", "phone": "9174105649", "location": "NY"},
+                {"customerid": "tollfree", "phone": "8005551234", "location": "NY"},
+            ]
+        )
+        cp = _cp_client()
+        mock_ddb = MagicMock()
+        mock_ddb.put_item.side_effect = RuntimeError("boom")
+        with (
+            patch(
+                "vip_shared.infrastructure.persistence.redis_lead_source.build_from_env",
+                return_value=rs,
+            ),
+            patch(
+                "vip_shared.infrastructure.persistence.customer_profiles_client.build_from_env",
+                return_value=cp,
+            ),
+            patch("executor.all_known_locations", return_value=frozenset({"NY"})),
+            patch("executor.locations_for_state_codes", return_value=["loc-ny"]),
+            patch("executor.campaign_to_segment_filters", return_value={}),
+            patch("executor._NON_GEOGRAPHIC_EXCLUSION_AUDIT_TABLE", "VipNonGeographicExclusionAudit"),
+            patch("executor._get_ddb_client", return_value=mock_ddb),
+        ):
+            # Must not raise despite put_item failing -- segment creation proceeds.
+            executor._create_segment(bucket, campaign)
+
+
 class TestRedisRebuildingGuard:
     def test_raises_when_redis_not_ready(self):
         campaign = {"name": "c0"}
